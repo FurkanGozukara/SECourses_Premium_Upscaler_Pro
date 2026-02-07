@@ -317,7 +317,7 @@ def wire_universal_preset_events(
     shared_state: gr.State,
     tab_name: Optional[str] = None,
     enable_auto_sync: bool = True,
-) -> None:
+) -> Dict[str, Any]:
     """
     Wire up event handlers for universal preset UI.
     
@@ -345,7 +345,7 @@ def wire_universal_preset_events(
         state = args[-1]  # Last argument is shared_state
         return callbacks["save_preset"](preset_name, tab_values, state)
     
-    save_btn.click(
+    save_event = save_btn.click(
         fn=save_preset_wrapper,
         inputs=[preset_name_input] + inputs_list + [shared_state],
         outputs=[preset_dropdown, preset_status, shared_state],
@@ -358,14 +358,14 @@ def wire_universal_preset_events(
         # result = (value1, value2, ..., valueN, status_message, updated_state)
         return result
     
-    load_btn.click(
+    load_click_event = load_btn.click(
         fn=load_preset_wrapper,
         inputs=[preset_dropdown, shared_state],
         outputs=inputs_list + [preset_status, shared_state],
     )
     
     # Auto-load on dropdown change
-    preset_dropdown.change(
+    load_change_event = preset_dropdown.change(
         fn=load_preset_wrapper,
         inputs=[preset_dropdown, shared_state],
         outputs=inputs_list + [preset_status, shared_state],
@@ -377,14 +377,14 @@ def wire_universal_preset_events(
         result = callbacks["reset_to_defaults"](state)
         return result
     
-    reset_btn.click(
+    reset_event = reset_btn.click(
         fn=reset_defaults_wrapper,
         inputs=[shared_state],
         outputs=inputs_list + [preset_status, shared_state],
     )
     
     # Delete preset
-    delete_btn.click(
+    delete_event = delete_btn.click(
         fn=callbacks["delete_preset"],
         inputs=[preset_dropdown],
         outputs=[preset_dropdown, preset_status],
@@ -398,6 +398,7 @@ def wire_universal_preset_events(
     #
     # Uses Gradio 6.x `gr.on()` to avoid wiring dozens of separate change handlers.
     # ------------------------------------------------------------------ #
+    sync_event = None
     if enable_auto_sync and tab_name:
         def _sync_wrapper(*args):
             # args = (value1, value2, ..., valueN, shared_state)
@@ -415,7 +416,7 @@ def wire_universal_preset_events(
 
         # Prefer gr.on() for a single endpoint; fall back to per-component wiring if needed.
         if hasattr(gr, "on"):
-            gr.on(
+            sync_event = gr.on(
                 triggers=triggers,
                 fn=_sync_wrapper,
                 inputs=inputs_list + [shared_state],
@@ -436,6 +437,15 @@ def wire_universal_preset_events(
                         show_progress="hidden",
                         trigger_mode="always_last",
                     )
+
+    return {
+        "save": save_event,
+        "load_click": load_click_event,
+        "load_change": load_change_event,
+        "reset": reset_event,
+        "delete": delete_event,
+        "sync": sync_event,
+    }
 
 
 def sync_tab_to_shared_state(

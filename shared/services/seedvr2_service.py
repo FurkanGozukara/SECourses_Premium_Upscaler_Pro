@@ -3304,6 +3304,25 @@ def build_seedvr2_callbacks(
             active_stage_batch_total = 0
             active_stage_percent = 0.0
             active_stage_chunk_idx = 1
+            try:
+                auto_chunk_enabled_ui = bool(seed_controls.get("auto_chunk", True))
+                static_chunk_size_sec_ui = float(seed_controls.get("chunk_size_sec", 0) or 0)
+            except Exception:
+                auto_chunk_enabled_ui = True
+                static_chunk_size_sec_ui = 0.0
+            try:
+                native_chunk_size_frames = int(settings.get("chunk_size", 0) or 0)
+            except Exception:
+                native_chunk_size_frames = 0
+
+            if auto_chunk_enabled_ui:
+                chunk_mode_label = "Auto Chunk (PySceneDetect scenes)"
+            elif static_chunk_size_sec_ui > 0:
+                chunk_mode_label = f"Static Chunk ({static_chunk_size_sec_ui:g}s)"
+            elif native_chunk_size_frames > 0:
+                chunk_mode_label = f"SeedVR2 Native Streaming ({native_chunk_size_frames} frames/chunk)"
+            else:
+                chunk_mode_label = "Single Pass (no external chunking)"
 
             ansi_escape_re = re.compile(r"\x1B[@-_][0-?]*[ -/]*[@-~]")
             chunk_progress_re = re.compile(
@@ -3545,8 +3564,7 @@ def build_seedvr2_callbacks(
                                 else:
                                     last_progress_value = max(last_progress_value, min(0.999, pct_fraction))
 
-                        # User-facing "overall job" progress for multi-chunk runs should represent
-                        # completed chunks only (0% until first chunk fully completes).
+                        # Multi-chunk overall progress is defined strictly by completed chunks.
                         if total_chunks_estimate > 1:
                             display_progress_value = max(
                                 0.0,
@@ -3643,18 +3661,18 @@ def build_seedvr2_callbacks(
                         if total_chunks_estimate > 1:
                             status_text = (
                                 f"Processing... {completed_shown}/{total_chunks_estimate} chunks completed "
-                                f"({percent_done}%)"
+                                f"| overall {percent_done}%"
                             )
                             if stage_summary_short:
                                 status_text = f"{status_text} | {stage_summary_short}"
                                 indicator_title = (
                                     f"Processing... ({completed_shown}/{total_chunks_estimate} chunks completed, "
-                                    f"{percent_done}% done, {stage_summary_short})"
+                                    f"overall {percent_done}% done, {stage_summary_short})"
                                 )
                             else:
                                 indicator_title = (
                                     f"Processing... ({completed_shown}/{total_chunks_estimate} chunks completed, "
-                                    f"{percent_done}% done)"
+                                    f"overall {percent_done}% done)"
                                 )
                         else:
                             if stage_summary_short:
@@ -3666,11 +3684,15 @@ def build_seedvr2_callbacks(
 
                         if total_chunks_estimate > 1:
                             chunk_status_lines = [
+                                f"Chunk mode: {chunk_mode_label}",
                                 f"Chunks completed: {completed_shown}/{total_chunks_estimate}",
                                 f"Current chunk: {current_shown}/{total_chunks_estimate}",
                             ]
                         else:
-                            chunk_status_lines = [f"Chunk {current_shown}/{max(1, total_chunks_estimate)}"]
+                            chunk_status_lines = [
+                                f"Chunk mode: {chunk_mode_label}",
+                                f"Chunk {current_shown}/{max(1, total_chunks_estimate)}",
+                            ]
                         if stage_summary_line:
                             chunk_status_lines.append(stage_summary_line)
                         chunk_status_lines.append(f"Latest: {message}")

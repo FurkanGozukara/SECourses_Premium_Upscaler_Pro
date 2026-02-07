@@ -20,7 +20,6 @@ from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
 )
-from shared.universal_preset import dict_to_values
 
 
 def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
@@ -270,16 +269,6 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         models_list=models_list,
         open_accordion=True,
     )
-
-    # Apply to pipeline
-    gr.Markdown("#### 🔗 Apply to Pipeline")
-    apply_to_seed_btn = gr.Button(
-        "✅ Apply Resolution Settings to All Upscalers",
-        variant="primary",
-        size="lg"
-    )
-    apply_status = gr.Markdown("")
-
     # Collect inputs - MUST match RESOLUTION_ORDER exactly
     inputs_list = [
         model_selector, auto_resolution, enable_max_target, auto_detect_scenes, upscale_factor,
@@ -290,7 +279,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
     ]
 
     # UNIVERSAL PRESET EVENT WIRING
-    wire_universal_preset_events(
+    preset_events = wire_universal_preset_events(
         preset_dropdown=preset_dropdown,
         preset_name_input=preset_name_input,
         save_btn=save_preset_btn,
@@ -304,11 +293,54 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         tab_name="resolution",
     )
 
-    apply_to_seed_btn.click(
-        fn=lambda *args: service["apply_to_seed"](*args),
-        inputs=inputs_list + [shared_state],
-        outputs=[apply_status, shared_state]
-    )
+    def _auto_apply_resolution_state(*args):
+        # Reuse service logic so global + per-model resolution caches stay in sync.
+        _, updated_state = service["apply_to_seed"](*args)
+        return updated_state
+
+    auto_apply_inputs = inputs_list + [shared_state]
+    auto_apply_kwargs = {
+        "fn": _auto_apply_resolution_state,
+        "inputs": auto_apply_inputs,
+        "outputs": [shared_state],
+        "queue": False,
+        "show_progress": "hidden",
+    }
+
+    # Apply immediately whenever any Resolution control changes.
+    auto_apply_triggers = []
+    for comp in inputs_list:
+        if hasattr(comp, "change"):
+            auto_apply_triggers.append(comp.change)
+        if hasattr(comp, "release"):
+            auto_apply_triggers.append(comp.release)
+
+    if hasattr(gr, "on"):
+        gr.on(
+            triggers=auto_apply_triggers,
+            trigger_mode="always_last",
+            **auto_apply_kwargs,
+        )
+    else:
+        for comp in inputs_list:
+            if hasattr(comp, "change"):
+                comp.change(
+                    trigger_mode="always_last",
+                    **auto_apply_kwargs,
+                )
+
+    # Preset load/reset updates component values; chain an explicit apply so caches
+    # update even if programmatic value updates do not emit component change events.
+    for key in ("load_click", "load_change", "reset"):
+        dep = (preset_events or {}).get(key)
+        if dep is not None and hasattr(dep, "then"):
+            dep.then(
+                fn=_auto_apply_resolution_state,
+                inputs=auto_apply_inputs,
+                outputs=[shared_state],
+                queue=False,
+                show_progress="hidden",
+            )
 
     # Auto-calculation callbacks
     def calculate_resolution_wrapper(input_path, scale_x, max_res, enable_max, auto_mode, 

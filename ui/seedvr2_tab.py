@@ -2178,12 +2178,16 @@ def seedvr2_tab(
         is_valid, message, corrected = validate_batch_size_seedvr2(val)
         if not is_valid:
             return corrected, gr.update(value=f"<span style='color: orange;'>{message}</span>", visible=True)
-        return val, gr.update(value="", visible=False)
+        return gr.update(), gr.update(value="", visible=False)
     
-    batch_size.change(
+    # Validate/correct on release to avoid jitter while dragging the slider.
+    batch_size.release(
         fn=validate_batch_size_ui,
         inputs=batch_size,
-        outputs=[batch_size, batch_size_warning]
+        outputs=[batch_size, batch_size_warning],
+        preprocess=False,
+        trigger_mode="always_last",
+        queue=False,
     )
     
     # NOTE: Legacy `resolution` control is hidden; sizing is now driven by Upscale-x.

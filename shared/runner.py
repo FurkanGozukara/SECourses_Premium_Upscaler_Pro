@@ -476,6 +476,12 @@ class Runner:
         
         # Prepare environment (optionally inject MSVC toolchain env for torch.compile on Windows)
         env = os.environ.copy()
+        # PyTorch renamed allocator env var; migrate legacy key to keep settings effective
+        # and avoid warning spam in subprocess logs.
+        legacy_alloc_conf = env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        if legacy_alloc_conf and not env.get("PYTORCH_ALLOC_CONF"):
+            env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
+            log_output("[SeedVR2] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF\n")
 
         compile_requested = bool(settings.get("compile_dit") or settings.get("compile_vae"))
         if platform.system() == "Windows" and compile_requested:

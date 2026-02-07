@@ -1412,6 +1412,11 @@ def _process_single_file(
                     else "Single pass: no chunking"
                 )
 
+        # Preserve subprocess logs for ALL paths so OOM/error detection can inspect
+        # the full CLI traceback even when processing exits with a non-zero code.
+        if result.log and (not local_logs or local_logs[-1] != result.log):
+            local_logs.append(result.log)
+
         # Extract output paths
         if result.output_path:
             output_video = result.output_path if result.output_path.lower().endswith(".mp4") else None
@@ -3529,6 +3534,11 @@ def build_seedvr2_callbacks(
                             accumulated_messages = accumulated_messages[-200:]
 
                         message_lc = message.lower()
+                        if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=message, settings=settings):
+                            state["operation_status"] = "error"
+                            show_vram_oom_modal(state, title="Out of VRAM (GPU) - SeedVR2", duration=None)
+
+                        oom_visible = bool(state.get("alerts", {}).get("oom", {}).get("visible"))
                         chunk_match = chunk_progress_re.search(message)
                         stage_match = stage_batch_re.search(message)
                         pct_match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%", message)
@@ -3768,6 +3778,10 @@ def build_seedvr2_callbacks(
                             else:
                                 status_text = f"Processing... {percent_done}%"
                                 indicator_title = f"Processing... ({percent_done}% done)"
+
+                        if oom_visible:
+                            status_text = "Out of VRAM (GPU) - see banner above"
+                            indicator_title = "Out of VRAM (GPU) - see banner above"
 
                         if total_chunks_estimate > 1:
                             chunk_status_lines = [

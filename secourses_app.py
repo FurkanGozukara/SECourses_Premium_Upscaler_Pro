@@ -134,7 +134,15 @@ run_logger = RunLogger(enabled=global_settings.get("telemetry", True))
 # --------------------------------------------------------------------- #
 # UI construction
 # --------------------------------------------------------------------- #
-def main():
+def _share_enabled_from_argv(argv=None) -> bool:
+    """Return True when --share is present in CLI args."""
+    args = list(argv) if argv is not None else sys.argv[1:]
+    return "--share" in args
+
+
+def main(argv=None):
+    share_enabled = _share_enabled_from_argv(argv)
+
     # Initialize health check data
     try:
         initial_report = collect_health_report(temp_dir=temp_dir, output_dir=output_dir)
@@ -1500,7 +1508,7 @@ def main():
             str(Path(temp_dir).resolve()),
         }
     )
-    demo.launch(inbrowser=True, allowed_paths=launch_allowed_paths)
+    demo.launch(inbrowser=True, allowed_paths=launch_allowed_paths, share=share_enabled)
 
 
 if __name__ == "__main__":

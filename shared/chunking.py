@@ -3,6 +3,7 @@ import math
 import re
 import shutil
 import subprocess
+import threading
 import tempfile
 import time
 from pathlib import Path
@@ -44,24 +45,26 @@ def _has_scenedetect() -> bool:
 
 
 def detect_scenes(
-    video_path: str, 
-    threshold: float = 27.0, 
+    video_path: str,
+    threshold: float = 27.0,
     min_scene_len: float = 1.0,
     fade_detection: bool = False,
     overlap_sec: float = 0.0,
-    on_progress: Optional[Callable[[str], None]] = None
+    on_progress: Optional[Callable[[str], None]] = None,
+    on_progress_pct: Optional[Callable[[int], None]] = None,
 ) -> List[Tuple[float, float]]:
     """
     Detect scenes using PySceneDetect with proper API usage and overlap support.
-    
+
     Args:
         video_path: Path to video file
         threshold: Content threshold for scene detection (lower = more sensitive)
         min_scene_len: Minimum scene length in seconds
         fade_detection: Enable fade in/out detection
         overlap_sec: Seconds of overlap between chunks (for temporal consistency)
-        on_progress: Optional callback for progress updates
-        
+        on_progress: Optional callback for text progress updates
+        on_progress_pct: Optional callback for numeric progress (0-100)
+
     Returns:
         List of (start_seconds, end_seconds) tuples for each scene with overlap applied
     """
@@ -75,8 +78,41 @@ def detect_scenes(
         from scenedetect import open_video, SceneManager
         from scenedetect.detectors import ContentDetector
 
+        def _emit_pct(pct: int) -> None:
+            if not on_progress_pct:
+                return
+            try:
+                on_progress_pct(max(0, min(100, int(pct))))
+            except Exception:
+                pass
+
+        def _timecode_to_frames(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            for attr in ("get_frames", "frame_num", "frames", "frame"):
+                try:
+                    raw = getattr(value, attr, None)
+                    if raw is None:
+                        continue
+                    frame_val = raw() if callable(raw) else raw
+                    if frame_val is None:
+                        continue
+                    frame_i = int(frame_val)
+                    if frame_i >= 0:
+                        return frame_i
+                except Exception:
+                    continue
+            try:
+                frame_i = int(value)
+                if frame_i >= 0:
+                    return frame_i
+            except Exception:
+                pass
+            return None
+
         if on_progress:
             on_progress(f"Detecting scenes: threshold={threshold}, min_len={min_scene_len}s\n")
+        _emit_pct(0)
 
         video = open_video(video_path)
         fps = float(getattr(video, "frame_rate", None) or 30.0)
@@ -100,7 +136,103 @@ def detect_scenes(
             except Exception:
                 pass
 
-        scene_manager.detect_scenes(video=video, show_progress=False)
+        total_frames = _timecode_to_frames(getattr(video, "duration", None))
+        if (not total_frames or total_frames <= 0) and fps > 0:
+            try:
+                duration_guess = get_media_duration_seconds(video_path)
+                if duration_guess and duration_guess > 0:
+                    total_frames = max(1, int(round(float(duration_guess) * float(fps))))
+            except Exception:
+                total_frames = None
+
+        poller_stop = threading.Event()
+        poller_thread: Optional[threading.Thread] = None
+        last_pct = -1
+        frames_seen = 0
+
+        def _publish_frame_progress(frame_value: Any, force: bool = False) -> None:
+            nonlocal last_pct
+            if not on_progress_pct or not total_frames or total_frames <= 0:
+                return
+            frame_i = _timecode_to_frames(frame_value)
+            if frame_i is None:
+                return
+            pct = int((float(frame_i) / float(total_frames)) * 100.0)
+            pct = max(0, min(99, pct))
+            if force or pct > last_pct:
+                last_pct = pct
+                _emit_pct(pct)
+
+        def _publish_position_progress(force: bool = False) -> None:
+            _publish_frame_progress(getattr(video, "position", None), force=force)
+
+        # Fallback for backends that do not expose `position` updates during detection.
+        # We wrap `read()` and track decoded frame count directly.
+        if on_progress_pct and total_frames and total_frames > 0:
+            original_read = getattr(video, "read", None)
+            if callable(original_read):
+                try:
+                    def _read_with_progress(*args, **kwargs):
+                        nonlocal frames_seen
+                        frame_data = original_read(*args, **kwargs)
+                        has_frame = frame_data is not None
+                        if isinstance(frame_data, tuple) and frame_data:
+                            first = frame_data[0]
+                            if isinstance(first, bool):
+                                has_frame = bool(first)
+                            else:
+                                has_frame = first is not None
+                        if has_frame:
+                            frames_seen += 1
+                            _publish_frame_progress(frames_seen)
+                        return frame_data
+
+                    setattr(video, "read", _read_with_progress)
+                except Exception:
+                    pass
+
+        if on_progress_pct and total_frames and total_frames > 0:
+
+            def _progress_poller() -> None:
+                while not poller_stop.wait(0.20):
+                    _publish_position_progress()
+
+            poller_thread = threading.Thread(target=_progress_poller, daemon=True)
+            poller_thread.start()
+
+        detect_kwargs: Dict[str, Any] = {"video": video, "show_progress": False}
+        if on_progress_pct:
+
+            def _detect_callback(*_args, **_kwargs) -> None:
+                for value in _args:
+                    frame_i = _timecode_to_frames(value)
+                    if frame_i is not None:
+                        _publish_frame_progress(frame_i, force=True)
+                        return
+                for value in _kwargs.values():
+                    frame_i = _timecode_to_frames(value)
+                    if frame_i is not None:
+                        _publish_frame_progress(frame_i, force=True)
+                        return
+                _publish_position_progress(force=True)
+
+            detect_kwargs["callback"] = _detect_callback
+
+        try:
+            scene_manager.detect_scenes(**detect_kwargs)
+        except TypeError as callback_exc:
+            # Some PySceneDetect versions do not support `callback=`.
+            if "callback" not in str(callback_exc).lower():
+                raise
+            detect_kwargs.pop("callback", None)
+            scene_manager.detect_scenes(**detect_kwargs)
+        finally:
+            poller_stop.set()
+            if poller_thread and poller_thread.is_alive():
+                poller_thread.join(timeout=0.5)
+
+        _publish_position_progress(force=True)
+        _emit_pct(100)
         scene_list = scene_manager.get_scene_list(start_in_scene=True)
 
         ranges: List[Tuple[float, float]] = []
@@ -110,8 +242,6 @@ def detect_scenes(
         # If we somehow end up with an empty list, treat the whole video as one scene.
         if not ranges:
             try:
-                from .path_utils import get_media_duration_seconds
-
                 duration = get_media_duration_seconds(video_path)
                 if duration and duration > 0:
                     ranges = [(0.0, float(duration))]
@@ -121,8 +251,6 @@ def detect_scenes(
         # Overlap is generally not desirable for scene cuts; only apply if explicitly requested.
         if overlap_sec and overlap_sec > 0 and ranges:
             try:
-                from .path_utils import get_media_duration_seconds
-
                 duration = get_media_duration_seconds(video_path)
                 if duration and duration > 0:
                     ranges = apply_overlap_to_scenes(ranges, float(overlap_sec), float(duration))
@@ -133,7 +261,7 @@ def detect_scenes(
             on_progress(f"✅ Detected {len(ranges)} scenes\n")
 
         return ranges
-        
+
     except ImportError as e:
         if on_progress:
             on_progress(f"⚠️ PySceneDetect import error: {e}, using fallback\n")

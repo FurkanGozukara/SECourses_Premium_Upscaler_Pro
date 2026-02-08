@@ -2071,13 +2071,33 @@ def build_seedvr2_callbacks(
             "chunk_max_frames": int(max(frame_counts)),
         }
 
-    def _auto_res_from_input(input_path: str, state: Dict[str, Any]):
+    def _auto_res_from_input(
+        input_path: str,
+        state: Dict[str, Any],
+        on_progress: Optional[Callable[[int, str], None]] = None,
+    ):
         """Compute dynamic sizing info for the new Upscale-x feature."""
         state = state or {"seed_controls": {}}
         state.setdefault("seed_controls", {})
         seed_controls = state.get("seed_controls", {})
         model_name = seed_controls.get("current_model") or defaults.get("dit_model")
         model_cache = seed_controls.get("resolution_cache", {}).get(model_name, {})
+
+        def _emit_progress(pct: int, note: str = "") -> None:
+            if not on_progress:
+                return
+            safe_pct = max(0, min(100, int(pct)))
+            try:
+                on_progress(safe_pct, str(note or ""))
+            except TypeError:
+                try:
+                    on_progress(safe_pct)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        _emit_progress(2, "Reading media metadata...")
 
         if not input_path:
             return gr.update(value="Provide an input to calculate sizing."), state
@@ -2090,6 +2110,7 @@ def build_seedvr2_callbacks(
         if not dims:
             return gr.update(value=" Could not determine input dimensions."), state
 
+        _emit_progress(16, "Calculating target resize plan...")
         w, h = dims
         input_short = min(w, h)
         input_long = max(w, h)
@@ -2124,6 +2145,7 @@ def build_seedvr2_callbacks(
             max_edge=max_edge,
             pre_downscale_then_upscale=pre_down,
         )
+        _emit_progress(32, "Building sizing summary...")
 
         out_w = plan.final_saved_width or plan.resize_width
         out_h = plan.final_saved_height or plan.resize_height
@@ -2293,6 +2315,7 @@ def build_seedvr2_callbacks(
         frame_count_source = "unknown"
 
         if is_video_input:
+            _emit_progress(42, "Probing duration/FPS/frame stats...")
             cache_key = str(p)
             try:
                 stat = p.stat()
@@ -2318,6 +2341,8 @@ def build_seedvr2_callbacks(
                     "frame_count_source": frame_count_source,
                 }
                 state["seed_controls"] = seed_controls
+
+            _emit_progress(56, "Collecting input stats...")
 
             if duration_sec and duration_sec > 0:
                 input_rows.append(_stat_row("Duration", f"{float(duration_sec):.2f}s"))
@@ -2387,6 +2412,7 @@ def build_seedvr2_callbacks(
                     sizing_rows.append(_stat_row(f"Output FPS (+Global RIFE {mult_val}x)", "Unavailable (input FPS unknown)"))
 
             # Chunking info (Resolution tab global settings)
+            _emit_progress(62, "Preparing chunk analysis...")
             auto_chunk = bool(seed_controls.get("auto_chunk", True))
             if auto_chunk:
                 scene_threshold = float(seed_controls.get("scene_threshold", 27.0) or 27.0)
@@ -2422,10 +2448,19 @@ def build_seedvr2_callbacks(
                     try:
                         from shared.chunking import detect_scenes
 
+                        _emit_progress(68, "Running scene detection...")
+
+                        def _scene_scan_progress(scene_pct: int) -> None:
+                            safe_scene_pct = max(0, min(100, int(scene_pct)))
+                            # Reserve the upper portion of analysis progress for scene scanning.
+                            mapped_pct = 68 + int(round((safe_scene_pct / 100.0) * 28.0))
+                            _emit_progress(mapped_pct, f"Running scene detection... {safe_scene_pct}%")
+
                         scenes = detect_scenes(
                             str(p),
                             threshold=scene_threshold,
                             min_scene_len=min_scene_len,
+                            on_progress_pct=_scene_scan_progress,
                         )
                         scene_stats = _calculate_scene_frame_stats(scenes or [], fps_val)
                         scene_count = int(scene_stats.get("scene_count", len(scenes or [])) or 0)
@@ -2452,6 +2487,7 @@ def build_seedvr2_callbacks(
 
                         seed_controls["last_scene_scan"] = scan_payload
                         state["seed_controls"] = seed_controls
+                        _emit_progress(96, "Building summary cards...")
                     except Exception as e:
                         scene_count = 0
                         chunk_min_frames = None
@@ -2467,6 +2503,10 @@ def build_seedvr2_callbacks(
                             "error": str(e),
                         }
                         state["seed_controls"] = seed_controls
+                elif cached_valid and scene_count > 0:
+                    _emit_progress(82, "Using cached scene detection results...")
+                elif not auto_detect_scenes:
+                    _emit_progress(74, "Scene detection disabled; using static chunk rules.")
 
                 chunk_rows.append(_stat_row("Chunk Mode", "Auto Scene Detect (PySceneDetect)"))
                 chunk_rows.append(
@@ -2500,6 +2540,7 @@ def build_seedvr2_callbacks(
                 else:
                     chunk_rows.append(_stat_row("Auto Chunk Status", "Scene scan failed."))
             else:
+                _emit_progress(74, "Static chunking mode selected.")
                 chunk_size = float(model_cache.get("chunk_size_sec", seed_controls.get("chunk_size_sec", 0) or 0))
                 chunk_overlap = float(model_cache.get("chunk_overlap_sec", seed_controls.get("chunk_overlap_sec", 0) or 0))
 
@@ -2524,6 +2565,7 @@ def build_seedvr2_callbacks(
                         est_chunk_frames = max(1, int(round(float(chunk_size) * float(fps_val))))
                         chunk_rows.append(_stat_row("Approx Frames / Chunk", _format_int(est_chunk_frames)))
         else:
+            _emit_progress(74, "Input is not a video; scene detection skipped.")
             chunk_rows.append(_stat_row("Chunk Stats", "Chunk frame stats are available for video inputs."))
 
         left_cards = [
@@ -2552,6 +2594,7 @@ def build_seedvr2_callbacks(
             f"{notes_html}"
             "</div>"
         )
+        _emit_progress(100, "Finalizing analysis report...")
         return gr.update(value=html_block, visible=True), state
 
     def run_action(

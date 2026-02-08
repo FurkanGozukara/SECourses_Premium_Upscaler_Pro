@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 import copy
 import html
+import queue
 import threading
 import time
 
@@ -1107,16 +1108,35 @@ def seedvr2_tab(
     def _iter_auto_res_progress(input_value: str, state: Dict[str, Any]):
         result_box: Dict[str, Any] = {}
         error_box: Dict[str, Exception] = {}
+        progress_box: "queue.Queue[tuple[int, str]]" = queue.Queue()
 
         seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
         scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
         cap_pct = 96 if scene_mode else 92
         speed = 5.0 if scene_mode else 12.0  # points/sec while waiting for synchronous analysis.
         poll_sec = 0.12
+        real_progress_seen = False
+        last_progress_at = time.monotonic()
+
+        def _push_progress(pct: int, note: str = "") -> None:
+            nonlocal last_progress_at
+            try:
+                safe_pct = max(0, min(99, int(pct)))
+            except Exception:
+                safe_pct = 0
+            progress_box.put((safe_pct, str(note or "")))
+            last_progress_at = time.monotonic()
 
         def _worker():
             try:
-                result_box["value"] = service["auto_res_on_input"](input_value, state)
+                auto_res_fn = service["auto_res_on_input"]
+                try:
+                    result_box["value"] = auto_res_fn(input_value, state, on_progress=_push_progress)
+                except TypeError as callback_exc:
+                    # Backward compatibility for older callback signatures.
+                    if "on_progress" not in str(callback_exc).lower():
+                        raise
+                    result_box["value"] = auto_res_fn(input_value, state)
             except Exception as exc:
                 error_box["value"] = exc
 
@@ -1125,16 +1145,41 @@ def seedvr2_tab(
 
         started = time.monotonic()
         last_pct = -1
+        last_note = ""
 
         while worker.is_alive():
+            while True:
+                try:
+                    pct, note = progress_box.get_nowait()
+                except queue.Empty:
+                    break
+                real_progress_seen = True
+                if pct > last_pct or (pct == last_pct and note and note != last_note):
+                    last_pct = max(last_pct, pct)
+                    last_note = note or _analysis_progress_note(scene_mode, last_pct)
+                    yield ("progress", last_pct, last_note)
+
             elapsed = max(0.0, time.monotonic() - started)
-            pct = int(min(cap_pct, elapsed * speed))
-            if pct != last_pct:
-                last_pct = pct
-                yield ("progress", pct, _analysis_progress_note(scene_mode, pct))
+            fallback_pct = int(min(cap_pct, elapsed * speed))
+            stalled = (time.monotonic() - last_progress_at) > 1.4
+            if fallback_pct > last_pct and (not real_progress_seen or stalled):
+                last_pct = fallback_pct
+                last_note = _analysis_progress_note(scene_mode, fallback_pct)
+                yield ("progress", fallback_pct, last_note)
             time.sleep(poll_sec)
 
         worker.join()
+
+        while True:
+            try:
+                pct, note = progress_box.get_nowait()
+            except queue.Empty:
+                break
+            real_progress_seen = True
+            if pct > last_pct or (pct == last_pct and note and note != last_note):
+                last_pct = max(last_pct, pct)
+                last_note = note or _analysis_progress_note(scene_mode, last_pct)
+                yield ("progress", last_pct, last_note)
 
         if "value" in error_box:
             raise error_box["value"]

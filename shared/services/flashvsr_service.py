@@ -647,7 +647,7 @@ def build_flashvsr_callbacks(
                     batch_input_path=str(in_dir),
                     batch_output_path=settings.get("batch_output_path"),
                     fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
-                    default_subdir_name="upscaled_images",
+                    default_subdir_name="upscaled_files",
                 )
                 settings["batch_output_path"] = str(batch_root)
                 try:

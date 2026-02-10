@@ -820,12 +820,12 @@ def build_gan_callbacks(
             if settings.get("batch_enable"):
                 settings["batch_input_path"] = inp
 
-                # Batch default: write to <batch_input>/upscaled_images when no explicit output folder is set.
+                # Batch default: write to <batch_input>/upscaled_files when no explicit output folder is set.
                 current_output_dir = resolve_batch_output_dir(
                     batch_input_path=inp,
                     batch_output_path=settings.get("batch_output_path"),
                     fallback_output_dir=current_output_dir,
-                    default_subdir_name="upscaled_images",
+                    default_subdir_name="upscaled_files",
                 )
                 settings["batch_output_path"] = str(current_output_dir)
 

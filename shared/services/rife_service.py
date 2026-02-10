@@ -1053,7 +1053,7 @@ def build_rife_callbacks(
                     batch_input_path=str(batch_input_path),
                     batch_output_path=settings.get("batch_output_path"),
                     fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
-                    default_subdir_name="upscaled_images",
+                    default_subdir_name="upscaled_files",
                 )
                 settings["batch_output_path"] = str(batch_output_folder)
 

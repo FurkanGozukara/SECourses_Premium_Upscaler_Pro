@@ -45,7 +45,7 @@ from ui.queue_tab import queue_tab
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.1 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.2 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #

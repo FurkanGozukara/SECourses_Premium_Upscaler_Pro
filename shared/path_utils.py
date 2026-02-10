@@ -164,14 +164,14 @@ def resolve_batch_output_dir(
     batch_input_path: str,
     batch_output_path: Optional[str],
     fallback_output_dir: Path,
-    default_subdir_name: str = "upscaled_images",
+    default_subdir_name: str = "upscaled_files",
 ) -> Path:
     """
     Resolve a stable output directory for batch runs.
 
     Priority:
     1) Explicit batch_output_path when provided (created if missing)
-    2) `<batch_input>/upscaled_images` (or input parent for file input)
+    2) `<batch_input>/upscaled_files` (or input parent for file input)
     3) fallback_output_dir
     """
     fallback_dir = Path(normalize_path(str(fallback_output_dir)))
@@ -188,7 +188,7 @@ def resolve_batch_output_dir(
             input_path = Path(normalize_path(input_raw))
             if input_path.exists():
                 base_dir = input_path if input_path.is_dir() else input_path.parent
-                subdir = str(default_subdir_name or "").strip() or "upscaled_images"
+                subdir = str(default_subdir_name or "").strip() or "upscaled_files"
                 chosen = base_dir / subdir
 
     target = chosen or fallback_dir

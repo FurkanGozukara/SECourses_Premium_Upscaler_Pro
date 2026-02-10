@@ -102,6 +102,24 @@ def _estimate_seedvr2_output_dims(in_w: int, in_h: int, resolution_short: int, m
     return out_w, out_h
 
 
+def _is_path_within(path: Path, parent: Path) -> bool:
+    """Return True when `path` is equal to or inside `parent`."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _predict_batch_video_output_path(item_out_dir: Path, input_file: Path, output_format: Any) -> Path:
+    """
+    Predict the stable output path for a batch video item without creating directories.
+    """
+    fmt = "png" if str(output_format or "auto").lower() == "png" else "mp4"
+    stem = input_file.stem or "output"
+    return item_out_dir / stem if fmt == "png" else item_out_dir / f"{stem}.mp4"
+
+
 # Defaults and ordering --------------------------------------------------------
 def _get_default_attention_mode() -> str:
     """
@@ -2962,7 +2980,7 @@ def build_seedvr2_callbacks(
                     batch_input_path=str(batch_input_path),
                     batch_output_path=settings.get("batch_output_path"),
                     fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
-                    default_subdir_name="upscaled_images",
+                    default_subdir_name="upscaled_files",
                 )
                 settings["batch_output_path"] = str(batch_output_folder)
 
@@ -2970,8 +2988,24 @@ def build_seedvr2_callbacks(
                 supported_exts = SEEDVR2_VIDEO_EXTS | SEEDVR2_IMAGE_EXTS
                 batch_files = []
                 if batch_input_path.is_dir():
+                    excluded_subtree: Optional[Path] = None
+                    try:
+                        # If output folder sits inside input folder, don't re-ingest produced files.
+                        if _is_path_within(batch_output_folder, batch_input_path) and batch_output_folder.resolve() != batch_input_path.resolve():
+                            excluded_subtree = batch_output_folder.resolve()
+                    except Exception:
+                        excluded_subtree = None
+
                     for ext in supported_exts:
-                        batch_files.extend(batch_input_path.glob(f"**/*{ext}"))
+                        for candidate in batch_input_path.glob(f"**/*{ext}"):
+                            try:
+                                if not candidate.is_file():
+                                    continue
+                                if excluded_subtree and _is_path_within(candidate, excluded_subtree):
+                                    continue
+                                batch_files.append(candidate)
+                            except Exception:
+                                continue
                 elif batch_input_path.suffix.lower() in supported_exts:
                     batch_files = [batch_input_path]
 
@@ -3153,7 +3187,7 @@ def build_seedvr2_callbacks(
                         input_file = Path(job.input_path)
 
                         from shared.output_run_manager import batch_item_dir, prepare_batch_video_run_dir
-                        from shared.path_utils import resolve_output_location, sanitize_filename
+                        from shared.path_utils import sanitize_filename
 
                         is_video = input_file.suffix.lower() in SEEDVR2_VIDEO_EXTS
                         if not is_video:
@@ -3174,16 +3208,10 @@ def build_seedvr2_callbacks(
                         else:
                             # Batch videos: stable per-input folder under outputs/<input_stem>/ with chunk artifacts inside.
                             item_out_dir = batch_item_dir(batch_output_folder, input_file.name)
-                            predicted_fmt = single_settings.get("output_format") or "auto"
-                            predicted_fmt = "png" if str(predicted_fmt).lower() == "png" else "mp4"
-                            predicted_output = resolve_output_location(
-                                input_path=str(input_file),
-                                output_format=str(predicted_fmt),
-                                global_output_dir=str(item_out_dir),
-                                batch_mode=False,
-                                png_padding=single_settings.get("png_padding"),
-                                png_keep_basename=bool(single_settings.get("png_keep_basename", True)),
-                                original_filename=input_file.name,
+                            predicted_output = _predict_batch_video_output_path(
+                                item_out_dir=item_out_dir,
+                                input_file=input_file,
+                                output_format=single_settings.get("output_format"),
                             )
                             if Path(predicted_output).exists() and not overwrite_existing:
                                 job.status = "skipped"
@@ -3244,6 +3272,7 @@ def build_seedvr2_callbacks(
                 # Summarize results and collect output paths for gallery
                 completed = int(batch_result.completed_files)
                 failed = int(batch_result.failed_files)
+                skipped = int(batch_result.skipped_files)
                 
                 # Collect successful outputs for gallery
                 batch_outputs = []
@@ -3252,6 +3281,8 @@ def build_seedvr2_callbacks(
                         batch_outputs.append(str(job.output_path))
 
                 summary_msg = f"Batch complete: {completed}/{len(jobs)} succeeded"
+                if skipped > 0:
+                    summary_msg += f", {skipped} skipped"
                 if failed > 0:
                     summary_msg += f", {failed} failed"
 
@@ -3271,6 +3302,7 @@ def build_seedvr2_callbacks(
                             "batch_type": "images",
                             "total_files": len(jobs),
                             "completed": completed,
+                            "skipped": skipped,
                             "failed": failed,
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "settings": settings,
@@ -3290,6 +3322,7 @@ def build_seedvr2_callbacks(
                             "video_files": video_count,
                             "image_files": image_count,
                             "completed": completed,
+                            "skipped": skipped,
                             "failed": failed,
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "settings": settings,
@@ -3316,6 +3349,8 @@ def build_seedvr2_callbacks(
 
                 # Compact failure summary for the log box
                 log_lines = [f"{summary_msg}"]
+                if skipped:
+                    log_lines.append("Skipped files were left unchanged (enable overwrite to reprocess existing outputs).")
                 if failed:
                     for j in [x for x in jobs if x.status == "failed"][:10]:
                         name = Path(j.input_path).name
@@ -3329,7 +3364,7 @@ def build_seedvr2_callbacks(
                     "",  # progress_indicator
                     gr.update(value=None, visible=False),  # output_video
                     gr.update(value=None, visible=False),  # output_image
-                    f"Batch: {completed} completed, {failed} failed",  # chunk_info
+                    f"Batch: {completed} completed, {skipped} skipped, {failed} failed",  # chunk_info
                     "",  # resume_status
                     "",  # chunk_progress
                     gr.update(value="", visible=False),  # comparison_note

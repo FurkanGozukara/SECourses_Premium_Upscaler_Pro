@@ -296,7 +296,7 @@ def build_face_callbacks(
                 batch_input_path=str(batch_in),
                 batch_output_path=settings.get("batch_output_path"),
                 fallback_output_dir=out_dir,
-                default_subdir_name="upscaled_images",
+                default_subdir_name="upscaled_files",
             )
             settings["batch_output_path"] = str(batch_out_dir)
 

@@ -16,7 +16,7 @@ import gradio as gr
 
 from shared.preset_manager import PresetManager
 from shared.runner import Runner
-from shared.path_utils import normalize_path, ffmpeg_set_fps, get_media_dimensions
+from shared.path_utils import normalize_path, ffmpeg_set_fps, get_media_dimensions, resolve_batch_output_dir
 from shared.face_restore import restore_video
 from shared.logging_utils import RunLogger
 from shared.models.rife_meta import get_rife_metadata, get_rife_default_model
@@ -1042,12 +1042,20 @@ def build_rife_callbacks(
                 # Use the batch processor for multiple files
                 from shared.batch_processor import BatchProcessor, BatchJob
 
-                batch_input_path = Path(settings.get("batch_input_path", ""))
-                batch_output_path = Path(settings.get("batch_output_path", ""))
+                batch_input_raw = str(settings.get("batch_input_path") or settings.get("input_path") or "").strip()
+                batch_input_path = Path(normalize_path(batch_input_raw)) if batch_input_raw else Path()
 
                 if not batch_input_path.exists():
                     yield ("âŒ Batch input path does not exist", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                     return
+
+                batch_output_folder = resolve_batch_output_dir(
+                    batch_input_path=str(batch_input_path),
+                    batch_output_path=settings.get("batch_output_path"),
+                    fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
+                    default_subdir_name="upscaled_images",
+                )
+                settings["batch_output_path"] = str(batch_output_folder)
 
                 # Collect all video files for RIFE
                 rife_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
@@ -1064,7 +1072,7 @@ def build_rife_callbacks(
 
                 # Create batch processor
                 batch_processor = BatchProcessor(
-                    output_dir=str(batch_output_path) if batch_output_path.exists() else str(output_dir),
+                    output_dir=str(batch_output_folder),
                     max_workers=1,  # Sequential processing for memory management
                     telemetry_enabled=global_settings.get("telemetry", True),
                 )
@@ -1095,7 +1103,6 @@ def build_rife_callbacks(
 
                         overwrite_existing = bool(seed_controls.get("overwrite_existing_batch_val", False))
 
-                        batch_output_folder = Path(batch_output_path) if batch_output_path.exists() else output_dir
                         batch_output_folder.mkdir(parents=True, exist_ok=True)
 
                         # Determine desired container extension (best-effort; RIFE runner uses output path suffix)

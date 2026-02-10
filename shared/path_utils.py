@@ -160,6 +160,46 @@ def get_default_temp_dir(base_dir: Path, global_settings: dict) -> Path:
     return Path(base_dir / "temp").resolve()
 
 
+def resolve_batch_output_dir(
+    batch_input_path: str,
+    batch_output_path: Optional[str],
+    fallback_output_dir: Path,
+    default_subdir_name: str = "upscaled_images",
+) -> Path:
+    """
+    Resolve a stable output directory for batch runs.
+
+    Priority:
+    1) Explicit batch_output_path when provided (created if missing)
+    2) `<batch_input>/upscaled_images` (or input parent for file input)
+    3) fallback_output_dir
+    """
+    fallback_dir = Path(normalize_path(str(fallback_output_dir)))
+    chosen: Optional[Path] = None
+
+    explicit = str(batch_output_path or "").strip()
+    if explicit:
+        explicit_path = Path(normalize_path(explicit))
+        # If user accidentally provides a file path, treat its parent as output dir.
+        chosen = explicit_path.parent if explicit_path.suffix else explicit_path
+    else:
+        input_raw = str(batch_input_path or "").strip()
+        if input_raw:
+            input_path = Path(normalize_path(input_raw))
+            if input_path.exists():
+                base_dir = input_path if input_path.is_dir() else input_path.parent
+                subdir = str(default_subdir_name or "").strip() or "upscaled_images"
+                chosen = base_dir / subdir
+
+    target = chosen or fallback_dir
+    try:
+        ensure_dir(target)
+        return target.resolve()
+    except Exception:
+        ensure_dir(fallback_dir)
+        return fallback_dir.resolve()
+
+
 def collision_safe_path(path: Path) -> Path:
     """
     Append numeric suffixes to avoid overwriting existing files or folders.

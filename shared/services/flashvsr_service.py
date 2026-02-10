@@ -23,6 +23,7 @@ from shared.path_utils import (
     detect_input_type,
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    resolve_batch_output_dir,
 )
 from shared.logging_utils import RunLogger
 from shared.comparison_unified import create_unified_comparison
@@ -600,7 +601,6 @@ def build_flashvsr_callbacks(
             # -------------------------------------------------------------
             if bool(settings.get("batch_enable")):
                 batch_in = normalize_path(settings.get("batch_input_path") or "")
-                batch_out = normalize_path(settings.get("batch_output_path") or "") if settings.get("batch_output_path") else ""
 
                 if not batch_in or not Path(batch_in).exists() or not Path(batch_in).is_dir():
                     vid_upd, img_upd = _media_updates(None)
@@ -614,12 +614,6 @@ def build_flashvsr_callbacks(
                         state,
                     )
                     return
-
-                if batch_out:
-                    try:
-                        Path(batch_out).mkdir(parents=True, exist_ok=True)
-                    except Exception:
-                        pass
 
                 in_dir = Path(batch_in)
                 items: List[Path] = [
@@ -649,7 +643,13 @@ def build_flashvsr_callbacks(
                 last_input_path: Optional[str] = None
                 last_output_path: Optional[str] = None
                 last_chunk_run_dir: Optional[Path] = None
-                batch_root = Path(batch_out) if batch_out else Path(global_settings.get("output_dir", output_dir))
+                batch_root = resolve_batch_output_dir(
+                    batch_input_path=str(in_dir),
+                    batch_output_path=settings.get("batch_output_path"),
+                    fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
+                    default_subdir_name="upscaled_images",
+                )
+                settings["batch_output_path"] = str(batch_root)
                 try:
                     batch_root.mkdir(parents=True, exist_ok=True)
                 except Exception:

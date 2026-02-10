@@ -2,6 +2,7 @@ import os
 import sys
 import hashlib
 import json
+import string
 from pathlib import Path
 from typing import Any, Dict
 
@@ -44,7 +45,7 @@ from ui.queue_tab import queue_tab
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.0 – https://www.patreon.com/posts/134405610"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.1 – https://www.patreon.com/posts/134405610"
 
 
 # --------------------------------------------------------------------- #
@@ -138,6 +139,35 @@ def _share_enabled_from_argv(argv=None) -> bool:
     """Return True when --share is present in CLI args."""
     args = list(argv) if argv is not None else sys.argv[1:]
     return "--share" in args
+
+
+def _scan_disk_roots() -> list[str]:
+    """
+    Discover mounted disk roots so Gradio can serve/cache files outside
+    the project directory (for example C:\\Users\\... paths).
+    """
+    roots: set[str] = set()
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            drive_root = Path(f"{letter}:/")
+            try:
+                if drive_root.exists():
+                    roots.add(str(drive_root.resolve()))
+            except OSError:
+                continue
+    else:
+        roots.add(str(Path("/").resolve()))
+    return sorted(roots)
+
+
+def _build_launch_allowed_paths(output_dir: str | Path, temp_dir: str | Path) -> list[str]:
+    allowed_paths = {
+        str(Path(BASE_DIR).resolve()),
+        str(Path(output_dir).resolve()),
+        str(Path(temp_dir).resolve()),
+    }
+    allowed_paths.update(_scan_disk_roots())
+    return sorted(allowed_paths)
 
 
 def main(argv=None):
@@ -1501,13 +1531,7 @@ def main(argv=None):
     # Enable Gradio queue so built-in toast notifications (gr.Info/gr.Warning/gr.Error) can work
     # and to improve streaming/progress consistency.
     demo.queue()
-    launch_allowed_paths = sorted(
-        {
-            str(Path(BASE_DIR).resolve()),
-            str(Path(output_dir).resolve()),
-            str(Path(temp_dir).resolve()),
-        }
-    )
+    launch_allowed_paths = _build_launch_allowed_paths(output_dir=output_dir, temp_dir=temp_dir)
     demo.launch(inbrowser=True, allowed_paths=launch_allowed_paths, share=share_enabled)
 
 

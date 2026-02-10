@@ -16,6 +16,7 @@ from shared.path_utils import (
     get_media_dimensions,
     detect_input_type,
     IMAGE_EXTENSIONS,
+    resolve_batch_output_dir,
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.face_restore import restore_image, restore_video
@@ -819,13 +820,14 @@ def build_gan_callbacks(
             if settings.get("batch_enable"):
                 settings["batch_input_path"] = inp
 
-                # Output selection: in batch mode prefer `batch_output_path` when provided.
-                batch_out_raw = (settings.get("batch_output_path") or "").strip()
-                if batch_out_raw:
-                    try:
-                        current_output_dir = Path(normalize_path(batch_out_raw))
-                    except Exception:
-                        pass
+                # Batch default: write to <batch_input>/upscaled_images when no explicit output folder is set.
+                current_output_dir = resolve_batch_output_dir(
+                    batch_input_path=inp,
+                    batch_output_path=settings.get("batch_output_path"),
+                    fallback_output_dir=current_output_dir,
+                    default_subdir_name="upscaled_images",
+                )
+                settings["batch_output_path"] = str(current_output_dir)
 
             # Ensure output/temp directories exist.
             try:

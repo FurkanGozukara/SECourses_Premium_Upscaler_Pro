@@ -10,6 +10,7 @@ from shared.path_utils import (
     detect_input_type,
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    resolve_batch_output_dir,
 )
 from shared.face_restore import restore_image, restore_video
 
@@ -291,8 +292,13 @@ def build_face_callbacks(
                     state,
                 )
 
-            batch_out_str = str(settings.get("batch_output_path") or "").strip()
-            batch_out_dir = _ensure_out_dir(batch_out_str) if batch_out_str else out_dir
+            batch_out_dir = resolve_batch_output_dir(
+                batch_input_path=str(batch_in),
+                batch_output_path=settings.get("batch_output_path"),
+                fallback_output_dir=out_dir,
+                default_subdir_name="upscaled_images",
+            )
+            settings["batch_output_path"] = str(batch_out_dir)
 
             files = _collect_batch_files(batch_in)
             if not files:

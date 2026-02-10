@@ -32,6 +32,7 @@ from shared.path_utils import (
     get_media_duration_seconds,
     get_media_fps,
     detect_input_type,
+    resolve_batch_output_dir,
 )
 from shared.resolution_calculator import estimate_seedvr2_upscale_plan_from_dims
 from shared.chunking import chunk_and_process, check_resume_available
@@ -2934,8 +2935,8 @@ def build_seedvr2_callbacks(
                 # Use the batch processor for multiple files
                 from shared.batch_processor import BatchProcessor, BatchJob
 
-                batch_input_path = Path(settings.get("batch_input_path", ""))
-                batch_output_path = Path(settings.get("batch_output_path", ""))
+                batch_input_raw = str(settings.get("batch_input_path") or settings.get("input_path") or "").strip()
+                batch_input_path = Path(normalize_path(batch_input_raw)) if batch_input_raw else Path()
 
                 if not batch_input_path.exists():
                     yield (
@@ -2956,6 +2957,14 @@ def build_seedvr2_callbacks(
                         state  # shared_state
                     )
                     return
+
+                batch_output_folder = resolve_batch_output_dir(
+                    batch_input_path=str(batch_input_path),
+                    batch_output_path=settings.get("batch_output_path"),
+                    fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
+                    default_subdir_name="upscaled_images",
+                )
+                settings["batch_output_path"] = str(batch_output_folder)
 
                 # Collect all files to process
                 supported_exts = SEEDVR2_VIDEO_EXTS | SEEDVR2_IMAGE_EXTS
@@ -2995,7 +3004,7 @@ def build_seedvr2_callbacks(
                 from shared.path_utils import get_disk_free_gb
                 try:
                     temp_dir_path = Path(global_settings.get("temp_dir", "temp"))
-                    output_dir_path = batch_output_path if batch_output_path.exists() else output_dir
+                    output_dir_path = batch_output_folder
                     
                     temp_free_gb = get_disk_free_gb(temp_dir_path)
                     output_free_gb = get_disk_free_gb(output_dir_path)
@@ -3099,7 +3108,7 @@ def build_seedvr2_callbacks(
                         pass
 
                 batch_processor = BatchProcessor(
-                    output_dir=str(batch_output_path) if batch_output_path.exists() else str(output_dir),
+                    output_dir=str(batch_output_folder),
                     max_workers=1,  # Sequential processing for memory management
                     # SeedVR2 already writes run_summary.json via run_logger in the single-file pipeline
                     # (and batch writes consolidated metadata at the end). Disable BatchProcessor's
@@ -3142,7 +3151,6 @@ def build_seedvr2_callbacks(
                         overwrite_existing = bool(seed_controls.get("overwrite_existing_batch_val", False))
 
                         input_file = Path(job.input_path)
-                        batch_output_folder = Path(batch_output_path) if batch_output_path.exists() else output_dir
 
                         from shared.output_run_manager import batch_item_dir, prepare_batch_video_run_dir
                         from shared.path_utils import resolve_output_location, sanitize_filename
@@ -3255,7 +3263,7 @@ def build_seedvr2_callbacks(
                 # - Mixed batches: Both image and video summaries
                 
                 try:
-                    metadata_dir = Path(batch_output_path) if batch_output_path.exists() else output_dir
+                    metadata_dir = batch_output_folder
                     
                     if is_image_only_batch:
                         # Image-only batch: Single consolidated metadata (no per-file metadata)

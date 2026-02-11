@@ -32,6 +32,7 @@ from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, sho
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
+from shared.preview_utils import prepare_preview_input
 
 
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
@@ -354,8 +355,12 @@ def build_gan_callbacks(
     def safe_defaults():
         return [defaults[k] for k in GAN_ORDER]
 
-    def prepare_single(single_path: str) -> Dict[str, Any]:
-        s = settings.copy()
+    def prepare_single(
+        single_path: str,
+        settings_base: Dict[str, Any],
+        seed_controls_local: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        s = settings_base.copy()
         s["input_path"] = normalize_path(single_path)
         s["base_dir"] = str(base_dir)  # Pass base directory for metadata lookup
         meta = _get_gan_meta(s.get("model", ""), base_dir)
@@ -363,14 +368,19 @@ def build_gan_callbacks(
         s["supports_multi_gpu"] = meta.get("supports_multi_gpu", False)
         s["model_name"] = meta.get("canonical", s.get("model", ""))
         # PNG padding (from Output tab cache if present)
-        s["png_padding"] = int(seed_controls.get("png_padding_val", 6))  # Match CLI default
+        s["png_padding"] = int(seed_controls_local.get("png_padding_val", 6))  # Match CLI default
         # vNext: disable legacy downscale system in gan_runner (we do all preprocessing here)
         s["target_resolution"] = 0
         s["downscale_first"] = False
         s["auto_calculate_input"] = False
         return s
 
-    def maybe_downscale(s):
+    def maybe_downscale(
+        s: Dict[str, Any],
+        seed_controls_local: Dict[str, Any],
+        current_output_dir_local: Path,
+        current_temp_dir_local: Path,
+    ):
             """
             Dynamic resolution adjustment for fixed-scale GAN models.
 
@@ -386,16 +396,16 @@ def build_gan_callbacks(
 
             # Decide whether to use global Resolution tab cache or local per-tab values
             use_global = bool(s.get("use_resolution_tab", True))
-            model_cache = seed_controls.get("resolution_cache", {}).get(s.get("model"), {}) if use_global else {}
+            model_cache = seed_controls_local.get("resolution_cache", {}).get(s.get("model"), {}) if use_global else {}
 
-            enable_max = model_cache.get("enable_max_target", seed_controls.get("enable_max_target", True)) if use_global else True
+            enable_max = model_cache.get("enable_max_target", seed_controls_local.get("enable_max_target", True)) if use_global else True
             scale_x = float(
-                (model_cache.get("upscale_factor_val") or seed_controls.get("upscale_factor_val"))
+                (model_cache.get("upscale_factor_val") or seed_controls_local.get("upscale_factor_val"))
                 if use_global
                 else (s.get("upscale_factor") or 4.0)
             )
             max_edge = int(
-                (model_cache.get("max_resolution_val") or seed_controls.get("max_resolution_val"))
+                (model_cache.get("max_resolution_val") or seed_controls_local.get("max_resolution_val"))
                 if use_global
                 else (s.get("max_resolution") or 0)
             )
@@ -428,7 +438,7 @@ def build_gan_callbacks(
 
             if in_type == "video":
                 # Save downscaled artifact into the user-visible output folder for this run.
-                out_root = Path(s.get("_run_dir") or current_output_dir)
+                out_root = Path(s.get("_run_dir") or current_output_dir_local)
                 original_name = s.get("_original_filename") or Path(s["input_path"]).name
                 pre_out = downscaled_video_path(out_root, str(original_name))
                 ok, _err = scale_video(
@@ -451,7 +461,7 @@ def build_gan_callbacks(
                     img = cv2.imread(s["input_path"], cv2.IMREAD_UNCHANGED)
                     if img is not None:
                         adjusted = cv2.resize(img, (optimal_w, optimal_h), interpolation=cv2.INTER_AREA)
-                        tmp_path = Path(current_temp_dir) / f"gan_input_adjust_{Path(s['input_path']).stem}{Path(s['input_path']).suffix}"
+                        tmp_path = Path(current_temp_dir_local) / f"gan_input_adjust_{Path(s['input_path']).stem}{Path(s['input_path']).suffix}"
                         cv2.imwrite(str(tmp_path), adjusted)
                         if tmp_path.exists():
                             s["_original_input_path_before_preprocess"] = s["input_path"]
@@ -469,7 +479,7 @@ def build_gan_callbacks(
                         return s
 
                     tmp_dir = collision_safe_dir(
-                        Path(current_temp_dir) / f"gan_input_adjust_{src_dir.name}_pre{optimal_w}x{optimal_h}"
+                        Path(current_temp_dir_local) / f"gan_input_adjust_{src_dir.name}_pre{optimal_w}x{optimal_h}"
                     )
                     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -626,10 +636,10 @@ def build_gan_callbacks(
                             except Exception:
                                 pass
 
-                        ps_base = prepare_single(job.input_path)
+                        ps_base = prepare_single(job.input_path, settings, seed_controls)
                         ps_base["_original_filename"] = input_file.name
                         ps_base["_desired_output_path"] = str(desired_out)
-                        ps = maybe_downscale(ps_base)
+                        ps = maybe_downscale(ps_base, seed_controls, current_output_dir, current_temp_dir)
                         status, lg, outp, cmp_html, slider_upd = run_single(ps, progress_cb=progress_q.put)
                     else:
                         # Batch videos: stable per-input folder under outputs/<input_stem>/ with chunk artifacts inside.
@@ -659,13 +669,13 @@ def build_gan_callbacks(
                             job.error_message = f"Could not create batch output folder: {item_out_dir}"
                             return False
 
-                        ps_base = prepare_single(job.input_path)
+                        ps_base = prepare_single(job.input_path, settings, seed_controls)
                         ps_base["_original_filename"] = input_file.name
                         ps_base["_run_dir"] = str(run_paths.run_dir)
                         ps_base["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         # Keep outputs inside the per-item folder (GAN runner chooses filenames).
                         ps_base["output_override"] = str(run_paths.run_dir)
-                        ps = maybe_downscale(ps_base)
+                        ps = maybe_downscale(ps_base, seed_controls, current_output_dir, current_temp_dir)
                         status, lg, outp, cmp_html, slider_upd = run_single(ps, progress_cb=progress_q.put)
                      
                     # Store results in job
@@ -816,7 +826,42 @@ def build_gan_callbacks(
                     yield ("âŒ Input missing", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
                     return
 
+            # Preview runs are single-item and operate on a prepared first-frame image.
+            if preview_only and settings.get("batch_enable"):
+                settings["batch_enable"] = False
+
+            preview_original_input = inp
+            if preview_only:
+                preview_src, preview_note = prepare_preview_input(
+                    inp,
+                    Path(global_settings.get("temp_dir", temp_dir)),
+                    prefix="gan",
+                    as_single_frame_dir=False,
+                )
+                if not preview_src:
+                    msg = preview_note or "Failed to prepare preview input."
+                    yield (
+                        "Preview preparation failed",
+                        msg,
+                        gr.update(value="", visible=False),
+                        gr.update(value=None, visible=False),
+                        gr.update(value=None, visible=False),
+                        "Preview error",
+                        gr.update(value=None),
+                        gr.update(value="", visible=False),
+                        gr.update(visible=False),
+                        state,
+                    )
+                    return
+                inp = normalize_path(preview_src)
+                settings["output_format"] = "png"
+                if preview_note:
+                    progress_q.put(preview_note)
+
             settings["input_path"] = inp
+            if preview_only:
+                settings["_preview_original_input"] = preview_original_input
+                settings["_preview_effective_input"] = inp
             if settings.get("batch_enable"):
                 settings["batch_input_path"] = inp
 
@@ -914,6 +959,8 @@ def build_gan_callbacks(
             # Determine if PySceneDetect chunking should be used for video inputs
             from shared.path_utils import detect_input_type as detect_type
             input_type = detect_type(inp)
+            if preview_only:
+                input_type = detect_type(settings.get("input_path") or inp)
             # Chunking is handled in `run_single()` so it also works in batch mode.
             should_use_chunking = False
             
@@ -1445,7 +1492,12 @@ def build_gan_callbacks(
                     except Exception:
                         pass
 
-                prepped = maybe_downscale(prepare_single(settings["input_path"]))
+                prepped = maybe_downscale(
+                    prepare_single(settings["input_path"], settings, seed_controls),
+                    seed_controls,
+                    current_output_dir,
+                    current_temp_dir,
+                )
                 # Single-image runs: enforce sequential numbering in output root (0001_<orig>.<ext>, ...).
                 try:
                     from shared.output_run_manager import numbered_single_image_output_path
@@ -1523,6 +1575,14 @@ def build_gan_callbacks(
             )
             live_logs = result_holder.get("live_logs", [])
             merged_logs = lg if lg else "\n".join(live_logs)
+            if preview_only:
+                status_lc = str(status).lower()
+                if "failed" in status_lc or "error" in status_lc:
+                    status = "Preview failed"
+                elif "cancel" in status_lc:
+                    status = "Preview canceled"
+                else:
+                    status = "Preview complete"
             
             # Update progress to 100% on completion
             if progress:
@@ -1687,7 +1747,7 @@ def build_gan_callbacks(
         "save_preset": save_preset,
         "load_preset": load_preset,
         "safe_defaults": safe_defaults,
-        "run_action": lambda *args: run_action(*args[:-1], args[-1]) if len(args) > 1 else run_action(*args),
+        "run_action": run_action,
         "model_scanner": lambda: _scan_gan_models(base_dir),
         "cancel_action": lambda *args: cancel_action(args[0] if args else None),
         "get_model_scale": get_model_scale,

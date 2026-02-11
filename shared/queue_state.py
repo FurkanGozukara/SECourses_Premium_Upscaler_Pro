@@ -22,6 +22,7 @@ _RUNTIME_SEED_KEYS = {
     "current_model",
     "gan_chunk_preview",
     "flashvsr_chunk_preview",
+    "flashvsr_batch_outputs",
     "rife_chunk_preview",
     "seedvr2_chunk_preview",
     "chunk_gallery_items",

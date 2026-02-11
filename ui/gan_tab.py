@@ -18,8 +18,7 @@ from ui.universal_preset_section import (
     wire_universal_preset_events,
 )
 from shared.universal_preset import dict_to_values
-from shared.path_utils import get_media_dimensions, normalize_path
-from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
+from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from ui.media_preview import preview_updates
 from shared.processing_queue import get_processing_queue_manager
 from shared.queue_state import (
@@ -67,15 +66,20 @@ def gan_tab(
 
     values = [merged_defaults[k] for k in GAN_ORDER]
 
-    gan_model_choices = sorted(
-        {
-            str(model_name).strip()
-            for model_name in (models_list or [])
-            if str(model_name).strip().lower().endswith((".pth", ".safetensors"))
-        }
-    )
+    # Only show GAN weights in this tab.
+    gan_model_choices = [m for m in service["model_scanner"]() if str(m).strip()]
     if not gan_model_choices:
-        gan_model_choices = service["model_scanner"]()
+        gan_model_choices = sorted(
+            {
+                str(model_name).strip()
+                for model_name in (models_list or [])
+                if str(model_name).strip().lower().endswith((".pth", ".safetensors"))
+            }
+        )
+
+    gan_model_value = values[4] if len(values) > 4 else ""
+    if gan_model_choices and gan_model_value not in gan_model_choices:
+        gan_model_value = gan_model_choices[0]
     # GPU availability check (parent-process safe: NO torch import)
     import platform
     cuda_available = False
@@ -170,15 +174,6 @@ def gan_tab(
                     gr.Markdown("#### GAN Model Configuration")
 
                     with gr.Group():
-                        gan_model = gr.Dropdown(
-                            label="GAN Model",
-                            choices=gan_model_choices,
-                            value=values[4],
-                            info="Pre-trained GAN models with fixed scale factors (2x, 4x, etc.). Models auto-detected from ./models (or legacy Image_Upscale_Models)."
-                        )
-
-                        model_info = gr.Markdown("Select a model to see details...")
-
                         def update_model_info(model_name):
                             if not model_name:
                                 return "Select a model to see details..."
@@ -188,7 +183,7 @@ def gan_tab(
                                 metadata = get_gan_model_metadata(model_name, base_dir)
 
                                 info_lines = [f"**{model_name}**"]
-                                info_lines.append(f"- **Scale**: {metadata.scale}x")
+                                info_lines.append(f"- **Upscale**: {metadata.scale}x")
                                 info_lines.append(f"- **Architecture**: {metadata.architecture}")
                                 if metadata.description and metadata.description != f"{model_name}":
                                     info_lines.append(f"- **Description**: {metadata.description}")
@@ -200,6 +195,15 @@ def gan_tab(
                                 return "\n".join(info_lines)
                             except Exception as e:
                                 return f"**{model_name}**\n\nUnable to load metadata: {str(e)}"
+
+                        gan_model = gr.Dropdown(
+                            label="GAN Model",
+                            choices=gan_model_choices,
+                            value=gan_model_value,
+                            info="Pre-trained GAN models with fixed scale factors (2x, 4x, etc.). Models auto-detected from ./models (or legacy Image_Upscale_Models)."
+                        )
+
+                        model_info = gr.Markdown(update_model_info(gan_model_value))
 
                         gan_model.change(
                             fn=update_model_info,
@@ -609,24 +613,6 @@ def gan_tab(
         except Exception as e:
             return gr.update(value=f"❌ **Detection Error**\n\n{str(e)}", visible=True)
 
-    def _resolve_dims_for_preview(path_val: str):
-        """Return (w,h) and a representative file path for directories (first media file)."""
-        if not path_val:
-            return None, None, None
-        p = Path(normalize_path(path_val))
-        if not p.exists():
-            return None, None, None
-        if p.is_file():
-            dims = get_media_dimensions(str(p))
-            return (dims[0], dims[1], str(p)) if dims else (None, None, str(p))
-        # Directory: pick first media file
-        exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".mp4", ".mov", ".mkv", ".avi", ".webm")
-        items = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in exts]
-        if not items:
-            return None, None, None
-        dims = get_media_dimensions(str(items[0]))
-        return (dims[0], dims[1], str(items[0])) if dims else (None, None, str(items[0]))
-
     def _build_sizing_info(
         input_path_val: str,
         model_name: str,
@@ -636,9 +622,6 @@ def gan_tab(
         local_pre_down: bool,
         state,
     ) -> gr.update:
-        if not input_path_val or not str(input_path_val).strip():
-            return gr.update(visible=False)
-        # Determine model scale
         try:
             from shared.gan_runner import get_gan_model_metadata
             meta = get_gan_model_metadata(model_name, base_dir)
@@ -646,64 +629,18 @@ def gan_tab(
         except Exception:
             model_scale = 4
 
-        seed_controls = (state or {}).get("seed_controls", {})
-        scale_x = float(seed_controls.get("upscale_factor_val", 4.0) or 4.0) if use_global else float(local_scale_x or 4.0)
-        max_edge = int(seed_controls.get("max_resolution_val", 0) or 0) if use_global else int(local_max_edge or 0)
-        pre_down = bool(seed_controls.get("ratio_downscale", False)) if use_global else bool(local_pre_down)
-
-        enable_max = bool(seed_controls.get("enable_max_target", True)) if use_global else True
-        if not enable_max:
-            max_edge = 0
-
-        w, h, rep = _resolve_dims_for_preview(input_path_val)
-        if not w or not h:
-            return gr.update(value="⚠️ Could not determine input dimensions for sizing preview.", visible=True)
-
-        # Fixed-scale planning (GAN)
-        plan = estimate_fixed_scale_upscale_plan_from_dims(
-            int(w),
-            int(h),
-            requested_scale=float(scale_x),
+        return build_fixed_scale_analysis_update(
+            input_path_val=input_path_val,
             model_scale=int(model_scale),
-            max_edge=int(max_edge or 0),
-            force_pre_downscale=True,
+            use_global=bool(use_global),
+            local_scale_x=float(local_scale_x or 4.0),
+            local_max_edge=int(local_max_edge or 0),
+            local_pre_down=bool(local_pre_down),
+            state=state,
+            model_label="GAN",
+            runtime_label=f"GAN pipeline (fixed {int(model_scale)}x pass)",
+            auto_scene_scan=True,
         )
-
-        out_w = plan.final_saved_width or plan.resize_width
-        out_h = plan.final_saved_height or plan.resize_height
-        input_short = min(plan.input_width, plan.input_height)
-        out_short = min(int(out_w), int(out_h))
-
-        items = []
-        items.append(f"📐 <strong>Input:</strong> {plan.input_width}×{plan.input_height} (short side: {input_short}px)")
-
-        t = f"🎯 <strong>Target setting:</strong> upscale {scale_x:g}x"
-        if max_edge and max_edge > 0:
-            t += f", max edge {max_edge}px (effective {plan.effective_scale:.2f}x)"
-        items.append(t)
-
-        # For fixed-scale models, pre-downscale is mandatory when the effective scale < model_scale.
-        if plan.pre_downscale_then_upscale and plan.preprocess_scale < 0.999999:
-            items.append(
-                f"🧩 <strong>Preprocess:</strong> {plan.input_width}×{plan.input_height} → {plan.preprocess_width}×{plan.preprocess_height} (×{plan.preprocess_scale:.3f})"
-            )
-
-        items.append(f"🧱 <strong>Model pass:</strong> fixed {model_scale}x GAN upscale")
-        items.append(f"✅ <strong>Final saved output:</strong> {int(out_w)}×{int(out_h)}")
-
-        if out_short < input_short:
-            items.append(f"📉 <strong>Mode:</strong> Downscaling (output short side {out_short}px < input short side {input_short}px)")
-        elif out_short > input_short:
-            items.append(f"📈 <strong>Mode:</strong> Upscaling (output short side {out_short}px > input short side {input_short}px)")
-        else:
-            items.append("➡️ <strong>Mode:</strong> Keep size (output short side matches input short side)")
-
-        if plan.notes:
-            for n in plan.notes:
-                items.append(f"ℹ️ {n}")
-
-        html = '<div style="font-size: 1.15em; line-height: 1.8;">' + "<br>".join(items) + "</div>"
-        return gr.update(value=html, visible=True)
 
     def cache_input(val, model_val, use_global, scale_x, max_edge, pre_down, state):
         state["seed_controls"]["last_input_path"] = val if val else ""
@@ -1050,5 +987,6 @@ def gan_tab(
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }
+
 
 

@@ -12,6 +12,8 @@ Provides subprocess wrapper for FlashVSR+ CLI (run.py) with:
 import subprocess
 import sys
 import time
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ from .path_utils import (
     normalize_path,
     collision_safe_path,
     detect_input_type,
+    IMAGE_EXTENSIONS,
     get_media_fps,
     resolve_output_location
 )
@@ -75,6 +78,7 @@ def run_flashvsr(
         log_lines.append(msg)
         if on_progress:
             on_progress(msg + "\n")
+    temp_input_dir: Optional[Path] = None
     
     try:
         # Validate input (support preprocessed effective input path)
@@ -82,6 +86,27 @@ def run_flashvsr(
         effective_input_path = normalize_path(settings.get("_effective_input_path") or original_input_path)
         if not effective_input_path or not Path(effective_input_path).exists():
             return FlashVSRResult(returncode=1, output_path=None, log="Invalid input path")
+
+        # FlashVSR CLI expects either a video path or a directory of images.
+        # For single-image inputs, wrap the image into a temporary one-frame folder.
+        effective_type = detect_input_type(effective_input_path)
+        if effective_type == "image":
+            try:
+                src_img = Path(effective_input_path)
+                temp_input_dir = Path(tempfile.mkdtemp(prefix="flashvsr_single_frame_"))
+                ext = src_img.suffix.lower()
+                if ext not in IMAGE_EXTENSIONS:
+                    ext = ".png"
+                dst_img = temp_input_dir / f"frame_000001{ext}"
+                shutil.copy2(src_img, dst_img)
+                effective_input_path = str(temp_input_dir)
+                log(f"[FlashVSR] Single image input wrapped as frame sequence: {effective_input_path}")
+            except Exception as e:
+                return FlashVSRResult(
+                    returncode=1,
+                    output_path=None,
+                    log=f"Failed to prepare single-image input for FlashVSR: {e}",
+                )
         
         # Determine output path (naming should follow ORIGINAL input)
         output_override = settings.get("output_override", "")
@@ -300,6 +325,11 @@ def run_flashvsr(
         )
     
     finally:
+        if temp_input_dir:
+            try:
+                shutil.rmtree(temp_input_dir, ignore_errors=True)
+            except Exception:
+                pass
         # Log command to executed_commands folder
         execution_time = time.time() - start_time
         try:

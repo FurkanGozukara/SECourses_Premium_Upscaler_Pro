@@ -37,6 +37,7 @@ from shared.ffmpeg_utils import scale_video
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
+from shared.preview_utils import prepare_preview_input
 
 # Cancel event for FlashVSR+ processing
 _flashvsr_cancel_event = threading.Event()
@@ -364,12 +365,15 @@ def build_flashvsr_callbacks(
                 "videos": [],
                 "count": 0,
             }
+            seed_controls["flashvsr_batch_outputs"] = []
             state["seed_controls"] = seed_controls
             settings_dict = _flashvsr_dict_from_args(list(args))
             settings = {**defaults, **settings_dict}
             
             # Apply FlashVSR+ guardrails (single GPU, tile validation, etc.)
             settings = _enforce_flashvsr_guardrails(settings, defaults)
+            if preview_only:
+                settings["batch_enable"] = False
             use_global_resolution = bool(settings.get("use_resolution_tab", True))
             
             # Apply shared Resolution & Scene Split tab settings (vNext Upscale-x)
@@ -900,6 +904,8 @@ def build_flashvsr_callbacks(
                     progress(1.0, desc=f"Batch complete ({len(outputs)}/{len(items)} succeeded)")
 
                 _cache_chunk_preview(last_chunk_run_dir)
+                seed_controls["flashvsr_batch_outputs"] = list(outputs)
+                state["seed_controls"] = seed_controls
 
                 # Track output path for pinned comparison feature (last output)
                 if last_output_path:
@@ -961,17 +967,49 @@ def build_flashvsr_callbacks(
             settings["input_path"] = input_path
             settings["_effective_input_path"] = input_path  # may be overridden by preprocessing
             settings["_original_filename"] = Path(input_path).name
+            seed_controls["flashvsr_batch_outputs"] = []
+            state["seed_controls"] = seed_controls
+
+            if preview_only:
+                preview_src, preview_note = prepare_preview_input(
+                    input_path,
+                    Path(global_settings.get("temp_dir", temp_dir)),
+                    prefix="flashvsr",
+                    as_single_frame_dir=True,
+                )
+                if not preview_src:
+                    vid_upd, img_upd = _media_updates(None)
+                    yield (
+                        "Preview preparation failed",
+                        preview_note or "Failed to prepare preview input.",
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
+                settings["_preview_original_input"] = input_path
+                settings["input_path"] = normalize_path(preview_src)
+                settings["_effective_input_path"] = settings["input_path"]
+                settings["_original_filename"] = f"{Path(input_path).stem}_preview"
+                input_path = settings["input_path"]
+                if preview_note and progress:
+                    try:
+                        progress(0, desc=preview_note[:120])
+                    except Exception:
+                        pass
 
             # NEW: Per-run output folder for videos (0001/0002/...) to avoid collisions and
             # to keep chunk artifacts user-visible.
-            if detect_input_type(input_path) == "video":
+            if detect_input_type(settings["input_path"]) == "video":
                 try:
                     base_out_root = Path(global_settings.get("output_dir", output_dir))
                     run_paths, explicit_final = prepare_single_video_run(
                         output_root_fallback=base_out_root,
                         output_override_raw=settings.get("output_override"),
-                        input_path=input_path,
-                        original_filename=settings.get("_original_filename") or Path(input_path).name,
+                        input_path=settings["input_path"],
+                        original_filename=settings.get("_original_filename") or Path(settings["input_path"]).name,
                         model_label="FlashVSR+",
                         mode="subprocess",
                     )
@@ -1378,6 +1416,14 @@ def build_flashvsr_callbacks(
                 )
             else:
                 status = "✅ FlashVSR+ upscaling complete" if result.returncode == 0 else f"⚠️ Exited with code {result.returncode}"
+            if preview_only:
+                if result.returncode == 0:
+                    status = "Preview complete"
+                elif _flashvsr_cancel_event.is_set():
+                    status = "Preview canceled"
+                else:
+                    status = "Preview failed"
+
             if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=result.log, settings=settings):
                 status = "🚫 Out of VRAM (GPU) — see banner above"
                 show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR+", duration=None)

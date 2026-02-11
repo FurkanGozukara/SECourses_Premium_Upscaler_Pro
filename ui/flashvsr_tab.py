@@ -7,12 +7,12 @@ UPDATED: Now uses Universal Preset System
 import gradio as gr
 from pathlib import Path
 from typing import Dict, Any
+import html
 
 from shared.services.flashvsr_service import (
     build_flashvsr_callbacks, FLASHVSR_ORDER
 )
-from shared.path_utils import get_media_dimensions, normalize_path
-from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
+from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -316,7 +316,7 @@ def flashvsr_tab(
             gr.Markdown("#### 🎯 Output & Actions")
             
             status_box = gr.Markdown(value="Ready.")
-            progress_indicator = gr.Markdown(value="", visible=True)
+            progress_indicator = gr.Markdown(value="", visible=False)
             
             log_box = gr.Textbox(
                 label="📋 Processing Log",
@@ -378,6 +378,16 @@ def flashvsr_tab(
                 visible=False,
                 buttons=["download"],
             )
+            batch_gallery = gr.Gallery(
+                label="📦 Batch Results",
+                visible=False,
+                columns=4,
+                rows=2,
+                height="auto",
+                object_fit="contain",
+                buttons=["download"],
+            )
+            last_processed = gr.Markdown("Batch processing results will appear here.")
 
             # Action buttons
             with gr.Row():
@@ -387,12 +397,16 @@ def flashvsr_tab(
                     size="lg",
                     elem_classes=["action-btn", "action-btn-upscale"],
                 )
+                preview_btn = gr.Button(
+                    "Preview First Frame",
+                    size="lg",
+                    elem_classes=["action-btn", "action-btn-preview"],
+                )
                 cancel_btn = gr.Button(
                     "⏹️ Cancel",
                     variant="stop",
                     elem_classes=["action-btn", "action-btn-cancel"],
                 )
-            
             cancel_confirm = gr.Checkbox(
                 label="⚠️ Confirm cancel (required for safety)",
                 value=False,
@@ -513,68 +527,20 @@ def flashvsr_tab(
             return gr.update(value=f"❌ **Detection Error**\n\n{str(e)}", visible=True)
 
     def _build_sizing_info(path_val, model_scale_val, use_global, local_scale_x, local_max_edge, local_pre_down, state):
-        if not path_val or not str(path_val).strip():
-            return gr.update(visible=False)
-        seed_controls = (state or {}).get("seed_controls", {})
-        enable_max = bool(seed_controls.get("enable_max_target", True)) if use_global else True
-        scale_x = float(seed_controls.get("upscale_factor_val", 4.0) or 4.0) if use_global else float(local_scale_x or 4.0)
-        max_edge = int(seed_controls.get("max_resolution_val", 0) or 0) if use_global else int(local_max_edge or 0)
-        pre_down = bool(seed_controls.get("ratio_downscale", False)) if use_global else bool(local_pre_down)
-        if not enable_max:
-            max_edge = 0
-
-        # Dimensions (file only; directory sizing preview is best-effort)
-        p = Path(normalize_path(path_val))
-        rep = None
-        if p.exists() and p.is_dir():
-            # pick first media file
-            exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".mp4", ".mov", ".mkv", ".avi", ".webm")
-            items = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in exts]
-            rep = str(items[0]) if items else None
-        else:
-            rep = str(p)
-        dims = get_media_dimensions(rep) if rep else None
-        if not dims:
-            return gr.update(value="⚠️ Could not determine input dimensions for sizing preview.", visible=True)
-        w, h = dims
-
         ms = int(model_scale_val or 4)
-        plan = estimate_fixed_scale_upscale_plan_from_dims(
-            int(w), int(h),
-            requested_scale=float(scale_x),
+        return build_fixed_scale_analysis_update(
+            input_path_val=path_val,
             model_scale=ms,
-            max_edge=int(max_edge or 0),
-            force_pre_downscale=True,
+            use_global=bool(use_global),
+            local_scale_x=float(local_scale_x or 4.0),
+            local_max_edge=int(local_max_edge or 0),
+            local_pre_down=bool(local_pre_down),
+            state=state,
+            model_label="FlashVSR+",
+            runtime_label=f"FlashVSR+ pipeline (fixed {ms}x pass)",
+            auto_scene_scan=True,
         )
 
-        out_w = plan.final_saved_width or plan.resize_width
-        out_h = plan.final_saved_height or plan.resize_height
-        input_short = min(plan.input_width, plan.input_height)
-        out_short = min(int(out_w), int(out_h))
-
-        items = []
-        items.append(f"📐 <strong>Input:</strong> {plan.input_width}×{plan.input_height} (short side: {input_short}px)")
-        t = f"🎯 <strong>Target setting:</strong> upscale {scale_x:g}x"
-        if max_edge and max_edge > 0:
-            t += f", max edge {max_edge}px (effective {plan.effective_scale:.2f}x)"
-        items.append(t)
-        # For fixed-scale models, pre-downscale is mandatory when the effective scale < model_scale.
-        if plan.pre_downscale_then_upscale and plan.preprocess_scale < 0.999999:
-            items.append(f"🧩 <strong>Preprocess:</strong> {plan.input_width}×{plan.input_height} → {plan.preprocess_width}×{plan.preprocess_height} (×{plan.preprocess_scale:.3f})")
-        items.append(f"🧱 <strong>Model pass:</strong> fixed {ms}x FlashVSR")
-        items.append(f"✅ <strong>Final saved output:</strong> {int(out_w)}×{int(out_h)}")
-        if out_short < input_short:
-            items.append(f"📉 <strong>Mode:</strong> Downscaling (output short side {out_short}px < input short side {input_short}px)")
-        elif out_short > input_short:
-            items.append(f"📈 <strong>Mode:</strong> Upscaling (output short side {out_short}px > input short side {input_short}px)")
-        else:
-            items.append("➡️ <strong>Mode:</strong> Keep size (output short side matches input short side)")
-        if plan.notes:
-            for n in plan.notes:
-                items.append(f"ℹ️ {n}")
-        html = '<div style="font-size: 1.15em; line-height: 1.8;">' + "<br>".join(items) + "</div>"
-        return gr.update(value=html, visible=True)
-    
     input_file.upload(
         fn=cache_input,
         inputs=[input_file, shared_state],
@@ -680,40 +646,129 @@ def flashvsr_tab(
         outputs=[chunk_preview_video],
     )
     
+    def _queue_status_indicator(title: str, subtitle: str, spinning: bool = True):
+        safe_title = html.escape(str(title or ""))
+        safe_subtitle = html.escape(str(subtitle or ""))
+        spinner_style = "" if spinning else ' style="opacity:0.45; animation:none;"'
+        indicator_html = (
+            '<div class="processing-banner">'
+            f'<div class="processing-spinner"{spinner_style}></div>'
+            '<div class="processing-col">'
+            f'<div class="processing-text">{safe_title}</div>'
+            f'<div class="processing-sub">{safe_subtitle}</div>'
+            "</div></div>"
+        )
+        return gr.update(value=indicator_html, visible=True)
+
+    def _extract_update_value(update_obj):
+        try:
+            if isinstance(update_obj, dict):
+                return update_obj.get("value")
+        except Exception:
+            pass
+        return None
+
+    def _batch_gallery_update_from_state(state):
+        outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
+        if not isinstance(outputs, list):
+            outputs = []
+        outputs = [str(p) for p in outputs if p and Path(str(p)).exists()]
+        return gr.update(value=outputs, visible=bool(outputs))
+
+    def _last_processed_text(state, vid_upd, img_upd) -> str:
+        outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
+        if isinstance(outputs, list) and outputs:
+            last_out = str(outputs[-1])
+            return f"Batch results: {len(outputs)} item(s). Last output: {Path(last_out).name}"
+
+        single = _extract_update_value(img_upd) or _extract_update_value(vid_upd)
+        if single:
+            return f"Output: {single}"
+        return "Batch processing results will appear here."
+
+    def _expand_service_payload(payload, live_state):
+        merged = merge_payload_state(payload, live_state)
+        if not isinstance(merged, tuple) or len(merged) < 7:
+            safe_state = live_state if isinstance(live_state, dict) else {}
+            return (
+                gr.update(value="❌ Invalid FlashVSR+ payload"),
+                "",
+                gr.update(value="", visible=False),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+                "Error",
+                gr.update(value=None),
+                gr.update(value="", visible=False),
+                gr.update(value=[], visible=False),
+                safe_state,
+            )
+
+        status, logs, vid_upd, img_upd, slider_upd, html_upd, state_out = merged
+        return (
+            status,
+            logs,
+            gr.update(value="", visible=False),
+            img_upd if img_upd is not None else gr.update(value=None, visible=False),
+            vid_upd if vid_upd is not None else gr.update(value=None, visible=False),
+            _last_processed_text(state_out, vid_upd, img_upd),
+            slider_upd if slider_upd is not None else gr.update(value=None),
+            html_upd if html_upd is not None else gr.update(value="", visible=False),
+            _batch_gallery_update_from_state(state_out),
+            state_out,
+        )
+
     def _queued_waiting_output(state, ticket_id: str, position: int):
         safe_state = state or {}
         pos = max(1, int(position)) if position else "?"
+        title = f"Queue waiting: {ticket_id} (position {pos})"
+        subtitle = (
+            f"Queued and waiting for active processing slot. Queue position: {pos}. "
+            "Run logs and chunk previews will update once processing starts."
+        )
         return (
-            gr.update(value=f"Queue waiting: {ticket_id} (position {pos})"),
+            gr.update(value=title),
             gr.update(value=f"Queued and waiting for active processing slot. Queue position: {pos}."),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            _queue_status_indicator(title, subtitle, spinning=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Waiting in queue",
+            gr.update(value=None),
+            gr.update(value="", visible=False),
+            _batch_gallery_update_from_state(safe_state),
             safe_state,
         )
 
     def _queued_cancelled_output(state, ticket_id: str):
         safe_state = state or {}
+        title = f"Queue item removed: {ticket_id}"
+        subtitle = "This queued request was removed before processing started."
         return (
-            gr.update(value=f"Queue item removed: {ticket_id}"),
-            gr.update(value="This queued request was removed before processing started."),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Removed from queue",
+            gr.update(value=None),
+            gr.update(value="", visible=False),
+            _batch_gallery_update_from_state(safe_state),
             safe_state,
         )
 
     def _queue_disabled_busy_output(state):
         safe_state = state or {}
+        title = "Processing already in progress (queue disabled)."
+        subtitle = "Enable 'Enable Queue' in Global Settings to stack additional requests."
         return (
-            gr.update(value="Processing already in progress (queue disabled)."),
-            gr.update(value="Enable 'Enable Queue' in Global Settings to stack additional requests."),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Queue disabled: request ignored",
+            gr.update(value=None),
+            gr.update(value="", visible=False),
+            _batch_gallery_update_from_state(safe_state),
             safe_state,
         )
 
@@ -739,7 +794,7 @@ def flashvsr_tab(
                     progress=progress,
                     global_settings_snapshot=queued_global_settings,
                 ):
-                    yield merge_payload_state(payload, live_state)
+                    yield _expand_service_payload(payload, live_state)
                 return
 
             wait_notice_sent = False
@@ -769,18 +824,43 @@ def flashvsr_tab(
                 progress=progress,
                 global_settings_snapshot=queued_global_settings,
             ):
-                yield merge_payload_state(payload, live_state)
+                yield _expand_service_payload(payload, live_state)
         finally:
             if acquired_slot:
                 queue_manager.complete(ticket.job_id)
             else:
                 queue_manager.cancel_waiting([ticket.job_id])
 
+    def run_preview_with_snapshot(*args, progress=gr.Progress()):
+        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
+        queued_state = snapshot_queue_state(live_state)
+        queued_global_settings = snapshot_global_settings(global_settings)
+        for payload in service["run_action"](
+            args[0],
+            *args[1:-1],
+            preview_only=True,
+            state=queued_state,
+            progress=progress,
+            global_settings_snapshot=queued_global_settings,
+        ):
+            yield _expand_service_payload(payload, live_state)
+
     # Main processing
     run_evt = upscale_btn.click(
         fn=run_upscale_with_queue,
         inputs=[input_file] + inputs_list + [shared_state],
-        outputs=[status_box, log_box, output_video, output_image, image_slider, video_comparison_html, shared_state],
+        outputs=[
+            status_box,
+            log_box,
+            progress_indicator,
+            output_image,
+            output_video,
+            last_processed,
+            image_slider,
+            video_comparison_html,
+            batch_gallery,
+            shared_state,
+        ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",
         trigger_mode="multiple",
@@ -790,7 +870,29 @@ def flashvsr_tab(
         inputs=[shared_state],
         outputs=[chunk_status, chunk_gallery, chunk_preview_video],
     )
-    
+
+    preview_evt = preview_btn.click(
+        fn=run_preview_with_snapshot,
+        inputs=[input_file] + inputs_list + [shared_state],
+        outputs=[
+            status_box,
+            log_box,
+            progress_indicator,
+            output_image,
+            output_video,
+            last_processed,
+            image_slider,
+            video_comparison_html,
+            batch_gallery,
+            shared_state,
+        ],
+    )
+    preview_evt.then(
+        fn=refresh_chunk_preview_ui,
+        inputs=[shared_state],
+        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+    )
+
     cancel_btn.click(
         fn=lambda ok: service["cancel_action"]() if ok else (gr.update(value="⚠️ Enable 'Confirm cancel' to stop."), ""),
         inputs=[cancel_confirm],
@@ -827,4 +929,3 @@ def flashvsr_tab(
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }
-

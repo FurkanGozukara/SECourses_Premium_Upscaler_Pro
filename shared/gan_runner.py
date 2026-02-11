@@ -53,6 +53,8 @@ REAL_ESRGAN_MODELS = {
     'realesr-general-x4v3': {'scale': 4, 'arch': 'SRVGGNetCompact'},
 }
 
+_IMAGE_OUTPUT_EXTS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"}
+
 
 def _normalize_video_codec_key(codec_raw: Any) -> str:
     """
@@ -76,6 +78,23 @@ def _normalize_video_codec_key(codec_raw: Any) -> str:
         "prores_ks": "prores",
     }
     return mapping.get(codec, "h264")
+
+
+def _normalize_image_output_format(output_format_raw: Any, input_path: Path) -> str:
+    """
+    Normalize requested image output format for GAN image saves.
+
+    - "auto" follows input extension when possible.
+    - Unsupported values fall back to "png".
+    """
+    requested = str(output_format_raw or "auto").strip().lower()
+    if requested in ("", "auto"):
+        inferred = input_path.suffix.lower().lstrip(".")
+        requested = inferred or "png"
+
+    if requested not in _IMAGE_OUTPUT_EXTS:
+        return "png"
+    return requested
 
 
 class GanModelRegistry:
@@ -678,8 +697,12 @@ def _run_with_spandrel_image(
         output_array = np.clip(output_array * 255.0, 0, 255).astype(np.uint8)
         output_img = Image.fromarray(output_array)
         
-        # Save output with proper directory and naming based on context
-        output_format = settings.get("output_format", "png")
+        # Save output with proper directory and naming based on context.
+        # "auto" must be resolved to a real image extension before writing.
+        output_format = _normalize_image_output_format(
+            settings.get("output_format", "auto"),
+            input_path=input_path,
+        )
         
         # Check if this is video frame processing (requires specific output dir/naming)
         video_frame_dir = settings.get("_video_frame_output_dir")
@@ -695,7 +718,19 @@ def _run_with_spandrel_image(
             # Single image processing - save next to input with _upscaled suffix and collision safety
             output_path = collision_safe_path(input_path.with_stem(f"{input_path.stem}_upscaled").with_suffix(f".{output_format}"))
         
-        output_img.save(output_path, quality=settings.get("output_quality", 95))
+        save_kwargs: Dict[str, Any] = {}
+        if output_format in {"jpg", "jpeg", "webp"}:
+            save_kwargs["quality"] = int(settings.get("output_quality", 95) or 95)
+        pil_format_map = {
+            "jpg": "JPEG",
+            "jpeg": "JPEG",
+            "png": "PNG",
+            "webp": "WEBP",
+            "bmp": "BMP",
+            "tif": "TIFF",
+            "tiff": "TIFF",
+        }
+        output_img.save(output_path, format=pil_format_map.get(output_format, "PNG"), **save_kwargs)
         
         return GanResult(0, str(output_path), f"Upscaled with spandrel to {output_path}")
         

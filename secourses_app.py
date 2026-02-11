@@ -3,6 +3,7 @@ import sys
 import hashlib
 import json
 import string
+import argparse
 from pathlib import Path
 from typing import Any, Dict
 
@@ -45,7 +46,7 @@ from ui.queue_tab import queue_tab
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.2 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.3 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -135,10 +136,17 @@ run_logger = RunLogger(enabled=global_settings.get("telemetry", True))
 # --------------------------------------------------------------------- #
 # UI construction
 # --------------------------------------------------------------------- #
-def _share_enabled_from_argv(argv=None) -> bool:
-    """Return True when --share is present in CLI args."""
-    args = list(argv) if argv is not None else sys.argv[1:]
-    return "--share" in args
+def _parse_launch_cli_args(argv=None):
+    """
+    Parse app-level launch flags and ignore unknown args so launcher
+    wrappers/scripts remain backward compatible.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--share", action="store_true", help="Enable Gradio share link")
+    parser.add_argument("--server", dest="server_name", type=str, default=None, help="Bind Gradio server host/IP")
+    parser.add_argument("--port", dest="server_port", type=int, default=None, help="Bind Gradio server port")
+    args, _unknown = parser.parse_known_args(list(argv) if argv is not None else sys.argv[1:])
+    return args
 
 
 def _scan_disk_roots() -> list[str]:
@@ -171,7 +179,8 @@ def _build_launch_allowed_paths(output_dir: str | Path, temp_dir: str | Path) ->
 
 
 def main(argv=None):
-    share_enabled = _share_enabled_from_argv(argv)
+    launch_cli_args = _parse_launch_cli_args(argv)
+    share_enabled = launch_cli_args.share
 
     # Initialize health check data
     try:
@@ -1532,7 +1541,16 @@ def main(argv=None):
     # and to improve streaming/progress consistency.
     demo.queue()
     launch_allowed_paths = _build_launch_allowed_paths(output_dir=output_dir, temp_dir=temp_dir)
-    demo.launch(inbrowser=True, allowed_paths=launch_allowed_paths, share=share_enabled)
+    launch_kwargs = {
+        "inbrowser": True,
+        "allowed_paths": launch_allowed_paths,
+        "share": share_enabled,
+    }
+    if launch_cli_args.server_name:
+        launch_kwargs["server_name"] = launch_cli_args.server_name
+    if launch_cli_args.server_port is not None:
+        launch_kwargs["server_port"] = launch_cli_args.server_port
+    demo.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

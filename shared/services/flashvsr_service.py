@@ -1311,11 +1311,11 @@ def build_flashvsr_callbacks(
                         on_progress=lambda x: log_buffer.append(x) if x else None,
                     )
                     if _err:
-                        log_buffer.append(f"âš ï¸ Audio mux: {_err}")
+                        log_buffer.append(f"WARNING: Audio mux: {_err}")
                     if _final and str(_final) != str(output_path):
                         output_path = str(_final)
                 except Exception as e:
-                    log_buffer.append(f"âš ï¸ Audio mux failed: {str(e)}")
+                    log_buffer.append(f"WARNING: Audio mux failed: {str(e)}")
 
             chunk_count = int(result_holder.get("chunk_count") or 0)
             if chunk_count > 0:

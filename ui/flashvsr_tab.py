@@ -316,7 +316,7 @@ def flashvsr_tab(
             gr.Markdown("#### 🎯 Output & Actions")
             
             status_box = gr.Markdown(value="Ready.")
-            progress_indicator = gr.Markdown(value="", visible=False)
+            progress_indicator = gr.Markdown(value="", visible=True)
             
             log_box = gr.Textbox(
                 label="📋 Processing Log",
@@ -490,18 +490,29 @@ def flashvsr_tab(
     if len(inputs_list) != len(FLASHVSR_ORDER):
         import logging
         logging.getLogger("FlashVSRTab").error(
-            f"❌ inputs_list ({len(inputs_list)}) != FLASHVSR_ORDER ({len(FLASHVSR_ORDER)})"
+            f"ERROR: inputs_list ({len(inputs_list)}) != FLASHVSR_ORDER ({len(FLASHVSR_ORDER)})"
         )
     
     # Wire up events
-    def cache_input(val, state):
+    def cache_input(val, scale_val, use_global, scale_x, max_edge, pre_down, state):
         try:
             state = state or {}
             state.setdefault("seed_controls", {})
             state["seed_controls"]["last_input_path"] = val if val else ""
         except Exception:
             pass
-        return val or "", gr.update(value="✅ Input cached", visible=True), state
+        det = _build_input_detection_md(val or "")
+        info = _build_sizing_info(val or "", int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
+        img_prev, vid_prev = preview_updates(val)
+        return (
+            val or "",
+            gr.update(value="OK: Input cached for processing.", visible=True),
+            img_prev,
+            vid_prev,
+            det,
+            info,
+            state,
+        )
 
     def _build_input_detection_md(path_val: str) -> gr.update:
         from shared.input_detector import detect_input
@@ -511,20 +522,20 @@ def flashvsr_tab(
         try:
             info = detect_input(path_val)
             if not info.is_valid:
-                return gr.update(value=f"❌ **Invalid Input**\n\n{info.error_message}", visible=True)
-            parts = [f"✅ **Input Detected: {info.input_type.upper()}**"]
+                return gr.update(value=f"ERROR: **Invalid Input**\n\n{info.error_message}", visible=True)
+            parts = [f"OK: **Input Detected: {info.input_type.upper()}**"]
             if info.input_type == "frame_sequence":
-                parts.append(f"&nbsp;&nbsp;📁 Pattern: `{info.frame_pattern}`")
-                parts.append(f"&nbsp;&nbsp;🎞️ Frames: {info.frame_start}-{info.frame_end}")
+                parts.append(f"&nbsp;&nbsp;Pattern: `{info.frame_pattern}`")
+                parts.append(f"&nbsp;&nbsp;Frames: {info.frame_start}-{info.frame_end}")
                 if info.missing_frames:
-                    parts.append(f"&nbsp;&nbsp;⚠️ Missing: {len(info.missing_frames)}")
+                    parts.append(f"&nbsp;&nbsp;Missing: {len(info.missing_frames)}")
             elif info.input_type == "directory":
-                parts.append(f"&nbsp;&nbsp;📂 Files: {info.total_files}")
+                parts.append(f"&nbsp;&nbsp;Files: {info.total_files}")
             elif info.input_type in ["video", "image"]:
-                parts.append(f"&nbsp;&nbsp;📄 Format: **{info.format.upper()}**")
+                parts.append(f"&nbsp;&nbsp;Format: **{info.format.upper()}**")
             return gr.update(value=" ".join(parts), visible=True)
         except Exception as e:
-            return gr.update(value=f"❌ **Detection Error**\n\n{str(e)}", visible=True)
+            return gr.update(value=f"ERROR: **Detection Error**\n\n{str(e)}", visible=True)
 
     def _build_sizing_info(path_val, model_scale_val, use_global, local_scale_x, local_max_edge, local_pre_down, state):
         ms = int(model_scale_val or 4)
@@ -543,8 +554,8 @@ def flashvsr_tab(
 
     input_file.upload(
         fn=cache_input,
-        inputs=[input_file, shared_state],
-        outputs=[input_path, input_cache_msg, shared_state]
+        inputs=[input_file, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
     )
 
     # Preview + sizing + detection refresh on input changes
@@ -554,28 +565,31 @@ def flashvsr_tab(
         info = _build_sizing_info(path_val, int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
         return img_prev, vid_prev, det, info, state
 
-    input_file.change(
-        fn=lambda p, state: (*preview_updates(p), _build_input_detection_md(p or ""), gr.update(visible=False), state),
-        inputs=[input_file, shared_state],
-        outputs=[input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
-    )
-
-    # When upload is cleared, also clear the textbox path so sizing/detection panels disappear.
+    # When upload is cleared, also clear the textbox path and hide dependent panels.
     def clear_input_path_on_upload_clear(file_path, state):
         if file_path:
-            return gr.update(), gr.update(), state
+            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), state
         try:
             state = state or {}
             state.setdefault("seed_controls", {})
             state["seed_controls"]["last_input_path"] = ""
         except Exception:
             pass
-        return "", gr.update(value="", visible=False), state
+        img_prev, vid_prev = preview_updates(None)
+        return (
+            "",
+            gr.update(value="", visible=False),
+            img_prev,
+            vid_prev,
+            gr.update(value="", visible=False),
+            gr.update(value="", visible=False),
+            state,
+        )
 
     input_file.change(
         fn=clear_input_path_on_upload_clear,
         inputs=[input_file, shared_state],
-        outputs=[input_path, input_cache_msg, shared_state],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
     def cache_input_path_only(path_val, state):
@@ -585,7 +599,7 @@ def flashvsr_tab(
             state["seed_controls"]["last_input_path"] = path_val if path_val else ""
         except Exception:
             pass
-        return gr.update(value="✅ Input path updated.", visible=True), state
+        return gr.update(value="OK: Input path updated.", visible=True), state
 
     input_path.change(
         fn=cache_input_path_only,
@@ -691,7 +705,7 @@ def flashvsr_tab(
         if not isinstance(merged, tuple) or len(merged) < 7:
             safe_state = live_state if isinstance(live_state, dict) else {}
             return (
-                gr.update(value="❌ Invalid FlashVSR+ payload"),
+                gr.update(value="ERROR: Invalid FlashVSR+ payload"),
                 "",
                 gr.update(value="", visible=False),
                 gr.update(value=None, visible=False),
@@ -704,10 +718,39 @@ def flashvsr_tab(
             )
 
         status, logs, vid_upd, img_upd, slider_upd, html_upd, state_out = merged
+        status_text = _extract_update_value(status) if isinstance(status, dict) else status
+        status_text = str(status_text or "").strip()
+        status_lc = status_text.lower()
+
+        terminal_tokens = (
+            "complete",
+            "failed",
+            "error",
+            "critical",
+            "cancel",
+            "no result",
+            "out of vram",
+            "oom",
+            "missing",
+            "insufficient",
+        )
+        is_terminal = any(tok in status_lc for tok in terminal_tokens)
+        if status_text and not is_terminal:
+            subtitle = "Processing..."
+            if isinstance(logs, str):
+                for line in reversed(logs.splitlines()):
+                    line = line.strip()
+                    if line:
+                        subtitle = line
+                        break
+            progress_update = _queue_status_indicator(status_text, subtitle, spinning=True)
+        else:
+            progress_update = gr.update(value="", visible=False)
+
         return (
             status,
             logs,
-            gr.update(value="", visible=False),
+            progress_update,
             img_upd if img_upd is not None else gr.update(value=None, visible=False),
             vid_upd if vid_upd is not None else gr.update(value=None, visible=False),
             _last_processed_text(state_out, vid_upd, img_upd),
@@ -894,7 +937,7 @@ def flashvsr_tab(
     )
 
     cancel_btn.click(
-        fn=lambda ok: service["cancel_action"]() if ok else (gr.update(value="⚠️ Enable 'Confirm cancel' to stop."), ""),
+        fn=lambda ok: service["cancel_action"]() if ok else (gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), ""),
         inputs=[cancel_confirm],
         outputs=[status_box, log_box]
     )

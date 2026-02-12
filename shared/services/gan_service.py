@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import threading
 import time
+import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple
 import gradio as gr
@@ -196,19 +197,19 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "gpu_acceleration": True,
         "gpu_device": "0",
         "batch_size": 1,
-        "output_format": "auto",
-        "output_quality": 95,
+        "output_format": "png",
+        "output_quality": 100,
         "save_metadata": True,
         "create_subfolders": False,
     }
 
 
 """
-ðŸ“‹ GAN PRESET ORDER
+ GAN PRESET ORDER
 
 MUST match inputs_list order in ui/gan_tab.py.
 
-ðŸ”§ TO ADD NEW CONTROLS:
+ TO ADD NEW CONTROLS:
 1. Add default to gan_defaults()
 2. Append key to GAN_ORDER below
 3. Add component to ui/gan_tab.py inputs_list
@@ -304,12 +305,12 @@ def build_gan_callbacks(
     def save_preset(preset_name: str, *args):
         """Save preset with validation"""
         if not preset_name.strip():
-            return gr.update(), gr.update(value="âš ï¸ Enter a preset name before saving"), *list(args)
+            return gr.update(), gr.update(value="WARNING: Enter a preset name before saving"), *list(args)
 
         try:
             # Validate component count
             if len(args) != len(GAN_ORDER):
-                error_msg = f"âš ï¸ Preset mismatch: {len(args)} values vs {len(GAN_ORDER)} expected. Check inputs_list in gan_tab.py"
+                error_msg = f"WARNING: Preset mismatch: {len(args)} values vs {len(GAN_ORDER)} expected. Check inputs_list in gan_tab.py"
                 return gr.update(), gr.update(value=error_msg), *list(args)
             
             payload = _gan_dict_from_args(list(args))
@@ -320,9 +321,9 @@ def build_gan_callbacks(
             current_map = dict(zip(GAN_ORDER, list(args)))
             loaded_vals = _apply_gan_preset(payload, defaults, preset_manager, current=current_map)
 
-            return dropdown, gr.update(value=f"âœ… Saved preset '{preset_name}' for {model_name}"), *loaded_vals
+            return dropdown, gr.update(value=f"SUCCESS: Saved preset '{preset_name}' for {model_name}"), *loaded_vals
         except Exception as e:
-            return gr.update(), gr.update(value=f"âŒ Error saving preset: {str(e)}"), *list(args)
+            return gr.update(), gr.update(value=f"ERROR: Error saving preset: {str(e)}"), *list(args)
 
     def load_preset(preset_name: str, model_name: str, current_values: List[Any]):
         """
@@ -345,12 +346,12 @@ def build_gan_callbacks(
             values = _apply_gan_preset(preset or {}, defaults_with_model, preset_manager, current=current_map)
             
             # Return values + status message (status is LAST)
-            status_msg = f"âœ… Loaded preset '{preset_name}'" if preset else "â„¹ï¸ Preset not found"
+            status_msg = f"SUCCESS: Loaded preset '{preset_name}'" if preset else "INFO: Preset not found"
             return (*values, gr.update(value=status_msg))
         except Exception as e:
             print(f"Error loading preset {preset_name}: {e}")
             # Return current values + error status
-            return (*current_values, gr.update(value=f"âŒ Error: {str(e)}"))
+            return (*current_values, gr.update(value=f"ERROR: Error: {str(e)}"))
 
     def safe_defaults():
         return [defaults[k] for k in GAN_ORDER]
@@ -536,6 +537,20 @@ def build_gan_callbacks(
             except Exception:
                 pass
             return gr.update(value=None, visible=False), gr.update(value=None, visible=False)
+
+        def _running_indicator(title: str, subtitle: str, spinning: bool = True):
+            safe_title = html.escape(str(title or ""))
+            safe_subtitle = html.escape(str(subtitle or ""))
+            spinner_style = "" if spinning else ' style="opacity:0.45; animation:none;"'
+            indicator_html = (
+                '<div class="processing-banner">'
+                f'<div class="processing-spinner"{spinner_style}></div>'
+                '<div class="processing-col">'
+                f'<div class="processing-text">{safe_title}</div>'
+                f'<div class="processing-sub">{safe_subtitle}</div>'
+                "</div></div>"
+            )
+            return gr.update(value=indicator_html, visible=True)
         
         # Initialize progress if provided
         if progress:
@@ -547,7 +562,7 @@ def build_gan_callbacks(
         ffmpeg_ok, ffmpeg_msg = check_ffmpeg_available()
         if not ffmpeg_ok:
             yield (
-                "âŒ ffmpeg not found in PATH",
+                "ERROR: ffmpeg not found in PATH",
                 ffmpeg_msg or "Install ffmpeg and add to PATH before processing",
                 gr.update(value="", visible=False),
                 gr.update(value=None, visible=False),
@@ -565,7 +580,7 @@ def build_gan_callbacks(
         has_space, space_warning = check_disk_space(output_path_check, required_mb=5000)
         if not has_space:
             yield (
-                "âŒ Insufficient disk space",
+                "ERROR: Insufficient disk space",
                 space_warning or f"Free up disk space before processing. Required: 5GB+, Available: {output_path_check}",
                 gr.update(value="", visible=False),
                 gr.update(value=None, visible=False),
@@ -580,7 +595,7 @@ def build_gan_callbacks(
         elif space_warning:
             # Low space warning - continue but warn user
             if progress:
-                progress(0, desc="âš ï¸ Low disk space detected")
+                progress(0, desc="WARNING: Low disk space detected")
 
         # Define worker functions (moved outside try block)
         def worker_single(prepped_settings):
@@ -765,10 +780,10 @@ def build_gan_callbacks(
             except Exception as e:
                 # Don't fail batch on metadata error
                 if progress_q:
-                    progress_q.put(f"âš ï¸ Warning: Failed to write batch metadata: {e}\n")
+                    progress_q.put(f"WARNING: Failed to write batch metadata: {e}\n")
             
             result_holder["payload"] = (
-                f"âœ… Batch complete: {len(outputs)}/{len(batch_items)} processed ({batch_result.failed_files} failed)",
+                f"SUCCESS: Batch complete: {len(outputs)}/{len(batch_items)} processed ({batch_result.failed_files} failed)",
                 "\n\n".join(logs),
                 outputs[0] if outputs else None,
                 last_cmp,
@@ -819,11 +834,11 @@ def build_gan_callbacks(
                 pass
             if settings.get("batch_enable"):
                 if not inp or not Path(inp).exists() or not Path(inp).is_dir():
-                    yield ("âŒ Batch input folder missing", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
+                    yield ("ERROR: Batch input folder missing", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
                     return
             else:
                 if not inp or not Path(inp).exists():
-                    yield ("âŒ Input missing", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
+                    yield ("ERROR: Input missing", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
                     return
 
             # Preview runs are single-item and operate on a prepared first-frame image.
@@ -891,12 +906,12 @@ def build_gan_callbacks(
 
             cuda_warn = validate_cuda_device_spec(settings.get("cuda_device", ""))
             if cuda_warn:
-                yield (f"âš ï¸ {cuda_warn}", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "CUDA Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
+                yield (f"WARNING: {cuda_warn}", "", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "CUDA Error", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
                 return
             devices = [d.strip() for d in str(settings.get("cuda_device") or "").split(",") if d.strip()]
             if len(devices) > 1:
                 yield (
-                    "âš ï¸ GAN backends currently use a single GPU; select one CUDA device.",
+                    "WARNING: GAN backends currently use a single GPU; select one CUDA device.",
                     "",
                     gr.update(value="", visible=False),
                     gr.update(value=None, visible=False),
@@ -1018,10 +1033,10 @@ def build_gan_callbacks(
                 if progress:
                     progress(1.0, desc="Chunking complete!")
                 
-                status = "âœ… GAN chunked upscale complete" if rc == 0 else f"âš ï¸ GAN chunking failed (code {rc})"
+                status = "SUCCESS: GAN chunked upscale complete" if rc == 0 else f"WARNING: GAN chunking failed (code {rc})"
                 if rc != 0 and maybe_set_vram_oom_alert(state, model_label="GAN", text=clog, settings=settings):
-                    status = "ðŸš« Out of VRAM (GPU) â€” see banner above"
-                    show_vram_oom_modal(state, title="Out of VRAM (GPU) â€” GAN", duration=None)
+                    status = "OOM: Out of VRAM (GPU) - see banner above"
+                    show_vram_oom_modal(state, title="Out of VRAM (GPU) - GAN", duration=None)
                 
                 # Build comparison for chunked output
                 video_comp_html_update = gr.update(value="", visible=False)
@@ -1046,7 +1061,7 @@ def build_gan_callbacks(
                     gr.update(value="", visible=False),
                     img_upd,
                     vid_upd,
-                    f"Chunking: {'Auto (PySceneDetect scenes)' if auto_chunk else 'Static'} â€” {chunk_count} chunks",
+                    f"Chunking: {'Auto (PySceneDetect scenes)' if auto_chunk else 'Static'} - {chunk_count} chunks",
                     slider_update,
                     video_comp_html_update,
                     gr.update(visible=False),
@@ -1075,7 +1090,7 @@ def build_gan_callbacks(
             # Define run_single function (moved outside try block)
             def run_single(prepped_settings: Dict[str, Any], progress_cb: Optional[Callable[[str], None]] = None):
                 if cancel_event.is_set():
-                    return ("â¹ï¸ Canceled", "\n".join(["Canceled before start"]), None, "", gr.update(value=None))
+                    return ("CANCELED: Canceled", "\n".join(["Canceled before start"]), None, "", gr.update(value=None))
                 run_output_root = Path(prepped_settings.get("_run_dir") or current_output_dir)
                 try:
                     run_output_root.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1127,7 @@ def build_gan_callbacks(
                             if found:
                                 break
                         if not found:
-                            return ("âŒ Model weights not found", "\n".join(header_log + ["Missing model file."]), None, "", gr.update(value=None))
+                            return ("ERROR: Model weights not found", "\n".join(header_log + ["Missing model file."]), None, "", gr.update(value=None))
                     
                     # Add face restoration settings
                     prepped_settings["face_restore"] = face_apply
@@ -1154,9 +1169,9 @@ def build_gan_callbacks(
                             model_type="gan",
                         )
 
-                        status = "âœ… GAN chunked upscale complete" if rc == 0 else f"âš ï¸ GAN chunking failed (code {rc})"
+                        status = "SUCCESS: GAN chunked upscale complete" if rc == 0 else f"WARNING: GAN chunking failed (code {rc})"
                         if rc != 0 and maybe_set_vram_oom_alert(state, model_label="GAN", text=clog, settings=chunk_settings):
-                            status = "ðŸš« Out of VRAM (GPU) â€” see banner above"
+                            status = "OOM: Out of VRAM (GPU) - see banner above"
 
                         outp = final_output
                         if outp and Path(outp).exists() and face_apply:
@@ -1276,7 +1291,7 @@ def build_gan_callbacks(
                         cancel_event=cancel_event  # Fixed: Pass cancel event to enable cancellation
                     )
                 except Exception as exc:  # surface ffmpeg or other runtime issues
-                    err_msg = f"âŒ GAN upscale failed: {exc}"
+                    err_msg = f"ERROR: GAN upscale failed: {exc}"
                     if maybe_set_vram_oom_alert(state, model_label="GAN", text=str(exc), settings=prepped_settings):
                         # NOTE: Modal popups must be triggered from the main Gradio event thread.
                         # We show the modal after the worker thread finishes (see below).
@@ -1285,12 +1300,12 @@ def build_gan_callbacks(
                         progress_cb(err_msg)
                     return (err_msg, "\n".join(header_log + [str(exc)]), None, "", gr.update(value=None))
                 if cancel_event.is_set():
-                    status = "â¹ï¸ Canceled"
+                    status = "CANCELED: Canceled"
                 else:
-                    status = "âœ… GAN upscale complete" if result.returncode == 0 else f"âš ï¸ GAN upscale failed"
+                    status = "SUCCESS: GAN upscale complete" if result.returncode == 0 else f"WARNING: GAN upscale failed"
                 log_body = result.log or ""
                 if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="GAN", text=log_body, settings=prepped_settings):
-                    status = "ðŸš« Out of VRAM (GPU) â€” see banner above"
+                    status = "OOM: Out of VRAM (GPU) - see banner above"
                 full_log = "\n".join(header_log + [log_body])
                 if progress_cb:
                     progress_cb(status)
@@ -1357,7 +1372,7 @@ def build_gan_callbacks(
                                 on_progress=progress_cb if progress_cb else None,
                             )
                             if _err and progress_cb:
-                                progress_cb(f"Ã¢Å¡Â Ã¯Â¸Â Audio mux: {_err}")
+                                progress_cb(f"WARNING: Audio mux: {_err}")
                             if _final and str(_final) != str(final_out_path):
                                 final_out_path = str(_final)
                                 result.output_path = final_out_path
@@ -1457,7 +1472,7 @@ def build_gan_callbacks(
 
                 if not items:
                     yield (
-                        "âŒ No media files or frame folders found in batch folder",
+                        "ERROR: No media files or frame folders found in batch folder",
                         "",
                         gr.update(value="", visible=False),
                         gr.update(value=None, visible=False),
@@ -1554,10 +1569,17 @@ def build_gan_callbacks(
                     last_yield = now
                     live_logs = result_holder.get("live_logs", [])
                     img_upd, vid_upd = _media_updates(None)
+                    status_title = "RUNNING: GAN upscaling in progress"
+                    status_detail = "Waiting for model output..."
+                    for cand in reversed(live_logs):
+                        cand_s = str(cand or "").strip()
+                        if cand_s:
+                            status_detail = cand_s
+                            break
                     yield (
-                        gr.update(value="â³ Running GAN upscale..."),
+                        gr.update(value=status_title),
                         "\n".join(live_logs[-400:]),
-                        gr.update(value="", visible=False),
+                        _running_indicator(status_title, status_detail, spinning=True),
                         img_upd,
                         vid_upd,
                         "Running...",
@@ -1571,7 +1593,7 @@ def build_gan_callbacks(
 
             status, lg, outp, cmp_html, slider_upd = result_holder.get(
                 "payload",
-                ("âŒ Failed", "", None, "", gr.update(value=None)),
+                ("ERROR: Failed", "", None, "", gr.update(value=None)),
             )
             live_logs = result_holder.get("live_logs", [])
             merged_logs = lg if lg else "\n".join(live_logs)
@@ -1586,9 +1608,10 @@ def build_gan_callbacks(
             
             # Update progress to 100% on completion
             if progress:
-                if "âœ…" in status:
-                    progress(1.0, desc="GAN upscaling complete!")
-                elif "âŒ" in status:
+                status_lc = str(status or "").lower()
+                if ("success" in status_lc or "complete" in status_lc) and ("error" not in status_lc and "fail" not in status_lc):
+                    progress(1.0, desc="GAN upscaling complete")
+                elif ("error" in status_lc or "fail" in status_lc or "oom" in status_lc):
                     progress(0, desc="Failed")
             
             # Build video comparison for videos
@@ -1608,7 +1631,7 @@ def build_gan_callbacks(
 
             # If VRAM OOM was detected during the worker run, show a modal popup (easy to notice).
             if isinstance(state, dict) and state.get("alerts", {}).get("oom", {}).get("visible"):
-                show_vram_oom_modal(state, title="Out of VRAM (GPU) â€” GAN", duration=None)
+                show_vram_oom_modal(state, title="Out of VRAM (GPU) - GAN", duration=None)
             
             img_upd, vid_upd = _media_updates(outp)
             yield (
@@ -1626,7 +1649,7 @@ def build_gan_callbacks(
         except Exception as e:
             error_msg = f"Critical error in GAN processing: {str(e)}"
             yield (
-                "âŒ Critical error",
+                "ERROR: Critical error",
                 error_msg,
                 gr.update(value="", visible=False),
                 gr.update(value=None, visible=False),

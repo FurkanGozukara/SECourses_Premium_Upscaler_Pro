@@ -331,6 +331,21 @@ def flashvsr_tab(
                 placeholder="Leave empty for auto naming",
                 info="Optional custom output location. A folder saves into that folder. A .mp4 file path renames the final output to that exact file.",
             )
+
+            resume_run_dir = gr.Textbox(
+                label="Resume Run Folder (chunk/scene resume)",
+                value=(
+                    values[FLASHVSR_ORDER.index("resume_run_dir")]
+                    if "resume_run_dir" in FLASHVSR_ORDER and len(values) > FLASHVSR_ORDER.index("resume_run_dir")
+                    else ""
+                ),
+                placeholder="Optional: G:/.../outputs/0019",
+                info=(
+                    "Optional. When set, chunk/scene processing resumes from the last completed chunk in that folder. "
+                    "Use the same settings as the original run to continue remaining chunks. "
+                    "Fresh output path overrides are ignored while resume is active."
+                ),
+            )
             
             with gr.Accordion("🎬 Upscaled Output", open=True):
                 output_video = gr.Video(
@@ -482,8 +497,9 @@ def flashvsr_tab(
         input_path, output_override, scale, version, mode,
         tiled_vae, tiled_dit, tile_size, overlap, unload_dit,
         color_fix, seed, dtype, device, fps_flashvsr,
-        quality, attention, batch_enable, batch_input, batch_output
-        , use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale
+        quality, attention, batch_enable, batch_input, batch_output,
+        use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
+        resume_run_dir,
     ]
 
     # Development validation: inputs_list must stay aligned with FLASHVSR_ORDER

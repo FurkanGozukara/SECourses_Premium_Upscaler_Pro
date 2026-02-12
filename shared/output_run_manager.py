@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .path_utils import ensure_dir, sanitize_filename
+from .path_utils import ensure_dir, sanitize_filename, normalize_path
 
 
 RUN_CONTEXT_FILENAME = "run_context.json"
@@ -241,6 +241,115 @@ def init_existing_video_run_dir(
         thumbs_dir=thumbs_dir,
         context_path=context_path,
     )
+
+
+def resolve_resume_input_from_run_dir(run_dir: Path) -> tuple[Optional[Path], Optional[str], str]:
+    """
+    Best-effort recovery of the original processing input for a resumable run folder.
+
+    Returns:
+        (input_path_or_none, original_filename_or_none, source_label)
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.exists() or not run_dir.is_dir():
+        return None, None, "run folder not found"
+
+    original_filename: Optional[str] = None
+
+    def _load_json(path: Path) -> Any:
+        try:
+            if not path.exists() or not path.is_file():
+                return None
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _iter_entries(path: Path) -> list[Dict[str, Any]]:
+        payload = _load_json(path)
+        if isinstance(payload, dict):
+            return [payload]
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
+    preferred: list[tuple[Path, str]] = []
+    fallback: list[tuple[Path, str]] = []
+
+    # 1) Chunk run metadata: prioritize preprocessed full input when available.
+    metadata_paths = [
+        run_dir / "processed_chunks" / "run_metadata.json",
+        run_dir / "run_metadata.json",
+    ]
+    for meta_path in metadata_paths:
+        for entry in reversed(_iter_entries(meta_path)):
+            status = str(entry.get("status") or "").strip().lower()
+            returncode = entry.get("returncode")
+            is_success = (status in {"success", "completed", "ok"}) or (str(returncode).strip() == "0")
+            if not is_success:
+                continue
+
+            args_blob = entry.get("args")
+            args: Dict[str, Any] = args_blob if isinstance(args_blob, dict) else {}
+
+            if not original_filename:
+                orig = str(args.get("_original_filename") or "").strip()
+                if orig:
+                    original_filename = Path(orig).name
+
+            pre = str(args.get("_preprocessed_input_path") or "").strip()
+            if pre:
+                preferred.append((Path(normalize_path(pre)), "run_metadata.preprocessed"))
+
+            orig_src = str(args.get("_original_input_path_before_preprocess") or "").strip()
+            if orig_src:
+                fallback.append((Path(normalize_path(orig_src)), "run_metadata.original"))
+
+            in_src = str(args.get("input_path") or "").strip()
+            if in_src:
+                in_path = Path(normalize_path(in_src))
+                stem_lc = in_path.stem.lower()
+                # Skip chunk-level inputs; resume needs the full source.
+                if not (stem_lc.startswith("chunk_") or in_path.parent.name.lower() == "input_chunks"):
+                    fallback.append((in_path, "run_metadata.input"))
+
+    # 2) Downscaled artifacts are stable, user-visible inputs for resumed chunking.
+    try:
+        downscaled_candidates = sorted(
+            [p for p in run_dir.glob("downscaled_*") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        downscaled_candidates = []
+    for cand in downscaled_candidates:
+        preferred.append((cand, "run_dir.downscaled"))
+
+    # 3) Run context fallback.
+    context_payload = _load_json(run_dir / RUN_CONTEXT_FILENAME)
+    if isinstance(context_payload, dict):
+        if not original_filename:
+            ctx_name = str(context_payload.get("original_filename") or "").strip()
+            if ctx_name:
+                original_filename = Path(ctx_name).name
+        ctx_input = str(context_payload.get("input_path") or "").strip()
+        if ctx_input:
+            fallback.append((Path(normalize_path(ctx_input)), "run_context.input"))
+
+    # Resolve first existing candidate, de-duplicated.
+    seen: set[str] = set()
+    for p, source in preferred + fallback:
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.exists() and (p.is_file() or p.is_dir()):
+            return p, (original_filename or p.name), source
+
+    return None, original_filename, "no recoverable input found in run folder"
 
 
 def parse_output_override_as_root(override: Optional[str]) -> tuple[Optional[Path], Optional[str]]:

@@ -562,6 +562,7 @@ class Runner:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                bufsize=1,  # line-buffered text stream for lower UI log latency
                 text=True,
                 encoding="utf-8",
                 errors="replace",

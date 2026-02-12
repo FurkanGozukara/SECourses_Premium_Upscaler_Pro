@@ -32,7 +32,12 @@ from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
-from shared.output_run_manager import prepare_single_video_run, batch_item_dir, downscaled_video_path
+from shared.output_run_manager import (
+    prepare_single_video_run,
+    batch_item_dir,
+    downscaled_video_path,
+    resolve_resume_input_from_run_dir,
+)
 from shared.ffmpeg_utils import scale_video
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
@@ -130,6 +135,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "batch_enable": False,
         "batch_input_path": "",
         "batch_output_path": "",
+        "resume_run_dir": "",
         # vNext sizing (app-level)
         "use_resolution_tab": True,
         "upscale_factor": float(scale),
@@ -164,6 +170,8 @@ FLASHVSR_ORDER: List[str] = [
     "upscale_factor",
     "max_target_resolution",
     "pre_downscale_then_upscale",
+    # Resume from an existing chunk run folder.
+    "resume_run_dir",
 ]
 
 
@@ -369,6 +377,10 @@ def build_flashvsr_callbacks(
             state["seed_controls"] = seed_controls
             settings_dict = _flashvsr_dict_from_args(list(args))
             settings = {**defaults, **settings_dict}
+            if preview_only:
+                settings["resume_run_dir"] = ""
+            if settings.get("batch_enable"):
+                settings["resume_run_dir"] = ""
             
             # Apply FlashVSR+ guardrails (single GPU, tile validation, etc.)
             settings = _enforce_flashvsr_guardrails(settings, defaults)
@@ -950,7 +962,42 @@ def build_flashvsr_callbacks(
                 return
             
             # Resolve input
-            input_path = normalize_path(upload if upload else settings["input_path"])
+            resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+            resume_mode = bool(resume_run_dir_raw and (not settings.get("batch_enable")) and (not preview_only))
+            if resume_mode:
+                resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                    vid_upd, img_upd = _media_updates(None)
+                    yield (
+                        "❌ Resume folder not found",
+                        f"Configured resume folder does not exist: {resume_run_dir}",
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
+                recovered_input, recovered_name, _recovered_source = resolve_resume_input_from_run_dir(resume_run_dir)
+                if recovered_input is None:
+                    vid_upd, img_upd = _media_updates(None)
+                    yield (
+                        "❌ Resume input not found",
+                        (
+                            f"Could not recover input source from resume folder: {resume_run_dir}. "
+                            "Expected run_context.json input path or run_metadata/downscaled artifact."
+                        ),
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
+                input_path = normalize_path(str(recovered_input))
+                settings["_original_filename"] = recovered_name or Path(input_path).name
+            else:
+                input_path = normalize_path(upload if upload else settings["input_path"])
             if not input_path or not Path(input_path).exists():
                 vid_upd, img_upd = _media_updates(None)
                 yield (
@@ -966,7 +1013,8 @@ def build_flashvsr_callbacks(
             
             settings["input_path"] = input_path
             settings["_effective_input_path"] = input_path  # may be overridden by preprocessing
-            settings["_original_filename"] = Path(input_path).name
+            if not settings.get("_original_filename"):
+                settings["_original_filename"] = Path(input_path).name
             seed_controls["flashvsr_batch_outputs"] = []
             state["seed_controls"] = seed_controls
 
@@ -1003,29 +1051,60 @@ def build_flashvsr_callbacks(
             # NEW: Per-run output folder for videos (0001/0002/...) to avoid collisions and
             # to keep chunk artifacts user-visible.
             if detect_input_type(settings["input_path"]) == "video":
-                try:
-                    base_out_root = Path(global_settings.get("output_dir", output_dir))
-                    run_paths, explicit_final = prepare_single_video_run(
-                        output_root_fallback=base_out_root,
-                        output_override_raw=settings.get("output_override"),
-                        input_path=settings["input_path"],
-                        original_filename=settings.get("_original_filename") or Path(settings["input_path"]).name,
-                        model_label="FlashVSR+",
-                        mode="subprocess",
-                    )
-                    run_dir = Path(run_paths.run_dir)
+                resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+                if resume_run_dir_raw:
+                    resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                    if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                        vid_upd, img_upd = _media_updates(None)
+                        yield (
+                            "Resume folder not found",
+                            f"Configured resume folder does not exist: {resume_run_dir}",
+                            vid_upd,
+                            img_upd,
+                            gr.update(visible=False),
+                            gr.update(value="", visible=False),
+                            state,
+                        )
+                        return
+                    run_dir = resume_run_dir
+                    processed_chunks_dir = run_dir / "processed_chunks"
+                    processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                     seed_controls["last_run_dir"] = str(run_dir)
                     settings["_run_dir"] = str(run_dir)
-                    settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
+                    settings["_processed_chunks_dir"] = str(processed_chunks_dir)
+                    settings["_resume_run_requested"] = True
                     settings["_user_output_override_raw"] = settings.get("output_override") or ""
 
                     base_stem = Path(settings.get("_original_filename") or input_path).stem
                     seed_val = int(settings.get("seed", 0) or 0)
                     mode_val = str(settings.get("mode", "tiny") or "tiny")
                     default_final = run_dir / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4"
-                    settings["output_override"] = str(explicit_final) if explicit_final else str(default_final)
-                except Exception:
-                    pass
+                    # Resume mode ignores new output override paths and keeps output in the selected run folder.
+                    settings["output_override"] = str(default_final)
+                else:
+                    try:
+                        base_out_root = Path(global_settings.get("output_dir", output_dir))
+                        run_paths, explicit_final = prepare_single_video_run(
+                            output_root_fallback=base_out_root,
+                            output_override_raw=settings.get("output_override"),
+                            input_path=settings["input_path"],
+                            original_filename=settings.get("_original_filename") or Path(settings["input_path"]).name,
+                            model_label="FlashVSR+",
+                            mode="subprocess",
+                        )
+                        run_dir = Path(run_paths.run_dir)
+                        seed_controls["last_run_dir"] = str(run_dir)
+                        settings["_run_dir"] = str(run_dir)
+                        settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
+                        settings["_user_output_override_raw"] = settings.get("output_override") or ""
+
+                        base_stem = Path(settings.get("_original_filename") or input_path).stem
+                        seed_val = int(settings.get("seed", 0) or 0)
+                        mode_val = str(settings.get("mode", "tiny") or "tiny")
+                        default_final = run_dir / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4"
+                        settings["output_override"] = str(explicit_final) if explicit_final else str(default_final)
+                    except Exception:
+                        pass
             
             # Output root for artifacts + preprocessing
             settings["global_output_dir"] = str(Path(settings.get("_run_dir") or output_dir))
@@ -1044,6 +1123,39 @@ def build_flashvsr_callbacks(
             # Chunk against the effective (preprocessed) input, but keep output naming from the original filename.
             effective_for_chunk = normalize_path(settings.get("_effective_input_path") or input_path)
             should_use_chunking = (detect_input_type(effective_for_chunk) == "video") and (auto_chunk or chunk_size_sec > 0)
+            resume_requested = bool(settings.get("_resume_run_requested") or str(settings.get("resume_run_dir") or "").strip())
+            if resume_requested and not should_use_chunking:
+                vid_upd, img_upd = _media_updates(None)
+                yield (
+                    "Resume unavailable for current mode",
+                    (
+                        "Resume run folder works only with chunk/scene-based video processing. "
+                        "Enable chunking and keep the same settings as the original run."
+                    ),
+                    vid_upd,
+                    img_upd,
+                    gr.update(visible=False),
+                    gr.update(value="", visible=False),
+                    state,
+                )
+                return
+            if resume_requested:
+                from shared.chunking import check_resume_available
+
+                resume_root = Path(settings.get("_run_dir") or Path(global_settings.get("output_dir", output_dir)))
+                resume_ok, resume_msg = check_resume_available(resume_root, "mp4")
+                if not resume_ok:
+                    vid_upd, img_upd = _media_updates(None)
+                    yield (
+                        "Resume failed",
+                        f"Resume requested but no resumable chunk outputs were found in {resume_root}. {resume_msg}",
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
             
             # Run FlashVSR+ in thread with cancel support
             result_holder = {}
@@ -1074,6 +1186,11 @@ def build_flashvsr_callbacks(
                                 chunk_settings["output_override"] = str(out_base / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4")
                             except Exception:
                                 pass
+                        if resume_requested:
+                            progress_queue.put(
+                                "Resume run folder detected. Resuming from last processed chunk and "
+                                "continuing remaining chunks (same settings required)."
+                            )
 
                         def _process_chunk(s: Dict[str, Any], on_progress=None) -> RunResult:
                             r = run_flashvsr(
@@ -1104,7 +1221,7 @@ def build_flashvsr_callbacks(
                             per_chunk_cleanup=per_chunk_cleanup,
                             allow_partial=True,
                             global_output_dir=str(Path(settings.get("_run_dir") or Path(global_settings.get("output_dir", output_dir)))),
-                            resume_from_partial=False,
+                            resume_from_partial=resume_requested,
                             progress_tracker=_chunk_progress_cb,
                             process_func=_process_chunk,
                             model_type="flashvsr",

@@ -439,6 +439,21 @@ def rife_tab(
                 buttons=["copy"]
             )
 
+            resume_run_dir = gr.Textbox(
+                label="Resume Run Folder (chunk/scene resume)",
+                value=(
+                    values[RIFE_ORDER.index("resume_run_dir")]
+                    if "resume_run_dir" in RIFE_ORDER and len(values) > RIFE_ORDER.index("resume_run_dir")
+                    else ""
+                ),
+                placeholder="Optional: G:/.../outputs/0019",
+                info=(
+                    "Optional. When set, chunk/scene processing resumes from the last completed chunk in that folder. "
+                    "Use the same settings as the original run to continue remaining chunks. "
+                    "Fresh output path overrides are ignored while resume is active."
+                ),
+            )
+
             # Output displays
             output_video = gr.Video(
                 label="🎬 Processed Video",
@@ -548,7 +563,7 @@ def rife_tab(
     # ============================================================================
     # 📋 RIFE PRESET INPUT LIST - MUST match RIFE_ORDER in rife_service.py
     # Adding controls? Update rife_defaults(), RIFE_ORDER, and this list in sync.
-    # Current count: 32 components
+    # Current count: 33 components
     # ============================================================================
 
     # Kept for ORDER compatibility with persisted presets; no longer exposed as a UI toggle.
@@ -587,6 +602,7 @@ def rife_tab(
         video_codec_rife,     # 29: video_codec
         output_quality_rife,  # 30: output_quality
         concat_videos,        # 31: concat_videos
+        resume_run_dir,       # 32: resume_run_dir
     ]
     
     # Development validation

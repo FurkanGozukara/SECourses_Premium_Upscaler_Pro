@@ -372,6 +372,21 @@ def gan_tab(
                 buttons=["copy"]
             )
 
+            resume_run_dir = gr.Textbox(
+                label="Resume Run Folder (chunk/scene resume)",
+                value=(
+                    values[GAN_ORDER.index("resume_run_dir")]
+                    if "resume_run_dir" in GAN_ORDER and len(values) > GAN_ORDER.index("resume_run_dir")
+                    else ""
+                ),
+                placeholder="Optional: G:/.../outputs/0019",
+                info=(
+                    "Optional. When set, chunk/scene processing resumes from the last completed chunk in that folder. "
+                    "Use the same settings as the original run to continue with remaining chunks. "
+                    "Fresh output path overrides are ignored while resume is active."
+                ),
+            )
+
             with gr.Accordion("Upscaled Output", open=True):
                 output_video = gr.Video(
                     label="Upscaled Video",
@@ -506,7 +521,7 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 24 components (includes vNext sizing)
+    # Current count: 25 components (includes vNext sizing + resume path)
     # ============================================================================
     
     inputs_list = [
@@ -515,7 +530,9 @@ def gan_tab(
         denoising_strength, sharpening, color_correction, gpu_acceleration, gpu_device,
         batch_size, output_format_gan, output_quality_gan, save_metadata, create_subfolders,
         # vNext sizing
-        upscale_factor, max_resolution, pre_downscale_then_upscale
+        upscale_factor, max_resolution, pre_downscale_then_upscale,
+        # Resume path (chunk/scene mode)
+        resume_run_dir,
     ]
     
     # Development validation

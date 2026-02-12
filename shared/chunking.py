@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import re
 import shutil
 import subprocess
@@ -1439,6 +1440,94 @@ def detect_resume_state(work_dir: Path, output_format: str) -> Tuple[Optional[Pa
         # Backward compatibility: older versions stored chunks directly in work_dir.
         chunks_root = work_dir
 
+    def _load_metadata_entries(meta_path: Path) -> List[Dict[str, Any]]:
+        try:
+            if not meta_path.exists() or not meta_path.is_file():
+                return []
+            with meta_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return [payload]
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+        except Exception:
+            return []
+        return []
+
+    def _collect_contiguous_video_chunks() -> List[Path]:
+        """
+        Gather completed chunk outputs using both filesystem patterns and run_metadata.json,
+        then keep only a contiguous prefix (chunk_0001..chunk_00NN) for safe resume.
+        """
+        by_index: Dict[int, Path] = {}
+
+        def _put(path_like: Any) -> Optional[int]:
+            try:
+                p = Path(normalize_path(str(path_like)))
+            except Exception:
+                return None
+            idx = _extract_chunk_index(p)
+            if idx is None:
+                return None
+            if p.exists() and p.is_file():
+                by_index[idx] = p
+            return idx
+
+        # Primary discovery from processed chunk files.
+        for pat in ("chunk_*_upscaled.mp4", "chunk_*_out.mp4"):
+            for cand in sorted(chunks_root.glob(pat)):
+                _put(cand)
+
+        # Supplement with run metadata (useful when filenames differ but include chunk index).
+        metadata_candidates = [
+            chunks_root / "run_metadata.json",
+            work_dir / "run_metadata.json",
+        ]
+        for meta_path in metadata_candidates:
+            for entry in _load_metadata_entries(meta_path):
+                status = str(entry.get("status") or "").strip().lower()
+                returncode = entry.get("returncode")
+                is_success = (status in {"success", "completed", "ok"}) or (str(returncode).strip() == "0")
+                if not is_success:
+                    continue
+
+                args_blob = entry.get("args")
+                args: Dict[str, Any] = args_blob if isinstance(args_blob, dict) else {}
+                candidates: List[Any] = []
+
+                for key in ("output", "output_path"):
+                    val = entry.get(key)
+                    if val:
+                        candidates.append(val)
+                for key in ("output_override",):
+                    val = args.get(key)
+                    if val:
+                        candidates.append(val)
+
+                found_idx: Optional[int] = None
+                for cand in candidates:
+                    found_idx = _put(cand)
+                    if found_idx is not None:
+                        break
+
+                # If metadata indicates chunk index but path is missing, fall back to canonical names.
+                if found_idx is not None and found_idx not in by_index:
+                    for fallback in (
+                        chunks_root / f"chunk_{found_idx:04d}_upscaled.mp4",
+                        chunks_root / f"chunk_{found_idx:04d}_out.mp4",
+                    ):
+                        if fallback.exists() and fallback.is_file():
+                            by_index[found_idx] = fallback
+                            break
+
+        # Resume is safe only across a contiguous prefix.
+        contiguous: List[Path] = []
+        idx = 1
+        while idx in by_index:
+            contiguous.append(by_index[idx])
+            idx += 1
+        return contiguous
+
     # Check for partial outputs
     if output_format == "png":
         partial_candidates = list(work_dir.glob("*_partial"))
@@ -1451,10 +1540,8 @@ def detect_resume_state(work_dir: Path, output_format: str) -> Tuple[Optional[Pa
                     completed_chunks.append(chunk_file)
             return partial_dir, completed_chunks
     else:
-        # Video: detect completed per-chunk outputs to support cancel salvage and best-effort resume.
-        completed_chunks = sorted(chunks_root.glob("chunk_*_upscaled.mp4"))
-        if not completed_chunks:
-            completed_chunks = sorted(chunks_root.glob("chunk_*_out.mp4"))
+        # Video: detect completed per-chunk outputs (file scan + metadata), contiguous only.
+        completed_chunks = _collect_contiguous_video_chunks()
 
         # If a stitched partial exists inside the chunks dir, prefer it as the "partial indicator".
         partial_candidates = list(work_dir.glob("*_partial.mp4"))

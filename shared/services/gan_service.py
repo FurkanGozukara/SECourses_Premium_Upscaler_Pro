@@ -22,7 +22,11 @@ from shared.path_utils import (
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.face_restore import restore_image, restore_video
 from shared.logging_utils import RunLogger
-from shared.output_run_manager import prepare_single_video_run, downscaled_video_path
+from shared.output_run_manager import (
+    prepare_single_video_run,
+    downscaled_video_path,
+    resolve_resume_input_from_run_dir,
+)
 from shared.realesrgan_runner import run_realesrgan
 from shared.gan_runner import run_gan_upscale, GanResult, get_gan_model_metadata
 from shared.ffmpeg_utils import scale_video
@@ -201,6 +205,7 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "output_quality": 100,
         "save_metadata": True,
         "create_subfolders": False,
+        "resume_run_dir": "",
     }
 
 
@@ -242,6 +247,8 @@ GAN_ORDER: List[str] = [
     "upscale_factor",
     "max_resolution",
     "pre_downscale_then_upscale",
+    # Resume from an existing chunk run folder.
+    "resume_run_dir",
 ]
 
 
@@ -808,6 +815,10 @@ def build_gan_callbacks(
             cancel_event.clear()
             settings_dict = _gan_dict_from_args(list(args))
             settings = {**defaults, **settings_dict}
+            if preview_only:
+                settings["resume_run_dir"] = ""
+            if settings.get("batch_enable"):
+                settings["resume_run_dir"] = ""
             settings["output_override"] = settings.get("output_override")
             settings["cuda_device"] = settings.get("cuda_device", "")
 
@@ -815,19 +826,47 @@ def build_gan_callbacks(
             current_output_dir = Path(global_settings.get("output_dir", output_dir))
             current_temp_dir = Path(global_settings.get("temp_dir", temp_dir))
 
-            # Input selection: in batch mode prefer `batch_input_path`.
-            raw_inp = upload if upload else (
-                settings.get("batch_input_path") if settings.get("batch_enable") else settings.get("input_path")
-            )
+            resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+            resume_mode = bool(resume_run_dir_raw and (not settings.get("batch_enable")) and (not preview_only))
 
-            # Gradio may provide FileData as a dict (path + orig_name). Handle both forms.
             original_filename = None
-            if isinstance(raw_inp, dict):
-                original_filename = raw_inp.get("orig_name") or raw_inp.get("name")
-                raw_inp = raw_inp.get("path") or ""
+            if resume_mode:
+                resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                    yield ("ERROR: Resume folder not found", f"Configured resume folder does not exist: {resume_run_dir}", gr.update(value="", visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False), "Resume folder invalid", gr.update(value=None), gr.update(value="", visible=False), gr.update(visible=False), state)
+                    return
+                recovered_input, recovered_name, _recovered_source = resolve_resume_input_from_run_dir(resume_run_dir)
+                if recovered_input is None:
+                    yield (
+                        "ERROR: Resume input not found",
+                        (
+                            f"Could not recover input source from resume folder: {resume_run_dir}. "
+                            "Expected run_context.json input path or run_metadata/downscaled artifact."
+                        ),
+                        gr.update(value="", visible=False),
+                        gr.update(value=None, visible=False),
+                        gr.update(value=None, visible=False),
+                        "Resume input missing",
+                        gr.update(value=None),
+                        gr.update(value="", visible=False),
+                        gr.update(visible=False),
+                        state,
+                    )
+                    return
+                raw_inp = str(recovered_input)
+                original_filename = recovered_name or Path(raw_inp).name
+            else:
+                # Input selection: in batch mode prefer `batch_input_path`.
+                raw_inp = upload if upload else (
+                    settings.get("batch_input_path") if settings.get("batch_enable") else settings.get("input_path")
+                )
+                # Gradio may provide FileData as a dict (path + orig_name). Handle both forms.
+                if isinstance(raw_inp, dict):
+                    original_filename = raw_inp.get("orig_name") or raw_inp.get("name")
+                    raw_inp = raw_inp.get("path") or ""
 
-            inp = normalize_path(str(raw_inp))
-            settings["_original_filename"] = original_filename or Path(inp).name
+            inp = normalize_path(str(raw_inp)) if raw_inp else ""
+            settings["_original_filename"] = original_filename or (Path(inp).name if inp else "")
             try:
                 state.setdefault("seed_controls", {})["_original_filename"] = settings["_original_filename"]
             except Exception:
@@ -1144,8 +1183,18 @@ def build_gan_callbacks(
 
                     # Apply universal chunking (Resolution tab) for video inputs (single + batch).
                     should_chunk_video = (detect_input_type(runtime_settings["input_path"]) == "video") and (auto_chunk or chunk_size_sec > 0)
+                    resume_requested_local = bool(
+                        runtime_settings.get("_resume_run_requested")
+                        or str(runtime_settings.get("resume_run_dir") or "").strip()
+                    )
+                    if resume_requested_local and not should_chunk_video:
+                        msg = (
+                            "Resume run folder works only with chunk/scene-based video processing. "
+                            "Enable chunking and keep the same settings as the original run."
+                        )
+                        return ("Resume unavailable for current mode", "\n".join(header_log + [msg]), None, "", gr.update(value=None))
                     if should_chunk_video:
-                        from shared.chunking import chunk_and_process
+                        from shared.chunking import chunk_and_process, check_resume_available
 
                         chunk_settings = runtime_settings.copy()
                         # Disable per-chunk face restore; apply once on final output to match non-chunked behavior.
@@ -1155,6 +1204,19 @@ def build_gan_callbacks(
                         chunk_settings["chunk_overlap_sec"] = chunk_overlap_sec
                         chunk_settings["per_chunk_cleanup"] = per_chunk_cleanup
                         chunk_settings["frame_accurate_split"] = frame_accurate_split
+                        if resume_requested_local:
+                            resume_ok, resume_msg = check_resume_available(run_output_root, "mp4")
+                            if not resume_ok:
+                                msg = (
+                                    f"Resume requested but no resumable chunk outputs were found in {run_output_root}. "
+                                    f"{resume_msg}"
+                                )
+                                return ("Resume failed", "\n".join(header_log + [msg]), None, "", gr.update(value=None))
+                            if progress_cb:
+                                progress_cb(
+                                    "Resume run folder detected. Resuming from the last processed chunk "
+                                    "and continuing remaining chunks (same settings required)."
+                                )
 
                         def _chunk_progress_cb(_progress_val, desc=""):
                             if progress_cb and desc:
@@ -1172,7 +1234,7 @@ def build_gan_callbacks(
                             per_chunk_cleanup=per_chunk_cleanup,
                             allow_partial=True,
                             global_output_dir=str(run_output_root),
-                            resume_from_partial=False,
+                            resume_from_partial=resume_requested_local,
                             progress_tracker=_chunk_progress_cb,
                             process_func=None,
                             model_type="gan",
@@ -1498,23 +1560,55 @@ def build_gan_callbacks(
                 # NEW: Per-run output folder for single video runs (0001/0002/...)
                 # Keeps chunk artifacts user-visible and prevents collisions between app instances.
                 if input_type == "video":
-                    try:
-                        run_paths, _explicit_final = prepare_single_video_run(
-                            output_root_fallback=current_output_dir,
-                            output_override_raw=settings.get("output_override"),
-                            input_path=settings["input_path"],
-                            original_filename=Path(settings["input_path"]).name,
-                            model_label="GAN",
-                            mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
-                        )
-                        current_output_dir = Path(run_paths.run_dir)
+                    resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+                    if resume_run_dir_raw:
+                        resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                        if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                            yield (
+                                "ERROR: Resume folder not found",
+                                f"Configured resume folder does not exist: {resume_run_dir}",
+                                gr.update(value="", visible=False),
+                                gr.update(value=None, visible=False),
+                                gr.update(value=None, visible=False),
+                                "Resume folder invalid",
+                                gr.update(value=None),
+                                gr.update(value="", visible=False),
+                                gr.update(visible=False),
+                                state,
+                            )
+                            return
+                        current_output_dir = resume_run_dir
+                        processed_chunks_dir = current_output_dir / "processed_chunks"
+                        processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                         seed_controls["last_run_dir"] = str(current_output_dir)
                         settings["_run_dir"] = str(current_output_dir)
+                        settings["_processed_chunks_dir"] = str(processed_chunks_dir)
+                        settings["_resume_run_requested"] = True
                         settings["_user_output_override_raw"] = settings.get("output_override") or ""
-                        # For GAN, we use the run folder as the output root; explicit file naming is handled later.
+                        # Resume mode ignores new output overrides and keeps writing in the selected run folder.
                         settings["output_override"] = str(current_output_dir)
-                    except Exception:
-                        pass
+                        progress_q.put(
+                            f"Resume run folder detected: {current_output_dir}. "
+                            "Processing will continue from the next chunk (same settings required)."
+                        )
+                    else:
+                        try:
+                            run_paths, _explicit_final = prepare_single_video_run(
+                                output_root_fallback=current_output_dir,
+                                output_override_raw=settings.get("output_override"),
+                                input_path=settings["input_path"],
+                                original_filename=Path(settings["input_path"]).name,
+                                model_label="GAN",
+                                mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
+                            )
+                            current_output_dir = Path(run_paths.run_dir)
+                            seed_controls["last_run_dir"] = str(current_output_dir)
+                            settings["_run_dir"] = str(current_output_dir)
+                            settings["_user_output_override_raw"] = settings.get("output_override") or ""
+                            # For GAN, we use the run folder as the output root; explicit file naming is handled later.
+                            settings["output_override"] = str(current_output_dir)
+                        except Exception:
+                            pass
 
                 prepped = maybe_downscale(
                     prepare_single(settings["input_path"], settings, seed_controls),

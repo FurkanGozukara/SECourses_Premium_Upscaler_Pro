@@ -719,6 +719,21 @@ def seedvr2_tab(
                         scale=1,
                         elem_classes=["action-btn", "action-btn-cancel"],
                     )
+
+                resume_run_dir = gr.Textbox(
+                    label="Resume Run Folder (chunk/scene resume)",
+                    value=(
+                        values[SEEDVR2_ORDER.index("resume_run_dir")]
+                        if "resume_run_dir" in SEEDVR2_ORDER and len(values) > SEEDVR2_ORDER.index("resume_run_dir")
+                        else ""
+                    ),
+                    placeholder="Optional: G:/.../outputs/0019",
+                    info=(
+                        "Optional. When set, this run resumes from the last processed chunk in that folder. "
+                        "Use the same settings as the original run; processing continues from the next remaining chunk. "
+                        "Output override for this run is ignored while resume is active."
+                    ),
+                )
             
             with gr.Accordion(" Upscaled Output", open=True):
                 output_video = gr.Video(
@@ -1006,7 +1021,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 54, len(inputs_list) must also = 54
+    # Current count: len(SEEDVR2_ORDER) = 55, len(inputs_list) must also = 55
     # (includes: save_metadata, fps_override, video_backend, use_10bit)
     # ============================================================================
     
@@ -1032,6 +1047,8 @@ def seedvr2_tab(
         upscale_factor, pre_downscale_then_upscale,
         # Per-run SeedVR2 toggle
         face_restore_chk,
+        # Resume path (chunk/scene mode)
+        resume_run_dir,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

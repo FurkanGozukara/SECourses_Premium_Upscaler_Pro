@@ -36,7 +36,12 @@ from shared.path_utils import (
 )
 from shared.resolution_calculator import estimate_seedvr2_upscale_plan_from_dims
 from shared.chunking import chunk_and_process, check_resume_available
-from shared.output_run_manager import prepare_single_video_run, downscaled_video_path, numbered_single_image_output_path
+from shared.output_run_manager import (
+    prepare_single_video_run,
+    downscaled_video_path,
+    numbered_single_image_output_path,
+    resolve_resume_input_from_run_dir,
+)
 from shared.ffmpeg_utils import scale_video
 from shared.face_restore import restore_image, restore_video
 from shared.models.seedvr2_meta import get_seedvr2_model_names, model_meta_map
@@ -296,6 +301,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "cache_vae": False,
         "debug": False,
         "resume_chunking": False,
+        "resume_run_dir": "",
         "save_metadata": True,  # Per-run metadata toggle (respects global telemetry)
         "fps_override": 0,  # FPS override (0 = use source FPS, >0 = set specific FPS)
         # ADDED v2.5.22: FFmpeg 10-bit encoding support for reduced banding in gradients
@@ -530,6 +536,8 @@ SEEDVR2_ORDER: List[str] = [
     "pre_downscale_then_upscale",
     # Per-run post-upscale face restoration toggle (SeedVR2 tab checkbox).
     "face_restore_after_upscale",
+    # Resume from an existing chunk run folder (shared across chunk-capable upscalers).
+    "resume_run_dir",
 ]
 
 
@@ -1178,6 +1186,24 @@ def _process_single_file(
             and not preview_only
             and detect_input_type(settings["input_path"]) == "video"
         )
+        resume_requested = bool(
+            str(settings.get("resume_run_dir") or "").strip() or bool(settings.get("_resume_run_requested", False))
+        )
+        if resume_requested and not should_chunk:
+            msg = (
+                "Resume run folder is only supported for chunk/scene-based video processing. "
+                "Enable Resolution tab chunking and use the same settings as the original run."
+            )
+            local_logs.append(msg)
+            return (
+                "Resume unavailable for current mode",
+                "\n".join(local_logs),
+                None,
+                None,
+                "Resume requires chunk/scene mode",
+                msg,
+                msg,
+            )
         chunk_count = 0
         scene_threshold = float(seed_controls.get("scene_threshold", 27.0))
         min_scene_len = float(seed_controls.get("min_scene_len", 1.0))
@@ -1185,6 +1211,28 @@ def _process_single_file(
         if should_chunk:
             # Process with external PySceneDetect chunking
             # This splits video into scenes, processes each, then concatenates
+            if resume_requested and progress_cb:
+                progress_cb(
+                    "Resume run folder detected. Resuming from last processed chunk "
+                    "(same settings required) and continuing remaining chunks.\n"
+                )
+            if resume_requested:
+                resume_ok, resume_msg = check_resume_available(Path(output_dir), "mp4")
+                if not resume_ok:
+                    msg = (
+                        f"Resume requested but no resumable chunk outputs were found in {output_dir}. "
+                        f"{resume_msg}"
+                    )
+                    local_logs.append(msg)
+                    return (
+                        "Resume failed",
+                        "\n".join(local_logs),
+                        None,
+                        None,
+                        "Resume folder is not resumable",
+                        msg,
+                        msg,
+                    )
             completed_chunks = 0
             processing_chunk_idx = 0
             total_chunks_estimate = 1
@@ -1327,7 +1375,7 @@ def _process_single_file(
                 chunk_seconds=0.0 if auto_chunk else chunk_size_sec,
                 chunk_overlap=0.0 if auto_chunk else float(seed_controls.get("chunk_overlap_sec", 0) or 0),
                 per_chunk_cleanup=bool(seed_controls.get("per_chunk_cleanup", False)),
-                resume_from_partial=bool(settings.get("resume_chunking", False)),
+                resume_from_partial=bool(settings.get("resume_chunking", False) or resume_requested),
                 allow_partial=True,
                 global_output_dir=str(output_dir),
                 progress_tracker=chunk_progress_callback,
@@ -2697,6 +2745,12 @@ def build_seedvr2_callbacks(
 
             # Parse settings
             settings = dict(zip(SEEDVR2_ORDER, list(args)))
+            if preview_only:
+                # Preview should never trigger run-folder resume semantics.
+                settings["resume_run_dir"] = ""
+            if settings.get("batch_enable"):
+                # Resume folder mode is single-run only.
+                settings["resume_run_dir"] = ""
 
             # Sync live SeedVR2 sizing controls into shared cache before guardrails.
             # Prevents stale global/per-model cached values from overriding current UI controls.
@@ -2734,6 +2788,60 @@ def build_seedvr2_callbacks(
                 original_filename = Path(settings["input_path"]).name
             else:
                 original_filename = None
+
+            # Resume folder mode ignores normal input fields; recover source input from run folder metadata/artifacts.
+            resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+            if resume_run_dir_raw:
+                resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                    yield (
+                        "Resume folder not found",
+                        f"Configured resume folder does not exist: {resume_run_dir}",
+                        "",
+                        gr.update(value=None, visible=False),
+                        gr.update(value=None, visible=False),
+                        "No chunks",
+                        "",
+                        "",
+                        gr.update(value="", visible=False),
+                        gr.update(value=None, visible=False),
+                        gr.update(value="", visible=False),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        state,
+                    )
+                    return
+
+                recovered_input, recovered_name, _recovered_source = resolve_resume_input_from_run_dir(resume_run_dir)
+                if recovered_input is None:
+                    yield (
+                        "Resume input not found",
+                        (
+                            f"Could not recover input source from resume folder: {resume_run_dir}. "
+                            "Expected run_context.json input path or run_metadata/downscaled artifact."
+                        ),
+                        "",
+                        gr.update(value=None, visible=False),
+                        gr.update(value=None, visible=False),
+                        "No chunks",
+                        "",
+                        "",
+                        gr.update(value="", visible=False),
+                        gr.update(value=None, visible=False),
+                        gr.update(value="", visible=False),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        state,
+                    )
+                    return
+
+                settings["input_path"] = str(recovered_input)
+                if recovered_name and str(recovered_name).strip():
+                    original_filename = Path(str(recovered_name).strip()).name
+                elif not original_filename:
+                    original_filename = Path(str(recovered_input)).name
 
             settings["_original_filename"] = original_filename  # Store for output naming
             state["seed_controls"]["last_input_path"] = settings["input_path"]
@@ -3380,6 +3488,7 @@ def build_seedvr2_callbacks(
             # Single file processing with streaming updates
             processing_complete = False
             chunk_info = "Waiting for first progress update..."
+            prepare_log_msg = "Preparing run..."
 
             # Start processing with progress tracking
             effective_output_dir = Path(global_settings.get("output_dir", output_dir))
@@ -3387,33 +3496,72 @@ def build_seedvr2_callbacks(
             # NEW: Per-run output folder for videos (0001/0002/...) to avoid collisions
             # and to store chunk artifacts in user-visible locations.
             if (not preview_only) and detect_input_type(settings["input_path"]) == "video":
-                try:
-                    run_paths, explicit_final = prepare_single_video_run(
-                        output_root_fallback=effective_output_dir,
-                        output_override_raw=settings.get("output_override"),
-                        input_path=settings["input_path"],
-                        original_filename=original_filename,
-                        model_label="SeedVR2",
-                        mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
-                    )
-                    effective_output_dir = Path(run_paths.run_dir)
-                    # Store for UI (chunk gallery, resume helpers, user visibility)
-                    seed_controls["last_run_dir"] = str(effective_output_dir)
-                    seed_controls["processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
-                    settings["_run_dir"] = str(effective_output_dir)
-                    settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
+                resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
+                if resume_run_dir_raw:
+                    resume_run_dir = Path(normalize_path(resume_run_dir_raw))
+                    if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
+                        yield (
+                            "Resume folder not found",
+                            f"Configured resume folder does not exist: {resume_run_dir}",
+                            "",
+                            gr.update(value=None, visible=False),
+                            gr.update(value=None, visible=False),
+                            "Resume folder invalid",
+                            "",
+                            "",
+                            gr.update(value="", visible=False),
+                            gr.update(value=None, visible=False),
+                            gr.update(value="", visible=False),
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            state,
+                        )
+                        return
 
-                    # Output override now targets the run folder (or an explicit file inside it)
-                    settings["_user_output_override_raw"] = settings.get("output_override") or ""
-                    settings["output_override"] = str(explicit_final) if explicit_final else str(effective_output_dir)
-                except Exception as e:
-                    # Fail open: fall back to global output dir if run folder creation fails.
+                    effective_output_dir = resume_run_dir
+                    processed_chunks_dir = effective_output_dir / "processed_chunks"
+                    processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                     seed_controls["last_run_dir"] = str(effective_output_dir)
+                    seed_controls["processed_chunks_dir"] = str(processed_chunks_dir)
                     settings["_run_dir"] = str(effective_output_dir)
+                    settings["_processed_chunks_dir"] = str(processed_chunks_dir)
+                    settings["_resume_run_requested"] = True
+                    settings["_user_output_override_raw"] = settings.get("output_override") or ""
+                    # Resume mode ignores fresh output overrides and keeps writing into the selected run folder.
+                    settings["output_override"] = str(effective_output_dir)
+                    prepare_log_msg = (
+                        f"Resuming from run folder {effective_output_dir} "
+                        "(continuing from last processed chunk; keep same settings)."
+                    )
+                else:
+                    try:
+                        run_paths, explicit_final = prepare_single_video_run(
+                            output_root_fallback=effective_output_dir,
+                            output_override_raw=settings.get("output_override"),
+                            input_path=settings["input_path"],
+                            original_filename=original_filename,
+                            model_label="SeedVR2",
+                            mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
+                        )
+                        effective_output_dir = Path(run_paths.run_dir)
+                        # Store for UI (chunk gallery, resume helpers, user visibility)
+                        seed_controls["last_run_dir"] = str(effective_output_dir)
+                        seed_controls["processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
+                        settings["_run_dir"] = str(effective_output_dir)
+                        settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
+
+                        # Output override now targets the run folder (or an explicit file inside it)
+                        settings["_user_output_override_raw"] = settings.get("output_override") or ""
+                        settings["output_override"] = str(explicit_final) if explicit_final else str(effective_output_dir)
+                    except Exception:
+                        # Fail open: fall back to global output dir if run folder creation fails.
+                        seed_controls["last_run_dir"] = str(effective_output_dir)
+                        settings["_run_dir"] = str(effective_output_dir)
 
             yield (
                 "Starting processing...",  # status_box
-                "Preparing run...",  # log_box
+                prepare_log_msg,  # log_box
                 _processing_indicator("Upscale in progress..."),  # progress_indicator
                 gr.update(value=None, visible=False),  # output_video
                 gr.update(value=None, visible=False),  # output_image
@@ -3461,13 +3609,17 @@ def build_seedvr2_callbacks(
             total_chunks_estimate = 1
             last_progress_value = 0.0
             last_ui_update_time = 0
-            ui_update_throttle = 0.25
+            ui_update_throttle = 0.12
             accumulated_messages = []
             active_stage_name = ""
             active_stage_batch_current = 0
             active_stage_batch_total = 0
             active_stage_percent = 0.0
             active_stage_chunk_idx = 1
+            last_gallery_update_time = 0.0
+            gallery_update_interval = 1.0
+            last_gallery_signature: Tuple[str, ...] = ()
+            thumb_cache: Dict[str, str] = {}
             try:
                 auto_chunk_enabled_ui = bool(seed_controls.get("auto_chunk", True))
                 static_chunk_size_sec_ui = float(seed_controls.get("chunk_size_sec", 0) or 0)
@@ -3602,6 +3754,11 @@ def build_seedvr2_callbacks(
                 if stage_key == "decoding":
                     return 0.75 + 0.25 * batch_fraction
                 return batch_fraction
+
+            try:
+                from shared.frame_utils import extract_video_thumbnail
+            except Exception:
+                extract_video_thumbnail = None
 
             while proc_thread.is_alive() or not progress_queue.empty():
                 try:
@@ -3759,56 +3916,6 @@ def build_seedvr2_callbacks(
                         if progress:
                             progress(display_progress_value, desc=message[:100] if message else "Processing...")
 
-                        # Get chunk video paths and convert to thumbnails for gallery display
-                        # gr.Gallery in Gradio 6.x doesn't display videos well, so we use thumbnails
-                        current_chunk_items = (state or {}).get("seed_controls", {}).get("chunk_gallery_items", [])
-                        if not current_chunk_items:
-                            current_chunk_items = (state or {}).get("seed_controls", {}).get("chunk_thumbnails", [])
-
-                        # Convert video paths to thumbnail images for gallery
-                        # Also store video paths for playback when chunk is selected
-                        gallery_display_items = []
-                        chunk_video_paths = []  # Store original video paths for preview playback
-                        if current_chunk_items:
-                            from shared.frame_utils import extract_video_thumbnail
-                            for idx, item in enumerate(current_chunk_items):
-                                if isinstance(item, str) and Path(item).exists():
-                                    if Path(item).suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv', '.webm'}:
-                                        # Store original video path for preview
-                                        chunk_video_paths.append(item)
-                                        # Generate thumbnail for video
-                                        success, thumb_path, _ = extract_video_thumbnail(item, width=280)
-                                        if success and thumb_path:
-                                            gallery_display_items.append((thumb_path, f"Chunk {idx+1}"))
-                                        else:
-                                            # Fallback: use video path directly (may show as broken)
-                                            gallery_display_items.append((item, f"Chunk {idx+1}"))
-                                    else:
-                                        # Image file - use directly (no video preview)
-                                        gallery_display_items.append((item, f"Chunk {idx+1}"))
-                                        chunk_video_paths.append(None)
-
-                        # Store video paths in state for gallery selection handler
-                        if chunk_video_paths:
-                            state["seed_controls"]["chunk_video_paths"] = chunk_video_paths
-
-                        chunk_gallery_update = (
-                            gr.update(
-                                value=gallery_display_items if gallery_display_items else current_chunk_items,
-                                visible=len(gallery_display_items) > 0 or len(current_chunk_items) > 0,
-                                columns=4,
-                                rows=2,
-                                height=200,
-                            )
-                            if gallery_display_items or current_chunk_items
-                            else gr.update(visible=False)
-                        )
-
-                        # Show first video in preview if available
-                        chunk_preview_update = gr.update(visible=False)
-                        if chunk_video_paths and chunk_video_paths[0]:
-                            chunk_preview_update = gr.update(value=chunk_video_paths[0], visible=True)
-
                         stage_summary_short = ""
                         stage_summary_line = ""
                         if active_stage_name and active_stage_batch_total > 0:
@@ -3829,6 +3936,69 @@ def build_seedvr2_callbacks(
                         )
                         if (current_time - last_ui_update_time) < ui_update_throttle and not is_key_event:
                             continue
+
+                        chunk_gallery_update = gr.update()
+                        chunk_preview_update = gr.update()
+                        current_chunk_items = (state or {}).get("seed_controls", {}).get("chunk_gallery_items", [])
+                        if not current_chunk_items:
+                            current_chunk_items = (state or {}).get("seed_controls", {}).get("chunk_thumbnails", [])
+                        current_signature = tuple(
+                            str(item)
+                            for item in current_chunk_items
+                            if isinstance(item, str)
+                        )
+                        should_refresh_gallery = (
+                            is_key_event
+                            or current_signature != last_gallery_signature
+                            or (current_time - last_gallery_update_time) >= gallery_update_interval
+                        )
+                        if should_refresh_gallery:
+                            gallery_display_items = []
+                            chunk_video_paths = []
+                            if current_chunk_items:
+                                for idx, item in enumerate(current_chunk_items):
+                                    if not (isinstance(item, str) and Path(item).exists()):
+                                        continue
+                                    item_path = Path(item)
+                                    if item_path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+                                        chunk_video_paths.append(item)
+                                        thumb_path = thumb_cache.get(item)
+                                        if thumb_path and Path(thumb_path).exists():
+                                            gallery_display_items.append((thumb_path, f"Chunk {idx+1}"))
+                                        elif extract_video_thumbnail:
+                                            ok, generated_thumb, _ = extract_video_thumbnail(item, width=280)
+                                            if ok and generated_thumb:
+                                                thumb_cache[item] = generated_thumb
+                                                gallery_display_items.append((generated_thumb, f"Chunk {idx+1}"))
+                                            else:
+                                                gallery_display_items.append((item, f"Chunk {idx+1}"))
+                                        else:
+                                            gallery_display_items.append((item, f"Chunk {idx+1}"))
+                                    else:
+                                        gallery_display_items.append((item, f"Chunk {idx+1}"))
+                                        chunk_video_paths.append(None)
+
+                            if chunk_video_paths:
+                                state["seed_controls"]["chunk_video_paths"] = chunk_video_paths
+
+                            chunk_gallery_update = (
+                                gr.update(
+                                    value=gallery_display_items if gallery_display_items else current_chunk_items,
+                                    visible=len(gallery_display_items) > 0 or len(current_chunk_items) > 0,
+                                    columns=4,
+                                    rows=2,
+                                    height=200,
+                                )
+                                if gallery_display_items or current_chunk_items
+                                else gr.update(visible=False)
+                            )
+
+                            if chunk_video_paths and chunk_video_paths[0]:
+                                chunk_preview_update = gr.update(value=chunk_video_paths[0], visible=True)
+                            else:
+                                chunk_preview_update = gr.update(visible=False)
+                            last_gallery_signature = current_signature
+                            last_gallery_update_time = current_time
 
                         if total_chunks_estimate > 1:
                             overall_fraction_for_text = max(

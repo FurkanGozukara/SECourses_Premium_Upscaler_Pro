@@ -46,7 +46,7 @@ from ui.queue_tab import queue_tab
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.6 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.61 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -606,6 +606,142 @@ def main(argv=None):
       }
     }
 
+    /* Health status banner + Health tab report cards */
+    .health-banner {
+      border: 1px solid rgba(14, 116, 144, 0.32);
+      background: linear-gradient(120deg, rgba(2, 132, 199, 0.10), rgba(16, 185, 129, 0.10));
+      border-radius: 12px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+      font-weight: 600;
+    }
+    .health-report-shell {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 6px;
+    }
+    .health-report-summary {
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: linear-gradient(135deg, rgba(15, 23, 42, 0.42), rgba(30, 41, 59, 0.28));
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+    .health-report-summary.is-ok {
+      border-color: rgba(34, 197, 94, 0.34);
+      background: linear-gradient(135deg, rgba(22, 101, 52, 0.28), rgba(5, 46, 22, 0.25));
+    }
+    .health-report-summary.is-warning {
+      border-color: rgba(245, 158, 11, 0.38);
+      background: linear-gradient(135deg, rgba(146, 64, 14, 0.30), rgba(120, 53, 15, 0.22));
+    }
+    .health-report-summary.is-error {
+      border-color: rgba(248, 113, 113, 0.42);
+      background: linear-gradient(135deg, rgba(127, 29, 29, 0.34), rgba(69, 10, 10, 0.25));
+    }
+    .health-report-summary-title {
+      font-size: 16px;
+      font-weight: 850;
+      letter-spacing: 0.2px;
+      margin-bottom: 6px;
+    }
+    .health-report-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .health-report-metrics span {
+      border: 1px solid rgba(148, 163, 184, 0.30);
+      border-radius: 9999px;
+      padding: 3px 10px;
+      font-size: 12px;
+      background: rgba(15, 23, 42, 0.34);
+    }
+    .health-report-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .health-report-card {
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: linear-gradient(160deg, rgba(15, 23, 42, 0.40), rgba(30, 41, 59, 0.26));
+      border-radius: 14px;
+      padding: 12px;
+      min-width: 0;
+    }
+    .health-report-card.is-ok {
+      border-color: rgba(74, 222, 128, 0.34);
+    }
+    .health-report-card.is-warning {
+      border-color: rgba(251, 191, 36, 0.42);
+    }
+    .health-report-card.is-error {
+      border-color: rgba(248, 113, 113, 0.48);
+    }
+    .health-report-card.is-skipped {
+      border-color: rgba(148, 163, 184, 0.34);
+      opacity: 0.93;
+    }
+    .health-report-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .health-report-card-head h4 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 800;
+      min-width: 0;
+    }
+    .health-report-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 9999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 850;
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      background: rgba(15, 23, 42, 0.42);
+      text-transform: uppercase;
+      letter-spacing: 0.35px;
+      white-space: nowrap;
+    }
+    .health-report-badge.is-ok {
+      color: #86efac;
+      border-color: rgba(74, 222, 128, 0.55);
+    }
+    .health-report-badge.is-warning {
+      color: #fcd34d;
+      border-color: rgba(251, 191, 36, 0.58);
+    }
+    .health-report-badge.is-error {
+      color: #fca5a5;
+      border-color: rgba(248, 113, 113, 0.62);
+    }
+    .health-report-badge.is-skipped {
+      color: #cbd5e1;
+      border-color: rgba(148, 163, 184, 0.46);
+    }
+    .health-report-detail {
+      margin: 0;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: rgba(2, 6, 23, 0.48);
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.42;
+      font-size: 12.5px;
+      color: #e2e8f0;
+      max-height: 230px;
+      overflow: auto;
+    }
+
     @media (max-width: 768px) {
       .action-btn button,
       button.action-btn {
@@ -614,6 +750,9 @@ def main(argv=None):
       .action-btn-upscale button,
       button.action-btn-upscale {
         box-shadow: 0 10px 24px rgba(21, 128, 61, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
+      }
+      .health-report-grid {
+        grid-template-columns: 1fr;
       }
     }
     """

@@ -1,4 +1,4 @@
-import io
+﻿import io
 import os
 import platform
 import runpy
@@ -205,7 +205,7 @@ class Runner:
                 # Note: If the *main* app process has initialized CUDA, Windows may still
                 # show a small persistent VRAM reservation (CUDA context overhead).
                 # That is expected and only fully disappears when the app exits.
-                print("✅ CUDA cache cleared after cancellation")
+                print("âœ… CUDA cache cleared after cancellation")
             except Exception:
                 # Silently ignore if CUDA not available
                 pass
@@ -343,8 +343,8 @@ class Runner:
             )
             if vcvars_error:
                 retry_msg = (
-                    "\n[SeedVR2] ⚠️ VS Build Tools activation failed, so torch.compile cannot run.\n"
-                    "[SeedVR2] ↻ Auto-retrying with torch.compile disabled.\n"
+                    "\n[SeedVR2] âš ï¸ VS Build Tools activation failed, so torch.compile cannot run.\n"
+                    "[SeedVR2] â†» Auto-retrying with torch.compile disabled.\n"
                     "        To re-enable compile: install/repair Visual Studio Build Tools and the\n"
                     "        'Desktop development with C++' workload (MSVC toolset).\n"
                 )
@@ -389,8 +389,8 @@ class Runner:
             current_attn = str(settings.get("attention_mode") or "").strip().lower()
             if windows_access_violation and current_attn and current_attn != "sdpa":
                 retry_msg = (
-                    "\n[SeedVR2] ⚠️ Detected Windows native crash (0xC0000005 / access violation).\n"
-                    "[SeedVR2] ↻ Auto-retrying with safer settings: attention_mode=sdpa"
+                    "\n[SeedVR2] âš ï¸ Detected Windows native crash (0xC0000005 / access violation).\n"
+                    "[SeedVR2] â†» Auto-retrying with safer settings: attention_mode=sdpa"
                 )
                 if preview_only or int(settings.get("load_cap") or 0) == 1:
                     retry_msg += ", batch_size=1"
@@ -488,7 +488,7 @@ class Runner:
             vcvars_path = self._find_vcvars()
             if not vcvars_path:
                 warning_msg = (
-                    "⚠️ VS Build Tools not found; disabling torch.compile for compatibility.\n"
+                    "âš ï¸ VS Build Tools not found; disabling torch.compile for compatibility.\n"
                     "Install 'Desktop development with C++' workload from Visual Studio Installer for torch.compile support.\n"
                 )
                 self._log_lines.append(warning_msg.strip())
@@ -503,7 +503,7 @@ class Runner:
 
                 if not vs_env:
                     warning_msg = (
-                        "⚠️ VS Build Tools detected but could not be activated; running without torch.compile.\n"
+                        "âš ï¸ VS Build Tools detected but could not be activated; running without torch.compile.\n"
                         f"Path: {vcvars_path}\n"
                         f"Reason: {vs_detail}\n"
                     )
@@ -514,7 +514,7 @@ class Runner:
                     cmd = self._strip_torch_compile_flags(cmd)
                 else:
                     env.update(vs_env)
-                    log_output(f"✅ Using VS Build Tools for torch.compile: {vcvars_path}\n   {vs_detail}\n")
+                    log_output(f"âœ… Using VS Build Tools for torch.compile: {vcvars_path}\n   {vs_detail}\n")
 
         # Log the (final) command being executed for debugging
         cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
@@ -696,7 +696,7 @@ class Runner:
             output_path = str(predicted_output)
             log_output(f"[SeedVR2] Output file created: {output_path}\n")
         elif predicted_output:
-            log_output(f"[SeedVR2] ⚠️ Expected output not found: {predicted_output}\n")
+            log_output(f"[SeedVR2] âš ï¸ Expected output not found: {predicted_output}\n")
 
         # Handle cancellation case
         if self._canceled and predicted_output and Path(predicted_output).exists():
@@ -754,9 +754,9 @@ class Runner:
                     "predicted_output": str(predicted_output) if predicted_output else None
                 }
             )
-            log_output(f"[SeedVR2] ✅ Command logged to executed_commands folder\n")
+            log_output(f"[SeedVR2] âœ… Command logged to executed_commands folder\n")
         except Exception as e:
-            log_output(f"[SeedVR2] ⚠️ Failed to log command: {e}\n")
+            log_output(f"[SeedVR2] âš ï¸ Failed to log command: {e}\n")
 
         # Combine all log lines
         full_log = "\n".join(log_lines)
@@ -767,7 +767,7 @@ class Runner:
         """
         Execute SeedVR2 in-app mode (EXPERIMENTAL - NOT RECOMMENDED).
 
-        ⚠️ CRITICAL LIMITATION: SeedVR2 CLI ARCHITECTURE PREVENTS MODEL PERSISTENCE
+        âš ï¸ CRITICAL LIMITATION: SeedVR2 CLI ARCHITECTURE PREVENTS MODEL PERSISTENCE
         ============================================================================
         The SeedVR2 CLI is designed to load models, process, then exit. Even when run
         via runpy (in-process), the CLI code does NOT maintain model instances between
@@ -776,12 +776,12 @@ class Runner:
         RESULT: In-app mode provides **ZERO SPEED BENEFIT** for SeedVR2 compared to subprocess.
         
         CURRENT IMPLEMENTATION STATUS:
-        - ⚠️ PARTIALLY IMPLEMENTED: Runs CLI via runpy but does NOT implement persistent model caching
-        - ❌ Models reload each run (IDENTICAL to subprocess mode - no performance gain)
-        - ❌ Cannot cancel mid-run (no subprocess to kill)
-        - ❌ VS Build Tools wrapper not applied (torch.compile may fail on Windows)
-        - ⚠️ Memory leaks possible without subprocess isolation
-        - ⚠️ ModelManager tracking exists but cannot force CLI to keep models loaded
+        - âš ï¸ PARTIALLY IMPLEMENTED: Runs CLI via runpy but does NOT implement persistent model caching
+        - âŒ Models reload each run (IDENTICAL to subprocess mode - no performance gain)
+        - âŒ Cannot cancel mid-run (no subprocess to kill)
+        - âŒ VS Build Tools wrapper not applied (torch.compile may fail on Windows)
+        - âš ï¸ Memory leaks possible without subprocess isolation
+        - âš ï¸ ModelManager tracking exists but cannot force CLI to keep models loaded
         
         WHY THIS EXISTS:
         - Framework placeholder for future GAN/RIFE in-app optimization
@@ -789,8 +789,8 @@ class Runner:
         - SeedVR2 would need CLI refactoring to support true model persistence
         
         RECOMMENDATION FOR SEEDVR2:
-        🚫 **DO NOT USE IN-APP MODE** - It provides no benefits and loses cancellation.
-        ✅ **USE SUBPROCESS MODE** - Same speed, full cancellation, better isolation.
+        ðŸš« **DO NOT USE IN-APP MODE** - It provides no benefits and loses cancellation.
+        âœ… **USE SUBPROCESS MODE** - Same speed, full cancellation, better isolation.
         
         FUTURE WORK (requires SeedVR2 CLI changes):
         - Refactor CLI to expose model loading/inference as separate functions
@@ -799,10 +799,10 @@ class Runner:
         - Enable proper cancellation via threading interrupts
         """
         if on_progress:
-            on_progress("⚠️ IN-APP MODE ACTIVE (NOT RECOMMENDED FOR SEEDVR2)\n")
-            on_progress("🚫 CRITICAL: SeedVR2 CLI reloads models each run - NO SPEED BENEFIT over subprocess\n")
-            on_progress("❌ LIMITATION: Cannot cancel mid-run (no subprocess to kill)\n")
-            on_progress("💡 RECOMMENDATION: Use subprocess mode for SeedVR2 (same speed + cancellation)\n")
+            on_progress("âš ï¸ IN-APP MODE ACTIVE (NOT RECOMMENDED FOR SEEDVR2)\n")
+            on_progress("ðŸš« CRITICAL: SeedVR2 CLI reloads models each run - NO SPEED BENEFIT over subprocess\n")
+            on_progress("âŒ LIMITATION: Cannot cancel mid-run (no subprocess to kill)\n")
+            on_progress("ðŸ’¡ RECOMMENDATION: Use subprocess mode for SeedVR2 (same speed + cancellation)\n")
         
         # Check for compile + Windows - attempt vcvars environment setup
         if platform.system() == "Windows" and (settings.get("compile_dit") or settings.get("compile_vae")):
@@ -813,35 +813,35 @@ class Runner:
             
             if not vcvars_active:
                 if on_progress:
-                    on_progress("⚠️ WARNING: torch.compile requested but vcvars environment not active.\n")
+                    on_progress("âš ï¸ WARNING: torch.compile requested but vcvars environment not active.\n")
                 
                 # Try to find and source vcvars
                 vcvars_path = self._find_vcvars()
                 
                 if vcvars_path and vcvars_path.exists():
                     if on_progress:
-                        on_progress(f"🔧 Attempting to activate VS Build Tools: {vcvars_path}\n")
+                        on_progress(f"ðŸ”§ Attempting to activate VS Build Tools: {vcvars_path}\n")
                     
                     # In-app mode limitation: We cannot directly modify the current process environment
                     # after Python has started. The vcvars.bat sets up C++ compiler paths, but these
                     # need to be active BEFORE Python imports torch.
                     if on_progress:
-                        on_progress("⚠️ IN-APP LIMITATION: Cannot activate vcvars after Python started.\n")
-                        on_progress("💡 WORKAROUND: Activate vcvars BEFORE starting this app, or use subprocess mode.\n")
-                        on_progress("🚫 Auto-disabling torch.compile to prevent cryptic compilation errors.\n")
+                        on_progress("âš ï¸ IN-APP LIMITATION: Cannot activate vcvars after Python started.\n")
+                        on_progress("ðŸ’¡ WORKAROUND: Activate vcvars BEFORE starting this app, or use subprocess mode.\n")
+                        on_progress("ðŸš« Auto-disabling torch.compile to prevent cryptic compilation errors.\n")
                     
                     settings["compile_dit"] = False
                     settings["compile_vae"] = False
                 else:
                     if on_progress:
-                        on_progress("❌ VS Build Tools not found. torch.compile disabled.\n")
-                        on_progress("💡 Install 'Desktop development with C++' workload from Visual Studio Installer.\n")
+                        on_progress("âŒ VS Build Tools not found. torch.compile disabled.\n")
+                        on_progress("ðŸ’¡ Install 'Desktop development with C++' workload from Visual Studio Installer.\n")
                     
                     settings["compile_dit"] = False
                     settings["compile_vae"] = False
             else:
                 if on_progress:
-                    on_progress("✅ VS Build Tools environment active - torch.compile should work.\n")
+                    on_progress("âœ… VS Build Tools environment active - torch.compile should work.\n")
 
         log_lines: List[str] = []
         returncode = -1
@@ -869,7 +869,7 @@ class Runner:
             old_model_id = model_manager.current_model_id
             if old_model_id and old_model_id != model_id:
                 if on_progress:
-                    on_progress(f"Model changed ({old_model_id} → {model_id}), clearing cache...\n")
+                    on_progress(f"Model changed ({old_model_id} â†’ {model_id}), clearing cache...\n")
                 try:
                     from .gpu_utils import clear_cuda_cache
                     clear_cuda_cache()
@@ -900,7 +900,7 @@ class Runner:
                     except SystemExit as e:
                         returncode = e.code if isinstance(e.code, int) else (1 if e.code else 0)
                     except Exception as e:
-                        log_lines.append(f"❌ In-app execution error: {str(e)}")
+                        log_lines.append(f"âŒ In-app execution error: {str(e)}")
                         returncode = 1
                 
                 log_lines.append(log_buffer.getvalue())
@@ -949,9 +949,9 @@ class Runner:
             
         except Exception as e:
             error_msg = f"In-app execution failed: {str(e)}"
-            log_lines.append(f"❌ {error_msg}")
+            log_lines.append(f"âŒ {error_msg}")
             if on_progress:
-                on_progress(f"{error_msg}\n")
+                on_progress(f"ERROR: {error_msg}\\n")
             return RunResult(1, None, "\n".join(log_lines))
 
     def ensure_seedvr2_model_loaded(self, settings: Dict[str, Any], on_progress: Optional[Callable[[str], None]] = None) -> bool:
@@ -1354,7 +1354,7 @@ class Runner:
         if not vcvars_path:
             if compile_requested:
                 # Compile was requested but vcvars not found - disable compile flags
-                warning_msg = "⚠️ VS Build Tools not found; disabling torch.compile for compatibility.\n" \
+                warning_msg = "âš ï¸ VS Build Tools not found; disabling torch.compile for compatibility.\n" \
                              "Install 'Desktop development with C++' workload from Visual Studio Installer for torch.compile support.\n"
                 self._log_lines.append(warning_msg.strip())
                 
@@ -1372,7 +1372,7 @@ class Runner:
                 # No compile requested and vcvars not found - proceed without vcvars
                 # Log a warning but don't block execution
                 if not hasattr(self, '_vcvars_warning_shown'):
-                    info_msg = "ℹ️ VS Build Tools not found. torch.compile will be unavailable.\n"
+                    info_msg = "â„¹ï¸ VS Build Tools not found. torch.compile will be unavailable.\n"
                     self._log_lines.append(info_msg.strip())
                     if on_progress:
                         on_progress(info_msg)
@@ -1384,12 +1384,12 @@ class Runner:
         if not compile_requested:
             # No compile requested - don't wrap with vcvars (avoid output capture issues)
             if on_progress:
-                on_progress("ℹ️ VS Build Tools available but torch.compile not enabled\n")
+                on_progress("â„¹ï¸ VS Build Tools available but torch.compile not enabled\n")
             return cmd
         
         # Compile requested and vcvars found - wrap command to enable C++ toolchain
         if on_progress:
-            on_progress(f"✅ Using VS Build Tools for torch.compile: {vcvars_path}\n")
+            on_progress(f"âœ… Using VS Build Tools for torch.compile: {vcvars_path}\n")
         quoted_cmd = " ".join(f'"{c}"' if " " in c else c for c in cmd)
 
         # IMPORTANT:
@@ -1487,10 +1487,10 @@ class Runner:
                 effective_input = str(trimmed_video)
                 
                 if on_progress:
-                    on_progress(f"✅ Video trimmed: {trimmed_video.name}\n")
+                    on_progress(f"âœ… Video trimmed: {trimmed_video.name}\n")
             except Exception as e:
                 if on_progress:
-                    on_progress(f"⚠️ Video trimming failed: {e}, using original input\n")
+                    on_progress(f"âš ï¸ Video trimming failed: {e}, using original input\n")
                 # Fall back to original if trim fails
                 effective_input = input_path
 
@@ -1635,17 +1635,17 @@ class Runner:
                 }
             )
             if on_progress:
-                on_progress("✅ Command logged to executed_commands folder\n")
+                on_progress("âœ… Command logged to executed_commands folder\n")
         except Exception as e:
             if on_progress:
-                on_progress(f"⚠️ Failed to log command: {e}\n")
+                on_progress(f"âš ï¸ Failed to log command: {e}\n")
         
         # FIXED: Clean up trimmed temp file if we created one
         if trimmed_video and trimmed_video.exists():
             try:
                 trimmed_video.unlink()
                 if on_progress:
-                    on_progress("✅ Cleaned up temporary trimmed video\n")
+                    on_progress("âœ… Cleaned up temporary trimmed video\n")
             except Exception:
                 pass  # Non-critical cleanup failure
 
@@ -1889,14 +1889,14 @@ class Runner:
             if not model_name:
                 error_msg = "No GAN model specified"
                 if on_progress:
-                    on_progress(f"❌ {error_msg}\n")
+                    on_progress(f"ERROR: {error_msg}\n")
                 return RunResult(1, None, error_msg)
 
             input_path = normalize_path(settings.get("input_path"))
             if not input_path or not Path(input_path).exists():
                 error_msg = f"Input path not found: {input_path}"
                 if on_progress:
-                    on_progress(f"❌ {error_msg}\n")
+                    on_progress(f"ERROR: {error_msg}\n")
                 return RunResult(1, None, error_msg)
 
             if on_progress:
@@ -1990,7 +1990,8 @@ class Runner:
         except Exception as e:
             error_msg = f"GAN processing failed: {str(e)}"
             if on_progress:
-                on_progress(f"❌ {error_msg}\n")
+                on_progress(f"ERROR: {error_msg}\n")
             return RunResult(1, None, error_msg)
+
 
 

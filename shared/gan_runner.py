@@ -1,4 +1,4 @@
-import shutil
+﻿import shutil
 import subprocess
 import tempfile
 import json
@@ -379,10 +379,10 @@ def run_gan_upscale(
                 }
             )
             if on_progress:
-                on_progress("✅ Command logged to executed_commands folder\n")
+                on_progress("Command logged to executed_commands folder\n")
         except Exception as e:
             if on_progress:
-                on_progress(f"⚠️ Failed to log command: {e}\n")
+                on_progress(f"Warning: Failed to log command: {e}\n")
 
 
 def _run_gan_image(
@@ -446,18 +446,28 @@ def _run_gan_video(
     if cancel_event and cancel_event.is_set():
         return GanResult(1, None, "Canceled")
 
-    work_dir = temp_dir / f"gan_{input_path.stem}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        # Extract frames
-        frames_dir = work_dir / "frames"
-        frames_up_dir = work_dir / "frames_upscaled"
+        # Persist frame artifacts inside the active output run folder.
+        artifact_root_raw = settings.get("_run_dir") or settings.get("global_output_dir") or str(output_dir)
+        artifact_root = Path(normalize_path(str(artifact_root_raw)))
+        if artifact_root.suffix:
+            artifact_root = artifact_root.parent
+        artifact_root.mkdir(parents=True, exist_ok=True)
+
+        # Extract frames. For chunked inputs, keep per-chunk subfolders to avoid
+        # overwriting earlier chunk artifacts.
+        chunk_like_input = bool(re.match(r"^chunk_\d+$", input_path.stem.lower()))
+        frames_root = artifact_root / "frames"
+        frames_up_root = artifact_root / "frames_upscaled"
+        frames_dir = (frames_root / input_path.stem) if chunk_like_input else frames_root
+        frames_up_dir = (frames_up_root / input_path.stem) if chunk_like_input else frames_up_root
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        shutil.rmtree(frames_up_dir, ignore_errors=True)
         frames_dir.mkdir(parents=True, exist_ok=True)
         frames_up_dir.mkdir(parents=True, exist_ok=True)
 
         if on_progress:
-            on_progress("Extracting frames...\n")
+            on_progress("Extracting frames")
 
         # Respect user's PNG padding setting (default 6 for consistency with SeedVR2)
         png_padding = int(settings.get("png_padding", 6))
@@ -470,7 +480,6 @@ def _run_gan_video(
         subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
         if cancel_event and cancel_event.is_set():
-            shutil.rmtree(work_dir, ignore_errors=True)
             return GanResult(1, None, "Canceled after frame extraction")
 
         # Count frames
@@ -481,10 +490,12 @@ def _run_gan_video(
             return GanResult(1, None, "No frames extracted from video")
 
         if on_progress:
-            on_progress(f"Processing {total_frames} frames...\n")
+            on_progress(f"FRAME_PROGRESS 0/{total_frames} frames completed (0%)")
 
         # Batch process frames
         batch_size = settings.get("batch_size", 1)
+        processed_count = 0
+        last_reported_pct = -1
         
         for i in range(0, total_frames, batch_size):
             if cancel_event and cancel_event.is_set():
@@ -492,11 +503,6 @@ def _run_gan_video(
 
             batch_frames = frame_files[i:i+batch_size]
             
-            if on_progress:
-                progress_pct = int((i / total_frames) * 100)
-                # Report progress in format that gr.Progress can parse
-                on_progress(f"Progress: {progress_pct}% - Processing frames {i}/{total_frames}\n")
-
             # Process each frame in batch
             for frame_path in batch_frames:
                 # Create temp settings for this frame
@@ -513,10 +519,18 @@ def _run_gan_video(
                     frame_path, model_name, frame_settings, base_dir, temp_dir,
                     output_dir, metadata, None, cancel_event
                 )
+
+                processed_count += 1
+                progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
+                if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
+                    last_reported_pct = progress_pct
+                    on_progress(
+                        f"FRAME_PROGRESS {processed_count}/{total_frames} frames completed ({progress_pct}%)"
+                    )
                 
                 if result.returncode != 0:
                     if on_progress:
-                        on_progress(f"Warning: Frame {frame_path.name} failed\n")
+                        on_progress(f"Warning: Frame {frame_path.name} failed")
 
         if cancel_event and cancel_event.is_set():
             # FIXED: Compile partial results if any frames were processed
@@ -525,12 +539,13 @@ def _run_gan_video(
             
             if len(upscaled_frames) > 0:
                 if on_progress:
-                    on_progress(f"⏹️ Cancelled - Compiling {len(upscaled_frames)} partial frames to video...\n")
+                    on_progress(f"Canceled - Compiling {len(upscaled_frames)} partial frames to video")
                 
                 # Build partial video from completed frames
                 partial_output = resolve_output_location(
                     input_path=str(input_path),
-                    output_format=settings.get("output_format", "mp4"),
+                    # Video input always emits a playable video. Frame folders are saved separately.
+                    output_format="mp4",
                     global_output_dir=str(output_dir),
                     batch_mode=False,
                     original_filename=settings.get("_original_filename"),
@@ -573,29 +588,37 @@ def _run_gan_video(
                     if not ok:
                         raise RuntimeError("Frame-to-video encoding failed")
                     
-                    # Cleanup temp directory
-                    if not settings.get("keep_temp", False):
-                        shutil.rmtree(work_dir, ignore_errors=True)
-                    
                     if on_progress:
-                        on_progress(f"✅ Partial video saved: {partial_output_final}\n")
+                        on_progress(f"Partial video saved: {partial_output_final}")
                     
-                    return GanResult(1, str(partial_output_final), f"Cancelled - Partial video saved ({len(upscaled_frames)} frames)")
+                    return GanResult(
+                        1,
+                        str(partial_output_final),
+                        (
+                            f"Cancelled - Partial video saved ({len(upscaled_frames)} frames)\n"
+                            f"Extracted frames: {frames_dir}\n"
+                            f"Upscaled frames: {frames_up_dir}"
+                        ),
+                    )
                     
                 except Exception as e:
                     if on_progress:
-                        on_progress(f"⚠️ Partial compilation failed: {e}\n")
-                    # Still try to return the frames directory
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                    return GanResult(1, None, f"Cancelled - {len(upscaled_frames)} frames processed but video compilation failed: {e}")
+                        on_progress(f"Warning: Partial compilation failed: {e}")
+                    return GanResult(
+                        1,
+                        None,
+                        (
+                            f"Cancelled - {len(upscaled_frames)} frames processed but video compilation failed: {e}\n"
+                            f"Extracted frames: {frames_dir}\n"
+                            f"Upscaled frames: {frames_up_dir}"
+                        ),
+                    )
             else:
-                # No frames processed yet
-                shutil.rmtree(work_dir, ignore_errors=True)
                 return GanResult(1, None, "Cancelled before any frames were processed")
 
         # Reconstruct video from upscaled frames
         if on_progress:
-            on_progress("Reconstructing video from upscaled frames...\n")
+            on_progress("Reconstructing video from upscaled frames")
 
         # Get original FPS
         original_fps = get_media_fps(str(input_path)) or 30.0
@@ -604,7 +627,8 @@ def _run_gan_video(
 
         output_path = resolve_output_location(
             input_path=str(input_path),
-            output_format=settings.get("output_format", "mp4"),
+            # Video input always emits a playable video. Frame folders are saved separately.
+            output_format="mp4",
             global_output_dir=str(output_dir),
             batch_mode=False,
             original_filename=settings.get("_original_filename"),
@@ -635,22 +659,25 @@ def _run_gan_video(
         if not ok:
             raise RuntimeError("Frame-to-video encoding failed")
 
-        # Cleanup temp directory
-        if not settings.get("keep_temp", False):
-            shutil.rmtree(work_dir, ignore_errors=True)
-
         # Apply face restoration to video if requested
         if settings.get("face_restore") and Path(output_path).exists():
             if on_progress:
-                on_progress("Applying face restoration to video...\n")
+                on_progress("Applying face restoration to video")
             restored = restore_video(output_path, strength=settings.get("face_strength", 0.5), on_progress=on_progress)
             if restored:
                 output_path = restored
 
-        return GanResult(0, str(output_path), f"Video upscaled successfully to {output_path}")
+        return GanResult(
+            0,
+            str(output_path),
+            (
+                f"Video upscaled successfully to {output_path}\n"
+                f"Extracted frames: {frames_dir}\n"
+                f"Upscaled frames: {frames_up_dir}"
+            ),
+        )
 
     except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
         return GanResult(1, None, f"Video upscale error: {str(e)}")
 
 
@@ -798,7 +825,7 @@ def _run_with_realesrgan_image(
                 if proc.returncode == 0 and temp_downscaled.exists():
                     effective_input = temp_downscaled
                     if on_progress:
-                        on_progress(f"✓ Downscaled input to {result_calc.input_resize_width}x{result_calc.input_resize_height}\n")
+                        on_progress(f"âœ“ Downscaled input to {result_calc.input_resize_width}x{result_calc.input_resize_height}\n")
 
         # Prepare settings for Real-ESRGAN
         realesrgan_settings = {
@@ -845,3 +872,4 @@ def _run_with_realesrgan_image(
     except Exception as e:
         import traceback
         return GanResult(1, None, f"Real-ESRGAN error: {str(e)}\n{traceback.format_exc()}")
+

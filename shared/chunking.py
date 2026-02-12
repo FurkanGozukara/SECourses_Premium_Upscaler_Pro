@@ -2077,7 +2077,8 @@ def chunk_and_process(
         elif model_type == "seedvr2":
             res = runner.run_seedvr2(chunk_settings, on_progress=None, preview_only=False)
         elif model_type == "gan":
-            res = runner.run_gan(chunk_settings, on_progress=None)
+            # Forward GAN progress so frame-level runtime status can be shown in the UI.
+            res = runner.run_gan(chunk_settings, on_progress=on_progress)
         elif model_type == "rife":
             res = runner.run_rife(chunk_settings, on_progress=None)
         elif model_type == "flashvsr":

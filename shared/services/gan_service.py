@@ -1097,12 +1097,21 @@ def build_gan_callbacks(
                 except Exception:
                     pass
 
+                runtime_settings = prepped_settings
+                runtime_input_type = detect_input_type(prepped_settings.get("input_path", ""))
+                if runtime_input_type == "video":
+                    runtime_settings = prepped_settings.copy()
+                    runtime_settings["_requested_output_format"] = runtime_settings.get("output_format", "auto")
+                    runtime_settings["output_format"] = "mp4"
+                    if progress_cb:
+                        progress_cb("Video output format forced to MP4 for playback/comparison; frame artifacts remain in frames/ and frames_upscaled/.")
+
                 header_log = [
-                    f"Model: {prepped_settings['model_name']}",
+                    f"Model: {runtime_settings['model_name']}",
                     f"Backend: {backend_val}",
-                    f"Scale: {prepped_settings['scale']}x",
-                    f"GPU: {prepped_settings.get('cuda_device') or 'auto/CPU'} (single GPU enforced)",
-                    f"Input: {prepped_settings['input_path']}",
+                    f"Scale: {runtime_settings['scale']}x",
+                    f"GPU: {runtime_settings.get('cuda_device') or 'auto/CPU'} (single GPU enforced)",
+                    f"Input: {runtime_settings['input_path']}",
                 ]
                 if progress_cb:
                     for line in header_log:
@@ -1130,15 +1139,15 @@ def build_gan_callbacks(
                             return ("ERROR: Model weights not found", "\n".join(header_log + ["Missing model file."]), None, "", gr.update(value=None))
                     
                     # Add face restoration settings
-                    prepped_settings["face_restore"] = face_apply
-                    prepped_settings["face_strength"] = face_strength
+                    runtime_settings["face_restore"] = face_apply
+                    runtime_settings["face_strength"] = face_strength
 
                     # Apply universal chunking (Resolution tab) for video inputs (single + batch).
-                    should_chunk_video = (detect_input_type(prepped_settings["input_path"]) == "video") and (auto_chunk or chunk_size_sec > 0)
+                    should_chunk_video = (detect_input_type(runtime_settings["input_path"]) == "video") and (auto_chunk or chunk_size_sec > 0)
                     if should_chunk_video:
                         from shared.chunking import chunk_and_process
 
-                        chunk_settings = prepped_settings.copy()
+                        chunk_settings = runtime_settings.copy()
                         # Disable per-chunk face restore; apply once on final output to match non-chunked behavior.
                         chunk_settings["face_restore"] = False
                         chunk_settings["face_strength"] = face_strength
@@ -1210,7 +1219,7 @@ def build_gan_callbacks(
                             elif rife_msg and progress_cb:
                                 progress_cb(rife_msg)
                             comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                                prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path"),
+                                runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path"),
                                 outp,
                                 seed_controls,
                                 label_output="GAN",
@@ -1235,7 +1244,7 @@ def build_gan_callbacks(
                             run_logger.write_summary(
                                 Path(outp) if outp else current_output_dir,
                                 {
-                                    "input": prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path"),
+                                    "input": runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path"),
                                     "output": outp,
                                     "returncode": rc,
                                     "args": chunk_settings,
@@ -1264,7 +1273,7 @@ def build_gan_callbacks(
 
                         cmp_html = ""
                         slider_update = gr.update(value=None)
-                        src = prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path")
+                        src = runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path")
                         if outp and Path(outp).exists():
                             if Path(outp).suffix.lower() in (".mp4", ".mov", ".mkv", ".avi"):
                                 cmp_html = create_video_comparison_html(
@@ -1281,9 +1290,9 @@ def build_gan_callbacks(
                     
                     # Use GAN runner with proper backend integration
                     result = run_gan_upscale(
-                        input_path=prepped_settings["input_path"],
-                        model_name=prepped_settings["model"],
-                        settings=prepped_settings,
+                        input_path=runtime_settings["input_path"],
+                        model_name=runtime_settings["model"],
+                        settings=runtime_settings,
                         base_dir=base_dir,
                         temp_dir=current_temp_dir,
                         output_dir=run_output_root,
@@ -1292,7 +1301,7 @@ def build_gan_callbacks(
                     )
                 except Exception as exc:  # surface ffmpeg or other runtime issues
                     err_msg = f"ERROR: GAN upscale failed: {exc}"
-                    if maybe_set_vram_oom_alert(state, model_label="GAN", text=str(exc), settings=prepped_settings):
+                    if maybe_set_vram_oom_alert(state, model_label="GAN", text=str(exc), settings=runtime_settings):
                         # NOTE: Modal popups must be triggered from the main Gradio event thread.
                         # We show the modal after the worker thread finishes (see below).
                         pass
@@ -1304,7 +1313,7 @@ def build_gan_callbacks(
                 else:
                     status = "SUCCESS: GAN upscale complete" if result.returncode == 0 else f"WARNING: GAN upscale failed"
                 log_body = result.log or ""
-                if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="GAN", text=log_body, settings=prepped_settings):
+                if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="GAN", text=log_body, settings=runtime_settings):
                     status = "OOM: Out of VRAM (GPU) - see banner above"
                 full_log = "\n".join(header_log + [log_body])
                 if progress_cb:
@@ -1335,7 +1344,7 @@ def build_gan_callbacks(
 
                                 img = Image.open(src_path)
                                 fmt = dest_path.suffix.lower().lstrip(".")
-                                quality = int(prepped_settings.get("output_quality", 95) or 95)
+                                quality = int(runtime_settings.get("output_quality", 95) or 95)
                                 if fmt in ("jpg", "jpeg"):
                                     img = img.convert("RGB")
                                     img.save(dest_path, format="JPEG", quality=quality)
@@ -1360,10 +1369,10 @@ def build_gan_callbacks(
                     if final_out_path and Path(final_out_path).exists() and Path(final_out_path).suffix.lower() in (".mp4", ".mov", ".mkv", ".avi", ".webm"):
                         from shared.audio_utils import ensure_audio_on_video
 
-                        audio_src = prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path")
+                        audio_src = runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path")
                         if audio_src and Path(audio_src).exists():
-                            audio_codec = str(prepped_settings.get("audio_codec") or settings.get("audio_codec") or "copy")
-                            audio_bitrate = prepped_settings.get("audio_bitrate") or settings.get("audio_bitrate") or None
+                            audio_codec = str(runtime_settings.get("audio_codec") or settings.get("audio_codec") or "copy")
+                            audio_bitrate = runtime_settings.get("audio_bitrate") or settings.get("audio_bitrate") or None
                             _changed, _final, _err = ensure_audio_on_video(
                                 Path(final_out_path),
                                 Path(audio_src),
@@ -1394,7 +1403,7 @@ def build_gan_callbacks(
                     elif rife_msg:
                         full_log = "\n".join([full_log, rife_msg])
                     comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                        prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path"),
+                        runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path"),
                         final_out_path,
                         seed_controls,
                         label_output="GAN",
@@ -1406,7 +1415,7 @@ def build_gan_callbacks(
                         full_log = "\n".join([full_log, f"Comparison video failed: {comp_vid_err}"])
 
                 # Save preprocessed input (if we created one) alongside outputs
-                pre_in = prepped_settings.get("_preprocessed_input_path")
+                pre_in = runtime_settings.get("_preprocessed_input_path")
                 if pre_in and Path(pre_in).exists():
                     full_log = "\n".join([full_log, f"Downscaled input saved: {pre_in}"])
                     if progress_cb:
@@ -1423,11 +1432,11 @@ def build_gan_callbacks(
                     run_logger.write_summary(
                         Path(final_out_path) if final_out_path else run_output_root,
                         {
-                            "input": prepped_settings.get("_original_input_path_before_preprocess")
-                            or prepped_settings.get("input_path"),
+                            "input": runtime_settings.get("_original_input_path_before_preprocess")
+                            or runtime_settings.get("input_path"),
                             "output": final_out_path,
                             "returncode": result.returncode,
-                            "args": prepped_settings,
+                            "args": runtime_settings,
                             "face_apply": face_apply,
                             "pipeline": "gan",
                         },
@@ -1437,7 +1446,7 @@ def build_gan_callbacks(
                 cmp_html = ""
                 slider_update = gr.update(value=None)
                 if final_out_path:
-                    src = prepped_settings.get("_original_input_path_before_preprocess") or prepped_settings.get("input_path")
+                    src = runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path")
                     outp = final_out_path
                     if Path(outp).exists():
                         if Path(outp).suffix.lower() in (".mp4", ".mov", ".mkv", ".avi", ".webm"):
@@ -1541,27 +1550,53 @@ def build_gan_callbacks(
                 try:
                     line = progress_q.get(timeout=0.2)
                     if line:
-                        result_holder.setdefault("live_logs", []).append(line)
+                        line_s = str(line).strip()
+                        if not line_s:
+                            continue
+                        live_logs = result_holder.setdefault("live_logs", [])
+                        frame_marker = "FRAME_PROGRESS "
+                        frame_progress_detail = None
+                        if line_s.startswith(frame_marker):
+                            frame_progress_detail = line_s[len(frame_marker):].strip()
+                            result_holder["runtime_status_detail"] = frame_progress_detail
+                            compact_line = f"{frame_marker}{frame_progress_detail}"
+                            if live_logs and str(live_logs[-1]).startswith(frame_marker):
+                                live_logs[-1] = compact_line
+                            else:
+                                live_logs.append(compact_line)
+                        else:
+                            live_logs.append(line_s)
+                            result_holder["runtime_status_detail"] = line_s
                         
                         # Update gr.Progress from log messages
                         if progress:
                             import re
-                            # Look for progress indicators in logs
-                            # Pattern: "Progress: 50%", "Processing 5/10 frames", etc.
-                            pct_match = re.search(r'(\d+(?:\.\d+)?)%', line)
-                            if pct_match:
-                                pct = float(pct_match.group(1)) / 100.0
-                                progress(pct, desc=line[:100])
-                                last_progress_update = pct
-                            elif re.search(r'(\d+)/(\d+)', line):
-                                nm_match = re.search(r'(\d+)/(\d+)', line)
+                            if frame_progress_detail:
+                                nm_match = re.search(r'(\d+)\s*/\s*(\d+)', frame_progress_detail)
                                 if nm_match:
                                     current = int(nm_match.group(1))
                                     total = int(nm_match.group(2))
                                     if total > 0:
                                         pct = current / total
-                                        progress(pct, desc=line[:100])
+                                        progress(pct, desc=f"{current}/{total} frames ({int(pct * 100)}%)")
                                         last_progress_update = pct
+                            else:
+                                # Look for progress indicators in logs
+                                # Pattern: "Progress: 50%", "Processing 5/10 frames", etc.
+                                pct_match = re.search(r'(\d+(?:\.\d+)?)%', line_s)
+                                if pct_match:
+                                    pct = float(pct_match.group(1)) / 100.0
+                                    progress(pct, desc=line_s[:100])
+                                    last_progress_update = pct
+                                elif re.search(r'(\d+)/(\d+)', line_s):
+                                    nm_match = re.search(r'(\d+)/(\d+)', line_s)
+                                    if nm_match:
+                                        current = int(nm_match.group(1))
+                                        total = int(nm_match.group(2))
+                                        if total > 0:
+                                            pct = current / total
+                                            progress(pct, desc=line_s[:100])
+                                            last_progress_update = pct
                 except queue.Empty:
                     pass
                 now = time.time()
@@ -1570,19 +1605,24 @@ def build_gan_callbacks(
                     live_logs = result_holder.get("live_logs", [])
                     img_upd, vid_upd = _media_updates(None)
                     status_title = "RUNNING: GAN upscaling in progress"
-                    status_detail = "Waiting for model output..."
-                    for cand in reversed(live_logs):
-                        cand_s = str(cand or "").strip()
-                        if cand_s:
-                            status_detail = cand_s
-                            break
+                    status_detail = str(result_holder.get("runtime_status_detail") or "").strip()
+                    if not status_detail:
+                        for cand in reversed(live_logs):
+                            cand_s = str(cand or "").strip()
+                            if cand_s.startswith("FRAME_PROGRESS "):
+                                cand_s = cand_s[len("FRAME_PROGRESS "):].strip()
+                            if cand_s:
+                                status_detail = cand_s
+                                break
+                    if not status_detail:
+                        status_detail = "Waiting for model output..."
                     yield (
                         gr.update(value=status_title),
                         "\n".join(live_logs[-400:]),
                         _running_indicator(status_title, status_detail, spinning=True),
                         img_upd,
                         vid_upd,
-                        "Running...",
+                        status_detail,
                         gr.update(value=None),
                         gr.update(value="", visible=False),
                         gr.update(visible=False),

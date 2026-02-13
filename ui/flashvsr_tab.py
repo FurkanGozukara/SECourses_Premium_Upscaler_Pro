@@ -116,71 +116,73 @@ def flashvsr_tab(
         with gr.Column(scale=3):
             gr.Markdown("####  Input")
 
-            with gr.Row():
-                input_file = gr.File(
-                    label="Upload video or image (optional)",
-                    type="filepath",
-                    file_types=["video", "image"]
-                )
-                with gr.Column():
-                    input_image_preview = gr.Image(
-                        label=" Input Preview (Image)",
-                        type="filepath",
-                        interactive=False,
-                        height=250,
-                        visible=False
-                    )
-                    input_video_preview = gr.Video(
-                        label=" Input Preview (Video)",
-                        interactive=False,
-                        height=250,
-                        visible=False
-                    )
-            input_path = gr.Textbox(
-                label="Input Path",
-                value=_value("input_path", ""),
-                placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
-                info="Video file or image sequence folder"
-            )
-            input_cache_msg = gr.Markdown("", visible=False)
-            sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
-            input_detection_result = gr.Markdown("", visible=False)
-            
-            # Model Configuration
-            gr.Markdown("####  Model Configuration")
-            
-            with gr.Row():
-                scale = gr.Dropdown(
-                    label="Upscale Factor",
-                    choices=["2", "4"],
-                    value="2" if str(_value("scale", "4")).strip() == "2" else "4",
-                    info="2x or 4x upscaling"
-                )
-                version = gr.Dropdown(
-                    label="Model Version",
-                    choices=["10", "11"],
-                    value=str(_value("version", "10")) if str(_value("version", "10")) in {"10", "11"} else "10",
-                    info="v10 = faster, v11 = higher quality"
-                )
-                mode = gr.Dropdown(
-                    label="Pipeline Mode",
-                    choices=["tiny", "tiny-long", "full"],
-                    value=str(_value("mode", "tiny")) if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"} else "tiny",
-                    info="tiny = fastest (4-6GB VRAM), tiny-long = balanced (5-7GB), full = best quality (8-12GB)"
-                )
+            with gr.Group():
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=2):
+                        input_file = gr.File(
+                            label="Upload video or image (optional)",
+                            type="filepath",
+                            file_types=["video", "image"]
+                        )
+                        input_path = gr.Textbox(
+                            label="Input Path",
+                            value=_value("input_path", ""),
+                            placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
+                            info="Video file or image sequence folder"
+                        )
+
+                    with gr.Column(scale=2):
+                        # Hidden model scale: FlashVSR pipeline runs fixed model scale internally.
+                        # UI keeps only Upscale-x controls in the right column as requested.
+                        scale = gr.Dropdown(
+                            label="Upscale Factor",
+                            choices=["2", "4"],
+                            value="4",
+                            visible=False,
+                            interactive=False,
+                        )
+                        version = gr.Dropdown(
+                            label="Model Version",
+                            choices=["10", "11"],
+                            value=str(_value("version", "10")) if str(_value("version", "10")) in {"10", "11"} else "10",
+                            info="v10 = faster, v11 = higher quality"
+                        )
+                        mode = gr.Dropdown(
+                            label="Pipeline Mode",
+                            choices=["tiny", "tiny-long", "full"],
+                            value=str(_value("mode", "tiny")) if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"} else "tiny",
+                            info="tiny = fastest (4-6GB VRAM), tiny-long = balanced (5-7GB), full = best quality (8-12GB)"
+                        )
+                        model_info_display = gr.Markdown("")
+
+                    with gr.Column(scale=2):
+                        input_image_preview = gr.Image(
+                            label=" Input Preview (Image)",
+                            type="filepath",
+                            interactive=False,
+                            height=250,
+                            visible=False
+                        )
+                        input_video_preview = gr.Video(
+                            label=" Input Preview (Video)",
+                            interactive=False,
+                            height=250,
+                            visible=False
+                        )
+
+                input_cache_msg = gr.Markdown("", visible=False)
+                sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
+                input_detection_result = gr.Markdown("", visible=False)
 
             # vNext sizing controls are placed in the right column to mirror SeedVR2 layout.
-            
-            # Model info display with metadata
-            model_info_display = gr.Markdown("")
-            
+
             def update_flashvsr_model_info(version_val, mode_val, scale_val):
                 """Display model metadata information"""
                 from shared.models.flashvsr_meta import get_flashvsr_metadata
-                
+
                 model_id = f"v{version_val}_{mode_val}_{scale_val}x"
                 metadata = get_flashvsr_metadata(model_id)
-                
+
                 if metadata:
                     info_lines = [
                         f"** Model: {metadata.name}**",
@@ -191,11 +193,11 @@ def flashvsr_tab(
                     ]
                     if metadata.notes:
                         info_lines.append(f"\n {metadata.notes}")
-                    
+
                     return gr.update(value="\n".join(info_lines), visible=True)
                 else:
                     return gr.update(value="Model metadata not available", visible=False)
-            
+
             # Wire up model info updates
             for component in [version, mode, scale]:
                 component.change(
@@ -688,6 +690,19 @@ def flashvsr_tab(
             outputs=[sizing_info, shared_state],
             trigger_mode="always_last",
         )
+
+    def _lock_flashvsr_scale(scale_val):
+        if str(scale_val).strip() == "4":
+            return gr.skip()
+        return gr.update(value="4")
+
+    scale.change(
+        fn=_lock_flashvsr_scale,
+        inputs=[scale],
+        outputs=[scale],
+        queue=False,
+        show_progress="hidden",
+    )
 
     def refresh_chunk_preview_ui(state):
         preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})

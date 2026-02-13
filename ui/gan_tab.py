@@ -187,6 +187,15 @@ def gan_tab(
                         )
 
                     with gr.Column(scale=2):
+                        gan_model = gr.Dropdown(
+                            label="GAN Model",
+                            choices=gan_model_dropdown_choices,
+                            value=gan_model_value,
+                            info="Only GAN model weights are shown here. Model labels include native upscale metadata."
+                        )
+                        model_info = gr.Markdown(update_model_info(gan_model_value))
+
+                    with gr.Column(scale=2):
                         input_image_preview = gr.Image(
                             label="Input Preview (Image)",
                             type="filepath",
@@ -200,15 +209,6 @@ def gan_tab(
                             height=250,
                             visible=False
                         )
-
-                    with gr.Column(scale=2):
-                        gan_model = gr.Dropdown(
-                            label="GAN Model",
-                            choices=gan_model_dropdown_choices,
-                            value=gan_model_value,
-                            info="Only GAN model weights are shown here. Model labels include native upscale metadata."
-                        )
-                        model_info = gr.Markdown(update_model_info(gan_model_value))
 
                 input_cache_msg = gr.Markdown("", visible=False)
                 input_detection_result = gr.Markdown("", visible=False)

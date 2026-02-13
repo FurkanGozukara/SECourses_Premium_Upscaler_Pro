@@ -148,18 +148,48 @@ def seedvr2_tab(
         with gr.Column(scale=3):
             gr.Markdown("###  Input / Controls")
 
+            available_models = sorted(
+                {
+                    str(model_name).strip()
+                    for model_name in (models_list or [])
+                    if str(model_name).strip().lower().startswith("seedvr2_")
+                }
+            )
+            if not available_models:
+                available_models = get_seedvr2_model_names()
+
+            # Ensure we always have at least one model choice (fallback to placeholder)
+            if not available_models:
+                available_models = ["seedvr2_ema_7b_fp16.safetensors"]
+                dit_model_value = available_models[0]
+            else:
+                dit_model_value = values[4] if len(values) > 4 else available_models[0]
+                if dit_model_value not in available_models:
+                    dit_model_value = available_models[0]
+
             # Input section with enhanced detection (file upload only, path textbox moved below)
             with gr.Group():
                 gr.Markdown("####  Enhanced Input: Video Files & Frame Folders")
                 gr.Markdown("*Auto-detects whether your input is a single video file or a folder containing frame sequences*")
 
-                with gr.Row():
-                    input_file = gr.File(
-                        label="Upload video or image (optional)",
-                        type="filepath",
-                        file_types=["video", "image"]
-                    )
-                    with gr.Column():
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=2):
+                        input_file = gr.File(
+                            label="Upload video or image (optional)",
+                            type="filepath",
+                            file_types=["video", "image"]
+                        )
+
+                    with gr.Column(scale=2):
+                        dit_model = gr.Dropdown(
+                            label="SeedVR2 Model",
+                            choices=available_models,
+                            value=dit_model_value,
+                            info="3B models are faster, 7B models higher quality. 'sharp' variants enhance edges. fp16 recommended for best speed/quality balance.",
+                        )
+                        model_cache_msg = gr.Markdown("", visible=False)
+
+                    with gr.Column(scale=2):
                         input_image_preview = gr.Image(
                             label=" Input Preview (Image)",
                             type="filepath",
@@ -188,7 +218,7 @@ def seedvr2_tab(
             # Output controls (Output Override / Output Format) moved to the right column
             # above the utility buttons for quick access before/after runs.
 
-            # Model selection is placed above Batch Size (see below).
+            # Model selection is intentionally kept in the compact top row.
 
             # -----------------------------------------------------------------
             #  New sizing controls (Upscale-x)
@@ -208,34 +238,6 @@ def seedvr2_tab(
             # are defined in the right column directly above  Run Log for quick access.
 
             # Core processing parameters
-            # SeedVR2 Model selection (placed just above Batch Size)
-            available_models = sorted(
-                {
-                    str(model_name).strip()
-                    for model_name in (models_list or [])
-                    if str(model_name).strip().lower().startswith("seedvr2_")
-                }
-            )
-            if not available_models:
-                available_models = get_seedvr2_model_names()
-            
-            # Ensure we always have at least one model choice (fallback to placeholder)
-            if not available_models:
-                available_models = ["seedvr2_ema_7b_fp16.safetensors"]  # Placeholder if no models found
-                dit_model_value = available_models[0]
-            else:
-                dit_model_value = values[4] if len(values) > 4 else available_models[0]
-                if dit_model_value not in available_models:
-                    dit_model_value = available_models[0]  # Fallback to first available model
-            
-            dit_model = gr.Dropdown(
-                label="SeedVR2 Model",
-                choices=available_models,
-                value=dit_model_value,
-                info="3B models are faster, 7B models higher quality. 'sharp' variants enhance edges. fp16 recommended for best speed/quality balance.",
-            )
-            model_cache_msg = gr.Markdown("", visible=False)
-
             with gr.Row():
                 batch_size = gr.Slider(
                     label="Batch Size (must be 4n+1: 5, 9, 13, 17...)",
@@ -1421,88 +1423,67 @@ def seedvr2_tab(
         trigger_mode="always_last",
     )
 
-    # Model caching and status updates with preset reload + dynamic UI updates
+    # Model caching and status updates with dynamic UI updates.
+    # Universal preset system is authoritative; model changes do not load
+    # per-model presets anymore.
     def cache_model_and_reload_preset(m, state, *current_vals):
         """
-        Cache model selection, reload preset, and update UI based on model metadata.
-        
+        Cache model selection and apply model metadata guardrails.
+
         Dynamically disables incompatible options (e.g., compile for GGUF models).
         """
-        state["seed_controls"]["current_model"] = m
-        
+        try:
+            state = state or {}
+            state.setdefault("seed_controls", {})
+            state["seed_controls"]["current_model"] = m
+        except Exception:
+            pass
+
         # Get model metadata to check compatibility
         from shared.models.seedvr2_meta import model_meta_map
         meta_map = model_meta_map()
         model_meta = meta_map.get(m)
-        
+
         # Determine if compile should be disabled for this model
         compile_supported = True
         multi_gpu_supported = True
         compile_warning = ""
         multi_gpu_warning = ""
-        
+
         if model_meta:
             compile_supported = getattr(model_meta, 'compile_compatible', True)
             multi_gpu_supported = getattr(model_meta, 'supports_multi_gpu', True)
-            
+
             if not compile_supported:
                 compile_warning = f" Model '{m}' doesn't support torch.compile (e.g., GGUF quantized models). Compile options will be auto-disabled at runtime."
-            
+
             if not multi_gpu_supported:
                 multi_gpu_warning = f" Model '{m}' is single-GPU only. Multi-GPU device specs will be reduced to first GPU."
-        
-        # Load last-used preset for this model
-        last_used_preset = preset_manager.load_last_used("seedvr2", m)
-        
+
         # Get model status
         try:
-            from shared.model_manager import get_model_manager
-            model_manager = get_model_manager()
             status_text = service.get("get_model_loading_status", lambda: "Model status unavailable")()
-            
-            # Add metadata warnings to status
-            if compile_warning or multi_gpu_warning:
-                warnings = []
-                if compile_warning:
-                    warnings.append(compile_warning)
-                if multi_gpu_warning:
-                    warnings.append(multi_gpu_warning)
-                status_text += "\n\n" + "\n".join(warnings)
-            
             model_status_update = gr.update(value=f"###  Model Status\n{status_text}")
         except Exception as e:
             model_status_update = gr.update(value=f"###  Model Status\nError: {str(e)}")
-        
-        # If last-used preset exists, merge with current values
-        if last_used_preset:
-            current_dict = dict(zip(SEEDVR2_ORDER, current_vals))
-            merged = preset_manager.merge_config(current_dict, last_used_preset)
-            
-            # Apply model constraints to merged preset
-            if not compile_supported:
-                merged["compile_dit"] = False
-                merged["compile_vae"] = False
-            
-            new_vals = [merged[k] for k in SEEDVR2_ORDER]
-            cache_msg = gr.update(
-                value=f" Model '{m}' selected - loaded last-used preset\n{compile_warning}\n{multi_gpu_warning}", 
-                visible=True
-            )
-            return [cache_msg, model_status_update] + new_vals
+
+        # Keep current values (synced by universal preset system), only enforce
+        # model-specific compatibility guardrails.
+        current_dict = dict(zip(SEEDVR2_ORDER, current_vals))
+        current_dict["dit_model"] = m
+        if not compile_supported:
+            current_dict["compile_dit"] = False
+            current_dict["compile_vae"] = False
+
+        new_vals = [current_dict[k] for k in SEEDVR2_ORDER]
+
+        warnings = [w for w in [compile_warning, multi_gpu_warning] if w]
+        if warnings:
+            cache_msg = gr.update(value="\n".join(warnings), visible=True)
         else:
-            # No last-used preset, keep current values but apply constraints
-            current_dict = dict(zip(SEEDVR2_ORDER, current_vals))
-            if not compile_supported:
-                current_dict["compile_dit"] = False
-                current_dict["compile_vae"] = False
-            
-            new_vals = [current_dict[k] for k in SEEDVR2_ORDER]
-            
-            cache_msg = gr.update(
-                value=f" Model '{m}' selected (no saved preset)\n{compile_warning}\n{multi_gpu_warning}", 
-                visible=True
-            )
-            return [cache_msg, model_status_update] + new_vals
+            cache_msg = gr.update(value="", visible=False)
+
+        return [cache_msg, model_status_update] + new_vals
 
     dit_model.change(
         fn=cache_model_and_reload_preset,

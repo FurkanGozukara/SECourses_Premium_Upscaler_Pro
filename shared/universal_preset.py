@@ -443,17 +443,11 @@ def update_shared_state_from_preset(
     if auto_chunk:
         res_settings["chunk_overlap"] = 0.0
     seed_controls["resolution_settings"] = res_settings
-    # NEW (vNext): unified Upscale-x sizing cache (applies to SeedVR2/GAN/FlashVSR)
-    seed_controls["upscale_factor_val"] = float(res_settings.get("upscale_factor", 4.0) or 4.0)
-    seed_controls["max_resolution_val"] = int(res_settings.get("max_target_resolution", 0) or 0)
     seed_controls["auto_chunk"] = auto_chunk
     seed_controls["auto_detect_scenes"] = bool(res_settings.get("auto_detect_scenes", True))
     seed_controls["frame_accurate_split"] = bool(res_settings.get("frame_accurate_split", True))
     seed_controls["chunk_size_sec"] = res_settings.get("chunk_size", 0)
     seed_controls["chunk_overlap_sec"] = 0.0 if auto_chunk else float(res_settings.get("chunk_overlap", 0.0) or 0.0)
-    seed_controls["ratio_downscale"] = res_settings.get("ratio_downscale_then_upscale", True)
-    seed_controls["enable_max_target"] = res_settings.get("enable_max_target", True)
-    seed_controls["auto_resolution"] = res_settings.get("auto_resolution", True)
     seed_controls["per_chunk_cleanup"] = res_settings.get("per_chunk_cleanup", False)
     seed_controls["scene_threshold"] = res_settings.get("scene_threshold", 27.0)
     seed_controls["min_scene_len"] = res_settings.get("min_scene_len", 1.0)
@@ -480,7 +474,11 @@ def update_shared_state_from_preset(
     seed_controls["fullscreen_val"] = out_settings.get("fullscreen_enabled", True)
     seed_controls["save_metadata_val"] = out_settings.get("save_metadata", True)
     seed_controls["telemetry_enabled_val"] = out_settings.get("telemetry_enabled", True)
-    
+    seed_controls["audio_codec_val"] = str(out_settings.get("audio_codec", "copy") or "copy")
+    seed_controls["audio_bitrate_val"] = str(out_settings.get("audio_bitrate", "") or "")
+    seed_controls["generate_comparison_video_val"] = bool(out_settings.get("generate_comparison_video", True))
+    seed_controls["comparison_video_layout_val"] = str(out_settings.get("comparison_video_layout", "auto") or "auto")
+
     state["seed_controls"] = seed_controls
     return state
 

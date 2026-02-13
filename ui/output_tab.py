@@ -64,7 +64,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     else:
         rife_models = get_rife_model_names(base_dir)
 
-    # Build service callbacks with global_settings for pinned reference persistence
+    # Build service callbacks
     service = build_output_callbacks(preset_manager, shared_state, combined_models, global_settings)
 
     # Get defaults
@@ -450,32 +450,6 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                     info="Detail level for processing logs"
                 )
 
-    # Pin Reference Feature
-    with gr.Accordion("📌 Pin Reference Frame", open=False):
-        gr.Markdown("#### Pin a reference frame for iterative comparison")
-        gr.Markdown("*Useful when testing different settings - keep the original pinned while comparing multiple upscaled versions*")
-        
-        pinned_reference_display = gr.Image(
-            label="Pinned Reference",
-            interactive=False,
-            height=200
-        )
-        
-        with gr.Row():
-            pin_btn = gr.Button("📌 Pin Current Output", variant="secondary")
-            unpin_btn = gr.Button("❌ Unpin Reference")
-        
-        pin_status = gr.Markdown("")
-
-    # Apply to Pipeline
-    gr.Markdown("#### 🔗 Apply to Pipeline")
-    apply_to_pipeline_btn = gr.Button(
-        "✅ Apply Output Settings to All Upscalers",
-        variant="primary",
-        size="lg"
-    )
-    apply_status = gr.Markdown("")
-
     # UNIVERSAL PRESET MANAGEMENT
     (
         preset_dropdown,
@@ -495,20 +469,6 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         models_list=models_list,
         open_accordion=True,
     )
-
-    # Cache management buttons
-    with gr.Accordion("🔄 Cache Management", open=False):
-        gr.Markdown("#### Update Cached Values")
-
-        with gr.Row():
-            cache_fps_btn = gr.Button("📹 Cache FPS", size="lg")
-            cache_comparison_btn = gr.Button("🔍 Cache Comparison", size="lg")
-
-        with gr.Row():
-            cache_png_btn = gr.Button("🖼️ Cache PNG Settings", size="lg")
-            cache_skip_btn = gr.Button("⏭️ Cache Skip/Cap", size="lg")
-
-        cache_status = gr.Markdown("")
 
     # Collect inputs for callbacks (must match OUTPUT_ORDER exactly)
     inputs_list = [
@@ -536,108 +496,6 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         inputs_list=inputs_list,
         shared_state=shared_state,
         tab_name="output",
-    )
-
-    # Apply to pipeline
-    apply_to_pipeline_btn.click(
-        fn=lambda *args: service["apply_to_pipeline"](*args),
-        inputs=inputs_list + [shared_state],
-        outputs=[apply_status, shared_state]
-    )
-
-    # Pin reference handlers
-    def pin_current_output(state):
-        """Pin the current output as reference"""
-        # Get last output path from state
-        last_output = state.get("seed_controls", {}).get("last_output_path", "")
-        return service["pin_reference_frame"](last_output, state)
-    
-    pin_btn.click(
-        fn=pin_current_output,
-        inputs=shared_state,
-        outputs=[pin_status, shared_state]
-    )
-    
-    unpin_btn.click(
-        fn=lambda state: service["unpin_reference"](state),
-        inputs=shared_state,
-        outputs=[pin_status, shared_state]
-    )
-
-    # Cache management - wire individual values correctly
-    def cache_fps_wrapper(fps_val, state):
-        return service["cache_fps"](fps_val, state)
-    
-    def cache_comparison_wrapper(comp_mode, state):
-        return service["cache_comparison"](comp_mode, state)
-
-    def _update_text(upd):
-        if isinstance(upd, dict):
-            return str(upd.get("value", "") or "")
-        return str(upd or "")
-    
-    def cache_png_wrapper(padding, basename, state):
-        msg1, state1 = service["cache_png_padding"](padding, state)
-        msg2, state2 = service["cache_png_basename"](basename, state1)
-        joined = "\n".join([m for m in [_update_text(msg1), _update_text(msg2)] if m.strip()])
-        return gr.update(value=joined), state2
-    
-    def cache_skip_wrapper(skip_val, cap_val, state):
-        msg1, state1 = service["cache_skip"](skip_val, state)
-        msg2, state2 = service["cache_cap"](cap_val, state1)
-        joined = "\n".join([m for m in [_update_text(msg1), _update_text(msg2)] if m.strip()])
-        return gr.update(value=joined), state2
-    
-    cache_fps_btn.click(
-        fn=cache_fps_wrapper,
-        inputs=[fps_override, shared_state],
-        outputs=[cache_status, shared_state]
-    )
-
-    cache_comparison_btn.click(
-        fn=cache_comparison_wrapper,
-        inputs=[comparison_mode, shared_state],
-        outputs=[cache_status, shared_state]
-    )
-
-    cache_png_btn.click(
-        fn=cache_png_wrapper,
-        inputs=[png_padding, png_keep_basename, shared_state],
-        outputs=[cache_status, shared_state]
-    )
-
-    cache_skip_btn.click(
-        fn=cache_skip_wrapper,
-        inputs=[skip_first_frames, load_cap, shared_state],
-        outputs=[cache_status, shared_state]
-    )
-
-    overwrite_existing_batch.change(
-        fn=lambda val, state: service["cache_overwrite_batch"](val, state),
-        inputs=[overwrite_existing_batch, shared_state],
-        outputs=[cache_status, shared_state],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    # Comparison video generation - auto-cache on change
-    generate_comparison_video.change(
-        fn=lambda val, state: service["cache_generate_comparison_video"](val, state),
-        inputs=[generate_comparison_video, shared_state],
-        outputs=[cache_status, shared_state],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    comparison_video_layout.change(
-        fn=lambda val, state: service["cache_comparison_video_layout"](val, state),
-        inputs=[comparison_video_layout, shared_state],
-        outputs=[cache_status, shared_state],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
     )
 
     # Codec info updates

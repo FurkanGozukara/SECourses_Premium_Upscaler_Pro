@@ -920,8 +920,6 @@ def main(argv=None):
                 "output_settings": startup_preset.get("output", {}),
                 
                 # Individual cached values (for backward compatibility with other code)
-                "upscale_factor_val": startup_res_settings.get("upscale_factor", 4.0),
-                "max_resolution_val": startup_res_settings.get("max_target_resolution", 0),
                 "current_model": None,
                 "last_input_path": "",
                 "last_output_dir": "",
@@ -961,9 +959,6 @@ def main(argv=None):
                 "frame_accurate_split": bool(startup_res_settings.get("frame_accurate_split", True)),
                 "chunk_size_sec": startup_res_settings.get("chunk_size", 0),
                 "chunk_overlap_sec": startup_chunk_overlap_sec,
-                "ratio_downscale": startup_res_settings.get("ratio_downscale_then_upscale", True),
-                "enable_max_target": startup_res_settings.get("enable_max_target", True),
-                "auto_resolution": startup_res_settings.get("auto_resolution", True),
                 "per_chunk_cleanup": startup_res_settings.get("per_chunk_cleanup", False),
                 "scene_threshold": startup_res_settings.get("scene_threshold", 27.0),
                 "min_scene_len": startup_res_settings.get("min_scene_len", 1.0),

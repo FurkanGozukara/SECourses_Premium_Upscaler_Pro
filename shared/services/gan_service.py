@@ -406,17 +406,26 @@ def build_gan_callbacks(
             use_global = bool(s.get("use_resolution_tab", True))
             model_cache = seed_controls_local.get("resolution_cache", {}).get(s.get("model"), {}) if use_global else {}
 
-            enable_max = model_cache.get("enable_max_target", seed_controls_local.get("enable_max_target", True)) if use_global else True
-            scale_x = float(
-                (model_cache.get("upscale_factor_val") or seed_controls_local.get("upscale_factor_val"))
-                if use_global
-                else (s.get("upscale_factor") or 4.0)
-            )
-            max_edge = int(
-                (model_cache.get("max_resolution_val") or seed_controls_local.get("max_resolution_val"))
-                if use_global
-                else (s.get("max_resolution") or 0)
-            )
+            if use_global:
+                enable_max = model_cache.get("enable_max_target", seed_controls_local.get("enable_max_target", True))
+                scale_raw = model_cache.get("upscale_factor_val")
+                if scale_raw is None:
+                    scale_raw = seed_controls_local.get("upscale_factor_val")
+                if scale_raw is None:
+                    scale_raw = s.get("upscale_factor", 4.0)
+
+                max_raw = model_cache.get("max_resolution_val")
+                if max_raw is None:
+                    max_raw = seed_controls_local.get("max_resolution_val")
+                if max_raw is None:
+                    max_raw = s.get("max_resolution", 0)
+            else:
+                enable_max = True
+                scale_raw = s.get("upscale_factor", 4.0)
+                max_raw = s.get("max_resolution", 0)
+
+            scale_x = float(scale_raw or 4.0)
+            max_edge = int(max_raw or 0)
             if not enable_max:
                 max_edge = 0
 

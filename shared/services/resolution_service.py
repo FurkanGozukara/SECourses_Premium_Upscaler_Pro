@@ -446,19 +446,13 @@ def build_resolution_callbacks(
         # Update shared state with resolution settings for all pipelines
         seed_controls = state.get("seed_controls", {})
         
-        # Cache resolution values for all upscalers to use (GLOBAL level)
-        seed_controls["upscale_factor_val"] = float(settings_dict.get("upscale_factor", 4.0) or 4.0)
-        seed_controls["max_resolution_val"] = int(settings_dict.get("max_target_resolution", 0) or 0)
-        seed_controls["enable_max_target"] = settings_dict.get("enable_max_target", True)
-        seed_controls["auto_resolution"] = settings_dict.get("auto_resolution", True)  # kept for backward compat
+        # Resolution tab now manages chunking/splitting only.
         seed_controls["auto_detect_scenes"] = bool(settings_dict.get("auto_detect_scenes", True))
         seed_controls["auto_chunk"] = bool(settings_dict.get("auto_chunk", True))
         seed_controls["frame_accurate_split"] = bool(settings_dict.get("frame_accurate_split", True))
         seed_controls["chunk_size_sec"] = settings_dict.get("chunk_size", 0)
         # Overlap is only meaningful for static chunking; force 0 when auto chunking is enabled.
         seed_controls["chunk_overlap_sec"] = 0.0 if seed_controls["auto_chunk"] else float(settings_dict.get("chunk_overlap", 0) or 0)
-        # Repurposed: now controls "pre-downscale then upscale when clamped"
-        seed_controls["ratio_downscale"] = settings_dict.get("ratio_downscale_then_upscale", True)
         seed_controls["per_chunk_cleanup"] = settings_dict.get("per_chunk_cleanup", False)
         seed_controls["scene_threshold"] = settings_dict.get("scene_threshold", 27.0)
         seed_controls["min_scene_len"] = settings_dict.get("min_scene_len", 1.0)
@@ -468,16 +462,11 @@ def build_resolution_callbacks(
         model_name = settings_dict.get("model", "")
         if model_name:
             model_cache = _ensure_model_cache(model_name, state)
-            model_cache["upscale_factor_val"] = float(settings_dict.get("upscale_factor", 4.0) or 4.0)
-            model_cache["max_resolution_val"] = int(settings_dict.get("max_target_resolution", 0) or 0)
-            model_cache["enable_max_target"] = settings_dict.get("enable_max_target", True)
-            model_cache["auto_resolution"] = settings_dict.get("auto_resolution", True)
             model_cache["auto_detect_scenes"] = bool(settings_dict.get("auto_detect_scenes", True))
             model_cache["auto_chunk"] = bool(settings_dict.get("auto_chunk", True))
             model_cache["frame_accurate_split"] = bool(settings_dict.get("frame_accurate_split", True))
             model_cache["chunk_size_sec"] = float(settings_dict.get("chunk_size", 0) or 0)
             model_cache["chunk_overlap_sec"] = 0.0 if model_cache["auto_chunk"] else float(settings_dict.get("chunk_overlap", 0) or 0)
-            model_cache["ratio_downscale"] = settings_dict.get("ratio_downscale_then_upscale", True)
             model_cache["per_chunk_cleanup"] = settings_dict.get("per_chunk_cleanup", False)
             model_cache["scene_threshold"] = float(settings_dict.get("scene_threshold", 27.0))
             model_cache["min_scene_len"] = float(settings_dict.get("min_scene_len", 1.0))
@@ -485,9 +474,6 @@ def build_resolution_callbacks(
         state["seed_controls"] = seed_controls
         
         status_msg = f"✅ Applied resolution settings to ALL upscalers:\n"
-        status_msg += f"- Upscale Factor: {seed_controls['upscale_factor_val']}x\n"
-        status_msg += f"- Max Resolution: {seed_controls['max_resolution_val']}px\n"
-        status_msg += f"- Auto-Resolution: {seed_controls['auto_resolution']}\n"
         status_msg += f"- Auto Detect Scenes (info): {seed_controls.get('auto_detect_scenes', True)}\n"
         if seed_controls.get("auto_chunk", True):
             status_msg += "- Chunking: Auto (PySceneDetect scenes, overlap forced 0)\n"
@@ -518,24 +504,6 @@ def build_resolution_callbacks(
         est = math.ceil(dur / max(0.001, size - ov))
         return gr.update(value=f"Duration ~{dur:.1f}s → est. {est} chunks (size {size}s, overlap {ov}s)."), state
 
-    def cache_resolution(scale_x, m_res, model, state):
-        model_cache = _ensure_model_cache(model, state)
-        model_cache["upscale_factor_val"] = float(scale_x or 4.0)
-        model_cache["max_resolution_val"] = int(m_res or 0)
-        return gr.update(value=f"Resolution cached for {model}."), state
-
-    def cache_resolution_flags(auto_res, enable_max, chunk_sz, chunk_ov, ratio_down, per_cleanup, scene_thresh, min_scene, model, state):
-        model_cache = _ensure_model_cache(model, state)
-        model_cache["auto_resolution"] = auto_res
-        model_cache["enable_max_target"] = enable_max
-        model_cache["chunk_size_sec"] = float(chunk_sz or 0)
-        model_cache["chunk_overlap_sec"] = float(chunk_ov or 0)
-        model_cache["ratio_downscale"] = ratio_down
-        model_cache["per_chunk_cleanup"] = per_cleanup
-        model_cache["scene_threshold"] = float(scene_thresh or 27.0)
-        model_cache["min_scene_len"] = float(min_scene or 1.0)
-        return gr.update(value=f"Resolution options cached for {model}."), state
-
     return {
         "defaults": defaults,
         "order": RESOLUTION_ORDER,
@@ -546,8 +514,6 @@ def build_resolution_callbacks(
         "apply_to_seed": apply_to_seed,
         "chunk_estimate": chunk_estimate,
         "estimate_from_input": estimate_from_input,
-        "cache_resolution": lambda *args: cache_resolution(*args[:-1], args[-1]),
-        "cache_resolution_flags": lambda *args: cache_resolution_flags(*args[:-1], args[-1]),
         "calculate_auto_resolution": calculate_auto_resolution,
         "calculate_chunk_estimate": calculate_chunk_estimate,
     }

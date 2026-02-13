@@ -26,8 +26,10 @@ def _check_universal_preset_caches() -> None:
     update_shared_state_from_preset(state, preset, preset_name="smoke")
     assert state["seed_controls"]["telemetry_enabled_val"] is False
     assert state["seed_controls"]["overwrite_existing_batch_val"] is True
-    assert float(state["seed_controls"]["upscale_factor_val"]) == 3.0
-    assert int(state["seed_controls"]["max_resolution_val"]) == 1024
+    assert float(state["seed_controls"]["resolution_settings"]["upscale_factor"]) == 3.0
+    assert int(state["seed_controls"]["resolution_settings"]["max_target_resolution"]) == 1024
+    assert "upscale_factor_val" not in state["seed_controls"]
+    assert "max_resolution_val" not in state["seed_controls"]
     assert bool(state["seed_controls"].get("auto_detect_scenes", True)) is True
     assert bool(state["seed_controls"].get("frame_accurate_split", True)) is True
 
@@ -56,8 +58,10 @@ def _check_universal_preset_caches() -> None:
     res_vals[RESOLUTION_ORDER.index("upscale_factor")] = 2.5
     res_vals[RESOLUTION_ORDER.index("max_target_resolution")] = 720
     sync_tab_to_shared_state("resolution", res_vals, state2)
-    assert float(state2["seed_controls"]["upscale_factor_val"]) == 2.5
-    assert int(state2["seed_controls"]["max_resolution_val"]) == 720
+    assert float(state2["seed_controls"]["resolution_settings"]["upscale_factor"]) == 2.5
+    assert int(state2["seed_controls"]["resolution_settings"]["max_target_resolution"]) == 720
+    assert "upscale_factor_val" not in state2["seed_controls"]
+    assert "max_resolution_val" not in state2["seed_controls"]
     assert bool(state2["seed_controls"].get("frame_accurate_split", True)) is True
     assert float(state2["seed_controls"].get("min_scene_len", 0.0) or 0.0) == 1.0
 

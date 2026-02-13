@@ -120,7 +120,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
             **ℹ️ Global Mode Info:**
             - Face restoration will be applied to SeedVR2, GAN, and RIFE processing
             - Settings below control the enhancement strength and behavior
-            - Individual model presets can override global settings
+            - Universal presets manage these settings across the app
             - Processing time increases with face restoration enabled
             """)
 
@@ -131,12 +131,14 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
         )
         global_status = gr.Markdown("")
 
-    # Model selector for presets
-    model_selector = gr.Dropdown(
-        label="Model Context (for presets)",
-        choices=combined_models,
-        value=combined_models[0] if combined_models else "default",
-        info="Settings are saved/loaded per model type"
+    # Legacy model context is kept as a hidden field for preset/order compatibility.
+    model_selector_value = values[0] if values else (combined_models[0] if combined_models else "default")
+    if combined_models and model_selector_value not in combined_models:
+        model_selector_value = combined_models[0]
+    model_selector = gr.Textbox(
+        value=model_selector_value,
+        visible=False,
+        interactive=False,
     )
 
     with gr.Tabs():

@@ -466,16 +466,6 @@ def sync_tab_to_shared_state(
     # Keep derived cross-tab caches in sync so other pipelines immediately
     # see updated Resolution/Output settings without requiring "Apply" buttons.
     if tab_name == "resolution":
-        try:
-            seed_controls["upscale_factor_val"] = float(tab_dict.get("upscale_factor", 4.0) or 4.0)
-        except Exception:
-            seed_controls["upscale_factor_val"] = 4.0
-        try:
-            seed_controls["max_resolution_val"] = int(tab_dict.get("max_target_resolution", 0) or 0)
-        except Exception:
-            seed_controls["max_resolution_val"] = 0
-        seed_controls["enable_max_target"] = bool(tab_dict.get("enable_max_target", True))
-        seed_controls["auto_resolution"] = bool(tab_dict.get("auto_resolution", True))
         seed_controls["auto_detect_scenes"] = bool(tab_dict.get("auto_detect_scenes", True))
         seed_controls["auto_chunk"] = bool(tab_dict.get("auto_chunk", True))
         seed_controls["frame_accurate_split"] = bool(tab_dict.get("frame_accurate_split", True))
@@ -485,7 +475,6 @@ def sync_tab_to_shared_state(
             seed_controls["chunk_overlap_sec"] = 0.0
         else:
             seed_controls["chunk_overlap_sec"] = float(tab_dict.get("chunk_overlap", 0.0) or 0.0)
-        seed_controls["ratio_downscale"] = bool(tab_dict.get("ratio_downscale_then_upscale", True))
         seed_controls["per_chunk_cleanup"] = bool(tab_dict.get("per_chunk_cleanup", False))
         seed_controls["scene_threshold"] = float(tab_dict.get("scene_threshold", 27.0) or 27.0)
         seed_controls["min_scene_len"] = float(tab_dict.get("min_scene_len", 1.0) or 1.0)
@@ -514,6 +503,10 @@ def sync_tab_to_shared_state(
         seed_controls["fullscreen_val"] = bool(tab_dict.get("fullscreen_enabled", True))
         seed_controls["save_metadata_val"] = bool(tab_dict.get("save_metadata", True))
         seed_controls["telemetry_enabled_val"] = bool(tab_dict.get("telemetry_enabled", True))
+        seed_controls["audio_codec_val"] = str(tab_dict.get("audio_codec", "copy") or "copy")
+        seed_controls["audio_bitrate_val"] = str(tab_dict.get("audio_bitrate", "") or "")
+        seed_controls["generate_comparison_video_val"] = bool(tab_dict.get("generate_comparison_video", True))
+        seed_controls["comparison_video_layout_val"] = str(tab_dict.get("comparison_video_layout", "auto") or "auto")
 
     state["seed_controls"] = seed_controls
     return state

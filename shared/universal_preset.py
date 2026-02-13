@@ -78,10 +78,13 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     # Dropdown-safe values to avoid Gradio "value not in choices" errors.
+    cfg["output_format"] = "mp4"
     scale_raw = str(cfg.get("scale", "4")).strip()
     cfg["scale"] = "2" if scale_raw == "2" else "4"
     cfg["version"] = str(cfg.get("version", "10") or "10")
     cfg["mode"] = str(cfg.get("mode", "tiny") or "tiny")
+    cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
+    cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
     return cfg
 
 
@@ -192,6 +195,7 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
         defaults["gan"] = {k: "" if k.endswith("_path") else None for k in GAN_ORDER}
         defaults["gan"].update({
             "input_path": "",
+            "output_override": "",
             "batch_enable": False,
             "batch_input_path": "",
             "batch_output_path": "",
@@ -211,6 +215,8 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
             "output_format": "auto",
             "output_quality": 95,
             "save_metadata": True,
+            "fps_override": 0,
+            "face_restore_after_upscale": False,
             "create_subfolders": False,
             # vNext sizing
             "upscale_factor": 4.0,

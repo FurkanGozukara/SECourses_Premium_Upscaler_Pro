@@ -64,6 +64,18 @@ def flashvsr_tab(
             merged_defaults[key] = value
     
     values = [merged_defaults[k] for k in FLASHVSR_ORDER]
+
+    def _value(key: str, default=None):
+        try:
+            idx = FLASHVSR_ORDER.index(key)
+            if 0 <= idx < len(values):
+                raw = values[idx]
+                if raw is None and default is not None:
+                    return default
+                return raw
+        except Exception:
+            pass
+        return default
     # GPU detection and warnings (parent-process safe: NO torch import)
     cuda_available = False
     cuda_count = 0
@@ -77,22 +89,22 @@ def flashvsr_tab(
         cuda_available = cuda_count > 0
         
         if cuda_available:
-            gpu_hint = f"✅ Detected {cuda_count} CUDA GPU(s) - GPU acceleration available\n⚠️ FlashVSR+ uses single GPU only (multi-GPU not supported)"
+            gpu_hint = f" Detected {cuda_count} CUDA GPU(s) - GPU acceleration available\n FlashVSR+ uses single GPU only (multi-GPU not supported)"
         else:
-            gpu_hint = "⚠️ CUDA not detected (nvidia-smi unavailable or no NVIDIA GPU) - Processing will use CPU (significantly slower)"
+            gpu_hint = " CUDA not detected (nvidia-smi unavailable or no NVIDIA GPU) - Processing will use CPU (significantly slower)"
     except Exception as e:
-        gpu_hint = f"❌ CUDA detection failed: {str(e)}"
+        gpu_hint = f" CUDA detection failed: {str(e)}"
         cuda_available = False
 
     # Layout
-    gr.Markdown("### ⚡ FlashVSR+ - Real-Time Diffusion Video Super-Resolution")
+    gr.Markdown("###  FlashVSR+ - Real-Time Diffusion Video Super-Resolution")
     gr.Markdown("*High-quality real-time video upscaling with diffusion models*")
     
     # Show GPU warning if not available
     if not cuda_available:
         gr.Markdown(
             f'<div style="background: #fff3cd; padding: 12px; border-radius: 8px; border: 1px solid #ffc107;">'
-            f'<strong>⚠️ GPU Acceleration Unavailable</strong><br>'
+            f'<strong> GPU Acceleration Unavailable</strong><br>'
             f'{gpu_hint}<br><br>'
             f'FlashVSR+ requires CUDA for optimal performance. CPU mode is extremely slow.'
             f'</div>',
@@ -102,7 +114,7 @@ def flashvsr_tab(
     with gr.Row():
         # Left Column: Input & Settings
         with gr.Column(scale=3):
-            gr.Markdown("#### 📁 Input")
+            gr.Markdown("####  Input")
 
             with gr.Row():
                 input_file = gr.File(
@@ -112,21 +124,21 @@ def flashvsr_tab(
                 )
                 with gr.Column():
                     input_image_preview = gr.Image(
-                        label="📸 Input Preview (Image)",
+                        label=" Input Preview (Image)",
                         type="filepath",
                         interactive=False,
                         height=250,
                         visible=False
                     )
                     input_video_preview = gr.Video(
-                        label="🎬 Input Preview (Video)",
+                        label=" Input Preview (Video)",
                         interactive=False,
                         height=250,
                         visible=False
                     )
             input_path = gr.Textbox(
                 label="Input Path",
-                value=values[0],
+                value=_value("input_path", ""),
                 placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
                 info="Video file or image sequence folder"
             )
@@ -135,55 +147,29 @@ def flashvsr_tab(
             input_detection_result = gr.Markdown("", visible=False)
             
             # Model Configuration
-            gr.Markdown("#### 🤖 Model Configuration")
+            gr.Markdown("####  Model Configuration")
             
             with gr.Row():
                 scale = gr.Dropdown(
                     label="Upscale Factor",
                     choices=["2", "4"],
-                    value="2" if str(values[2]).strip() == "2" else "4",
+                    value="2" if str(_value("scale", "4")).strip() == "2" else "4",
                     info="2x or 4x upscaling"
                 )
                 version = gr.Dropdown(
                     label="Model Version",
                     choices=["10", "11"],
-                    value=str(values[3]) if str(values[3]) in {"10", "11"} else "10",
+                    value=str(_value("version", "10")) if str(_value("version", "10")) in {"10", "11"} else "10",
                     info="v10 = faster, v11 = higher quality"
                 )
                 mode = gr.Dropdown(
                     label="Pipeline Mode",
                     choices=["tiny", "tiny-long", "full"],
-                    value=str(values[4]) if str(values[4]) in {"tiny", "tiny-long", "full"} else "tiny",
+                    value=str(_value("mode", "tiny")) if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"} else "tiny",
                     info="tiny = fastest (4-6GB VRAM), tiny-long = balanced (5-7GB), full = best quality (8-12GB)"
                 )
 
-            # vNext sizing controls (any x + max edge + pre-downscale)
-            with gr.Group():
-                use_resolution_tab = gr.Checkbox(
-                    label="🔗 Use Resolution & Scene Split Tab Settings",
-                    value=values[20] if len(values) > 20 else True,
-                    info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from Resolution tab. Recommended ON."
-                )
-
-                upscale_factor = gr.Number(
-                    label="Upscale x (any factor)",
-                    value=values[21] if len(values) > 21 else float(values[2]),
-                    precision=2,
-                    info="Desired effective upscale. For FlashVSR fixed 2x/4x models, input is pre-downscaled to hit the target without exceeding Max Resolution."
-                )
-
-                with gr.Row():
-                    max_target_resolution = gr.Slider(
-                        label="Max Resolution (max edge, 0 = no cap)",
-                        minimum=0, maximum=8192, step=16,
-                        value=values[22] if len(values) > 22 else 0,
-                        info="Caps the LONG side (max(width,height)) of the target."
-                    )
-                    pre_downscale_then_upscale = gr.Checkbox(
-                        label="⬇️➡️⬆️ Pre-downscale then upscale (auto when needed)",
-                        value=values[23] if len(values) > 23 else False,
-                        info="For fixed-scale FlashVSR models this is applied automatically when needed to satisfy Upscale-x / Max Resolution without post-resize."
-                    )
+            # vNext sizing controls are placed in the right column to mirror SeedVR2 layout.
             
             # Model info display with metadata
             model_info_display = gr.Markdown("")
@@ -197,14 +183,14 @@ def flashvsr_tab(
                 
                 if metadata:
                     info_lines = [
-                        f"**📊 Model: {metadata.name}**",
+                        f"** Model: {metadata.name}**",
                         f"**VRAM Estimate:** ~{metadata.estimated_vram_gb:.1f}GB",
                         f"**Speed:** {metadata.speed_tier.title()} | **Quality:** {metadata.quality_tier.replace('_', ' ').title()}",
-                        f"**Multi-GPU:** {'❌ Not supported' if not metadata.supports_multi_gpu else '✅ Supported'}",
-                        f"**Compile:** {'✅ Compatible' if metadata.compile_compatible else '❌ Not supported'}",
+                        f"**Multi-GPU:** {' Not supported' if not metadata.supports_multi_gpu else ' Supported'}",
+                        f"**Compile:** {' Compatible' if metadata.compile_compatible else ' Not supported'}",
                     ]
                     if metadata.notes:
-                        info_lines.append(f"\n💡 {metadata.notes}")
+                        info_lines.append(f"\n {metadata.notes}")
                     
                     return gr.update(value="\n".join(info_lines), visible=True)
                 else:
@@ -219,19 +205,19 @@ def flashvsr_tab(
                 )
             
             # Processing Settings
-            gr.Markdown("#### ⚙️ Processing Settings")
+            gr.Markdown("####  Processing Settings")
             
             with gr.Group():
                 dtype = gr.Dropdown(
                     label="Precision",
                     choices=["fp16", "bf16"],
-                    value=str(values[12]) if str(values[12]) in {"fp16", "bf16"} else "bf16",
+                    value=str(_value("dtype", "bf16")) if str(_value("dtype", "bf16")) in {"fp16", "bf16"} else "bf16",
                     info="bf16 = faster, more stable. fp16 = broader compatibility"
                 )
                 
                 device = gr.Textbox(
                     label="Device (Single GPU Only)",
-                    value=values[13] if cuda_available else "cpu",
+                    value=_value("device", "auto") if cuda_available else "cpu",
                     placeholder="auto, cuda:0, cpu" if cuda_available else "CPU only (no CUDA)",
                     info=f"{gpu_hint}\nauto = automatic GPU selection, cuda:0 = specific GPU, cpu = CPU mode. Multi-GPU NOT supported by FlashVSR+.",
                     interactive=cuda_available
@@ -239,7 +225,7 @@ def flashvsr_tab(
                 
                 seed = gr.Number(
                     label="Random Seed",
-                    value=values[11],
+                    value=_value("seed", 0),
                     precision=0,
                     info="Seed for reproducibility. 0 = random"
                 )
@@ -247,59 +233,59 @@ def flashvsr_tab(
                 attention = gr.Dropdown(
                     label="Attention Mode",
                     choices=["sage", "block"],
-                    value=str(values[16]) if str(values[16]) in {"sage", "block"} else "sage",
+                    value=str(_value("attention", "sage")) if str(_value("attention", "sage")) in {"sage", "block"} else "sage",
                     info="sage = default, block = alternative implementation"
                 )
             
             # Memory Optimization
-            gr.Markdown("#### 💾 Memory Optimization (Tiling)")
+            gr.Markdown("####  Memory Optimization (Tiling)")
             
             with gr.Group():
                 tiled_vae = gr.Checkbox(
                     label="Enable VAE Tiling",
-                    value=values[5],
+                    value=bool(_value("tiled_vae", False)),
                     info="Reduce VRAM usage during VAE encoding/decoding. Essential for high resolutions."
                 )
                 
                 tiled_dit = gr.Checkbox(
                     label="Enable DiT Tiling",
-                    value=values[6],
+                    value=bool(_value("tiled_dit", False)),
                     info="Reduce VRAM usage during diffusion inference. Enables processing larger videos."
                 )
                 
                 tile_size = gr.Slider(
                     label="Tile Size",
                     minimum=128, maximum=512, step=32,
-                    value=values[7],
+                    value=int(_value("tile_size", 256) or 256),
                     info="Size of each tile. Larger = faster but more VRAM"
                 )
                 
                 overlap = gr.Slider(
                     label="Tile Overlap",
                     minimum=8, maximum=64, step=8,
-                    value=values[8],
+                    value=int(_value("overlap", 24) or 24),
                     info="Overlap between tiles to reduce seams. Higher = smoother"
                 )
                 
                 unload_dit = gr.Checkbox(
                     label="Unload DiT Before Decoding",
-                    value=values[9],
+                    value=bool(_value("unload_dit", False)),
                     info="Free VRAM before VAE decoding. Slower but uses less memory."
                 )
             
             # Quality Settings
-            gr.Markdown("#### 🎨 Quality Settings")
+            gr.Markdown("####  Quality Settings")
             
             with gr.Group():
                 color_fix = gr.Checkbox(
                     label="Color Correction",
-                    value=values[10],
+                    value=bool(_value("color_fix", True)),
                     info="Maintain color accuracy. Recommended ON."
                 )
                 
                 fps_flashvsr = gr.Number(
                     label="Output FPS (image sequences only)",
-                    value=values[14],
+                    value=int(_value("fps", 30) or 30),
                     precision=0,
                     info="Frame rate for image sequence outputs. Ignored for video inputs."
                 )
@@ -307,19 +293,66 @@ def flashvsr_tab(
                 quality = gr.Slider(
                     label="Video Quality",
                     minimum=1, maximum=10, step=1,
-                    value=values[15],
+                    value=int(_value("quality", 6) or 6),
                     info="Output quality. 1 = lowest, 10 = highest. 6 is recommended."
                 )
         
         # Right Column: Output & Controls
         with gr.Column(scale=2):
-            gr.Markdown("#### 🎯 Output & Actions")
+            gr.Markdown("####  Output & Actions")
+
+            with gr.Group():
+                _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
+                try:
+                    _upscale_factor_default = float(_upscale_factor_default)
+                except Exception:
+                    _upscale_factor_default = 4.0
+                _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
+
+                _max_resolution_default = _value("max_target_resolution", 0)
+                try:
+                    _max_resolution_default = int(_max_resolution_default)
+                except Exception:
+                    _max_resolution_default = 0
+                _max_resolution_default = min(8192, max(0, _max_resolution_default))
+
+                with gr.Row():
+                    upscale_factor = gr.Slider(
+                        label="Upscale x (any factor)",
+                        minimum=1.0,
+                        maximum=9.9,
+                        step=0.1,
+                        value=_upscale_factor_default,
+                        info="e.g., 4.0 = 4x. Target size is computed from input, then capped by Max Resolution (max edge).",
+                        scale=2,
+                    )
+                    max_target_resolution = gr.Slider(
+                        label="Max Resolution (max edge, 0 = no cap)",
+                        minimum=0,
+                        maximum=8192,
+                        step=16,
+                        value=_max_resolution_default,
+                        info="Caps the LONG side (max(width,height)) of the target. 0 = unlimited.",
+                        scale=2,
+                    )
+                    pre_downscale_then_upscale = gr.Checkbox(
+                        label="Pre-downscale then upscale (when capped)",
+                        value=bool(_value("pre_downscale_then_upscale", False)),
+                        info="If max edge would reduce effective scale, downscale input first so the model still runs at the full Upscale x.",
+                        scale=1,
+                    )
+
+                use_resolution_tab = gr.Checkbox(
+                    label="Use Resolution & Scene Split Tab Settings",
+                    value=bool(_value("use_resolution_tab", True)),
+                    info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from Resolution tab. Recommended ON.",
+                )
             
             status_box = gr.Markdown(value="Ready.")
             progress_indicator = gr.Markdown(value="", visible=True)
             
             log_box = gr.Textbox(
-                label="📋 Processing Log",
+                label=" Processing Log",
                 value="",
                 lines=12,
                 buttons=["copy"]
@@ -327,15 +360,35 @@ def flashvsr_tab(
 
             output_override = gr.Textbox(
                 label="Output Override (folder or .mp4 file)",
-                value=values[1],
+                value=_value("output_override", ""),
                 placeholder="Leave empty for auto naming",
                 info="Optional custom output location. A folder saves into that folder. A .mp4 file path renames the final output to that exact file.",
             )
 
+            output_format = gr.Dropdown(
+                label="Output Format",
+                choices=["mp4"],
+                value=str(_value("output_format", "mp4") or "mp4"),
+                info="FlashVSR+ currently outputs MP4.",
+                interactive=False,
+            )
+
+            with gr.Row():
+                save_metadata = gr.Checkbox(
+                    label="Save Processing Metadata",
+                    value=bool(_value("save_metadata", True)),
+                    info="Save run metadata to output folder."
+                )
+                face_restore_after_upscale = gr.Checkbox(
+                    label="Apply Face Restoration after upscale",
+                    value=bool(_value("face_restore_after_upscale", False)),
+                    info="Per-run face restore toggle. Also respects Global Settings face toggle."
+                )
+
             resume_run_dir = gr.Textbox(
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
-                    values[FLASHVSR_ORDER.index("resume_run_dir")]
+                    _value("resume_run_dir", "")
                     if "resume_run_dir" in FLASHVSR_ORDER and len(values) > FLASHVSR_ORDER.index("resume_run_dir")
                     else ""
                 ),
@@ -347,15 +400,15 @@ def flashvsr_tab(
                 ),
             )
             
-            with gr.Accordion("🎬 Upscaled Output", open=True):
+            with gr.Accordion(" Upscaled Output", open=True):
                 output_video = gr.Video(
-                    label="🎬 Upscaled Video",
+                    label=" Upscaled Video",
                     interactive=False,
                     visible=False,
                     buttons=["download"],
                 )
                 output_image = gr.Image(
-                    label="🖼️ Upscaled Image",
+                    label=" Upscaled Image",
                     interactive=False,
                     visible=False,
                     buttons=["download"],
@@ -363,7 +416,7 @@ def flashvsr_tab(
             
             # Comparison
             image_slider = gr.ImageSlider(
-                label="🔍 Comparison",
+                label=" Comparison",
                 interactive=False,
                 slider_position=50,
                 max_height=1000,
@@ -372,7 +425,7 @@ def flashvsr_tab(
             )
             
             video_comparison_html = gr.HTML(
-                label="🎬 Video Comparison",
+                label=" Video Comparison",
                 value="",
                 js_on_load=get_video_comparison_js_on_load(),
                 visible=False
@@ -380,7 +433,7 @@ def flashvsr_tab(
             
             chunk_status = gr.Markdown("", visible=False)
             chunk_gallery = gr.Gallery(
-                label="🧩 Chunk Preview",
+                label=" Chunk Preview",
                 visible=False,
                 columns=4,
                 rows=2,
@@ -388,13 +441,13 @@ def flashvsr_tab(
                 object_fit="contain",
             )
             chunk_preview_video = gr.Video(
-                label="🎬 Selected Chunk",
+                label=" Selected Chunk",
                 interactive=False,
                 visible=False,
                 buttons=["download"],
             )
             batch_gallery = gr.Gallery(
-                label="📦 Batch Results",
+                label=" Batch Results",
                 visible=False,
                 columns=4,
                 rows=2,
@@ -407,7 +460,7 @@ def flashvsr_tab(
             # Action buttons
             with gr.Row():
                 upscale_btn = gr.Button(
-                    "🚀 Start Upscaling",
+                    " Start Upscaling",
                     variant="primary",
                     size="lg",
                     elem_classes=["action-btn", "action-btn-upscale"],
@@ -418,12 +471,12 @@ def flashvsr_tab(
                     elem_classes=["action-btn", "action-btn-preview"],
                 )
                 cancel_btn = gr.Button(
-                    "⏹️ Cancel",
+                    " Cancel",
                     variant="stop",
                     elem_classes=["action-btn", "action-btn-cancel"],
                 )
             cancel_confirm = gr.Checkbox(
-                label="⚠️ Confirm cancel (required for safety)",
+                label=" Confirm cancel (required for safety)",
                 value=False,
                 info="Enable this checkbox to confirm cancellation of processing"
             )
@@ -431,12 +484,29 @@ def flashvsr_tab(
             # Utility buttons
             with gr.Row():
                 open_outputs_btn = gr.Button(
-                    "📂 Open Outputs",
+                    " Open Outputs",
                     elem_classes=["action-btn", "action-btn-open"],
                 )
                 clear_temp_btn = gr.Button(
-                    "🗑️ Clear Temp",
+                    " Clear Temp",
                     elem_classes=["action-btn", "action-btn-clear"],
+                )
+
+            with gr.Accordion(" Batch Processing", open=False):
+                batch_enable = gr.Checkbox(
+                    label="Enable Batch",
+                    value=bool(_value("batch_enable", False)),
+                    info="Process multiple files"
+                )
+                batch_input = gr.Textbox(
+                    label="Batch Input Folder",
+                    value=_value("batch_input_path", ""),
+                    placeholder="Folder with videos"
+                )
+                batch_output = gr.Textbox(
+                    label="Batch Output Folder",
+                    value=_value("batch_output_path", ""),
+                    placeholder="Output directory"
                 )
             
             # UNIVERSAL PRESET MANAGEMENT
@@ -461,7 +531,7 @@ def flashvsr_tab(
             
             # Info
             gr.Markdown("""
-            #### ℹ️ About FlashVSR+
+            ####  About FlashVSR+
             
             **Real-time Diffusion Video SR:**
             - Streaming processing for memory efficiency
@@ -474,30 +544,12 @@ def flashvsr_tab(
             - Use color fix for accurate colors
             """)
     
-    # Batch processing (optional)
-    with gr.Accordion("📦 Batch Processing", open=False):
-        batch_enable = gr.Checkbox(
-            label="Enable Batch",
-            value=values[17],
-            info="Process multiple files"
-        )
-        batch_input = gr.Textbox(
-            label="Batch Input Folder",
-            value=values[18],
-            placeholder="Folder with videos"
-        )
-        batch_output = gr.Textbox(
-            label="Batch Output Folder",
-            value=values[19],
-            placeholder="Output directory"
-        )
-    
     # Collect inputs
     inputs_list = [
-        input_path, output_override, scale, version, mode,
+        input_path, output_override, output_format, scale, version, mode,
         tiled_vae, tiled_dit, tile_size, overlap, unload_dit,
         color_fix, seed, dtype, device, fps_flashvsr,
-        quality, attention, batch_enable, batch_input, batch_output,
+        quality, attention, save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
     ]
@@ -988,3 +1040,4 @@ def flashvsr_tab(
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }
+

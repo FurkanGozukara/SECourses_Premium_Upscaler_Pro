@@ -66,6 +66,18 @@ def gan_tab(
 
     values = [merged_defaults[k] for k in GAN_ORDER]
 
+    def _value(key: str, default=None):
+        try:
+            idx = GAN_ORDER.index(key)
+            if 0 <= idx < len(values):
+                raw = values[idx]
+                if raw is None and default is not None:
+                    return default
+                return raw
+        except Exception:
+            pass
+        return default
+
     # Only show GAN weights in this tab.
     gan_model_choices = [m for m in service["model_scanner"]() if str(m).strip()]
     if not gan_model_choices:
@@ -77,7 +89,7 @@ def gan_tab(
             }
         )
 
-    gan_model_value = values[4] if len(values) > 4 else ""
+    gan_model_value = _value("model", "")
     if gan_model_choices and gan_model_value not in gan_model_choices:
         gan_model_value = gan_model_choices[0]
 
@@ -169,7 +181,7 @@ def gan_tab(
                         )
                         input_path = gr.Textbox(
                             label="Image/Video Path",
-                            value=values[0],
+                            value=_value("input_path", ""),
                             placeholder="C:/path/to/image.jpg or C:/path/to/video.mp4",
                             info="Direct path to image, video, or frame-sequence folder"
                         )
@@ -205,19 +217,19 @@ def gan_tab(
             with gr.Accordion("Batch Processing", open=False):
                 batch_enable = gr.Checkbox(
                     label="Enable Batch Processing",
-                    value=values[1],
+                    value=bool(_value("batch_enable", False)),
                     info="Process multiple files from directory"
                 )
                 with gr.Row():
                     batch_input = gr.Textbox(
                         label="Batch Input Folder",
-                        value=values[2],
+                        value=_value("batch_input_path", ""),
                         placeholder="Folder containing images/videos",
                         info="Directory with images, videos, or frame-sequence subfolders"
                     )
                     batch_output = gr.Textbox(
                         label="Batch Output Folder",
-                        value=values[3],
+                        value=_value("batch_output_path", ""),
                         placeholder="Output directory for batch results"
                     )
 
@@ -227,7 +239,7 @@ def gan_tab(
                 target_resolution = gr.Slider(
                     label="(Legacy) Target Resolution (longest side) [internal]",
                     minimum=512, maximum=4096, step=64,
-                    value=values[5],
+                    value=_value("target_resolution", 1920),
                     visible=False,
                     interactive=False,
                 )
@@ -235,60 +247,35 @@ def gan_tab(
 
                 downscale_first = gr.Checkbox(
                     label="(Legacy) Downscale First if Needed [internal]",
-                    value=values[6],
+                    value=bool(_value("downscale_first", True)),
                     visible=False,
                     interactive=False,
                 )
 
                 auto_calculate_input = gr.Checkbox(
                     label="(Legacy) Auto-Calculate Input Resolution [internal]",
-                    value=values[7],
+                    value=bool(_value("auto_calculate_input", True)),
                     visible=False,
                     interactive=False,
                 )
 
-                upscale_factor = gr.Number(
-                    label="Upscale x (any factor)",
-                    value=values[21] if len(values) > 21 else 4.0,
-                    precision=2,
-                    info="Target scale factor relative to input. For fixed-scale GAN models, input is pre-downscaled so one model pass reaches the target."
-                )
-
-                with gr.Row():
-                    max_resolution = gr.Slider(
-                        label="Max Resolution (max edge, 0 = no cap)",
-                        minimum=0, maximum=8192, step=16,
-                        value=values[22] if len(values) > 22 else 0,
-                        info="Caps the LONG side (max(width,height)) of the target."
-                    )
-                    pre_downscale_then_upscale = gr.Checkbox(
-                        label="Pre-downscale then upscale (auto when needed)",
-                        value=values[23] if len(values) > 23 else False,
-                        info="For fixed-scale GAN models this is applied automatically when needed to satisfy Upscale-x / Max Resolution without post-resize."
-                    )
-                    use_resolution_tab = gr.Checkbox(
-                        label="Use Resolution & Scene Split Tab Settings",
-                        value=values[8],
-                        info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from the Resolution tab. Recommended ON."
-                    )
-
                 with gr.Row():
                     tile_size = gr.Number(
                         label="Tile Size",
-                        value=values[9],
+                        value=_value("tile_size", 0),
                         precision=0,
                         info="Process image in tiles to reduce VRAM usage. 0 = process whole image. Try 512 for 8GB GPUs, 1024 for 12GB+."
                     )
                     overlap = gr.Number(
                         label="Tile Overlap",
-                        value=values[10],
+                        value=_value("overlap", 32),
                         precision=0,
                         info="Pixels of overlap between tiles to reduce seam artifacts. Must be less than tile size."
                     )
                     batch_size = gr.Slider(
                         label="Batch Size (Frames per Iteration)",
                         minimum=1, maximum=16, step=1,
-                        value=values[16],
+                        value=int(_value("batch_size", 1) or 1),
                         info="Frames processed simultaneously for videos. Higher is faster but uses more VRAM."
                     )
 
@@ -298,31 +285,31 @@ def gan_tab(
                     denoising_strength = gr.Slider(
                         label="Denoising Strength",
                         minimum=0.0, maximum=1.0, step=0.05,
-                        value=values[11],
+                        value=float(_value("denoising_strength", 0.0) or 0.0),
                         info="Reduce noise/compression artifacts. 0 = no denoising, 1 = maximum."
                     )
                     sharpening = gr.Slider(
                         label="Output Sharpening",
                         minimum=0.0, maximum=2.0, step=0.1,
-                        value=values[12],
+                        value=float(_value("sharpening", 0.0) or 0.0),
                         info="Post-process sharpening. 0 = none, 1 = moderate, 2 = strong."
                     )
 
                 with gr.Row():
                     color_correction = gr.Checkbox(
                         label="Color Correction",
-                        value=values[13],
+                        value=bool(_value("color_correction", True)),
                         info="Maintain color accuracy by matching output colors to input."
                     )
                     gpu_acceleration = gr.Checkbox(
                         label="GPU Acceleration",
-                        value=values[14] if cuda_available else False,
+                        value=bool(_value("gpu_acceleration", True)) if cuda_available else False,
                         info=f"{gpu_hint} | Use GPU for processing. CPU fallback is significantly slower.",
                         interactive=cuda_available
                     )
                     gpu_device = gr.Textbox(
                         label="GPU Device",
-                        value=values[15] if cuda_available else "",
+                        value=_value("gpu_device", "0") if cuda_available else "",
                         placeholder="0 or all" if cuda_available else "CUDA not available",
                         info=f"GPU device ID(s). {cuda_count} GPU(s) detected. Single ID (0) for one GPU, 'all' for all available.",
                         interactive=cuda_available
@@ -331,7 +318,7 @@ def gan_tab(
 
             gr.Markdown("#### Output Settings")
             with gr.Group():
-                output_format_default = str(values[17]).strip().lower()
+                output_format_default = str(_value("output_format", "png")).strip().lower()
                 if output_format_default not in {"auto", "png", "jpg", "webp"}:
                     output_format_default = "png"
                 with gr.Row():
@@ -344,24 +331,84 @@ def gan_tab(
                     output_quality_gan = gr.Slider(
                         label="Output Quality",
                         minimum=70, maximum=100, step=5,
-                        value=values[18],
+                        value=int(_value("output_quality", 100) or 100),
                         info="Quality for lossy formats (JPG/WebP)"
                     )
 
                 with gr.Row():
                     save_metadata = gr.Checkbox(
                         label="Save Processing Metadata",
-                        value=values[19],
+                        value=bool(_value("save_metadata", True)),
                         info="Embed processing information in output files"
+                    )
+                    fps_override = gr.Number(
+                        label="FPS Override (0 = use source FPS)",
+                        value=float(_value("fps_override", 0) or 0),
+                        precision=2,
+                        info="Override output video FPS. 0 preserves source FPS."
+                    )
+
+                with gr.Row():
+                    face_restore_after_upscale = gr.Checkbox(
+                        label="Apply Face Restoration after upscale",
+                        value=bool(_value("face_restore_after_upscale", False)),
+                        info="Per-run face restore toggle. Also respects Global Settings face toggle."
                     )
                     create_subfolders = gr.Checkbox(
                         label="Create Subfolders by Model",
-                        value=values[20],
+                        value=bool(_value("create_subfolders", False)),
                         info="Organize outputs in model-named subdirectories"
                     )
 
         with gr.Column(scale=2):
             gr.Markdown("### Output / Actions")
+
+            with gr.Group():
+                _upscale_factor_default = _value("upscale_factor", 4.0)
+                try:
+                    _upscale_factor_default = float(_upscale_factor_default)
+                except Exception:
+                    _upscale_factor_default = 4.0
+                _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
+
+                _max_resolution_default = _value("max_resolution", 0)
+                try:
+                    _max_resolution_default = int(_max_resolution_default)
+                except Exception:
+                    _max_resolution_default = 0
+                _max_resolution_default = min(8192, max(0, _max_resolution_default))
+
+                with gr.Row():
+                    upscale_factor = gr.Slider(
+                        label="Upscale x (any factor)",
+                        minimum=1.0,
+                        maximum=9.9,
+                        step=0.1,
+                        value=_upscale_factor_default,
+                        info="e.g., 4.0 = 4x. Target size is computed from input, then capped by Max Resolution (max edge).",
+                        scale=2,
+                    )
+                    max_resolution = gr.Slider(
+                        label="Max Resolution (max edge, 0 = no cap)",
+                        minimum=0,
+                        maximum=8192,
+                        step=16,
+                        value=_max_resolution_default,
+                        info="Caps the LONG side (max(width,height)) of the target. 0 = unlimited.",
+                        scale=2,
+                    )
+                    pre_downscale_then_upscale = gr.Checkbox(
+                        label="Pre-downscale then upscale (when capped)",
+                        value=bool(_value("pre_downscale_then_upscale", False)),
+                        info="If max edge would reduce effective scale, downscale input first so the model still runs at the full Upscale x.",
+                        scale=1,
+                    )
+
+                use_resolution_tab = gr.Checkbox(
+                    label="Use Resolution & Scene Split Tab Settings",
+                    value=bool(_value("use_resolution_tab", True)),
+                    info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from the Resolution tab. Recommended ON.",
+                )
 
             status_box = gr.Markdown(value="Ready for processing.")
             progress_indicator = gr.Markdown(value="", visible=True)
@@ -372,10 +419,17 @@ def gan_tab(
                 buttons=["copy"]
             )
 
+            output_override = gr.Textbox(
+                label="Output Override (single run)",
+                value=_value("output_override", ""),
+                placeholder="Leave empty for auto naming",
+                info="Optional output folder override for this run. Ignored when resume mode is active.",
+            )
+
             resume_run_dir = gr.Textbox(
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
-                    values[GAN_ORDER.index("resume_run_dir")]
+                    _value("resume_run_dir", "")
                     if "resume_run_dir" in GAN_ORDER and len(values) > GAN_ORDER.index("resume_run_dir")
                     else ""
                 ),
@@ -521,14 +575,14 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 25 components (includes vNext sizing + resume path)
+    # Current count: 28 components (includes shared output controls + vNext sizing + resume path)
     # ============================================================================
     
     inputs_list = [
-        input_path, batch_enable, batch_input, batch_output, gan_model,
+        input_path, output_override, batch_enable, batch_input, batch_output, gan_model,
         target_resolution, downscale_first, auto_calculate_input, use_resolution_tab, tile_size, overlap,
         denoising_strength, sharpening, color_correction, gpu_acceleration, gpu_device,
-        batch_size, output_format_gan, output_quality_gan, save_metadata, create_subfolders,
+        batch_size, output_format_gan, output_quality_gan, save_metadata, fps_override, face_restore_after_upscale, create_subfolders,
         # vNext sizing
         upscale_factor, max_resolution, pre_downscale_then_upscale,
         # Resume path (chunk/scene mode)

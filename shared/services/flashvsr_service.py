@@ -117,6 +117,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     return {
         "input_path": "",
         "output_override": "",
+        "output_format": "mp4",
         "scale": scale,
         "version": version,
         "mode": mode,
@@ -132,6 +133,8 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "fps": 30,
         "quality": 6,
         "attention": default_attention,
+        "save_metadata": True,
+        "face_restore_after_upscale": False,
         "batch_enable": False,
         "batch_input_path": "",
         "batch_output_path": "",
@@ -147,6 +150,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
 FLASHVSR_ORDER: List[str] = [
     "input_path",
     "output_override",
+    "output_format",
     "scale",
     "version",
     "mode",
@@ -162,6 +166,8 @@ FLASHVSR_ORDER: List[str] = [
     "fps",
     "quality",
     "attention",
+    "save_metadata",
+    "face_restore_after_upscale",
     "batch_enable",
     "batch_input_path",
     "batch_output_path",
@@ -191,6 +197,9 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     - Valid version/mode/scale combinations
     """
     cfg = cfg.copy()
+    cfg["output_format"] = "mp4"
+    cfg["save_metadata"] = bool(cfg.get("save_metadata", defaults.get("save_metadata", True)))
+    cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", defaults.get("face_restore_after_upscale", False)))
     # Dropdown-safe normalization to avoid Gradio choice mismatches.
     try:
         cfg["scale"] = "2" if str(cfg.get("scale", defaults.get("scale", "4"))).strip() == "2" else "4"
@@ -406,7 +415,7 @@ def build_flashvsr_callbacks(
                 settings["fps"] = seed_controls["fps_override_val"]
             if seed_controls.get("comparison_mode_val"):
                 settings["_comparison_mode"] = seed_controls["comparison_mode_val"]
-            if seed_controls.get("save_metadata_val") is not None:
+            if ("save_metadata" not in settings_dict or settings.get("save_metadata") is None) and seed_controls.get("save_metadata_val") is not None:
                 settings["save_metadata"] = seed_controls["save_metadata_val"]
             # Audio mux preferences (used by chunking + final output postprocessing)
             if seed_controls.get("audio_codec_val") is not None:
@@ -426,6 +435,9 @@ def build_flashvsr_callbacks(
                 ):
                     if output_settings.get(key) is not None:
                         settings[key] = output_settings.get(key)
+
+            face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
+            face_strength = float(global_settings.get("face_strength", 0.5))
             
             # Clear cancel event
             _flashvsr_cancel_event.clear()
@@ -640,9 +652,6 @@ def build_flashvsr_callbacks(
                 if not items:
                     # If the batch folder itself is a frame directory, treat it as a single job.
                     items = [in_dir]
-
-                face_apply = bool(global_settings.get("face_global", False))
-                face_strength = float(global_settings.get("face_strength", 0.5))
 
                 # Universal chunking (Resolution tab) applies to FlashVSR+ batch runs too.
                 auto_chunk = bool(seed_controls.get("auto_chunk", True))
@@ -1244,9 +1253,7 @@ def build_flashvsr_callbacks(
             thread = threading.Thread(target=processing_thread, daemon=True)
             thread.start()
             
-            # Apply face restoration if globally enabled
-            face_apply = global_settings.get("face_global", False)
-            face_strength = global_settings.get("face_strength", 0.5)
+            # Apply face restoration if enabled (per-run toggle OR global setting)
             
             # Stream progress updates
             last_update = time.time()
@@ -1377,10 +1384,8 @@ def build_flashvsr_callbacks(
             if progress:
                 progress(1.0, desc="FlashVSR+ complete!")
             
-            # Apply face restoration if globally enabled
+            # Apply face restoration if enabled (per-run toggle OR global setting)
             output_path = result.output_path
-            face_apply = global_settings.get("face_global", False)
-            face_strength = global_settings.get("face_strength", 0.5)
             
             if face_apply and output_path and Path(output_path).exists():
                 from shared.face_restore import restore_video, restore_image

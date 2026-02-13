@@ -181,6 +181,7 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
 
     return {
         "input_path": "",
+        "output_override": "",
         "batch_enable": False,
         "batch_input_path": "",
         "batch_output_path": "",
@@ -204,6 +205,8 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "output_format": "png",
         "output_quality": 100,
         "save_metadata": True,
+        "fps_override": 0,
+        "face_restore_after_upscale": False,
         "create_subfolders": False,
         "resume_run_dir": "",
     }
@@ -223,6 +226,7 @@ MUST match inputs_list order in ui/gan_tab.py.
 
 GAN_ORDER: List[str] = [
     "input_path",
+    "output_override",
     "batch_enable",
     "batch_input_path",
     "batch_output_path",
@@ -242,6 +246,8 @@ GAN_ORDER: List[str] = [
     "output_format",
     "output_quality",
     "save_metadata",
+    "fps_override",
+    "face_restore_after_upscale",
     "create_subfolders",
     # vNext sizing (app-level; preserves backward compatibility by appending)
     "upscale_factor",
@@ -828,7 +834,7 @@ def build_gan_callbacks(
                 settings["resume_run_dir"] = ""
             if settings.get("batch_enable"):
                 settings["resume_run_dir"] = ""
-            settings["output_override"] = settings.get("output_override")
+            settings["output_override"] = str(settings.get("output_override") or "").strip()
             settings["cuda_device"] = settings.get("cuda_device", "")
 
             # Pull latest global paths in case user changed them in Global tab
@@ -972,9 +978,8 @@ def build_gan_callbacks(
                 )
                 return
 
-            # Face restoration is controlled ONLY by global setting (no per-run toggle in GAN tab)
-            # GAN tab doesn't have a face_restore checkbox, so we only use global setting
-            face_apply = global_settings.get("face_global", False)
+            # Per-run toggle matches SeedVR2 behavior: local OR global face restore enables post-pass.
+            face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))
             backend_val = settings.get("backend", "realesrgan")
             

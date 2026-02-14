@@ -79,6 +79,57 @@ def _save_preprocessed_artifact(pre_path: Path, output_path_str: str) -> Optiona
         return None
 
 
+def _apply_image_output_preferences(
+    image_path: Optional[str],
+    image_output_format: Any,
+    image_output_quality: Any,
+) -> Optional[str]:
+    """Convert a finalized image output to the globally configured format/quality."""
+    if not image_path:
+        return image_path
+    try:
+        src = Path(str(image_path))
+        if (not src.exists()) or src.is_dir():
+            return image_path
+
+        fmt = str(image_output_format or "png").strip().lower()
+        if fmt not in {"png", "jpg", "webp"}:
+            fmt = "png"
+
+        try:
+            quality = int(float(image_output_quality or 95))
+        except Exception:
+            quality = 95
+        quality = max(1, min(100, quality))
+
+        target_ext = ".jpg" if fmt == "jpg" else f".{fmt}"
+        needs_reencode = src.suffix.lower() != target_ext or fmt in {"jpg", "webp"}
+        if not needs_reencode:
+            return image_path
+
+        from PIL import Image
+
+        dst = collision_safe_path(src.with_suffix(target_ext))
+        with Image.open(src) as img:
+            if fmt == "jpg":
+                img = img.convert("RGB")
+                img.save(dst, format="JPEG", quality=quality)
+            elif fmt == "webp":
+                img.save(dst, format="WEBP", quality=quality)
+            else:
+                img.save(dst, format="PNG")
+
+        try:
+            if dst.resolve() != src.resolve():
+                src.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return str(dst)
+    except Exception:
+        return image_path
+
+
 def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Get default FlashVSR+ settings aligned with CLI defaults.
@@ -415,8 +466,35 @@ def build_flashvsr_callbacks(
                 settings["fps"] = seed_controls["fps_override_val"]
             if seed_controls.get("comparison_mode_val"):
                 settings["_comparison_mode"] = seed_controls["comparison_mode_val"]
-            if ("save_metadata" not in settings_dict or settings.get("save_metadata") is None) and seed_controls.get("save_metadata_val") is not None:
-                settings["save_metadata"] = seed_controls["save_metadata_val"]
+            settings["save_metadata"] = bool(
+                seed_controls.get(
+                    "save_metadata_val",
+                    output_settings.get("save_metadata", settings.get("save_metadata", True)),
+                )
+            )
+            image_fmt = str(
+                seed_controls.get(
+                    "image_output_format_val",
+                    output_settings.get("image_output_format", "png"),
+                )
+                or "png"
+            ).strip().lower()
+            if image_fmt not in {"png", "jpg", "webp"}:
+                image_fmt = "png"
+            settings["image_output_format"] = image_fmt
+            try:
+                image_quality = int(
+                    float(
+                        seed_controls.get(
+                            "image_output_quality_val",
+                            output_settings.get("image_output_quality", 95),
+                        )
+                        or 95
+                    )
+                )
+            except Exception:
+                image_quality = 95
+            settings["image_output_quality"] = max(1, min(100, image_quality))
             # Audio mux preferences (used by chunking + final output postprocessing)
             if seed_controls.get("audio_codec_val") is not None:
                 settings["audio_codec"] = seed_controls.get("audio_codec_val") or "copy"
@@ -831,6 +909,16 @@ def build_flashvsr_callbacks(
                             except Exception:
                                 pass
 
+                        # Apply global image output format/quality preferences.
+                        if Path(outp).suffix.lower() in image_exts:
+                            converted = _apply_image_output_preferences(
+                                outp,
+                                settings.get("image_output_format", "png"),
+                                settings.get("image_output_quality", 95),
+                            )
+                            if converted and Path(converted).exists():
+                                outp = converted
+
                         # Save preprocessed input (if created) alongside outputs
                         pre_in = item_settings.get("_preprocessed_input_path")
                         if pre_in and outp:
@@ -889,37 +977,38 @@ def build_flashvsr_callbacks(
                         logs.append(f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed")
 
                     # Log run summary per-item
-                    try:
-                        run_logger.write_summary(
-                            Path(outp) if outp else output_dir,
-                            {
-                                "input": item_path,
-                                "output": outp,
-                                "returncode": result.returncode,
-                                "args": item_settings,
-                                "face_apply": face_apply,
-                                "face_strength": face_strength,
-                                "pipeline": "flashvsr",
-                                "batch": True,
-                                **(
-                                    {
-                                        "chunking": {
-                                            "mode": "auto" if auto_chunk else "static",
-                                            "chunk_size_sec": 0.0 if auto_chunk else float(chunk_size_sec or 0),
-                                            "chunk_overlap_sec": 0.0 if auto_chunk else float(chunk_overlap_sec or 0),
-                                            "scene_threshold": float(scene_threshold or 27.0),
-                                            "min_scene_len": float(min_scene_len or 1.0),
-                                            "chunks": int(chunk_count_item or 0),
-                                            "frame_accurate_split": bool(frame_accurate_split),
+                    if bool(item_settings.get("save_metadata", True)):
+                        try:
+                            run_logger.write_summary(
+                                Path(outp) if outp else output_dir,
+                                {
+                                    "input": item_path,
+                                    "output": outp,
+                                    "returncode": result.returncode,
+                                    "args": item_settings,
+                                    "face_apply": face_apply,
+                                    "face_strength": face_strength,
+                                    "pipeline": "flashvsr",
+                                    "batch": True,
+                                    **(
+                                        {
+                                            "chunking": {
+                                                "mode": "auto" if auto_chunk else "static",
+                                                "chunk_size_sec": 0.0 if auto_chunk else float(chunk_size_sec or 0),
+                                                "chunk_overlap_sec": 0.0 if auto_chunk else float(chunk_overlap_sec or 0),
+                                                "scene_threshold": float(scene_threshold or 27.0),
+                                                "min_scene_len": float(min_scene_len or 1.0),
+                                                "chunks": int(chunk_count_item or 0),
+                                                "frame_accurate_split": bool(frame_accurate_split),
+                                            }
                                         }
-                                    }
-                                    if chunk_count_item
-                                    else {}
-                                ),
-                            },
-                        )
-                    except Exception:
-                        pass
+                                        if chunk_count_item
+                                        else {}
+                                    ),
+                                },
+                            )
+                        except Exception:
+                            pass
 
                 if progress:
                     progress(1.0, desc=f"Batch complete ({len(outputs)}/{len(items)} succeeded)")
@@ -1409,6 +1498,20 @@ def build_flashvsr_callbacks(
                         output_path = restored_img
                         log_buffer.append(f"✅ Face restoration complete: {restored_img}")
 
+            # Apply global image output format/quality preferences.
+            if output_path and Path(output_path).exists() and Path(output_path).suffix.lower() in image_exts:
+                converted = _apply_image_output_preferences(
+                    output_path,
+                    settings.get("image_output_format", "png"),
+                    settings.get("image_output_quality", 95),
+                )
+                if converted and Path(converted).exists() and converted != output_path:
+                    output_path = converted
+                    log_buffer.append(
+                        f"Converted image output to {Path(converted).suffix.lower()} "
+                        f"(quality {int(settings.get('image_output_quality', 95) or 95)})."
+                    )
+
             # Save preprocessed input (if we created one) alongside outputs
             pre_in = settings.get("_preprocessed_input_path")
             if pre_in and output_path:
@@ -1502,33 +1605,34 @@ def build_flashvsr_callbacks(
                     pass
             
             # Log run
-            run_logger.write_summary(
-                Path(output_path) if output_path else output_dir,
-                {
-                    "input": input_path,
-                    "output": output_path,
-                    "returncode": result.returncode,
-                    "args": settings,
-                    "face_apply": face_apply,
-                    "face_strength": face_strength,
-                    "pipeline": "flashvsr",
-                    **(
-                        {
-                            "chunking": {
-                                "mode": "auto" if auto_chunk else "static",
-                                "chunk_size_sec": 0.0 if auto_chunk else float(chunk_size_sec or 0),
-                                "chunk_overlap_sec": 0.0 if auto_chunk else float(chunk_overlap_sec or 0),
-                                "scene_threshold": float(scene_threshold or 27.0),
-                                "min_scene_len": float(min_scene_len or 1.0),
-                                "chunks": chunk_count,
-                                "frame_accurate_split": bool(frame_accurate_split),
+            if bool(settings.get("save_metadata", True)):
+                run_logger.write_summary(
+                    Path(output_path) if output_path else output_dir,
+                    {
+                        "input": input_path,
+                        "output": output_path,
+                        "returncode": result.returncode,
+                        "args": settings,
+                        "face_apply": face_apply,
+                        "face_strength": face_strength,
+                        "pipeline": "flashvsr",
+                        **(
+                            {
+                                "chunking": {
+                                    "mode": "auto" if auto_chunk else "static",
+                                    "chunk_size_sec": 0.0 if auto_chunk else float(chunk_size_sec or 0),
+                                    "chunk_overlap_sec": 0.0 if auto_chunk else float(chunk_overlap_sec or 0),
+                                    "scene_threshold": float(scene_threshold or 27.0),
+                                    "min_scene_len": float(min_scene_len or 1.0),
+                                    "chunks": chunk_count,
+                                    "frame_accurate_split": bool(frame_accurate_split),
+                                }
                             }
-                        }
-                        if chunk_count > 0
-                        else {}
-                    ),
-                }
-            )
+                            if chunk_count > 0
+                            else {}
+                        ),
+                    }
+                )
             
             if chunk_count > 0:
                 status = (

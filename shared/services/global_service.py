@@ -50,7 +50,6 @@ def apply_global_settings_live(
     output_dir_val: str,
     temp_dir_val: str,
     telemetry_enabled: bool,
-    face_global: bool,
     face_strength: float,
     queue_enabled: bool,
     mode_choice: str,
@@ -68,7 +67,14 @@ def apply_global_settings_live(
     """
     state = state or {}
     seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
-    pinned_ref = seed_controls.get("pinned_reference_path") or global_settings.get("pinned_reference_path")
+    seed_controls = seed_controls if isinstance(seed_controls, dict) else {}
+    state_global_settings = seed_controls.get("global_settings", {})
+    state_global_settings = state_global_settings if isinstance(state_global_settings, dict) else {}
+    pinned_ref = state_global_settings.get(
+        "pinned_reference_path",
+        seed_controls.get("pinned_reference_path") or global_settings.get("pinned_reference_path"),
+    )
+    face_global_enabled = bool(state_global_settings.get("face_global", global_settings.get("face_global", False)))
 
     old_models = str(global_settings.get("models_dir") or "")
     old_hf = str(global_settings.get("hf_home") or "")
@@ -93,7 +99,8 @@ def apply_global_settings_live(
             "output_dir": output_dir,
             "temp_dir": temp_dir,
             "telemetry": bool(telemetry_enabled),
-            "face_global": bool(face_global),
+            # Face global on/off remains managed from Face tab, but still persists in unified presets.
+            "face_global": face_global_enabled,
             "face_strength": float(face_strength),
             "queue_enabled": bool(queue_enabled),
             "mode": actual_mode,
@@ -118,8 +125,24 @@ def apply_global_settings_live(
 
     if isinstance(state, dict):
         state.setdefault("seed_controls", {})
-        state["seed_controls"]["face_strength_val"] = float(face_strength)
-        state["seed_controls"]["queue_enabled_val"] = bool(queue_enabled)
+        seed_controls = state["seed_controls"] if isinstance(state["seed_controls"], dict) else {}
+        state["seed_controls"] = seed_controls
+        seed_controls["face_strength_val"] = float(face_strength)
+        seed_controls["queue_enabled_val"] = bool(queue_enabled)
+        seed_controls["pinned_reference_path"] = pinned_ref
+        seed_controls["global_settings"] = {
+            "output_dir": output_dir,
+            "temp_dir": temp_dir,
+            "telemetry": bool(telemetry_enabled),
+            "face_global": face_global_enabled,
+            "face_strength": float(face_strength),
+            "queue_enabled": bool(queue_enabled),
+            "mode": actual_mode,
+            "models_dir": models_dir,
+            "hf_home": hf_home,
+            "transformers_cache": transformers_cache,
+            "pinned_reference_path": pinned_ref,
+        }
 
     changed_restart_keys: list[str] = []
     if models_dir != old_models:
@@ -130,7 +153,7 @@ def apply_global_settings_live(
         changed_restart_keys.append("TRANSFORMERS_CACHE")
 
     status = (
-        "Applied immediately and saved to global config.\n"
+        "Applied immediately and saved to global settings.\n"
         f"Active mode: {actual_mode}"
         f"{_build_restart_note(changed_restart_keys)}"
     )
@@ -141,7 +164,6 @@ def save_global_settings(
     output_dir_val: str,
     temp_dir_val: str,
     telemetry_enabled: bool,
-    face_global: bool,
     face_strength: float,
     queue_enabled: bool,
     models_dir_val: str,
@@ -160,7 +182,6 @@ def save_global_settings(
         output_dir_val=output_dir_val,
         temp_dir_val=temp_dir_val,
         telemetry_enabled=telemetry_enabled,
-        face_global=face_global,
         face_strength=face_strength,
         queue_enabled=queue_enabled,
         mode_choice=str(global_settings.get("mode", "subprocess")),
@@ -191,7 +212,6 @@ def apply_mode_selection(
         output_dir_val=str(global_settings.get("output_dir", "")),
         temp_dir_val=str(global_settings.get("temp_dir", "")),
         telemetry_enabled=bool(global_settings.get("telemetry", True)),
-        face_global=bool(global_settings.get("face_global", False)),
         face_strength=float(global_settings.get("face_strength", 0.5)),
         queue_enabled=bool(global_settings.get("queue_enabled", True)),
         mode_choice=mode_choice,

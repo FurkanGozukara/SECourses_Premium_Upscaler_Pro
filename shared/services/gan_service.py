@@ -243,10 +243,6 @@ GAN_ORDER: List[str] = [
     "gpu_acceleration",
     "gpu_device",
     "batch_size",
-    "output_format",
-    "output_quality",
-    "save_metadata",
-    "fps_override",
     "face_restore_after_upscale",
     "create_subfolders",
     # vNext sizing (app-level; preserves backward compatibility by appending)
@@ -982,13 +978,43 @@ def build_gan_callbacks(
             face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))
             backend_val = settings.get("backend", "realesrgan")
-            
-            # NOTE: GAN tab's `output_format` is image-specific (auto/png/jpg/webp). Do NOT override it from the
-            # global Output tab (auto/mp4/png), otherwise image runs can break (e.g., output_format="mp4").
-            if (not settings.get("fps_override")) or float(settings.get("fps_override") or 0) == 0:
-                cached_fps = seed_controls.get("fps_override_val")
-                if cached_fps:
-                    settings["fps_override"] = cached_fps
+
+            # Apply shared Output-tab image settings (global source of truth for image saves).
+            image_fmt = str(
+                seed_controls.get(
+                    "image_output_format_val",
+                    output_settings.get("image_output_format", settings.get("output_format", "png")),
+                )
+                or "png"
+            ).strip().lower()
+            if image_fmt not in {"png", "jpg", "webp"}:
+                image_fmt = "png"
+            settings["output_format"] = image_fmt
+            try:
+                image_quality = int(
+                    float(
+                        seed_controls.get(
+                            "image_output_quality_val",
+                            output_settings.get("image_output_quality", settings.get("output_quality", 95)),
+                        )
+                        or 95
+                    )
+                )
+            except Exception:
+                image_quality = 95
+            settings["output_quality"] = max(1, min(100, image_quality))
+
+            settings["save_metadata"] = bool(
+                seed_controls.get(
+                    "save_metadata_val",
+                    output_settings.get("save_metadata", settings.get("save_metadata", True)),
+                )
+            )
+            if seed_controls.get("fps_override_val") is not None:
+                try:
+                    settings["fps_override"] = float(seed_controls.get("fps_override_val") or 0)
+                except Exception:
+                    settings["fps_override"] = 0.0
             # Audio mux preferences (used by chunking + final output postprocessing)
             if seed_controls.get("audio_codec_val") is not None:
                 settings["audio_codec"] = seed_controls.get("audio_codec_val") or "copy"
@@ -1316,27 +1342,28 @@ def build_gan_callbacks(
                             except Exception:
                                 pass
 
-                        try:
-                            run_logger.write_summary(
-                                Path(outp) if outp else current_output_dir,
-                                {
-                                    "input": runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path"),
-                                    "output": outp,
-                                    "returncode": rc,
-                                    "args": chunk_settings,
-                                    "face_apply": face_apply,
-                                    "pipeline": "gan",
-                                    "chunking": {
-                                        "mode": "auto" if auto_chunk else "static",
-                                        "chunk_size_sec": 0.0 if auto_chunk else chunk_size_sec,
-                                        "scene_threshold": scene_threshold,
-                                        "min_scene_len": min_scene_len,
-                                        "chunks": chunk_count,
+                        if bool(chunk_settings.get("save_metadata", True)):
+                            try:
+                                run_logger.write_summary(
+                                    Path(outp) if outp else current_output_dir,
+                                    {
+                                        "input": runtime_settings.get("_original_input_path_before_preprocess") or runtime_settings.get("input_path"),
+                                        "output": outp,
+                                        "returncode": rc,
+                                        "args": chunk_settings,
+                                        "face_apply": face_apply,
+                                        "pipeline": "gan",
+                                        "chunking": {
+                                            "mode": "auto" if auto_chunk else "static",
+                                            "chunk_size_sec": 0.0 if auto_chunk else chunk_size_sec,
+                                            "scene_threshold": scene_threshold,
+                                            "min_scene_len": min_scene_len,
+                                            "chunks": chunk_count,
+                                        },
                                     },
-                                },
-                            )
-                        except Exception:
-                            pass
+                                )
+                            except Exception:
+                                pass
 
                         try:
                             seed_controls["gan_chunk_preview"] = build_chunk_preview_payload(str(run_output_root))
@@ -1504,21 +1531,22 @@ def build_gan_callbacks(
                         seed_controls["last_output_path"] = str(outp) if outp.is_file() else None
                     except Exception:
                         pass
-                try:
-                    run_logger.write_summary(
-                        Path(final_out_path) if final_out_path else run_output_root,
-                        {
-                            "input": runtime_settings.get("_original_input_path_before_preprocess")
-                            or runtime_settings.get("input_path"),
-                            "output": final_out_path,
-                            "returncode": result.returncode,
-                            "args": runtime_settings,
-                            "face_apply": face_apply,
-                            "pipeline": "gan",
-                        },
-                    )
-                except Exception:
-                    pass
+                if bool(runtime_settings.get("save_metadata", True)):
+                    try:
+                        run_logger.write_summary(
+                            Path(final_out_path) if final_out_path else run_output_root,
+                            {
+                                "input": runtime_settings.get("_original_input_path_before_preprocess")
+                                or runtime_settings.get("input_path"),
+                                "output": final_out_path,
+                                "returncode": result.returncode,
+                                "args": runtime_settings,
+                                "face_apply": face_apply,
+                                "pipeline": "gan",
+                            },
+                        )
+                    except Exception:
+                        pass
                 cmp_html = ""
                 slider_update = gr.update(value=None)
                 if final_out_path:

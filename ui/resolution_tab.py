@@ -6,6 +6,7 @@ UPDATED: Uses Universal Preset System
 import gradio as gr
 from pathlib import Path
 
+from shared.path_dialogs import get_any_file_path
 from shared.services.resolution_service import (
     build_resolution_callbacks, RESOLUTION_ORDER
 )
@@ -121,7 +122,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
             with gr.Group():
                 with gr.Row():
                     auto_detect_scenes = gr.Checkbox(
-                        label="🎬 Auto Detect Scenes (on input)",
+                        label="Auto Detect Scenes (on input)",
                         value=values[3],
                         info="When Auto Chunk is ON and input is a video, auto-scan scene cuts to show the scene count. Can be slow for long videos."
                     )
@@ -207,14 +208,22 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
             gr.Markdown("#### Estimate & Preview")
             
             # Input path for estimation
-            calc_input_path = gr.Textbox(
-                label="Input Path (for estimation)",
-                placeholder="Paste input video/image path or use SeedVR2 tab input",
-                info="Path to estimate scene/chunk splitting for"
-            )
+            with gr.Row(equal_height=True):
+                calc_input_path = gr.Textbox(
+                    label="Input Path (for estimation)",
+                    placeholder="Paste input video/image path or use a Quick Action button below",
+                    info="Path to estimate scene/chunk splitting for",
+                    scale=20,
+                )
+                calc_input_browse_btn = gr.Button(
+                    "📂",
+                    size="lg",
+                    elem_id="open_folder_small",
+                    scale=1,
+                )
             
             with gr.Row():
-                calc_chunks_btn = gr.Button("📊 Estimate Chunks", variant="primary")
+                calc_chunks_btn = gr.Button("Estimate Chunks", variant="primary")
             
             # Results display
             calc_result = gr.Markdown("", visible=False)
@@ -223,10 +232,24 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
             disk_space_warning = gr.Markdown("", visible=False)
             
             # Quick actions
-            gr.Markdown("#### ⚡ Quick Actions")
+            gr.Markdown("#### Quick Actions")
             
-            with gr.Row():
-                use_seedvr2_input_btn = gr.Button("📥 Use SeedVR2 Input", size="lg")
+            with gr.Row(equal_height=True, elem_classes=["quick-actions-row"]):
+                use_seedvr2_input_btn = gr.Button(
+                    "Use SeedVR2 Input",
+                    size="lg",
+                    elem_classes=["action-btn", "action-btn-source-seed"],
+                )
+                use_gan_input_btn = gr.Button(
+                    "Use GAN Input",
+                    size="lg",
+                    elem_classes=["action-btn", "action-btn-source-gan"],
+                )
+                use_flashvsr_input_btn = gr.Button(
+                    "Use FlashVSR Input",
+                    size="lg",
+                    elem_classes=["action-btn", "action-btn-source-flash"],
+                )
 
     # UNIVERSAL PRESET MANAGEMENT
     (
@@ -326,7 +349,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         if not input_path or not input_path.strip():
             input_path = state.get("seed_controls", {}).get("last_input_path", "")
             if not input_path:
-                return gr.update(value="⚠️ No input path provided", visible=True), state, gr.update(visible=False)
+                return gr.update(value="WARNING: No input path provided", visible=True), state, gr.update(visible=False)
         
         info, updated_state = service["calculate_chunk_estimate"](
             input_path,
@@ -337,8 +360,9 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         )
         
         # Check for disk space warnings in the info
-        if "⚠️" in info and "disk space" in info.lower():
-            disk_warning = "⚠️ **DISK SPACE WARNING**: Insufficient space detected!"
+        info_lower = str(info or "").lower()
+        if "disk space" in info_lower and ("warning" in info_lower or "⚠" in str(info) or "âš" in str(info)):
+            disk_warning = "WARNING: Insufficient disk space detected!"
             return gr.update(value=info, visible=True), updated_state, gr.update(value=disk_warning, visible=True)
         
         return gr.update(value=info, visible=True), updated_state, gr.update(visible=False)
@@ -349,24 +373,48 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         outputs=[calc_result, shared_state, disk_space_warning]
     )
 
-    # Use SeedVR2 input button
-    def use_seedvr2_input(state):
-        input_path = state.get("seed_controls", {}).get("last_input_path", "")
+    calc_input_browse_btn.click(
+        fn=get_any_file_path,
+        inputs=[calc_input_path],
+        outputs=[calc_input_path],
+    )
+
+    # Quick Action input buttons (pull from per-tab cached settings)
+    def use_tab_input(state, tab_settings_key: str, tab_label: str):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        tab_settings = seed_controls.get(tab_settings_key, {}) if isinstance(seed_controls, dict) else {}
+        input_path = ""
+        if isinstance(tab_settings, dict):
+            input_path = str(tab_settings.get("input_path", "") or "").strip()
+
         if input_path:
-            return gr.update(value=input_path), gr.update(value=f"✅ Using input from SeedVR2 tab: {input_path}", visible=True)
-        else:
-            return gr.update(), gr.update(value="⚠️ No input set in SeedVR2 tab yet", visible=True)
+            return (
+                gr.update(value=input_path),
+                gr.update(value=f"✅ Using input from {tab_label} tab: {input_path}", visible=True),
+            )
+        return gr.update(), gr.update(value=f"⚠️ No input set in {tab_label} tab yet", visible=True)
 
     use_seedvr2_input_btn.click(
-        fn=use_seedvr2_input,
+        fn=lambda state: use_tab_input(state, "seedvr2_settings", "SeedVR2"),
         inputs=shared_state,
         outputs=[calc_input_path, calc_result]
     )
 
+    use_gan_input_btn.click(
+        fn=lambda state: use_tab_input(state, "gan_settings", "GAN"),
+        inputs=shared_state,
+        outputs=[calc_input_path, calc_result]
+    )
+
+    use_flashvsr_input_btn.click(
+        fn=lambda state: use_tab_input(state, "flashvsr_settings", "FlashVSR"),
+        inputs=shared_state,
+        outputs=[calc_input_path, calc_result]
+    )
     # Auto-update estimation hint when chunk settings change
     for component in [auto_detect_scenes, auto_chunk, chunk_size, chunk_overlap, scene_threshold, min_scene_len]:
         component.change(
-            fn=lambda *args: gr.update(value="ℹ️ Settings changed. Click 'Estimate Chunks' to update.", visible=True),
+            fn=lambda *args: gr.update(value="INFO: Settings changed. Click 'Estimate Chunks' to update.", visible=True),
             outputs=calc_result
         )
 

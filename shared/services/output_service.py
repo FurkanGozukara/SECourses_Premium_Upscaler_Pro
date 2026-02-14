@@ -19,6 +19,12 @@ def output_defaults(models: List[str]) -> Dict[str, Any]:
         "png_padding": 6,  # Match SeedVR2 CLI default (6-digit padding)
         "png_keep_basename": True,
         "fps_override": 0,
+        # Global image output settings (applies to image results from all model tabs).
+        "image_output_format": "png",
+        "image_output_quality": 95,
+        # SeedVR2 encoding controls moved from SeedVR2 tab into global Output tab.
+        "seedvr2_video_backend": "opencv",
+        "seedvr2_use_10bit": False,
         "video_codec": "h264",
         "video_quality": 18,
         "video_preset": "medium",
@@ -56,6 +62,10 @@ OUTPUT_ORDER: List[str] = [
     "png_padding",
     "png_keep_basename",
     "fps_override",
+    "image_output_format",
+    "image_output_quality",
+    "seedvr2_video_backend",
+    "seedvr2_use_10bit",
     "video_codec",
     "video_quality",
     "video_preset",
@@ -93,6 +103,26 @@ def _output_dict_from_args(args: List[Any]) -> Dict[str, Any]:
 
 def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    cfg["output_format"] = str(cfg.get("output_format", "auto") or "auto").strip().lower()
+    if cfg["output_format"] not in {"auto", "mp4", "png"}:
+        cfg["output_format"] = "auto"
+
+    image_format = str(cfg.get("image_output_format", "png") or "png").strip().lower()
+    if image_format not in {"png", "jpg", "webp"}:
+        image_format = "png"
+    cfg["image_output_format"] = image_format
+    try:
+        image_quality = int(float(cfg.get("image_output_quality", 95) or 95))
+    except Exception:
+        image_quality = 95
+    cfg["image_output_quality"] = max(1, min(100, image_quality))
+
+    backend = str(cfg.get("seedvr2_video_backend", "opencv") or "opencv").strip().lower()
+    if backend not in {"opencv", "ffmpeg"}:
+        backend = "opencv"
+    cfg["seedvr2_video_backend"] = backend
+    cfg["seedvr2_use_10bit"] = bool(cfg.get("seedvr2_use_10bit", False)) and backend == "ffmpeg"
+
     cfg["frame_interpolation"] = bool(cfg.get("frame_interpolation", False))
 
     mult_raw = str(cfg.get("global_rife_multiplier", "x2") or "x2").strip().lower()

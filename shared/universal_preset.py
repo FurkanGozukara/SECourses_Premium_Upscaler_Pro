@@ -5,7 +5,7 @@ This module provides a centralized preset system that saves/loads ALL settings
 from ALL tabs in a single preset file. No more per-tab, per-model presets.
 
 Features:
-- Single preset contains ALL 178+ settings from all 7 tabs
+- Single preset contains ALL settings from all tabs (including Global Settings)
 - Save/load from any tab updates ALL tabs simultaneously
 - Last used preset tracked in .last_used_preset.txt
 - Auto-load last preset on app startup
@@ -28,8 +28,46 @@ from shared.services.output_service import OUTPUT_ORDER, output_defaults
 from shared.models.rife_meta import get_rife_default_model
 
 
+GLOBAL_ORDER = [
+    "output_dir",
+    "temp_dir",
+    "telemetry",
+    "face_global",
+    "face_strength",
+    "queue_enabled",
+    "mode",
+    "models_dir",
+    "hf_home",
+    "transformers_cache",
+    "pinned_reference_path",
+]
+
+
+def global_defaults(base_dir: Path = None) -> Dict[str, Any]:
+    base = Path(base_dir) if base_dir else Path.cwd()
+    models_dir = str(base / "models")
+    return {
+        "output_dir": str(base / "outputs"),
+        "temp_dir": str(base / "temp"),
+        "telemetry": True,
+        "face_global": False,
+        "face_strength": 0.5,
+        "queue_enabled": True,
+        "mode": "subprocess",
+        "models_dir": models_dir,
+        "hf_home": models_dir,
+        "transformers_cache": models_dir,
+        "pinned_reference_path": None,
+    }
+
+
 # Tab configuration: maps tab name to (ORDER, defaults_function)
 TAB_CONFIGS = {
+    "global": {
+        "order": GLOBAL_ORDER,
+        "defaults_fn": global_defaults,
+        "needs_model_arg": True,  # global_defaults optionally uses base_dir
+    },
     "seedvr2": {
         "order": SEEDVR2_ORDER,
         "defaults_fn": seedvr2_defaults,
@@ -124,6 +162,26 @@ def _normalize_rife_settings(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    cfg["output_format"] = str(cfg.get("output_format", "auto") or "auto").strip().lower()
+    if cfg["output_format"] not in {"auto", "mp4", "png"}:
+        cfg["output_format"] = "auto"
+
+    image_fmt = str(cfg.get("image_output_format", "png") or "png").strip().lower()
+    if image_fmt not in {"png", "jpg", "webp"}:
+        image_fmt = "png"
+    cfg["image_output_format"] = image_fmt
+    try:
+        image_quality = int(float(cfg.get("image_output_quality", 95) or 95))
+    except Exception:
+        image_quality = 95
+    cfg["image_output_quality"] = max(1, min(100, image_quality))
+
+    backend = str(cfg.get("seedvr2_video_backend", "opencv") or "opencv").strip().lower()
+    if backend not in {"opencv", "ffmpeg"}:
+        backend = "opencv"
+    cfg["seedvr2_video_backend"] = backend
+    cfg["seedvr2_use_10bit"] = bool(cfg.get("seedvr2_use_10bit", False)) and backend == "ffmpeg"
+
     cfg["overwrite_existing_batch"] = bool(cfg.get("overwrite_existing_batch", False))
     cfg["frame_interpolation"] = bool(cfg.get("frame_interpolation", False))
     mult_raw = str(cfg.get("global_rife_multiplier", "x2") or "x2").strip().lower()
@@ -149,8 +207,34 @@ def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _normalize_global_settings(data: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(defaults or {})
+    cfg.update(dict(data or {}))
+
+    cfg["output_dir"] = str(cfg.get("output_dir", defaults.get("output_dir", "")) or "").strip()
+    cfg["temp_dir"] = str(cfg.get("temp_dir", defaults.get("temp_dir", "")) or "").strip()
+    cfg["telemetry"] = bool(cfg.get("telemetry", defaults.get("telemetry", True)))
+    cfg["face_global"] = bool(cfg.get("face_global", defaults.get("face_global", False)))
+    try:
+        face_strength = float(cfg.get("face_strength", defaults.get("face_strength", 0.5)) or 0.5)
+    except Exception:
+        face_strength = 0.5
+    cfg["face_strength"] = max(0.0, min(1.0, face_strength))
+    cfg["queue_enabled"] = bool(cfg.get("queue_enabled", defaults.get("queue_enabled", True)))
+    mode_raw = str(cfg.get("mode", defaults.get("mode", "subprocess")) or "subprocess").strip().lower()
+    cfg["mode"] = mode_raw if mode_raw in {"subprocess", "in_app"} else "subprocess"
+    cfg["models_dir"] = str(cfg.get("models_dir", defaults.get("models_dir", "")) or "").strip()
+    cfg["hf_home"] = str(cfg.get("hf_home", defaults.get("hf_home", "")) or "").strip()
+    cfg["transformers_cache"] = str(cfg.get("transformers_cache", defaults.get("transformers_cache", "")) or "").strip()
+    pinned = cfg.get("pinned_reference_path")
+    cfg["pinned_reference_path"] = str(pinned).strip() if pinned else ""
+    return cfg
+
+
 def _normalize_tab_settings(tab_name: str, data: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    if tab_name == "global":
+        return _normalize_global_settings(cfg, defaults or global_defaults())
     if tab_name == "seedvr2":
         try:
             from shared.services.seedvr2_service import _enforce_seedvr2_guardrails
@@ -183,6 +267,9 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
         models_list = ["default"]
     
     defaults = {}
+
+    # Global Settings
+    defaults["global"] = global_defaults(base_dir)
     
     # SeedVR2
     defaults["seedvr2"] = seedvr2_defaults()
@@ -288,6 +375,7 @@ def dict_to_values(tab_name: str, data: Dict[str, Any], defaults: Dict[str, Any]
 
 
 def create_universal_preset(
+    global_values: List[Any] = None,
     seedvr2_values: List[Any] = None,
     gan_values: List[Any] = None,
     rife_values: List[Any] = None,
@@ -318,6 +406,11 @@ def create_universal_preset(
     }
     
     # Convert values to dicts, using defaults for missing tabs
+    if global_values is not None:
+        preset["global"] = values_to_dict("global", global_values)
+    else:
+        preset["global"] = defaults["global"]
+
     if seedvr2_values is not None:
         preset["seedvr2"] = values_to_dict("seedvr2", seedvr2_values)
     else:
@@ -391,6 +484,11 @@ def merge_preset_with_defaults(
     merged = {"_meta": preset.get("_meta", {})}
     
     for tab_name in TAB_CONFIGS:
+        if tab_name == "global" and tab_name not in preset:
+            # Preserve current runtime/global state when loading legacy presets
+            # that predate global fields in universal schema.
+            merged[tab_name] = {}
+            continue
         tab_defaults = defaults.get(tab_name, {})
         tab_preset = preset.get(tab_name, {})
         
@@ -425,7 +523,19 @@ def update_shared_state_from_preset(
     """
     seed_controls = state.get("seed_controls", {})
     
+    current_global_settings = seed_controls.get("global_settings", {})
+    current_global_settings = (
+        dict(current_global_settings)
+        if isinstance(current_global_settings, dict)
+        else {}
+    )
+    global_settings = _normalize_global_settings(
+        preset.get("global", {}),
+        current_global_settings or global_defaults(),
+    )
+
     # Store tab settings in shared state
+    seed_controls["global_settings"] = global_settings
     seed_controls["seedvr2_settings"] = preset.get("seedvr2", {})
     seed_controls["gan_settings"] = preset.get("gan", {})
     seed_controls["rife_settings"] = preset.get("rife", {})
@@ -467,6 +577,10 @@ def update_shared_state_from_preset(
     seed_controls["skip_first_frames_val"] = out_settings.get("skip_first_frames", 0)
     seed_controls["load_cap_val"] = out_settings.get("load_cap", 0)
     seed_controls["fps_override_val"] = out_settings.get("fps_override", 0)
+    seed_controls["image_output_format_val"] = out_settings.get("image_output_format", "png")
+    seed_controls["image_output_quality_val"] = out_settings.get("image_output_quality", 95)
+    seed_controls["seedvr2_video_backend_val"] = out_settings.get("seedvr2_video_backend", "opencv")
+    seed_controls["seedvr2_use_10bit_val"] = bool(out_settings.get("seedvr2_use_10bit", False))
     seed_controls["frame_interpolation_val"] = bool(out_settings.get("frame_interpolation", False))
     seed_controls["global_rife_enabled_val"] = bool(out_settings.get("frame_interpolation", False))
     seed_controls["global_rife_multiplier_val"] = out_settings.get("global_rife_multiplier", "x2")
@@ -484,6 +598,9 @@ def update_shared_state_from_preset(
     seed_controls["audio_bitrate_val"] = str(out_settings.get("audio_bitrate", "") or "")
     seed_controls["generate_comparison_video_val"] = bool(out_settings.get("generate_comparison_video", True))
     seed_controls["comparison_video_layout_val"] = str(out_settings.get("comparison_video_layout", "auto") or "auto")
+    seed_controls["face_strength_val"] = float(global_settings.get("face_strength", 0.5))
+    seed_controls["queue_enabled_val"] = bool(global_settings.get("queue_enabled", True))
+    seed_controls["pinned_reference_path"] = global_settings.get("pinned_reference_path")
 
     state["seed_controls"] = seed_controls
     return state
@@ -502,6 +619,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "created_at": datetime.now().isoformat(),
             "last_modified": datetime.now().isoformat(),
         },
+        "global": seed_controls.get("global_settings", {}),
         "seedvr2": seed_controls.get("seedvr2_settings", {}),
         "gan": seed_controls.get("gan_settings", {}),
         "rife": seed_controls.get("rife_settings", {}),

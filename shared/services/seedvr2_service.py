@@ -125,6 +125,60 @@ def _predict_batch_video_output_path(item_out_dir: Path, input_file: Path, outpu
     return item_out_dir / stem if fmt == "png" else item_out_dir / f"{stem}.mp4"
 
 
+def _apply_image_output_preferences(
+    image_path: Optional[str],
+    image_output_format: Any,
+    image_output_quality: Any,
+) -> Optional[str]:
+    """
+    Convert final image output to the globally selected image format/quality.
+    Returns updated path (or original path on failure/no-op).
+    """
+    if not image_path:
+        return image_path
+    try:
+        src = Path(str(image_path))
+        if (not src.exists()) or src.is_dir():
+            return image_path
+
+        fmt = str(image_output_format or "png").strip().lower()
+        if fmt not in {"png", "jpg", "webp"}:
+            fmt = "png"
+
+        try:
+            quality = int(float(image_output_quality or 95))
+        except Exception:
+            quality = 95
+        quality = max(1, min(100, quality))
+
+        target_ext = ".jpg" if fmt == "jpg" else f".{fmt}"
+        needs_reencode = src.suffix.lower() != target_ext or fmt in {"jpg", "webp"}
+        if not needs_reencode:
+            return image_path
+
+        from PIL import Image
+
+        dst = collision_safe_path(src.with_suffix(target_ext))
+        with Image.open(src) as img:
+            if fmt == "jpg":
+                img = img.convert("RGB")
+                img.save(dst, format="JPEG", quality=quality)
+            elif fmt == "webp":
+                img.save(dst, format="WEBP", quality=quality)
+            else:
+                img.save(dst, format="PNG")
+
+        try:
+            if dst.resolve() != src.resolve():
+                src.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return str(dst)
+    except Exception:
+        return image_path
+
+
 # Defaults and ordering --------------------------------------------------------
 def _get_default_attention_mode() -> str:
     """
@@ -524,13 +578,6 @@ SEEDVR2_ORDER: List[str] = [
     # Debug and resume
     "debug",
     "resume_chunking",
-    # Output & shared settings (from Output tab integration)
-    "save_metadata",
-    "fps_override",
-    # ADDED v2.5.22: FFmpeg 10-bit encoding support
-    "video_backend",  # Video encoding backend ("opencv" or "ffmpeg")
-    "use_10bit",  # Enable 10-bit color depth (x265 yuv420p10le)
-
     # vNext sizing (app-level; does not directly map 1:1 to CLI flags)
     "upscale_factor",
     "pre_downscale_then_upscale",
@@ -1505,7 +1552,7 @@ def _process_single_file(
             # Log the run - use live output_dir from global settings
             live_output_dir = Path(global_settings.get("output_dir", output_dir))
             telemetry_enabled = bool(global_settings.get("telemetry", True))
-            if telemetry_enabled:
+            if telemetry_enabled and bool(settings.get("save_metadata", True)):
                 run_logger.write_summary(
                     Path(result.output_path) if result.output_path else live_output_dir,
                     {
@@ -1535,7 +1582,21 @@ def _process_single_file(
                 local_logs.append(f"Face-restored image saved to {restored_img} (strength {face_strength})")
                 output_image = restored_img
 
-        # Apply FPS override if specified (check both tab setting and Output tab cache)
+        # Apply global image output format/quality preferences.
+        if output_image and Path(output_image).exists() and not Path(output_image).is_dir():
+            converted_image = _apply_image_output_preferences(
+                output_image,
+                settings.get("image_output_format", "png"),
+                settings.get("image_output_quality", 95),
+            )
+            if converted_image and converted_image != output_image:
+                local_logs.append(
+                    f"Converted image output to {Path(converted_image).suffix.lower()} "
+                    f"(quality {int(settings.get('image_output_quality', 95) or 95)}): {converted_image}"
+                )
+                output_image = converted_image
+
+        # Apply FPS override from global Output settings.
         fps_val = settings.get("fps_override", 0) or seed_controls.get("fps_override_val", 0)
         if fps_val and fps_val > 0 and output_video and Path(output_video).exists():
             try:
@@ -2752,6 +2813,41 @@ def build_seedvr2_callbacks(
                 # Resume folder mode is single-run only.
                 settings["resume_run_dir"] = ""
 
+            # Shared Output tab values are the source of truth for these cross-model controls.
+            settings["save_metadata"] = bool(
+                seed_controls.get(
+                    "save_metadata_val",
+                    output_settings.get("save_metadata", defaults.get("save_metadata", True)),
+                )
+            )
+            try:
+                settings["fps_override"] = float(
+                    seed_controls.get(
+                        "fps_override_val",
+                        output_settings.get("fps_override", defaults.get("fps_override", 0)),
+                    )
+                    or 0
+                )
+            except Exception:
+                settings["fps_override"] = 0.0
+
+            backend_val = str(
+                seed_controls.get(
+                    "seedvr2_video_backend_val",
+                    output_settings.get("seedvr2_video_backend", defaults.get("video_backend", "opencv")),
+                )
+                or "opencv"
+            ).strip().lower()
+            if backend_val not in {"opencv", "ffmpeg"}:
+                backend_val = "opencv"
+            settings["video_backend"] = backend_val
+            settings["use_10bit"] = bool(
+                seed_controls.get(
+                    "seedvr2_use_10bit_val",
+                    output_settings.get("seedvr2_use_10bit", defaults.get("use_10bit", False)),
+                )
+            ) and backend_val == "ffmpeg"
+
             # Sync live SeedVR2 sizing controls into shared cache before guardrails.
             # Prevents stale global/per-model cached values from overriding current UI controls.
             try:
@@ -3004,7 +3100,32 @@ def build_seedvr2_callbacks(
 
             if settings["output_format"] == "auto":
                 settings["output_format"] = None
-            
+
+            # Global image output preferences (final image files across all model tabs).
+            image_fmt = str(
+                seed_controls.get(
+                    "image_output_format_val",
+                    output_settings.get("image_output_format", "png") if isinstance(output_settings, dict) else "png",
+                )
+                or "png"
+            ).strip().lower()
+            if image_fmt not in {"png", "jpg", "webp"}:
+                image_fmt = "png"
+            settings["image_output_format"] = image_fmt
+            try:
+                settings["image_output_quality"] = int(
+                    float(
+                        seed_controls.get(
+                            "image_output_quality_val",
+                            output_settings.get("image_output_quality", 95) if isinstance(output_settings, dict) else 95,
+                        )
+                        or 95
+                    )
+                )
+            except Exception:
+                settings["image_output_quality"] = 95
+            settings["image_output_quality"] = max(1, min(100, int(settings["image_output_quality"])))
+
             # Apply PNG padding/basename settings from Output tab if available
             # These are used for PNG sequence outputs and collision-safe path generation
             if seed_controls.get("png_padding_val") is not None:
@@ -3040,12 +3161,28 @@ def build_seedvr2_callbacks(
                 ):
                     if output_settings.get(key) is not None:
                         settings[key] = output_settings.get(key)
-            
-            # Apply FPS override from Output tab ONLY if not explicitly set in SeedVR2 tab
-            # SeedVR2 tab value takes precedence
-            if seed_controls.get("fps_override_val") is not None and seed_controls["fps_override_val"] > 0:
-                if settings.get("fps_override", 0) == 0:  # Only if not set in SeedVR2 tab
-                    settings["fps_override"] = float(seed_controls["fps_override_val"])
+
+            # SeedVR2 encoding controls moved to Output tab and apply globally.
+            backend_pref = seed_controls.get(
+                "seedvr2_video_backend_val",
+                output_settings.get("seedvr2_video_backend", settings.get("video_backend", "opencv")),
+            )
+            backend_pref = str(backend_pref or "opencv").strip().lower()
+            if backend_pref not in {"opencv", "ffmpeg"}:
+                backend_pref = "opencv"
+            settings["video_backend"] = backend_pref
+            use_10bit_pref = seed_controls.get(
+                "seedvr2_use_10bit_val",
+                output_settings.get("seedvr2_use_10bit", settings.get("use_10bit", False)),
+            )
+            settings["use_10bit"] = bool(use_10bit_pref) and backend_pref == "ffmpeg"
+
+            # Apply FPS override from Output tab (0 = keep source FPS).
+            if seed_controls.get("fps_override_val") is not None:
+                try:
+                    settings["fps_override"] = float(seed_controls["fps_override_val"] or 0)
+                except Exception:
+                    settings["fps_override"] = 0.0
             
             # Apply skip_first_frames and load_cap from Output tab ONLY if not explicitly set in SeedVR2 tab
             # SeedVR2 tab values take precedence over Output tab cached values

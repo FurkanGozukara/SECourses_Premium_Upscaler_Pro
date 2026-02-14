@@ -30,8 +30,9 @@ from shared.health import collect_health_report
 from shared.logging_utils import RunLogger
 from shared.path_utils import get_default_output_dir, get_default_temp_dir
 from shared.preset_manager import PresetManager
-from shared.universal_preset import dict_to_values, get_all_defaults
+from shared.universal_preset import dict_to_values, get_all_defaults, GLOBAL_ORDER
 from shared.models.rife_meta import get_rife_default_model
+from shared.services.output_service import OUTPUT_ORDER
 from shared.runner import Runner
 from shared.gradio_compat import check_gradio_version, check_required_features
 from ui.seedvr2_tab import seedvr2_tab
@@ -43,10 +44,11 @@ from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
+from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.61 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V1.7 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -597,6 +599,58 @@ def main(argv=None):
       box-shadow: 0 12px 28px rgba(194, 65, 12, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
     }
 
+    /* Resolution tab quick source buttons */
+    .quick-actions-row {
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .quick-actions-row .action-btn button,
+    .quick-actions-row button.action-btn {
+      min-height: 46px;
+      font-size: 0.95rem;
+    }
+    .action-btn-source-seed button,
+    button.action-btn-source-seed {
+      background: linear-gradient(135deg, #1d4ed8 0%, #0369a1 52%, #0f766e 100%) !important;
+      border-color: rgba(186, 230, 253, 0.95) !important;
+      box-shadow: 0 11px 26px rgba(3, 105, 161, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
+    }
+    .action-btn-source-seed button:hover,
+    button.action-btn-source-seed:hover {
+      box-shadow: 0 14px 30px rgba(3, 105, 161, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+    }
+    .action-btn-source-gan button,
+    button.action-btn-source-gan {
+      background: linear-gradient(135deg, #b45309 0%, #ea580c 54%, #dc2626 100%) !important;
+      border-color: rgba(254, 215, 170, 0.95) !important;
+      box-shadow: 0 11px 26px rgba(194, 65, 12, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+    }
+    .action-btn-source-gan button:hover,
+    button.action-btn-source-gan:hover {
+      box-shadow: 0 14px 30px rgba(194, 65, 12, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+    }
+    .action-btn-source-flash button,
+    button.action-btn-source-flash {
+      background: linear-gradient(135deg, #15803d 0%, #0f766e 52%, #0891b2 100%) !important;
+      border-color: rgba(167, 243, 208, 0.95) !important;
+      box-shadow: 0 11px 26px rgba(5, 150, 105, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
+    }
+    .action-btn-source-flash button:hover,
+    button.action-btn-source-flash:hover {
+      box-shadow: 0 14px 30px rgba(5, 150, 105, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+    }
+
+    /* Musubi-style small file/folder icon button */
+    #open_folder_small {
+      min-width: 2.25em !important;
+      max-width: 2.9em;
+      flex-grow: 0;
+      padding: 0.4em 0.35em !important;
+      font-size: 1.35em !important;
+      line-height: 1;
+      border-radius: 12px !important;
+    }
+
     @keyframes actionSweep {
       0% {
         left: -32%;
@@ -834,7 +888,6 @@ def main(argv=None):
         from shared.universal_preset import (
             get_all_defaults,
             merge_preset_with_defaults,
-            TAB_CONFIGS,
         )
         from shared.models import get_seedvr2_model_names, scan_gan_models, get_flashvsr_model_names, get_rife_model_names
         
@@ -863,19 +916,124 @@ def main(argv=None):
                 print(f"✅ Loaded universal preset '{last_preset_name}' on startup")
             else:
                 print(f"⚠️ Last used preset '{last_preset_name}' not found, using defaults")
-        
+
+        def _runtime_global_defaults() -> Dict[str, Any]:
+            return {
+                "output_dir": str(global_settings.get("output_dir", BASE_DIR / "outputs")),
+                "temp_dir": str(global_settings.get("temp_dir", BASE_DIR / "temp")),
+                "telemetry": bool(global_settings.get("telemetry", True)),
+                "face_global": bool(global_settings.get("face_global", False)),
+                "face_strength": float(global_settings.get("face_strength", 0.5)),
+                "queue_enabled": bool(global_settings.get("queue_enabled", True)),
+                "mode": str(global_settings.get("mode", "subprocess") or "subprocess"),
+                "models_dir": str(global_settings.get("models_dir", BASE_DIR / "models")),
+                "hf_home": str(global_settings.get("hf_home", BASE_DIR / "models")),
+                "transformers_cache": str(global_settings.get("transformers_cache", BASE_DIR / "models")),
+                "pinned_reference_path": global_settings.get("pinned_reference_path"),
+            }
+
         if loaded_preset:
             # Merge with defaults to fill any missing keys
             merged_preset = merge_preset_with_defaults(loaded_preset, BASE_DIR, all_models)
+            merged_global = _runtime_global_defaults()
+            loaded_global = merged_preset.get("global", {})
+            if isinstance(loaded_global, dict):
+                for key, value in loaded_global.items():
+                    if value is not None:
+                        merged_global[key] = value
+            merged_preset["global"] = merged_global
             return merged_preset, last_preset_name, all_models
         else:
             # Use defaults
             defaults = get_all_defaults(BASE_DIR, all_models)
+            defaults["global"] = _runtime_global_defaults()
             return defaults, None, all_models
     
     # Load universal preset on startup
     startup_preset, startup_preset_name, all_models = load_startup_universal_preset()
     sync_defaults = get_all_defaults(BASE_DIR, all_models)
+
+    def _merge_global_values(raw: Dict[str, Any] | None) -> Dict[str, Any]:
+        merged = {key: global_settings.get(key) for key in GLOBAL_ORDER}
+        for key in GLOBAL_ORDER:
+            if merged.get(key) is None:
+                merged[key] = sync_defaults.get("global", {}).get(key)
+        if isinstance(raw, dict):
+            for key in GLOBAL_ORDER:
+                if key in raw and raw.get(key) is not None:
+                    merged[key] = raw.get(key)
+        merged["output_dir"] = str(merged.get("output_dir", "") or "")
+        merged["temp_dir"] = str(merged.get("temp_dir", "") or "")
+        merged["telemetry"] = bool(merged.get("telemetry", True))
+        merged["face_global"] = bool(merged.get("face_global", False))
+        try:
+            merged["face_strength"] = max(0.0, min(1.0, float(merged.get("face_strength", 0.5) or 0.5)))
+        except Exception:
+            merged["face_strength"] = 0.5
+        merged["queue_enabled"] = bool(merged.get("queue_enabled", True))
+        mode_raw = str(merged.get("mode", "subprocess") or "subprocess").strip().lower()
+        merged["mode"] = mode_raw if mode_raw in {"subprocess", "in_app"} else "subprocess"
+        merged["models_dir"] = str(merged.get("models_dir", "") or "")
+        merged["hf_home"] = str(merged.get("hf_home", "") or "")
+        merged["transformers_cache"] = str(merged.get("transformers_cache", "") or "")
+        merged["pinned_reference_path"] = str(merged.get("pinned_reference_path", "") or "")
+        return merged
+
+    def apply_global_settings_live(
+        od,
+        td,
+        tel,
+        face_str,
+        queue_enabled,
+        mode_choice,
+        models_dir,
+        hf_home,
+        trans_cache,
+        state,
+    ):
+        from shared.services.global_service import apply_global_settings_live as _apply_global_settings_live
+
+        return _apply_global_settings_live(
+            output_dir_val=od,
+            temp_dir_val=td,
+            telemetry_enabled=tel,
+            face_strength=face_str,
+            queue_enabled=queue_enabled,
+            mode_choice=mode_choice,
+            models_dir_val=models_dir,
+            hf_home_val=hf_home,
+            transformers_cache_val=trans_cache,
+            runner=runner,
+            preset_manager=preset_manager,
+            global_settings=global_settings,
+            run_logger=run_logger,
+            state=state,
+        )
+
+    startup_global_settings = _merge_global_values(startup_preset.get("global", {}))
+    startup_preset["global"] = startup_global_settings
+    _startup_state = {
+        "seed_controls": {
+            "global_settings": dict(startup_global_settings),
+            "pinned_reference_path": startup_global_settings.get("pinned_reference_path"),
+        }
+    }
+    _startup_status, _startup_mode, _startup_state = apply_global_settings_live(
+        startup_global_settings.get("output_dir", global_settings.get("output_dir")),
+        startup_global_settings.get("temp_dir", global_settings.get("temp_dir")),
+        bool(startup_global_settings.get("telemetry", global_settings.get("telemetry", True))),
+        float(startup_global_settings.get("face_strength", global_settings.get("face_strength", 0.5))),
+        bool(startup_global_settings.get("queue_enabled", global_settings.get("queue_enabled", True))),
+        str(startup_global_settings.get("mode", global_settings.get("mode", "subprocess")) or "subprocess"),
+        startup_global_settings.get("models_dir", global_settings.get("models_dir")),
+        startup_global_settings.get("hf_home", global_settings.get("hf_home")),
+        startup_global_settings.get("transformers_cache", global_settings.get("transformers_cache")),
+        _startup_state,
+    )
+    startup_global_settings = _merge_global_values(_startup_state.get("seed_controls", {}).get("global_settings", {}))
+    startup_preset["global"] = startup_global_settings
+    active_temp_dir = Path(global_settings.get("temp_dir", temp_dir))
+    active_output_dir = Path(global_settings.get("output_dir", output_dir))
     
     with gr.Blocks(title=APP_TITLE, theme=modern_theme, css=CUSTOM_CSS, head=CUSTOM_HEAD) as demo:
         # =========================================================================
@@ -911,6 +1069,7 @@ def main(argv=None):
                 "preset_dirty": False,
                 
                 # UNIVERSAL PRESET: Full tab settings (used by all tabs)
+                "global_settings": startup_global_settings,
                 "seedvr2_settings": startup_preset.get("seedvr2", {}),
                 "gan_settings": startup_preset.get("gan", {}),
                 "rife_settings": startup_preset.get("rife", {}),
@@ -932,6 +1091,10 @@ def main(argv=None):
                 "skip_first_frames_val": startup_output_settings.get("skip_first_frames", 0),
                 "load_cap_val": startup_output_settings.get("load_cap", 0),
                 "fps_override_val": startup_output_settings.get("fps_override", 0),
+                "image_output_format_val": startup_output_settings.get("image_output_format", "png"),
+                "image_output_quality_val": startup_output_settings.get("image_output_quality", 95),
+                "seedvr2_video_backend_val": startup_output_settings.get("seedvr2_video_backend", "opencv"),
+                "seedvr2_use_10bit_val": bool(startup_output_settings.get("seedvr2_use_10bit", False)),
                 "frame_interpolation_val": bool(startup_output_settings.get("frame_interpolation", False)),
                 "global_rife_enabled_val": bool(startup_output_settings.get("frame_interpolation", False)),
                 "global_rife_multiplier_val": startup_output_settings.get("global_rife_multiplier", "x2"),
@@ -950,8 +1113,8 @@ def main(argv=None):
                 "audio_bitrate_val": startup_output_settings.get("audio_bitrate", ""),
                 "generate_comparison_video_val": startup_output_settings.get("generate_comparison_video", True),
                 "comparison_video_layout_val": startup_output_settings.get("comparison_video_layout", "auto"),
-                "face_strength_val": global_settings.get("face_strength", 0.5),
-                "queue_enabled_val": bool(global_settings.get("queue_enabled", True)),
+                "face_strength_val": float(startup_global_settings.get("face_strength", global_settings.get("face_strength", 0.5))),
+                "queue_enabled_val": bool(startup_global_settings.get("queue_enabled", global_settings.get("queue_enabled", True))),
                 
                 # Resolution tab cached values
                 "auto_chunk": startup_auto_chunk,
@@ -964,7 +1127,7 @@ def main(argv=None):
                 "min_scene_len": startup_res_settings.get("min_scene_len", 1.0),
                 
                 # Pinned reference (persisted globally)
-                "pinned_reference_path": global_settings.get("pinned_reference_path"),
+                "pinned_reference_path": startup_global_settings.get("pinned_reference_path", global_settings.get("pinned_reference_path")),
                 
                 # Available models list (for preset defaults)
                 "available_models": all_models,
@@ -983,11 +1146,12 @@ def main(argv=None):
         oom_timer = gr.Timer(value=2.0, active=True)
         health_sync_signature = gr.State(value="")
         oom_sync_signature = gr.State(value="")
+        global_sync_signature = gr.State(value="")
         gr.Markdown(f"# {APP_TITLE}")
 
         # Global settings tab (rendered LAST for a cleaner workflow)
         def render_global_settings_tab():
-            with gr.Tab("Global Settings", render_children=True):
+            with gr.Tab("Global Settings", render_children=True) as tab_global:
                 gr.Markdown("### 📁 Output & Temp Directories")
                 with gr.Row():
                     output_dir_box = gr.Textbox(
@@ -1001,23 +1165,19 @@ def main(argv=None):
                         info="Temporary files during processing"
                     )
                 
-                gr.Markdown("### 🎭 Face Restoration")
+                gr.Markdown("### Runtime Toggles")
                 with gr.Row():
                     telemetry_toggle = gr.Checkbox(
                         label="Save run metadata (local telemetry)",
                         value=global_settings.get("telemetry", True),
                         info="Save processing metadata for troubleshooting"
                     )
-                    face_global_toggle = gr.Checkbox(
-                        label="Apply Face Restoration globally",
-                        value=global_settings.get("face_global", False),
-                        info="Enable face restoration for all upscaling operations (SeedVR2, GAN, RIFE, FlashVSR+)"
-                    )
                     queue_enabled_toggle = gr.Checkbox(
                         label="Enable Queue",
                         value=bool(global_settings.get("queue_enabled", True)),
                         info="When enabled, extra generate/upscale clicks are queued. When disabled, new clicks are ignored while processing is active."
                     )
+                gr.Markdown("Face Restoration global on/off is managed only from the **Face Restoration** tab.")
                 with gr.Row():
                     face_strength_slider = gr.Slider(
                         label="Global Face Restoration Strength",
@@ -1085,7 +1245,7 @@ def main(argv=None):
                 # Processing mode selection controls (placed before Execution Mode explanation)
                 mode_radio = gr.Radio(
                     choices=["subprocess", "in_app"],
-                    value=saved_mode,
+                    value=str(global_settings.get("mode", "subprocess") or "subprocess"),
                     label="Processing Mode",
                     info="Applies immediately.",
                     interactive=True
@@ -1096,31 +1256,63 @@ def main(argv=None):
                     "They are saved immediately, but full effect across all libraries is guaranteed after app restart."
                 )
 
-                gr.Markdown("### Global Config")
-                global_config_choices = preset_manager.list_presets("global_config", "app")
-                last_global_config = preset_manager.get_last_used_name("global_config", "app")
-                global_config_value = (
-                    last_global_config
-                    if last_global_config in global_config_choices
-                    else (global_config_choices[-1] if global_config_choices else None)
+                face_global_hidden = gr.Checkbox(
+                    value=bool(global_settings.get("face_global", False)),
+                    visible=False,
+                    interactive=False,
                 )
-                with gr.Row():
-                    global_config_dropdown = gr.Dropdown(
-                        label="Saved Global Configs",
-                        choices=global_config_choices,
-                        value=global_config_value,
-                        allow_custom_value=False,
-                    )
-                    global_config_name = gr.Textbox(
-                        label="Save As",
-                        placeholder="e.g. workstation_a",
-                    )
-                with gr.Row():
-                    global_config_save_btn = gr.Button("Save Config", variant="secondary")
-                    global_config_load_btn = gr.Button("Load Config", variant="secondary")
-                    global_config_delete_btn = gr.Button("Delete Config", variant="stop")
-                global_config_status = gr.Markdown("")
-                
+                pinned_reference_path_hidden = gr.Textbox(
+                    value=str(global_settings.get("pinned_reference_path", "") or ""),
+                    visible=False,
+                    interactive=False,
+                )
+
+                (
+                    preset_dropdown,
+                    preset_name_input,
+                    save_preset_btn,
+                    load_preset_btn,
+                    preset_status,
+                    reset_defaults_btn,
+                    delete_preset_btn,
+                    preset_callbacks,
+                ) = universal_preset_section(
+                    preset_manager=preset_manager,
+                    shared_state=shared_state,
+                    tab_name="global",
+                    inputs_list=[],
+                    base_dir=BASE_DIR,
+                    models_list=all_models,
+                    open_accordion=True,
+                )
+
+                global_preset_inputs = [
+                    output_dir_box,
+                    temp_dir_box,
+                    telemetry_toggle,
+                    face_global_hidden,
+                    face_strength_slider,
+                    queue_enabled_toggle,
+                    mode_radio,
+                    models_dir_box,
+                    hf_home_box,
+                    transformers_cache_box,
+                    pinned_reference_path_hidden,
+                ]
+                wire_universal_preset_events(
+                    preset_dropdown=preset_dropdown,
+                    preset_name_input=preset_name_input,
+                    save_btn=save_preset_btn,
+                    load_btn=load_preset_btn,
+                    preset_status=preset_status,
+                    reset_btn=reset_defaults_btn,
+                    delete_btn=delete_preset_btn,
+                    callbacks=preset_callbacks,
+                    inputs_list=global_preset_inputs,
+                    shared_state=shared_state,
+                    tab_name="global",
+                )
+
                 # Execution mode controls
                 gr.Markdown("### ⚙️ Execution Mode")
                 
@@ -1212,167 +1404,18 @@ def main(argv=None):
                 
                 gr.Markdown("💡 **Note**: In-app mode exists ONLY as a code framework for potential future optimization. Consider it **disabled** for all practical purposes.")
 
-                # Wire up global settings events (auto-apply)
-                def apply_global_settings_live(od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state):
-                    from shared.services.global_service import apply_global_settings_live
-                    return apply_global_settings_live(
-                        od, td, tel, face, face_str, queue_enabled, mode_choice,
-                        models_dir, hf_home, trans_cache,
-                        runner, preset_manager, global_settings, run_logger, state,
-                    )
+                # Runtime apply is handled centrally by shared_state.change
+                # via apply_global_settings_from_state().
 
-                def apply_global_settings_live_no_mode(od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state):
-                    status_upd, _mode_upd, next_state = apply_global_settings_live(
-                        od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state
-                    )
-                    return status_upd, next_state
+                return {
+                    "tab": tab_global,
+                    "inputs_list": global_preset_inputs,
+                    "preset_dropdown": preset_dropdown,
+                    "preset_status": preset_status,
+                    "global_status": global_status,
+                    "mode_radio": mode_radio,
+                }
 
-                global_live_inputs = [
-                    output_dir_box, temp_dir_box, telemetry_toggle, face_global_toggle, face_strength_slider,
-                    queue_enabled_toggle, mode_radio, models_dir_box, hf_home_box, transformers_cache_box, shared_state,
-                ]
-
-                for comp in [
-                    output_dir_box, temp_dir_box, telemetry_toggle, face_global_toggle, face_strength_slider,
-                    queue_enabled_toggle, models_dir_box, hf_home_box, transformers_cache_box,
-                ]:
-                    comp.change(
-                        fn=apply_global_settings_live_no_mode,
-                        inputs=global_live_inputs,
-                        outputs=[global_status, shared_state],
-                        queue=False,
-                        show_progress="hidden",
-                        trigger_mode="always_last",
-                    )
-
-                mode_radio.change(
-                    fn=apply_global_settings_live,
-                    inputs=global_live_inputs,
-                    outputs=[global_status, mode_radio, shared_state],
-                    queue=False,
-                    show_progress="hidden",
-                    trigger_mode="always_last",
-                )
-
-                def build_global_config_payload(od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache):
-                    return {
-                        "output_dir": od,
-                        "temp_dir": td,
-                        "telemetry": bool(tel),
-                        "face_global": bool(face),
-                        "face_strength": float(face_str),
-                        "queue_enabled": bool(queue_enabled),
-                        "mode": str(mode_choice or "subprocess"),
-                        "models_dir": models_dir,
-                        "hf_home": hf_home,
-                        "transformers_cache": trans_cache,
-                    }
-
-                def save_global_config(cfg_name, od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state):
-                    name = str(cfg_name or "").strip()
-                    if not name:
-                        return gr.update(), gr.update(value="Enter a config name first."), gr.update(), gr.update(), state
-
-                    payload = build_global_config_payload(
-                        od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache
-                    )
-                    preset_manager.save_preset_safe("global_config", "app", name, payload)
-                    dropdown_upd = gr.update(
-                        choices=preset_manager.list_presets("global_config", "app"),
-                        value=name,
-                    )
-                    status_upd, mode_upd, next_state = apply_global_settings_live(
-                        od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state
-                    )
-                    return (
-                        dropdown_upd,
-                        gr.update(value=f"Saved global config '{name}'."),
-                        status_upd,
-                        mode_upd,
-                        next_state,
-                    )
-
-                def load_global_config(cfg_name, od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache, state):
-                    name = str(cfg_name or "").strip()
-                    if not name:
-                        return (
-                            od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache,
-                            gr.update(value="Select a config first."), gr.update(), state,
-                        )
-
-                    loaded = preset_manager.load_preset_safe("global_config", "app", name)
-                    if not loaded:
-                        return (
-                            od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache,
-                            gr.update(value=f"Config '{name}' not found."), gr.update(), state,
-                        )
-                    preset_manager.set_last_used("global_config", "app", name)
-
-                    merged = build_global_config_payload(
-                        od, td, tel, face, face_str, queue_enabled, mode_choice, models_dir, hf_home, trans_cache
-                    )
-                    merged.update(loaded)
-
-                    od2 = merged.get("output_dir", od)
-                    td2 = merged.get("temp_dir", td)
-                    tel2 = bool(merged.get("telemetry", tel))
-                    face2 = bool(merged.get("face_global", face))
-                    face_str2 = float(merged.get("face_strength", face_str))
-                    queue_enabled2 = bool(merged.get("queue_enabled", queue_enabled))
-                    mode2 = str(merged.get("mode", mode_choice) or "subprocess")
-                    models2 = merged.get("models_dir", models_dir)
-                    hf2 = merged.get("hf_home", hf_home)
-                    trans2 = merged.get("transformers_cache", trans_cache)
-
-                    status_upd, mode_upd, next_state = apply_global_settings_live(
-                        od2, td2, tel2, face2, face_str2, queue_enabled2, mode2, models2, hf2, trans2, state
-                    )
-                    mode_val = mode2
-                    if isinstance(mode_upd, dict) and ("value" in mode_upd):
-                        mode_val = mode_upd.get("value")
-
-                    return (
-                        od2, td2, tel2, face2, face_str2, queue_enabled2, mode_val, models2, hf2, trans2,
-                        gr.update(value=f"Loaded global config '{name}'"), status_upd, next_state,
-                    )
-
-                def delete_global_config(cfg_name):
-                    name = str(cfg_name or "").strip()
-                    if not name:
-                        return gr.update(), gr.update(value="Select a config first.")
-                    ok = preset_manager.delete_preset("global_config", "app", name)
-                    choices = preset_manager.list_presets("global_config", "app")
-                    value = choices[-1] if choices else None
-                    msg = f"Deleted global config '{name}'." if ok else f"Config '{name}' not found."
-                    return gr.update(choices=choices, value=value), gr.update(value=msg)
-
-                global_config_save_btn.click(
-                    fn=save_global_config,
-                    inputs=[global_config_name] + global_live_inputs,
-                    outputs=[global_config_dropdown, global_config_status, global_status, mode_radio, shared_state],
-                    queue=False,
-                    show_progress="hidden",
-                )
-
-                global_config_load_btn.click(
-                    fn=load_global_config,
-                    inputs=[global_config_dropdown] + global_live_inputs,
-                    outputs=[
-                        output_dir_box, temp_dir_box, telemetry_toggle, face_global_toggle, face_strength_slider,
-                        queue_enabled_toggle, mode_radio, models_dir_box, hf_home_box, transformers_cache_box,
-                        global_config_status, global_status, shared_state,
-                    ],
-                    queue=False,
-                    show_progress="hidden",
-                )
-
-                global_config_delete_btn.click(
-                    fn=delete_global_config,
-                    inputs=[global_config_dropdown],
-                    outputs=[global_config_dropdown, global_config_status],
-                    queue=False,
-                    show_progress="hidden",
-                )
 
         # ------------------------------------------------------------------ #
         # Universal preset sync:
@@ -1423,8 +1466,13 @@ def main(argv=None):
                 # Dropdown-safe fallbacks for historical presets/state corruption.
                 if tab_name == "rife" and len(values) > 5 and not str(values[5] or "").strip():
                     values[5] = get_rife_default_model()
-                if tab_name == "output" and len(values) > 17 and not str(values[17] or "").strip():
-                    values[17] = get_rife_default_model()
+                if tab_name == "output":
+                    try:
+                        global_rife_model_idx = OUTPUT_ORDER.index("global_rife_model")
+                        if len(values) > global_rife_model_idx and not str(values[global_rife_model_idx] or "").strip():
+                            values[global_rife_model_idx] = get_rife_default_model()
+                    except Exception:
+                        pass
 
                 selected = current if current in presets else (presets[-1] if presets else None)
                 dropdown_upd = gr.update(choices=presets, value=selected)
@@ -1440,6 +1488,7 @@ def main(argv=None):
         tab_sync_rife = gr.State(value="")
         tab_sync_gan = gr.State(value="")
         tab_sync_flashvsr = gr.State(value="")
+        tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
 
         # Self-contained tabs following SECourses pattern
@@ -1451,8 +1500,8 @@ def main(argv=None):
                 global_settings=global_settings,
                 shared_state=shared_state,
                 base_dir=BASE_DIR,
-                temp_dir=temp_dir,
-                output_dir=output_dir
+                temp_dir=active_temp_dir,
+                output_dir=active_output_dir
             )
         seedvr2_tab_select_evt = tab_seedvr2.select(
             fn=_make_tab_sync("seedvr2"),
@@ -1543,8 +1592,8 @@ def main(argv=None):
                 global_settings=global_settings,
                 shared_state=shared_state,
                 base_dir=BASE_DIR,
-                temp_dir=temp_dir,
-                output_dir=output_dir
+                temp_dir=active_temp_dir,
+                output_dir=active_output_dir
             )
         tab_rife.select(
             fn=_make_tab_sync("rife"),
@@ -1563,8 +1612,8 @@ def main(argv=None):
                 global_settings=global_settings,
                 shared_state=shared_state,
                 base_dir=BASE_DIR,
-                temp_dir=temp_dir,
-                output_dir=output_dir
+                temp_dir=active_temp_dir,
+                output_dir=active_output_dir
             )
         tab_gan.select(
             fn=_make_tab_sync("gan"),
@@ -1583,8 +1632,8 @@ def main(argv=None):
                 global_settings=global_settings,
                 shared_state=shared_state,
                 base_dir=BASE_DIR,
-                temp_dir=temp_dir,
-                output_dir=output_dir
+                temp_dir=active_temp_dir,
+                output_dir=active_output_dir
             )
         tab_flashvsr.select(
             fn=_make_tab_sync("flashvsr"),
@@ -1602,12 +1651,20 @@ def main(argv=None):
             health_tab(
                 global_settings=global_settings,
                 shared_state=shared_state,
-                temp_dir=temp_dir,
-                output_dir=output_dir
+                temp_dir=active_temp_dir,
+                output_dir=active_output_dir
             )
 
         # Global Settings should be the last tab (far-right)
-        render_global_settings_tab()
+        global_ui = render_global_settings_tab()
+        global_ui["tab"].select(
+            fn=_make_tab_sync("global"),
+            inputs=[shared_state, tab_sync_global],
+            outputs=global_ui["inputs_list"] + [global_ui["preset_dropdown"], global_ui["preset_status"], tab_sync_global],
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+        )
 
         # Update health banner on load and changes
         def update_health_banner(state, previous_signature: str = ""):
@@ -1627,6 +1684,35 @@ def main(argv=None):
             if signature == str(previous_signature or ""):
                 return gr.skip()
             return gr.update(value=html or "", visible=visible), gr.update(visible=visible), signature
+
+        def apply_global_settings_from_state(state, previous_signature: str = ""):
+            """
+            Keep runtime global settings (runner/env/global.json) in sync with
+            universal preset loads from any tab.
+            """
+            seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+            global_cfg = seed_controls.get("global_settings", {}) if isinstance(seed_controls, dict) else {}
+            if not isinstance(global_cfg, dict):
+                global_cfg = {}
+
+            merged_global = _merge_global_values(global_cfg)
+            signature = _sync_signature({"global_settings": merged_global})
+            if signature == str(previous_signature or ""):
+                return gr.skip()
+
+            status_upd, mode_upd, next_state = apply_global_settings_live(
+                merged_global.get("output_dir", global_settings.get("output_dir")),
+                merged_global.get("temp_dir", global_settings.get("temp_dir")),
+                bool(merged_global.get("telemetry", global_settings.get("telemetry", True))),
+                float(merged_global.get("face_strength", global_settings.get("face_strength", 0.5))),
+                bool(merged_global.get("queue_enabled", global_settings.get("queue_enabled", True))),
+                str(merged_global.get("mode", global_settings.get("mode", "subprocess")) or "subprocess"),
+                merged_global.get("models_dir", global_settings.get("models_dir")),
+                merged_global.get("hf_home", global_settings.get("hf_home")),
+                merged_global.get("transformers_cache", global_settings.get("transformers_cache")),
+                state,
+            )
+            return status_upd, mode_upd, next_state, signature
 
         def dismiss_oom(state):
             """Clear VRAM OOM banner (user dismiss)."""
@@ -1648,6 +1734,11 @@ def main(argv=None):
             inputs=[shared_state, oom_sync_signature],
             outputs=[oom_banner, oom_dismiss_btn, oom_sync_signature],
         )
+        demo.load(
+            fn=apply_global_settings_from_state,
+            inputs=[shared_state, global_sync_signature],
+            outputs=[global_ui["global_status"], global_ui["mode_radio"], shared_state, global_sync_signature],
+        )
         
         # Update when shared state changes (for dynamic updates from tabs)
         shared_state.change(
@@ -1659,6 +1750,11 @@ def main(argv=None):
             fn=update_oom_banner,
             inputs=[shared_state, oom_sync_signature],
             outputs=[oom_banner, oom_dismiss_btn, oom_sync_signature],
+        )
+        shared_state.change(
+            fn=apply_global_settings_from_state,
+            inputs=[shared_state, global_sync_signature],
+            outputs=[global_ui["global_status"], global_ui["mode_radio"], shared_state, global_sync_signature],
         )
 
         # Polling fallback (most reliable): refresh OOM banner visibility periodically
@@ -1674,7 +1770,7 @@ def main(argv=None):
     # Enable Gradio queue so built-in toast notifications (gr.Info/gr.Warning/gr.Error) can work
     # and to improve streaming/progress consistency.
     demo.queue()
-    launch_allowed_paths = _build_launch_allowed_paths(output_dir=output_dir, temp_dir=temp_dir)
+    launch_allowed_paths = _build_launch_allowed_paths(output_dir=active_output_dir, temp_dir=active_temp_dir)
     launch_kwargs = {
         "inbrowser": True,
         "allowed_paths": launch_allowed_paths,

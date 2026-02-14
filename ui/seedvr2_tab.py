@@ -555,65 +555,11 @@ def seedvr2_tab(
             # Cache warning for multi-GPU
             cache_warning = gr.Markdown("", visible=False)
 
-            # Output & Metadata controls (shared settings from Output tab)
             gr.Markdown("---")
-            gr.Markdown("####  Output & Metadata")
-            
-            with gr.Row():
-                save_metadata = gr.Checkbox(
-                    label="Save Processing Metadata",
-                    value=values[47] if len(values) > 47 else True,
-                    info="Save run metadata (settings, timestamps, status) to output folder. Respects global telemetry toggle.",
-                    scale=1,
-                )
-                
-                fps_override = gr.Number(
-                    label="FPS Override (0 = use source FPS)",
-                    value=values[48] if len(values) > 48 else 0,
-                    precision=2,
-                    info="Override output video FPS. 0 = preserve original FPS, 30 = force 30fps, 60 = force 60fps. Also sourced from Output tab if set.",
-                    scale=2,
-                )
-            
-            # ADDED v2.5.22: FFmpeg 10-bit encoding for reduced banding
-            gr.Markdown("####  Video Encoding (v2.5.22+)")
-            gr.Markdown("""
-            **NEW: 10-bit Color Depth Support**
-            
-            SeedVR2 v2.5.22 adds FFmpeg backend with 10-bit encoding (x265 yuv420p10le).
-            Benefits over default 8-bit OpenCV:
-            - **Reduced banding** in smooth gradients (skies, shadows)
-            - **Better color accuracy** for high-quality sources
-            - **Smaller file size** at same quality (x265 compression)
-            
-             Note: 10-bit requires `ffmpeg` backend (disables OpenCV).
-            """)
-            
-            with gr.Row():
-                # Validate video_backend value before using it
-                backend_value = values[49] if len(values) > 49 else "opencv"
-                if backend_value not in ["opencv", "ffmpeg"]:
-                    backend_value = "opencv"  # Fallback to default if invalid
-                
-                video_backend = gr.Dropdown(
-                    label="Video Backend",
-                    choices=["opencv", "ffmpeg"],
-                    value=backend_value,
-                    info="opencv: Fast 8-bit encoding (libx264) | ffmpeg: Subprocess-based, enables 10-bit support"
-                )
-                
-                # Validate use_10bit value before using it
-                use_10bit_value = values[50] if len(values) > 50 else False
-                if not isinstance(use_10bit_value, bool):
-                    use_10bit_value = False  # Fallback to default if invalid
-                
-                use_10bit = gr.Checkbox(
-                    label="Enable 10-bit Encoding",
-                    value=use_10bit_value,
-                    info="Use x265 with yuv420p10le for 10-bit color depth. Requires 'ffmpeg' backend. Reduces banding in gradients."
-                )
-            
-            video_backend_warning = gr.Markdown("", visible=False)
+            gr.Markdown(
+                "Shared output controls such as **Save Metadata**, **FPS Override**, and "
+                "**SeedVR2 video backend / 10-bit encoding** are managed in the **Output & Comparison** tab."
+            )
 
             # Input path textbox (direct path alternative to upload)
             gr.Markdown("---")
@@ -1023,8 +969,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 55, len(inputs_list) must also = 55
-    # (includes: save_metadata, fps_override, video_backend, use_10bit)
+    # Current count: len(SEEDVR2_ORDER) = 51, len(inputs_list) must also = 51
     # ============================================================================
     
     inputs_list = [
@@ -1041,10 +986,6 @@ def seedvr2_tab(
         attention_mode, compile_dit, compile_vae, compile_backend, compile_mode,
         compile_fullgraph, compile_dynamic, compile_dynamo_cache_size_limit,
         compile_dynamo_recompile_limit, cache_dit, cache_vae, debug, resume_chunking,
-        # Output & shared settings (integrated from Output tab)
-        save_metadata, fps_override,
-        # ADDED v2.5.22: FFmpeg 10-bit encoding support
-        video_backend, use_10bit,
         # vNext sizing
         upscale_factor, pre_downscale_then_upscale,
         # Per-run SeedVR2 toggle
@@ -2024,33 +1965,6 @@ def seedvr2_tab(
         fn=validate_tile_decode,
         inputs=[vae_decode_tile_size, vae_decode_tile_overlap],
         outputs=tile_decode_warning
-    )
-    
-    # Validate 10-bit encoding requirements
-    def validate_10bit_settings(backend, use_10bit_val):
-        """Validate that 10-bit encoding has required backend"""
-        if use_10bit_val and backend != "ffmpeg":
-            return gr.update(
-                value=" 10-bit encoding requires 'ffmpeg' backend. Please select 'ffmpeg' from Video Backend dropdown or disable 10-bit encoding.",
-                visible=True
-            )
-        elif use_10bit_val and backend == "ffmpeg":
-            return gr.update(
-                value=" 10-bit encoding enabled: Using x265 codec with yuv420p10le pixel format for reduced banding in gradients.",
-                visible=True
-            )
-        return gr.update(value="", visible=False)
-    
-    # Wire up 10-bit validation
-    video_backend.change(
-        fn=validate_10bit_settings,
-        inputs=[video_backend, use_10bit],
-        outputs=video_backend_warning
-    )
-    use_10bit.change(
-        fn=validate_10bit_settings,
-        inputs=[video_backend, use_10bit],
-        outputs=video_backend_warning
     )
     
     # FIXED: Live CUDA device validation with comprehensive checks

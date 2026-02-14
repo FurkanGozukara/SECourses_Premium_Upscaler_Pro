@@ -170,8 +170,19 @@ def build_face_callbacks(
     def set_face_global(val, state=None):
         global_settings["face_global"] = bool(val)
         preset_manager.save_global_settings(global_settings)
-        if state:
-            state["seed_controls"]["face_strength_val"] = global_settings.get("face_strength", 0.5)
+        if state and isinstance(state, dict):
+            seed_controls = state.setdefault("seed_controls", {})
+            if isinstance(seed_controls, dict):
+                seed_controls["face_strength_val"] = float(global_settings.get("face_strength", 0.5))
+                current_global = seed_controls.get("global_settings", {})
+                current_global = current_global if isinstance(current_global, dict) else {}
+                merged_global = dict(current_global)
+                merged_global.update({
+                    "face_global": bool(val),
+                    "face_strength": float(global_settings.get("face_strength", 0.5)),
+                })
+                seed_controls["global_settings"] = merged_global
+                seed_controls["preset_dirty"] = True
         return gr.update(value="✅ Global face restoration updated"), state or {}
 
     def cache_strength(strength_val: float, state=None):
@@ -182,8 +193,16 @@ def build_face_callbacks(
         strength_num = max(0.0, min(1.0, strength_num))
         global_settings["face_strength"] = strength_num
         preset_manager.save_global_settings(global_settings)
-        if state:
-            state["seed_controls"]["face_strength_val"] = strength_num
+        if state and isinstance(state, dict):
+            seed_controls = state.setdefault("seed_controls", {})
+            if isinstance(seed_controls, dict):
+                seed_controls["face_strength_val"] = strength_num
+                current_global = seed_controls.get("global_settings", {})
+                current_global = current_global if isinstance(current_global, dict) else {}
+                merged_global = dict(current_global)
+                merged_global["face_strength"] = strength_num
+                seed_controls["global_settings"] = merged_global
+                seed_controls["preset_dirty"] = True
         return gr.update(value=f"✅ Face strength set to {strength_num}"), state or {}
 
     # ------------------------------------------------------------------ #

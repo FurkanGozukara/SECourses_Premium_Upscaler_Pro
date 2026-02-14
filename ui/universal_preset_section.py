@@ -266,7 +266,7 @@ def universal_preset_section(
     with gr.Accordion("📦 Universal Preset (All Tabs)", open=open_accordion):
         gr.Markdown("""
         **Save/Load affects ALL tabs simultaneously.**  
-        One preset contains SeedVR2, GAN, RIFE, FlashVSR+, Face, Resolution, and Output settings.
+        One preset contains Global Settings, SeedVR2, GAN, RIFE, FlashVSR+, Face, Resolution, and Output settings.
         """)
         
         preset_dropdown = gr.Dropdown(
@@ -465,6 +465,11 @@ def sync_tab_to_shared_state(
 
     # Keep derived cross-tab caches in sync so other pipelines immediately
     # see updated Resolution/Output settings without requiring "Apply" buttons.
+    if tab_name == "global":
+        seed_controls["face_strength_val"] = float(tab_dict.get("face_strength", 0.5) or 0.5)
+        seed_controls["queue_enabled_val"] = bool(tab_dict.get("queue_enabled", True))
+        seed_controls["pinned_reference_path"] = tab_dict.get("pinned_reference_path")
+
     if tab_name == "resolution":
         seed_controls["auto_detect_scenes"] = bool(tab_dict.get("auto_detect_scenes", True))
         seed_controls["auto_chunk"] = bool(tab_dict.get("auto_chunk", True))
@@ -487,6 +492,10 @@ def sync_tab_to_shared_state(
         seed_controls["skip_first_frames_val"] = int(tab_dict.get("skip_first_frames", 0) or 0)
         seed_controls["load_cap_val"] = int(tab_dict.get("load_cap", 0) or 0)
         seed_controls["fps_override_val"] = float(tab_dict.get("fps_override", 0) or 0)
+        seed_controls["image_output_format_val"] = str(tab_dict.get("image_output_format", "png") or "png")
+        seed_controls["image_output_quality_val"] = int(tab_dict.get("image_output_quality", 95) or 95)
+        seed_controls["seedvr2_video_backend_val"] = str(tab_dict.get("seedvr2_video_backend", "opencv") or "opencv")
+        seed_controls["seedvr2_use_10bit_val"] = bool(tab_dict.get("seedvr2_use_10bit", False))
         seed_controls["frame_interpolation_val"] = bool(tab_dict.get("frame_interpolation", False))
         seed_controls["global_rife_enabled_val"] = bool(tab_dict.get("frame_interpolation", False))
         seed_controls["global_rife_multiplier_val"] = tab_dict.get("global_rife_multiplier", "x2") or "x2"

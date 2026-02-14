@@ -123,12 +123,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
             - Universal presets manage these settings across the app
             - Processing time increases with face restoration enabled
             """)
-
-        apply_global_btn = gr.Button(
-            "💾 Save Global Face Setting",
-            variant="secondary",
-            size="lg"
-        )
+        gr.Markdown("Changes here are applied immediately and tracked by the unified preset system.")
         global_status = gr.Markdown("")
 
     # Legacy model context is kept as a hidden field for preset/order compatibility.
@@ -522,11 +517,22 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
 
     # Wire up callbacks
     
-    # Global face toggle
-    apply_global_btn.click(
+    # Global face toggle and strength are applied immediately.
+    global_face_enabled.change(
         fn=lambda enabled, state: service["set_face_global"](enabled, state),
         inputs=[global_face_enabled, shared_state],
-        outputs=[global_status, shared_state]
+        outputs=[global_status, shared_state],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    face_strength.change(
+        fn=lambda strength, state: service["cache_strength"](strength, state),
+        inputs=[face_strength, shared_state],
+        outputs=[global_status, shared_state],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     def _queued_waiting_output(state, ticket_id: str, position: int):

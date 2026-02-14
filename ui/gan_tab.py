@@ -318,35 +318,10 @@ def gan_tab(
 
             gr.Markdown("#### Output Settings")
             with gr.Group():
-                output_format_default = str(_value("output_format", "png")).strip().lower()
-                if output_format_default not in {"auto", "png", "jpg", "webp"}:
-                    output_format_default = "png"
-                with gr.Row():
-                    output_format_gan = gr.Dropdown(
-                        label="Output Format",
-                        choices=["auto", "png", "jpg", "webp"],
-                        value=output_format_default,
-                        info="'auto' matches input format"
-                    )
-                    output_quality_gan = gr.Slider(
-                        label="Output Quality",
-                        minimum=70, maximum=100, step=5,
-                        value=int(_value("output_quality", 100) or 100),
-                        info="Quality for lossy formats (JPG/WebP)"
-                    )
-
-                with gr.Row():
-                    save_metadata = gr.Checkbox(
-                        label="Save Processing Metadata",
-                        value=bool(_value("save_metadata", True)),
-                        info="Embed processing information in output files"
-                    )
-                    fps_override = gr.Number(
-                        label="FPS Override (0 = use source FPS)",
-                        value=float(_value("fps_override", 0) or 0),
-                        precision=2,
-                        info="Override output video FPS. 0 preserves source FPS."
-                    )
+                gr.Markdown(
+                    "Global output controls (Image Output Format/Quality, Save Metadata, FPS Override) "
+                    "are configured in the **Output & Comparison** tab."
+                )
 
                 with gr.Row():
                     face_restore_after_upscale = gr.Checkbox(
@@ -359,6 +334,25 @@ def gan_tab(
                         value=bool(_value("create_subfolders", False)),
                         info="Organize outputs in model-named subdirectories"
                     )
+
+            (
+                preset_dropdown,
+                preset_name_input,
+                save_preset_btn,
+                load_preset_btn,
+                preset_status,
+                reset_defaults_btn,
+                delete_preset_btn,
+                preset_callbacks,
+            ) = universal_preset_section(
+                preset_manager=preset_manager,
+                shared_state=shared_state,
+                tab_name="gan",
+                inputs_list=[],
+                base_dir=base_dir,
+                models_list=models_list,
+                open_accordion=True,
+            )
 
         with gr.Column(scale=2):
             gr.Markdown("### Output / Actions")
@@ -412,12 +406,6 @@ def gan_tab(
 
             status_box = gr.Markdown(value="Ready for processing.")
             progress_indicator = gr.Markdown(value="", visible=True)
-            log_box = gr.Textbox(
-                label="Processing Log",
-                value="",
-                lines=10,
-                buttons=["copy"]
-            )
 
             output_override = gr.Textbox(
                 label="Output Override (single run)",
@@ -533,23 +521,11 @@ def gan_tab(
                     elem_classes=["action-btn", "action-btn-clear"],
                 )
 
-            (
-                preset_dropdown,
-                preset_name_input,
-                save_preset_btn,
-                load_preset_btn,
-                preset_status,
-                reset_defaults_btn,
-                delete_preset_btn,
-                preset_callbacks,
-            ) = universal_preset_section(
-                preset_manager=preset_manager,
-                shared_state=shared_state,
-                tab_name="gan",
-                inputs_list=[],
-                base_dir=base_dir,
-                models_list=models_list,
-                open_accordion=True,
+            log_box = gr.Textbox(
+                label="Processing Log",
+                value="",
+                lines=10,
+                buttons=["copy"]
             )
 
     gan_model.change(
@@ -575,14 +551,14 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 28 components (includes shared output controls + vNext sizing + resume path)
+    # Current count: 24 components (model-specific controls + vNext sizing + resume path)
     # ============================================================================
     
     inputs_list = [
         input_path, output_override, batch_enable, batch_input, batch_output, gan_model,
         target_resolution, downscale_first, auto_calculate_input, use_resolution_tab, tile_size, overlap,
         denoising_strength, sharpening, color_correction, gpu_acceleration, gpu_device,
-        batch_size, output_format_gan, output_quality_gan, save_metadata, fps_override, face_restore_after_upscale, create_subfolders,
+        batch_size, face_restore_after_upscale, create_subfolders,
         # vNext sizing
         upscale_factor, max_resolution, pre_downscale_then_upscale,
         # Resume path (chunk/scene mode)

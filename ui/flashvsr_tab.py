@@ -211,94 +211,145 @@ def flashvsr_tab(
             gr.Markdown("####  Processing Settings")
             
             with gr.Group():
-                dtype = gr.Dropdown(
-                    label="Precision",
-                    choices=["fp16", "bf16"],
-                    value=str(_value("dtype", "bf16")) if str(_value("dtype", "bf16")) in {"fp16", "bf16"} else "bf16",
-                    info="bf16 = faster, more stable. fp16 = broader compatibility"
-                )
-                
-                device = gr.Textbox(
-                    label="Device (Single GPU Only)",
-                    value=_value("device", "auto") if cuda_available else "cpu",
-                    placeholder="auto, cuda:0, cpu" if cuda_available else "CPU only (no CUDA)",
-                    info=f"{gpu_hint}\nauto = automatic GPU selection, cuda:0 = specific GPU, cpu = CPU mode. Multi-GPU NOT supported by FlashVSR+.",
-                    interactive=cuda_available
-                )
-                
-                seed = gr.Number(
-                    label="Random Seed",
-                    value=_value("seed", 0),
-                    precision=0,
-                    info="Seed for reproducibility. 0 = random"
-                )
-                
-                attention = gr.Dropdown(
-                    label="Attention Mode",
-                    choices=["sage", "block"],
-                    value=str(_value("attention", "sage")) if str(_value("attention", "sage")) in {"sage", "block"} else "sage",
-                    info="sage = default, block = alternative implementation"
-                )
+                with gr.Row():
+                    dtype = gr.Dropdown(
+                        label="Precision",
+                        choices=["fp16", "bf16"],
+                        value=str(_value("dtype", "bf16")) if str(_value("dtype", "bf16")) in {"fp16", "bf16"} else "bf16",
+                        info="bf16 = faster, more stable. fp16 = broader compatibility"
+                    )
+                    
+                    attention = gr.Dropdown(
+                        label="Attention Mode",
+                        choices=["sage", "block"],
+                        value=str(_value("attention", "sage")) if str(_value("attention", "sage")) in {"sage", "block"} else "sage",
+                        info="sage = default, block = alternative implementation"
+                    )
+
+                with gr.Row():
+                    seed = gr.Number(
+                        label="Random Seed",
+                        value=_value("seed", 0),
+                        precision=0,
+                        info="Seed for reproducibility. 0 = random"
+                    )
+                    
+                    device = gr.Textbox(
+                        label="Device (Single GPU Only)",
+                        value=_value("device", "auto") if cuda_available else "cpu",
+                        placeholder="auto, cuda:0, cpu" if cuda_available else "CPU only (no CUDA)",
+                        info=f"{gpu_hint}\nauto = automatic GPU selection, cuda:0 = specific GPU, cpu = CPU mode. Multi-GPU NOT supported by FlashVSR+.",
+                        interactive=cuda_available
+                    )
             
             # Memory Optimization
             gr.Markdown("####  Memory Optimization (Tiling)")
             
             with gr.Group():
-                tiled_vae = gr.Checkbox(
-                    label="Enable VAE Tiling",
-                    value=bool(_value("tiled_vae", False)),
-                    info="Reduce VRAM usage during VAE encoding/decoding. Essential for high resolutions."
-                )
-                
-                tiled_dit = gr.Checkbox(
-                    label="Enable DiT Tiling",
-                    value=bool(_value("tiled_dit", False)),
-                    info="Reduce VRAM usage during diffusion inference. Enables processing larger videos."
-                )
-                
-                tile_size = gr.Slider(
-                    label="Tile Size",
-                    minimum=128, maximum=512, step=32,
-                    value=int(_value("tile_size", 256) or 256),
-                    info="Size of each tile. Larger = faster but more VRAM"
-                )
-                
-                overlap = gr.Slider(
-                    label="Tile Overlap",
-                    minimum=8, maximum=64, step=8,
-                    value=int(_value("overlap", 24) or 24),
-                    info="Overlap between tiles to reduce seams. Higher = smoother"
-                )
-                
-                unload_dit = gr.Checkbox(
-                    label="Unload DiT Before Decoding",
-                    value=bool(_value("unload_dit", False)),
-                    info="Free VRAM before VAE decoding. Slower but uses less memory."
-                )
+                with gr.Row():
+                    tiled_vae = gr.Checkbox(
+                        label="Enable VAE Tiling",
+                        value=bool(_value("tiled_vae", False)),
+                        info="Reduce VRAM usage during VAE encoding/decoding. Essential for high resolutions."
+                    )
+                    
+                    tiled_dit = gr.Checkbox(
+                        label="Enable DiT Tiling",
+                        value=bool(_value("tiled_dit", False)),
+                        info="Reduce VRAM usage during diffusion inference. Enables processing larger videos."
+                    )
+                    
+                    unload_dit = gr.Checkbox(
+                        label="Unload DiT Before Decoding",
+                        value=bool(_value("unload_dit", False)),
+                        info="Free VRAM before VAE decoding. Slower but uses less memory."
+                    )
+
+                with gr.Row():
+                    tile_size = gr.Slider(
+                        label="Tile Size",
+                        minimum=128, maximum=512, step=32,
+                        value=int(_value("tile_size", 256) or 256),
+                        info="Size of each tile. Larger = faster but more VRAM"
+                    )
+                    
+                    overlap = gr.Slider(
+                        label="Tile Overlap",
+                        minimum=8, maximum=64, step=8,
+                        value=int(_value("overlap", 24) or 24),
+                        info="Overlap between tiles to reduce seams. Higher = smoother"
+                    )
             
             # Quality Settings
             gr.Markdown("####  Quality Settings")
             
             with gr.Group():
-                color_fix = gr.Checkbox(
-                    label="Color Correction",
-                    value=bool(_value("color_fix", True)),
-                    info="Maintain color accuracy. Recommended ON."
+                with gr.Row():
+                    color_fix = gr.Checkbox(
+                        label="Color Correction",
+                        value=bool(_value("color_fix", True)),
+                        info="Maintain color accuracy. Recommended ON."
+                    )
+                    
+                    fps_flashvsr = gr.Number(
+                        label="Output FPS (image sequences only)",
+                        value=int(_value("fps", 30) or 30),
+                        precision=0,
+                        info="Frame rate for image sequence outputs. Ignored for video inputs."
+                    )
+                    
+                    quality = gr.Slider(
+                        label="Video Quality",
+                        minimum=1, maximum=10, step=1,
+                        value=int(_value("quality", 6) or 6),
+                        info="Output quality. 1 = lowest, 10 = highest. 6 is recommended."
+                    )
+
+                output_override = gr.Textbox(
+                    label="Output Override (folder or .mp4 file)",
+                    value=_value("output_override", ""),
+                    placeholder="Leave empty for auto naming",
+                    info="Optional custom output location. A folder saves into that folder. A .mp4 file path renames the final output to that exact file.",
                 )
-                
-                fps_flashvsr = gr.Number(
-                    label="Output FPS (image sequences only)",
-                    value=int(_value("fps", 30) or 30),
-                    precision=0,
-                    info="Frame rate for image sequence outputs. Ignored for video inputs."
-                )
-                
-                quality = gr.Slider(
-                    label="Video Quality",
-                    minimum=1, maximum=10, step=1,
-                    value=int(_value("quality", 6) or 6),
-                    info="Output quality. 1 = lowest, 10 = highest. 6 is recommended."
-                )
+
+                with gr.Row():
+                    output_format = gr.Dropdown(
+                        label="Output Format",
+                        choices=["mp4"],
+                        value=str(_value("output_format", "mp4") or "mp4"),
+                        info="FlashVSR+ currently outputs MP4.",
+                        interactive=False,
+                    )
+                    save_metadata = gr.Checkbox(
+                        label="Save Processing Metadata",
+                        value=bool(_value("save_metadata", True)),
+                        info="Save run metadata to output folder."
+                    )
+                    face_restore_after_upscale = gr.Checkbox(
+                        label="Apply Face Restoration after upscale",
+                        value=bool(_value("face_restore_after_upscale", False)),
+                        info="Per-run face restore toggle. Also respects Global Settings face toggle."
+                    )
+
+            # UNIVERSAL PRESET MANAGEMENT
+            (
+                preset_dropdown,
+                preset_name_input,
+                save_preset_btn,
+                load_preset_btn,
+                preset_status,
+                reset_defaults_btn,
+                delete_preset_btn,
+                preset_callbacks,
+            ) = universal_preset_section(
+                preset_manager=preset_manager,
+                shared_state=shared_state,
+                tab_name="flashvsr",
+                inputs_list=[],
+                base_dir=base_dir,
+                models_list=models_list,
+                open_accordion=True,
+            )
         
         # Right Column: Output & Controls
         with gr.Column(scale=2):
@@ -353,40 +404,6 @@ def flashvsr_tab(
             
             status_box = gr.Markdown(value="Ready.")
             progress_indicator = gr.Markdown(value="", visible=True)
-            
-            log_box = gr.Textbox(
-                label=" Processing Log",
-                value="",
-                lines=12,
-                buttons=["copy"]
-            )
-
-            output_override = gr.Textbox(
-                label="Output Override (folder or .mp4 file)",
-                value=_value("output_override", ""),
-                placeholder="Leave empty for auto naming",
-                info="Optional custom output location. A folder saves into that folder. A .mp4 file path renames the final output to that exact file.",
-            )
-
-            output_format = gr.Dropdown(
-                label="Output Format",
-                choices=["mp4"],
-                value=str(_value("output_format", "mp4") or "mp4"),
-                info="FlashVSR+ currently outputs MP4.",
-                interactive=False,
-            )
-
-            with gr.Row():
-                save_metadata = gr.Checkbox(
-                    label="Save Processing Metadata",
-                    value=bool(_value("save_metadata", True)),
-                    info="Save run metadata to output folder."
-                )
-                face_restore_after_upscale = gr.Checkbox(
-                    label="Apply Face Restoration after upscale",
-                    value=bool(_value("face_restore_after_upscale", False)),
-                    info="Per-run face restore toggle. Also respects Global Settings face toggle."
-                )
 
             resume_run_dir = gr.Textbox(
                 label="Resume Run Folder (chunk/scene resume)",
@@ -512,24 +529,11 @@ def flashvsr_tab(
                     placeholder="Output directory"
                 )
             
-            # UNIVERSAL PRESET MANAGEMENT
-            (
-                preset_dropdown,
-                preset_name_input,
-                save_preset_btn,
-                load_preset_btn,
-                preset_status,
-                reset_defaults_btn,
-                delete_preset_btn,
-                preset_callbacks,
-            ) = universal_preset_section(
-                preset_manager=preset_manager,
-                shared_state=shared_state,
-                tab_name="flashvsr",
-                inputs_list=[],
-                base_dir=base_dir,
-                models_list=models_list,
-                open_accordion=True,
+            log_box = gr.Textbox(
+                label=" Processing Log",
+                value="",
+                lines=12,
+                buttons=["copy"]
             )
             
             # Info

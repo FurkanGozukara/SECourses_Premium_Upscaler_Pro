@@ -17,6 +17,7 @@ _CHECK_LABELS = {
     "gradio": "Gradio Compatibility",
     "ffmpeg": "FFmpeg",
     "cuda": "CUDA + GPUs",
+    "nvidia_driver": "NVIDIA Driver Version",
     "vs_build_tools": "Visual Studio Build Tools",
     "temp_dir": "Temp Directory Access",
     "output_dir": "Output Directory Access",
@@ -197,6 +198,7 @@ def health_tab(global_settings: Dict[str, Any], shared_state: gr.State, temp_dir
             - **Gradio compatibility**: Verifies version and required feature support.
             - **FFmpeg**: Confirms `ffmpeg` is available in PATH for video processing.
             - **CUDA + GPUs**: Detects NVIDIA GPUs, CUDA version, and free VRAM.
+            - **NVIDIA driver version**: Validates installed NVIDIA driver is at least 580+.
             - **VS Build Tools**: Validates MSVC toolchain availability for `torch.compile` on Windows.
             - **Directory access**: Checks write access for temp and output folders.
             - **Disk space**: Checks available free space for temp and output paths.

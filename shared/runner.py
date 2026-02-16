@@ -516,6 +516,11 @@ class Runner:
                     env.update(vs_env)
                     log_output(f"âœ… Using VS Build Tools for torch.compile: {vcvars_path}\n   {vs_detail}\n")
 
+        # Constrain visible GPU(s) before CLI startup to prevent stray contexts on GPU 0.
+        cmd, gpu_isolation_note = self._enforce_seedvr2_gpu_visibility(cmd, settings, env)
+        if gpu_isolation_note:
+            log_output(gpu_isolation_note + "\n")
+
         # Log the (final) command being executed for debugging
         cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
         log_output(f"[SeedVR2] Executing command:\n{cmd_str}\n")
@@ -526,9 +531,6 @@ class Runner:
         env["TEMP"] = str(self.temp_dir)
         env["TMP"] = str(self.temp_dir)
         env.setdefault("PYTHONWARNINGS", "ignore")
-        if str(env.get("SECOURSES_GLOBAL_GPU_DEVICE", "") or "").strip().lower() == "cpu":
-            # Force CPU visibility when global selector is set to CPU.
-            env["CUDA_VISIBLE_DEVICES"] = ""
         # Windows consoles often default to legacy code pages (cp1252) which can crash
         # SeedVR2 when it prints emojis (UnicodeEncodeError). Force UTF-8 for the CLI.
         if platform.system() == "Windows":
@@ -1032,6 +1034,115 @@ class Runner:
             out.append(token)
             i += 1
         return out
+
+    @staticmethod
+    def _normalize_cuda_token(token: Any) -> str:
+        text = str(token or "").strip().lower()
+        if text.startswith("cuda:"):
+            text = text.split(":", 1)[1].strip()
+        return text
+
+    @classmethod
+    def _split_cuda_spec(cls, value: Any) -> List[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        devices: List[str] = []
+        for part in parts:
+            normalized = cls._normalize_cuda_token(part)
+            if normalized.isdigit() and normalized not in devices:
+                devices.append(normalized)
+        return devices
+
+    @staticmethod
+    def _find_flag_index(command: List[str], flag: str) -> Optional[int]:
+        for i, token in enumerate(command):
+            if token == flag:
+                return i
+        return None
+
+    @classmethod
+    def _get_flag_value(cls, command: List[str], flag: str) -> Optional[str]:
+        idx = cls._find_flag_index(command, flag)
+        if idx is None or idx + 1 >= len(command):
+            return None
+        return str(command[idx + 1])
+
+    @classmethod
+    def _set_flag_value(cls, command: List[str], flag: str, value: str) -> List[str]:
+        updated = list(command)
+        idx = cls._find_flag_index(updated, flag)
+        if idx is None:
+            return updated
+        if idx + 1 < len(updated):
+            updated[idx + 1] = str(value)
+        else:
+            updated.append(str(value))
+        return updated
+
+    def _enforce_seedvr2_gpu_visibility(
+        self,
+        command: List[str],
+        settings: Dict[str, Any],
+        env: Dict[str, str],
+    ) -> Tuple[List[str], Optional[str]]:
+        """
+        Ensure SeedVR2 subprocess can only see selected GPU(s).
+
+        Why this exists:
+        - SeedVR2 pre-parses `--cuda_device` before heavy imports.
+        - If CUDA_VISIBLE_DEVICES is not pre-set, it imports torch to validate IDs.
+        - That early validation can create a context on physical GPU 0.
+
+        We set CUDA_VISIBLE_DEVICES in the parent launcher and remap CLI device IDs
+        to local indices (0..N-1) inside the constrained view.
+        """
+        updated_cmd = list(command)
+        selected_raw = str(settings.get("cuda_device", "") or "").strip()
+        global_raw = str(env.get("SECOURSES_GLOBAL_GPU_DEVICE", "") or "").strip().lower()
+
+        if global_raw == "cpu" or selected_raw.lower() in {"cpu", "none"}:
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            return updated_cmd, "[SeedVR2] GPU isolation: CPU mode (CUDA_VISIBLE_DEVICES cleared)"
+
+        # Prefer explicit SeedVR2 selection, fallback to global runtime selection.
+        visible_devices = self._split_cuda_spec(selected_raw or global_raw)
+        if not visible_devices:
+            return updated_cmd, None
+
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        mapping = {src: str(idx) for idx, src in enumerate(visible_devices)}
+
+        cmd_cuda_value = self._get_flag_value(updated_cmd, "--cuda_device")
+        requested_devices = self._split_cuda_spec(cmd_cuda_value if cmd_cuda_value is not None else selected_raw)
+        if requested_devices:
+            remapped_devices = [mapping.get(device_id, "0") for device_id in requested_devices]
+            updated_cmd = self._set_flag_value(updated_cmd, "--cuda_device", ",".join(remapped_devices))
+
+        for flag in ("--dit_offload_device", "--vae_offload_device", "--tensor_offload_device"):
+            current = self._get_flag_value(updated_cmd, flag)
+            if current is None:
+                continue
+            current_str = str(current).strip()
+            current_lower = current_str.lower()
+            if current_lower in {"", "cpu", "none"}:
+                continue
+
+            had_cuda_prefix = current_lower.startswith("cuda:")
+            current_id = self._normalize_cuda_token(current_str)
+            if not current_id.isdigit():
+                continue
+
+            remapped = mapping.get(current_id, "0")
+            remapped_value = f"cuda:{remapped}" if had_cuda_prefix else remapped
+            updated_cmd = self._set_flag_value(updated_cmd, flag, remapped_value)
+
+        remap_pairs = ", ".join(f"{src}->{dst}" for src, dst in mapping.items())
+        return (
+            updated_cmd,
+            f"[SeedVR2] GPU isolation: CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} (local mapping {remap_pairs})",
+        )
 
     def _capture_vcvars_env(self, vcvars_path: Path, arch: str = "x64", timeout: int = 25) -> Tuple[Optional[Dict[str, str]], str]:
         """

@@ -42,6 +42,38 @@ class FlashVSRResult:
     output_fps: float = 30.0
 
 
+def _normalize_cuda_token(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("cuda:"):
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def _resolve_flashvsr_device(device_value: Any) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Convert app GPU selection into a FlashVSR-safe runtime tuple:
+    - CLI device arg (`-d`)
+    - CUDA_VISIBLE_DEVICES value (or None to leave unchanged)
+    - Optional log note
+    """
+    raw = str(device_value or "").strip()
+    raw_lower = raw.lower()
+
+    if raw_lower in {"cpu", "none", "off"}:
+        return "cpu", "", "[FlashVSR] GPU isolation: CPU mode (CUDA_VISIBLE_DEVICES cleared)"
+
+    if raw_lower in {"", "auto"}:
+        return "auto", None, None
+
+    gpu_id = _normalize_cuda_token(raw)
+    if gpu_id.isdigit():
+        # Restrict to the selected physical GPU and remap to local cuda:0.
+        return "cuda:0", gpu_id, f"[FlashVSR] GPU isolation: CUDA_VISIBLE_DEVICES={gpu_id}, device remapped to cuda:0"
+
+    # Unknown format: pass through untouched.
+    return raw, None, None
+
+
 def run_flashvsr(
     settings: Dict[str, Any],
     base_dir: Path,
@@ -154,6 +186,7 @@ def run_flashvsr(
         mode = settings.get("mode", "tiny")
         dtype = settings.get("dtype", "bf16")
         device = settings.get("device", "auto")
+        device_arg, visible_gpu, gpu_note = _resolve_flashvsr_device(device)
         fps = int(settings.get("fps", 30))
         quality = int(settings.get("quality", 6))
         attention = settings.get("attention", "sage")
@@ -190,7 +223,7 @@ def run_flashvsr(
             "-v", version,
             "-m", mode,
             "-t", dtype,
-            "-d", device,
+            "-d", device_arg,
             "-f", str(fps),
             "-q", str(quality),
             "-a", attention,
@@ -236,6 +269,10 @@ def run_flashvsr(
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
         }
+        if visible_gpu is not None:
+            proc_env["CUDA_VISIBLE_DEVICES"] = visible_gpu
+        if gpu_note:
+            log(gpu_note)
         proc_env.setdefault("TRITON_CACHE_DIR", str(triton_cache_dir))
 
         proc = subprocess.Popen(

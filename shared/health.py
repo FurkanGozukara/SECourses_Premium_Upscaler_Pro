@@ -1,11 +1,15 @@
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
 
 from .path_utils import get_disk_free_gb, is_writable
+
+
+MIN_NVIDIA_DRIVER_MAJOR = 580
 
 
 def _check_ffmpeg() -> Dict[str, Optional[str]]:
@@ -64,6 +68,92 @@ def _check_cuda() -> Dict[str, Optional[str]]:
         
     except Exception as exc:
         return {"status": "error", "detail": f"CUDA check failed: {exc}"}
+
+
+def _parse_driver_version(value: str) -> Optional[tuple[int, int]]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d+)(?:\.(\d+))?", text)
+    if not match:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return major, minor
+
+
+def _check_nvidia_driver(min_major: int = MIN_NVIDIA_DRIVER_MAJOR) -> Dict[str, Optional[str]]:
+    """
+    Validate NVIDIA driver major version from nvidia-smi.
+
+    Requirement: major version >= `min_major` (default: 580).
+    """
+    try:
+        # Non-NVIDIA/macOS systems should not fail this check as an application error.
+        if platform.system() == "Darwin":
+            return {"status": "skipped", "detail": "NVIDIA driver check skipped on macOS"}
+
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip() or "nvidia-smi returned non-zero"
+            return {"status": "missing", "detail": f"Could not read NVIDIA driver version: {detail}"}
+
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if not lines:
+            return {"status": "missing", "detail": "No NVIDIA GPUs reported by nvidia-smi"}
+
+        parsed_versions: list[tuple[int, int]] = []
+        raw_versions: list[str] = []
+        gpu_names: list[str] = []
+
+        for line in lines:
+            parts = [p.strip() for p in line.split(",", 1)]
+            version_raw = parts[0] if parts else ""
+            gpu_name = parts[1] if len(parts) > 1 else "Unknown GPU"
+            parsed = _parse_driver_version(version_raw)
+            if parsed:
+                parsed_versions.append(parsed)
+                raw_versions.append(version_raw)
+            gpu_names.append(gpu_name)
+
+        if not parsed_versions:
+            sample = lines[0]
+            return {
+                "status": "warning",
+                "detail": f"Could not parse NVIDIA driver version from nvidia-smi output: {sample}",
+            }
+
+        lowest = min(parsed_versions)
+        lowest_raw = f"{lowest[0]}.{lowest[1]}"
+        unique_raw = sorted(set(raw_versions))
+        version_summary = ", ".join(unique_raw)
+        gpu_count = len(gpu_names)
+
+        if lowest[0] >= int(min_major):
+            return {
+                "status": "ok",
+                "detail": (
+                    f"NVIDIA driver version {version_summary} detected across {gpu_count} GPU(s). "
+                    f"Minimum required major version is {min_major}+."
+                ),
+            }
+
+        return {
+            "status": "warning",
+            "detail": (
+                f"DANGER: NVIDIA driver {lowest_raw} detected (minimum required: {min_major}+). "
+                "Update the NVIDIA driver to avoid CUDA/runtime instability."
+            ),
+        }
+    except FileNotFoundError:
+        return {"status": "missing", "detail": "nvidia-smi not found in PATH; NVIDIA driver version cannot be validated"}
+    except Exception as exc:
+        return {"status": "error", "detail": f"NVIDIA driver check failed: {exc}"}
 
 
 def _check_vs_build_tools() -> Dict[str, Optional[str]]:
@@ -342,6 +432,7 @@ def collect_health_report(temp_dir: Path, output_dir: Path) -> Dict[str, Dict[st
         "gradio": _check_gradio(),  # Check Gradio FIRST (critical for UI)
         "ffmpeg": _check_ffmpeg(),
         "cuda": _check_cuda(),
+        "nvidia_driver": _check_nvidia_driver(),
         "vs_build_tools": _check_vs_build_tools(),
         "temp_dir": _check_writable(temp_dir),
         "output_dir": _check_writable(output_dir),

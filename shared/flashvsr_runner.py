@@ -14,9 +14,11 @@ import sys
 import time
 import shutil
 import tempfile
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass
+from contextlib import suppress
 
 from .path_utils import (
     normalize_path,
@@ -27,6 +29,7 @@ from .path_utils import (
     resolve_output_location
 )
 from .command_logger import get_command_logger
+from .models.flashvsr_meta import flashvsr_version_to_internal, flashvsr_version_to_ui
 
 
 @dataclass
@@ -53,7 +56,7 @@ def run_flashvsr(
     - input_path: str (video or image folder)
     - output_path: str (output directory)
     - scale: int (2 or 4)
-    - version: str ("10" or "11")
+    - version: str ("1.0"/"1.1" UI, or legacy "10"/"11")
     - mode: str ("tiny", "tiny-long", "full")
     - tiled_vae: bool
     - tiled_dit: bool
@@ -73,11 +76,16 @@ def run_flashvsr(
     """
     start_time = time.time()
     log_lines = []
+    cmd: List[str] = []
     
     def log(msg: str):
         log_lines.append(msg)
         if on_progress:
-            on_progress(msg + "\n")
+            try:
+                on_progress(msg + "\n")
+            except Exception:
+                # Never let UI/console callback issues fail the actual run.
+                pass
     temp_input_dir: Optional[Path] = None
     
     try:
@@ -140,7 +148,9 @@ def run_flashvsr(
         
         # Get settings with defaults
         scale = int(settings.get("scale", 4))
-        version = str(settings.get("version", "10"))
+        raw_version = str(settings.get("version", "1.0"))
+        version = flashvsr_version_to_internal(raw_version)
+        version_ui = flashvsr_version_to_ui(raw_version)
         mode = settings.get("mode", "tiny")
         dtype = settings.get("dtype", "bf16")
         device = settings.get("device", "auto")
@@ -151,7 +161,6 @@ def run_flashvsr(
 
         # FlashVSR+ naming (mirrors FlashVSR_plus/run.py):
         #   FlashVSR_{mode}_{name.split('.')[0]}_{seed}.mp4
-        import os
         base_name = os.path.basename(original_input_path.rstrip("/\\"))
         base_no_ext = base_name.split(".")[0] if base_name else "FlashVSR"
         expected_output_path = output_folder_path / f"FlashVSR_{mode}_{base_no_ext}_{seed}.mp4"
@@ -202,7 +211,7 @@ def run_flashvsr(
         if color_fix:
             cmd.append("--color-fix")
         
-        log(f"Running FlashVSR+ with scale={scale}, mode={mode}, version={version}")
+        log(f"Running FlashVSR+ with scale={scale}, mode={mode}, version={version_ui}")
         if original_input_path != effective_input_path:
             log(f"Preprocessed input: {effective_input_path} (original: {original_input_path})")
         log(f"Command: {' '.join(cmd)}")
@@ -216,15 +225,28 @@ def run_flashvsr(
         if platform.system() == "Windows":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
-            import os
             preexec_fn = os.setsid
         
+        triton_cache_dir = base_dir / "temp" / "triton_cache"
+        with suppress(Exception):
+            triton_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        proc_env = {
+            **os.environ,
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
+        proc_env.setdefault("TRITON_CACHE_DIR", str(triton_cache_dir))
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=base_dir,
+            env=proc_env,
             creationflags=creationflags,
             preexec_fn=preexec_fn
         )
@@ -300,8 +322,16 @@ def run_flashvsr(
 
             log(f"✅ Output saved: {output_path}")
             
+            effective_returncode = int(returncode)
+            if effective_returncode != 0:
+                log(
+                    f"FlashVSR+ exited with code {effective_returncode} after producing output; "
+                    "treating run as successful."
+                )
+                effective_returncode = 0
+
             result = FlashVSRResult(
-                returncode=proc.returncode,
+                returncode=effective_returncode,
                 output_path=output_path,
                 log="\n".join(log_lines),
                 input_fps=get_media_fps(original_input_path) or 30.0,

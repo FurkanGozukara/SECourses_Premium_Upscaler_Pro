@@ -26,6 +26,7 @@ from shared.services.face_service import FACE_ORDER, face_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
 from shared.models.rife_meta import get_rife_default_model
+from shared.models.flashvsr_meta import flashvsr_version_to_ui
 
 
 GLOBAL_ORDER = [
@@ -119,7 +120,7 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["output_format"] = "mp4"
     scale_raw = str(cfg.get("scale", "4")).strip()
     cfg["scale"] = "2" if scale_raw == "2" else "4"
-    cfg["version"] = str(cfg.get("version", "10") or "10")
+    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", "1.0"))
     cfg["mode"] = str(cfg.get("mode", "tiny") or "tiny")
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))

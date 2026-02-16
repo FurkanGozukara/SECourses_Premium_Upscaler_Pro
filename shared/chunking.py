@@ -367,6 +367,7 @@ def split_video(
     work_dir: Path,
     precise: bool = True,
     preserve_quality: bool = True,
+    include_audio: bool = True,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -456,7 +457,7 @@ def split_video(
     if not normalized_scenes:
         return [Path(video_path)]
 
-    src_has_audio = has_audio_stream(Path(video_path))
+    src_has_audio = has_audio_stream(Path(video_path)) if include_audio else False
     src_pix_fmt = _probe_pix_fmt(video_path) if preserve_quality else None
     for idx, (start_f, end_f) in enumerate(normalized_scenes, 1):
         out = work_dir / f"chunk_{idx:04d}.mp4"
@@ -547,6 +548,8 @@ def split_video(
             cmd = [
                 "ffmpeg",
                 "-y",
+                "-fflags",
+                "+genpts",
                 "-ss",
                 str(start_f),
                 "-i",
@@ -557,6 +560,8 @@ def split_video(
                 "0:v:0",
                 "-map",
                 "0:a?",
+                "-vf",
+                "setpts=PTS-STARTPTS",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -580,6 +585,8 @@ def split_video(
             cmd = [
                 "ffmpeg",
                 "-y",
+                "-fflags",
+                "+genpts",
                 "-ss",
                 str(start_f),
                 "-i",
@@ -590,6 +597,8 @@ def split_video(
                 "0:v:0",
                 "-map",
                 "0:a?",
+                "-vf",
+                "setpts=PTS-STARTPTS",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -615,6 +624,8 @@ def split_video(
             cmd = [
                 "ffmpeg",
                 "-y",
+                "-fflags",
+                "+genpts",
                 "-ss",
                 str(start_f),
                 "-i",
@@ -623,6 +634,8 @@ def split_video(
                 str(duration),
                 "-map",
                 "0:v:0",
+                "-vf",
+                "setpts=PTS-STARTPTS",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -660,39 +673,48 @@ def split_video(
             on_progress(f"Splitting chunk {idx}/{len(scenes)} ({mode})...\n")
 
         if precise:
-            _split_precise_lossless(src_pix_fmt)
-            if not _ok_with_audio() and src_pix_fmt:
-                # Retry without forcing pixel format (better compatibility with non-x264 pix_fmts).
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_precise_lossless(None)
-            if not _ok_with_audio():
-                # Audio-copy can fail on some codecs/containers; retry with AAC audio.
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_precise_lossless_aac_audio(src_pix_fmt)
+            if include_audio:
+                _split_precise_lossless(src_pix_fmt)
                 if not _ok_with_audio() and src_pix_fmt:
+                    # Retry without forcing pixel format (better compatibility with non-x264 pix_fmts).
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
-                    _split_precise_lossless_aac_audio(None)
-            if not _ok_with_audio():
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_copy()
-            if not _ok_with_audio():
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_copy_aac_audio()
+                    _split_precise_lossless(None)
+                if not _ok_with_audio():
+                    # Audio-copy can fail on some codecs/containers; retry with AAC audio.
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_precise_lossless_aac_audio(src_pix_fmt)
+                    if not _ok_with_audio() and src_pix_fmt:
+                        try:
+                            out.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        _split_precise_lossless_aac_audio(None)
+                if not _ok_with_audio():
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_copy()
+                if not _ok_with_audio():
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_copy_aac_audio()
+            else:
+                _split_precise_lossless_video_only(src_pix_fmt)
+                if not _is_decodable(out) and src_pix_fmt:
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_precise_lossless_video_only(None)
 
             # Last-resort fallbacks: keep video even if audio cannot be preserved.
             if not _is_decodable(out):
@@ -714,37 +736,52 @@ def split_video(
                     pass
                 _split_copy_video_only()
         else:
-            _split_copy()
-            if not _ok_with_audio():
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_copy_aac_audio()
-            if not _ok_with_audio():
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_precise_lossless(src_pix_fmt)
-                if not _ok_with_audio() and src_pix_fmt:
+            if include_audio:
+                _split_copy()
+                if not _ok_with_audio():
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
-                    _split_precise_lossless(None)
-            if not _ok_with_audio():
-                try:
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                _split_precise_lossless_aac_audio(src_pix_fmt)
-                if not _ok_with_audio() and src_pix_fmt:
+                    _split_copy_aac_audio()
+                if not _ok_with_audio():
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
-                    _split_precise_lossless_aac_audio(None)
+                    _split_precise_lossless(src_pix_fmt)
+                    if not _ok_with_audio() and src_pix_fmt:
+                        try:
+                            out.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        _split_precise_lossless(None)
+                if not _ok_with_audio():
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_precise_lossless_aac_audio(src_pix_fmt)
+                    if not _ok_with_audio() and src_pix_fmt:
+                        try:
+                            out.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        _split_precise_lossless_aac_audio(None)
+            else:
+                _split_copy_video_only()
+                if not _is_decodable(out):
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    _split_precise_lossless_video_only(src_pix_fmt)
+                    if not _is_decodable(out) and src_pix_fmt:
+                        try:
+                            out.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        _split_precise_lossless_video_only(None)
 
             # Last-resort fallbacks: keep video even if audio cannot be preserved.
             if not _is_decodable(out):
@@ -1833,6 +1870,7 @@ def chunk_and_process(
             input_chunks_dir,
             precise=precise_split,
             preserve_quality=True,
+            include_audio=False if model_type == "flashvsr" else True,
             on_progress=on_progress,
         )
         on_progress(f"Split into {len(chunk_paths)} chunks\n")

@@ -13,6 +13,7 @@ from shared.services.flashvsr_service import (
     build_flashvsr_callbacks, FLASHVSR_ORDER
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
+from shared.models.flashvsr_meta import flashvsr_version_to_internal, flashvsr_version_to_ui
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -143,9 +144,9 @@ def flashvsr_tab(
                         )
                         version = gr.Dropdown(
                             label="Model Version",
-                            choices=["10", "11"],
-                            value=str(_value("version", "10")) if str(_value("version", "10")) in {"10", "11"} else "10",
-                            info="v10 = faster, v11 = higher quality"
+                            choices=["1.0", "1.1"],
+                            value=flashvsr_version_to_ui(_value("version", "1.0")),
+                            info="1.0 = faster, 1.1 = higher quality"
                         )
                         mode = gr.Dropdown(
                             label="Pipeline Mode",
@@ -180,7 +181,7 @@ def flashvsr_tab(
                 """Display model metadata information"""
                 from shared.models.flashvsr_meta import get_flashvsr_metadata
 
-                model_id = f"v{version_val}_{mode_val}_{scale_val}x"
+                model_id = f"v{flashvsr_version_to_internal(version_val)}_{mode_val}_{scale_val}x"
                 metadata = get_flashvsr_metadata(model_id)
 
                 if metadata:

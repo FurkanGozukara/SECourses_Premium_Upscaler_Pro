@@ -27,7 +27,12 @@ from shared.path_utils import (
 )
 from shared.logging_utils import RunLogger
 from shared.comparison_unified import create_unified_comparison
-from shared.models.flashvsr_meta import get_flashvsr_metadata, get_flashvsr_default_model
+from shared.models.flashvsr_meta import (
+    get_flashvsr_metadata,
+    get_flashvsr_default_model,
+    flashvsr_version_to_internal,
+    flashvsr_version_to_ui,
+)
 from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
@@ -153,7 +158,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_tile_size = model_meta.default_tile_size
         default_overlap = model_meta.default_overlap
         default_attention = model_meta.default_attention
-        version = model_meta.version
+        version = flashvsr_version_to_ui(model_meta.version)
         mode = model_meta.mode
         scale = model_meta.scale
     else:
@@ -161,7 +166,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_tile_size = 256
         default_overlap = 24
         default_attention = "sage"
-        version = "10"
+        version = "1.0"
         mode = "tiny"
         scale = 4
     
@@ -256,11 +261,12 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         cfg["scale"] = "2" if str(cfg.get("scale", defaults.get("scale", "4"))).strip() == "2" else "4"
     except Exception:
         cfg["scale"] = "4"
-    cfg["version"] = str(cfg.get("version", defaults.get("version", "10")) or "10")
+    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.0")))
     cfg["mode"] = str(cfg.get("mode", defaults.get("mode", "tiny")) or "tiny")
     
     # Build model identifier and get metadata
-    model_id = f"v{cfg.get('version', '10')}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
+    internal_version = flashvsr_version_to_internal(cfg.get("version", "1.0"))
+    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
     model_meta = get_flashvsr_metadata(model_id)
     
     if model_meta:
@@ -363,7 +369,8 @@ def build_flashvsr_callbacks(
 
         try:
             payload = _flashvsr_dict_from_args(list(args))
-            model_name = f"v{payload['version']}_{payload['mode']}"
+            internal_version = flashvsr_version_to_internal(payload.get("version", "1.0"))
+            model_name = f"v{internal_version}_{payload['mode']}"
             
             preset_manager.save_preset_safe("flashvsr", model_name, preset_name.strip(), payload)
             dropdown = refresh_presets(model_name, select_name=preset_name.strip())
@@ -383,7 +390,8 @@ def build_flashvsr_callbacks(
         UI expects: inputs_list + [preset_status]
         """
         try:
-            model_name = f"v{version}_{mode}"
+            internal_version = flashvsr_version_to_internal(version)
+            model_name = f"v{internal_version}_{mode}"
             preset = preset_manager.load_preset_safe("flashvsr", model_name, preset_name)
             if preset:
                 preset_manager.set_last_used("flashvsr", model_name, preset_name)

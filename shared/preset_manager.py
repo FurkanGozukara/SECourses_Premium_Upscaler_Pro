@@ -517,10 +517,16 @@ class PresetManager:
         validated = preset.copy()
         
         # Import metadata functions
-        from shared.models.flashvsr_meta import get_flashvsr_metadata
+        from shared.models.flashvsr_meta import (
+            get_flashvsr_metadata,
+            flashvsr_version_to_internal,
+            flashvsr_version_to_ui,
+        )
+        validated["version"] = flashvsr_version_to_ui(validated.get("version", "1.0"))
         
         # Build model identifier
-        model_id = f"v{validated.get('version', '10')}_{validated.get('mode', 'tiny')}_{validated.get('scale', 4)}x"
+        internal_version = flashvsr_version_to_internal(validated.get("version", "1.0"))
+        model_id = f"v{internal_version}_{validated.get('mode', 'tiny')}_{validated.get('scale', 4)}x"
         model_meta = get_flashvsr_metadata(model_id)
         
         if model_meta:

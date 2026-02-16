@@ -4,7 +4,26 @@ Provides comprehensive model metadata with VRAM, compile, and multi-GPU constrai
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+
+def flashvsr_version_to_internal(version: Any) -> str:
+    """
+    Normalize FlashVSR version to internal/CLI form.
+
+    Supported inputs:
+    - "10", "v10", "1.0", "v1.0"
+    - "11", "v11", "1.1", "v1.1"
+    """
+    raw = str(version or "").strip().lower()
+    if raw in {"11", "v11", "1.1", "v1.1"}:
+        return "11"
+    return "10"
+
+
+def flashvsr_version_to_ui(version: Any) -> str:
+    """Normalize FlashVSR version to UI form: '1.0' or '1.1'."""
+    return "1.1" if flashvsr_version_to_internal(version) == "11" else "1.0"
 
 
 @dataclass

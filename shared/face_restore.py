@@ -38,6 +38,14 @@ GFPGAN_AVAILABLE = _check_gfpgan()
 CODEFORMER_AVAILABLE = _check_codeformer()
 
 
+def _resolve_global_cuda_device_token() -> str:
+    """Read global GPU selection from environment for in-process face restoration."""
+    token = str(os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "") or "").strip().lower()
+    if token.startswith("cuda:"):
+        token = token.split(":", 1)[1].strip()
+    return token
+
+
 def get_available_backends() -> list:
     """Get list of available face restoration backends"""
     backends = []
@@ -306,13 +314,24 @@ def _restore_with_gfpgan(
         if on_progress:
             on_progress("Loading GFPGAN model...\n")
         
-        # Determine device
-        if use_gpu is False:
+        # Determine device (honors app-wide global GPU selector).
+        global_token = _resolve_global_cuda_device_token()
+        if use_gpu is False or global_token in {"cpu", "none", "off"}:
             device = torch.device("cpu")
-        elif use_gpu is True:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif torch.cuda.is_available():
+            if global_token.isdigit():
+                try:
+                    did = int(global_token)
+                    if 0 <= did < torch.cuda.device_count():
+                        device = torch.device(f"cuda:{did}")
+                    else:
+                        device = torch.device("cuda")
+                except Exception:
+                    device = torch.device("cuda")
+            else:
+                device = torch.device("cuda")
         else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = torch.device("cpu")
         
         # Initialize GFPGAN
         model_path = "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth"

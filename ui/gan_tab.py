@@ -307,14 +307,11 @@ def gan_tab(
                         info=f"{gpu_hint} | Use GPU for processing. CPU fallback is significantly slower.",
                         interactive=cuda_available
                     )
-                    gpu_device = gr.Textbox(
-                        label="GPU Device",
-                        value=_value("gpu_device", "0") if cuda_available else "",
-                        placeholder="0 or all" if cuda_available else "CUDA not available",
-                        info=f"GPU device ID(s). {cuda_count} GPU(s) detected. Single ID (0) for one GPU, 'all' for all available.",
-                        interactive=cuda_available
-                    )
-                gpu_device_warning = gr.Markdown("", visible=False)
+                gr.Markdown(
+                    "**GPU Device:** Controlled globally from the top app header selector. "
+                    "This tab no longer has a per-tab GPU override."
+                )
+                gpu_device = gr.State(str(_value("gpu_device", "0") or "0"))
 
             gr.Markdown("#### Output Settings")
             with gr.Group():
@@ -574,64 +571,7 @@ def gan_tab(
 
     # Wire up event handlers
     
-    # FIXED: Live CUDA device validation for GAN tab
-    def validate_cuda_device_live_gan(cuda_device_val):
-        """Live CUDA validation for GAN models (enforces single GPU)"""
-        if not cuda_device_val or not cuda_device_val.strip():
-            return gr.update(value="", visible=False)
-        
-        try:
-            if not cuda_available or cuda_count <= 0:
-                return gr.update(value="WARNING: CUDA not detected. GPU acceleration disabled.", visible=True)
-            
-            device_str = str(cuda_device_val).strip()
-            device_count = cuda_count
-            
-            if device_str.lower() == "all":
-                return gr.update(value=f"WARNING: GAN models use single GPU. 'all' will use GPU 0 (of {device_count} available)", visible=True)
-            
-            devices = [d.strip() for d in device_str.replace(" ", "").split(",") if d.strip()]
-            
-            invalid_devices = []
-            valid_devices = []
-            
-            for device in devices:
-                if not device.isdigit():
-                    invalid_devices.append(device)
-                else:
-                    device_id = int(device)
-                    if device_id >= device_count:
-                        invalid_devices.append(f"{device} (max: {device_count-1})")
-                    else:
-                        valid_devices.append(device_id)
-            
-            if invalid_devices:
-                return gr.update(
-                    value=f"ERROR: Invalid device ID(s): {', '.join(invalid_devices)}. Available: 0-{device_count-1}",
-                    visible=True
-                )
-            
-            if len(valid_devices) > 1:
-                return gr.update(
-                    value=f"WARNING: GAN models use single GPU. Will use GPU {valid_devices[0]} (ignoring others)",
-                    visible=True
-                )
-            elif len(valid_devices) == 1:
-                return gr.update(
-                    value=f"OK: Using GPU {valid_devices[0]}",
-                    visible=True
-                )
-            
-            return gr.update(value="", visible=False)
-        except Exception as e:
-            return gr.update(value=f"WARNING: Validation error: {str(e)}", visible=True)
-    
-    # Wire up live CUDA validation
-    gpu_device.change(
-        fn=validate_cuda_device_live_gan,
-        inputs=gpu_device,
-        outputs=gpu_device_warning
-    )
+    # Per-tab GPU override removed: global selector controls all runs.
 
     # Input handling
     def _build_input_detection_md(path_val: str) -> gr.update:

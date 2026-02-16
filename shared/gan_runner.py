@@ -1,4 +1,5 @@
-﻿import shutil
+import os
+import shutil
 import subprocess
 import tempfile
 import json
@@ -95,6 +96,35 @@ def _normalize_image_output_format(output_format_raw: Any, input_path: Path) -> 
     if requested not in _IMAGE_OUTPUT_EXTS:
         return "png"
     return requested
+
+
+def _resolve_cuda_device_id(settings: Dict[str, Any]) -> str:
+    """
+    Resolve CUDA device selection from runtime settings/global env.
+
+    Returns:
+        "<gpu_id>" for CUDA GPU selection, or "" for CPU mode.
+    """
+    preferred = settings.get("cuda_device")
+    if preferred is None:
+        preferred = settings.get("gpu_device")
+    if preferred is None:
+        preferred = os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "")
+
+    token = str(preferred or "").strip().lower()
+    if not token:
+        return "0"
+    if token in {"cpu", "none", "off"}:
+        return ""
+    if token == "all":
+        return "0"
+    if token.startswith("cuda:"):
+        token = token.split(":", 1)[1].strip()
+    if "," in token:
+        token = token.split(",", 1)[0].strip()
+    if token.isdigit():
+        return str(max(0, int(token)))
+    return ""
 
 
 class GanModelRegistry:
@@ -710,8 +740,22 @@ def _run_with_spandrel_image(
         img_array = np.array(img).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)
         
-        # Move to GPU if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Respect globally-selected GPU when CUDA is available.
+        if torch.cuda.is_available():
+            cuda_id = _resolve_cuda_device_id(settings)
+            if cuda_id != "":
+                try:
+                    did = int(cuda_id)
+                    if 0 <= did < torch.cuda.device_count():
+                        device = torch.device(f"cuda:{did}")
+                    else:
+                        device = torch.device("cuda")
+                except Exception:
+                    device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cpu")
         model = model.to(device)
         img_tensor = img_tensor.to(device)
         
@@ -833,7 +877,7 @@ def _run_with_realesrgan_image(
             "model": model_name,
             "scale": metadata.scale,
             "output_format": settings.get("output_format", "png"),
-            "cuda_device": settings.get("gpu_device", "0"),
+            "cuda_device": _resolve_cuda_device_id(settings),
         }
         
         # Pass through video frame settings if present (for correct output location/naming)
@@ -864,7 +908,6 @@ def _run_with_realesrgan_image(
         
         # Cleanup temporary downscaled file
         if temp_downscaled and temp_downscaled.exists():
-            import shutil
             shutil.rmtree(temp_downscaled.parent, ignore_errors=True)
 
         return GanResult(result.returncode, result.output_path, result.log)
@@ -872,4 +915,3 @@ def _run_with_realesrgan_image(
     except Exception as e:
         import traceback
         return GanResult(1, None, f"Real-ESRGAN error: {str(e)}\n{traceback.format_exc()}")
-

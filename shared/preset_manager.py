@@ -22,7 +22,6 @@ class PresetManager:
 
     NEW Layout (v2.0 - Universal Presets):
     presets/
-      global.json                    # Global app settings
       .last_used_preset.txt          # Name of last used universal preset
       my_preset.json                 # Universal preset (contains ALL tabs)
       another_preset.json            # Another universal preset
@@ -49,12 +48,22 @@ class PresetManager:
         self._universal_presets_cache_ts = 0.0
         self._universal_presets_cache_dir_mtime = 0.0
         self._universal_presets_cache: List[str] = []
+        self._remove_legacy_global_json()
         # Auto-migrate old preset structure on first load
         self._migrate_old_preset_structure()
 
     # ------------------------------------------------------------------ #
     # Core helpers
     # ------------------------------------------------------------------ #
+    def _remove_legacy_global_json(self) -> None:
+        """Remove legacy global.json file if it exists."""
+        legacy_path = self.base_dir / "global.json"
+        try:
+            if legacy_path.exists() and legacy_path.is_file():
+                legacy_path.unlink()
+        except Exception:
+            pass
+
     def _tab_dir(self, tab: str) -> Path:
         return self.base_dir / _sanitize_name(tab)
 
@@ -73,25 +82,14 @@ class PresetManager:
     # Global settings
     # ------------------------------------------------------------------ #
     def load_global_settings(self, defaults: Dict[str, Any]) -> Dict[str, Any]:
-        path = self.base_dir / "global.json"
-        if not path.exists():
-            return defaults.copy()
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            merged = defaults.copy()
-            merged.update(data)
-            return merged
-        except Exception:
-            return defaults.copy()
+        # Global JSON settings are intentionally disabled.
+        # Runtime/persistent global behavior is handled by universal presets.
+        return defaults.copy()
 
     def save_global_settings(self, settings: Dict[str, Any]) -> None:
-        path = self.base_dir / "global.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-        tmp_path.replace(path)
+        # Global JSON settings are intentionally disabled.
+        # Kept as a no-op for backward compatibility with older call paths.
+        _ = settings
 
     # ------------------------------------------------------------------ #
     # Preset operations
@@ -680,7 +678,6 @@ class PresetManager:
         List all universal presets (JSON files directly in presets/ folder).
         
         Excludes:
-        - global.json (app settings)
         - Subfolders (old per-tab structure)
         - Hidden files
         """

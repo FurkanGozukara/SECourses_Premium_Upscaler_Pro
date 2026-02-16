@@ -17,6 +17,7 @@ from shared.models import (
     scan_gan_models
 )
 from shared.models.rife_meta import get_rife_default_model
+from shared.gpu_utils import describe_gpu_selection, resolve_global_gpu_device
 from shared.video_codec_options import (
     get_codec_choices,
     get_pixel_format_choices,
@@ -42,6 +43,12 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     """
 
     seed_controls = shared_state.value.get("seed_controls", {})
+    global_settings_state = seed_controls.get("global_settings", {}) if isinstance(seed_controls, dict) else {}
+    if not isinstance(global_settings_state, dict):
+        global_settings_state = {}
+    resolved_global_gpu = resolve_global_gpu_device(
+        global_settings_state.get("global_gpu_device", seed_controls.get("global_gpu_device_val"))
+    )
     shared_models = seed_controls.get("available_models", [])
     if not isinstance(shared_models, list):
         shared_models = []
@@ -165,11 +172,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         allow_custom_value=True,
                         info="Model used for global post-upscale frame interpolation."
                     )
-                    global_rife_cuda_device = gr.Textbox(
-                        label="RIFE CUDA Device Override",
-                        value=str(_value("global_rife_cuda_device", "") or ""),
-                        placeholder="Leave empty for default GPU",
-                        info="Optional single CUDA device ID for global RIFE post-process."
+                    gr.Markdown(
+                        f"**GPU Source:** Global selector (`{describe_gpu_selection(resolved_global_gpu)}`) is used for Global RIFE and all tabs."
+                    )
+                    global_rife_cuda_device = gr.State(
+                        "" if resolved_global_gpu == "cpu" else resolved_global_gpu
                     )
                     global_rife_process_chunks = gr.Checkbox(
                         label="Chunk-Safe Global RIFE",

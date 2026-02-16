@@ -35,6 +35,12 @@ from shared.models.rife_meta import get_rife_default_model
 from shared.services.output_service import OUTPUT_ORDER
 from shared.runner import Runner
 from shared.gradio_compat import check_gradio_version, check_required_features
+from shared.gpu_utils import (
+    build_global_gpu_dropdown_choices,
+    describe_gpu_selection,
+    get_gpu_info,
+    resolve_global_gpu_device,
+)
 from ui.seedvr2_tab import seedvr2_tab
 from ui.resolution_tab import resolution_tab
 from ui.output_tab import output_tab
@@ -87,6 +93,8 @@ if launcher_temp and launcher_temp.lower() != system_temp.lower():
 else:
     default_temp = str(BASE_DIR / "temp")
 
+default_global_gpu_device = resolve_global_gpu_device(None)
+
 GLOBAL_DEFAULTS = {
     "output_dir": launcher_output or str(BASE_DIR / "outputs"),
     "temp_dir": default_temp,
@@ -94,6 +102,7 @@ GLOBAL_DEFAULTS = {
     "face_global": False,
     "face_strength": 0.5,
     "queue_enabled": True,
+    "global_gpu_device": default_global_gpu_device,
     "mode": "subprocess",
     "pinned_reference_path": None,  # Global pinned reference for iterative comparison
     # FIXED: Store model cache paths - editable in UI, persisted across restarts
@@ -105,10 +114,13 @@ GLOBAL_DEFAULTS = {
     "_original_hf_home": launcher_hf_home,
     "_original_transformers_cache": launcher_transformers_cache,
 }
-global_settings = preset_manager.load_global_settings(GLOBAL_DEFAULTS)
+# Runtime global settings start from defaults.
+# Persistent global values are sourced only from user universal presets.
+global_settings = GLOBAL_DEFAULTS.copy()
+global_settings["global_gpu_device"] = resolve_global_gpu_device(global_settings.get("global_gpu_device"))
+os.environ["SECOURSES_GLOBAL_GPU_DEVICE"] = global_settings["global_gpu_device"]
 
-# FIXED: Apply saved model cache paths to environment for current session
-# If user previously saved custom paths, honor them immediately (though full effect requires restart)
+# Apply current model cache paths to environment for current session.
 if global_settings.get("models_dir"):
     os.environ["MODELS_DIR"] = global_settings["models_dir"]
 if global_settings.get("hf_home"):
@@ -661,6 +673,33 @@ def main(argv=None):
     }
 
     /* Health status banner + Health tab report cards */
+    .top-status-row {
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .global-gpu-inline {
+      gap: 8px;
+      align-items: center;
+      flex-wrap: nowrap;
+      margin-top: 2px;
+    }
+    .global-gpu-inline .gradio-dropdown {
+      min-width: 0;
+      width: 100%;
+      flex: 1 1 auto;
+    }
+    .global-gpu-inline .gradio-dropdown .wrap {
+      min-height: 38px;
+    }
+    @media (max-width: 960px) {
+      .global-gpu-inline {
+        flex-wrap: wrap;
+      }
+      .global-gpu-inline .gradio-dropdown {
+        min-width: 100%;
+      }
+    }
     .health-banner {
       border: 1px solid rgba(14, 116, 144, 0.32);
       background: linear-gradient(120deg, rgba(2, 132, 199, 0.10), rgba(16, 185, 129, 0.10));
@@ -925,6 +964,7 @@ def main(argv=None):
                 "face_global": bool(global_settings.get("face_global", False)),
                 "face_strength": float(global_settings.get("face_strength", 0.5)),
                 "queue_enabled": bool(global_settings.get("queue_enabled", True)),
+                "global_gpu_device": resolve_global_gpu_device(global_settings.get("global_gpu_device")),
                 "mode": str(global_settings.get("mode", "subprocess") or "subprocess"),
                 "models_dir": str(global_settings.get("models_dir", BASE_DIR / "models")),
                 "hf_home": str(global_settings.get("hf_home", BASE_DIR / "models")),
@@ -971,6 +1011,7 @@ def main(argv=None):
         except Exception:
             merged["face_strength"] = 0.5
         merged["queue_enabled"] = bool(merged.get("queue_enabled", True))
+        merged["global_gpu_device"] = resolve_global_gpu_device(merged.get("global_gpu_device"))
         mode_raw = str(merged.get("mode", "subprocess") or "subprocess").strip().lower()
         merged["mode"] = mode_raw if mode_raw in {"subprocess", "in_app"} else "subprocess"
         merged["models_dir"] = str(merged.get("models_dir", "") or "")
@@ -985,6 +1026,7 @@ def main(argv=None):
         tel,
         face_str,
         queue_enabled,
+        global_gpu_device,
         mode_choice,
         models_dir,
         hf_home,
@@ -999,6 +1041,7 @@ def main(argv=None):
             telemetry_enabled=tel,
             face_strength=face_str,
             queue_enabled=queue_enabled,
+            global_gpu_device_val=global_gpu_device,
             mode_choice=mode_choice,
             models_dir_val=models_dir,
             hf_home_val=hf_home,
@@ -1024,6 +1067,7 @@ def main(argv=None):
         bool(startup_global_settings.get("telemetry", global_settings.get("telemetry", True))),
         float(startup_global_settings.get("face_strength", global_settings.get("face_strength", 0.5))),
         bool(startup_global_settings.get("queue_enabled", global_settings.get("queue_enabled", True))),
+        startup_global_settings.get("global_gpu_device", global_settings.get("global_gpu_device", "cpu")),
         str(startup_global_settings.get("mode", global_settings.get("mode", "subprocess")) or "subprocess"),
         startup_global_settings.get("models_dir", global_settings.get("models_dir")),
         startup_global_settings.get("hf_home", global_settings.get("hf_home")),
@@ -1100,7 +1144,11 @@ def main(argv=None):
                 "global_rife_multiplier_val": startup_output_settings.get("global_rife_multiplier", "x2"),
                 "global_rife_model_val": startup_output_settings.get("global_rife_model", get_rife_default_model()),
                 "global_rife_precision_val": startup_output_settings.get("global_rife_precision", "fp32"),
-                "global_rife_cuda_device_val": startup_output_settings.get("global_rife_cuda_device", ""),
+                "global_gpu_device_val": resolve_global_gpu_device(startup_global_settings.get("global_gpu_device")),
+                "global_rife_cuda_device_val": (
+                    "" if resolve_global_gpu_device(startup_global_settings.get("global_gpu_device")) == "cpu"
+                    else resolve_global_gpu_device(startup_global_settings.get("global_gpu_device"))
+                ),
                 "global_rife_process_chunks_val": bool(startup_output_settings.get("global_rife_process_chunks", True)),
                 "output_format_val": startup_output_settings.get("output_format", "auto"),
                 "png_sequence_enabled_val": bool(startup_output_settings.get("png_sequence_enabled", False)),
@@ -1135,8 +1183,27 @@ def main(argv=None):
             "operation_status": "ready"
         })
 
-        # Health banner at the top
-        health_banner = gr.Markdown(f'<div class="health-banner">{health_text}</div>')
+        initial_gpu_list = get_gpu_info()
+        initial_gpu_choices = build_global_gpu_dropdown_choices(initial_gpu_list)
+        initial_global_gpu_value = resolve_global_gpu_device(
+            startup_global_settings.get("global_gpu_device"),
+            initial_gpu_list,
+        )
+        if all(str(value) != str(initial_global_gpu_value) for _label, value in initial_gpu_choices):
+            initial_gpu_choices.append((describe_gpu_selection(initial_global_gpu_value), initial_global_gpu_value))
+
+        # Top status row: left = global GPU selector, right = health banner
+        with gr.Row(equal_height=True, elem_classes="top-status-row"):
+            with gr.Column(scale=1):
+                with gr.Row(elem_classes="global-gpu-inline"):
+                    global_gpu_dropdown = gr.Dropdown(
+                        choices=initial_gpu_choices,
+                        value=initial_global_gpu_value,
+                        show_label=False,
+                        container=False,
+                    )
+            with gr.Column(scale=1):
+                health_banner = gr.Markdown(f'<div class="health-banner">{health_text}</div>')
 
         # VRAM OOM banner (shown only on VRAM OOM)
         # NOTE: We update this via a Timer tick because gr.State change events can be
@@ -1147,6 +1214,7 @@ def main(argv=None):
         health_sync_signature = gr.State(value="")
         oom_sync_signature = gr.State(value="")
         global_sync_signature = gr.State(value="")
+        gpu_selector_sync_signature = gr.State(value="")
         gr.Markdown(f"# {APP_TITLE}")
 
         # Global settings tab (rendered LAST for a cleaner workflow)
@@ -1293,6 +1361,7 @@ def main(argv=None):
                     face_global_hidden,
                     face_strength_slider,
                     queue_enabled_toggle,
+                    global_gpu_dropdown,
                     mode_radio,
                     models_dir_box,
                     hf_home_box,
@@ -1675,6 +1744,27 @@ def main(argv=None):
                 return gr.skip()
             return gr.update(value=f'<div class="health-banner">{health_text}</div>'), signature
 
+        def update_global_gpu_dropdown(state, previous_signature: str = ""):
+            """Keep top global GPU selector synced with shared global settings."""
+            seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+            state_global = seed_controls.get("global_settings", {}) if isinstance(seed_controls, dict) else {}
+            if not isinstance(state_global, dict):
+                state_global = {}
+
+            gpu_list = get_gpu_info()
+            selected = resolve_global_gpu_device(
+                state_global.get("global_gpu_device", seed_controls.get("global_gpu_device_val")),
+                gpu_list,
+            )
+            choices = build_global_gpu_dropdown_choices(gpu_list)
+            if all(str(value) != str(selected) for _label, value in choices):
+                choices.append((describe_gpu_selection(selected, gpu_list), selected))
+
+            signature = _sync_signature({"selected": selected, "choices": choices})
+            if signature == str(previous_signature or ""):
+                return gr.skip()
+            return gr.update(choices=choices, value=selected), signature
+
         def update_oom_banner(state, previous_signature: str = ""):
             """Update global VRAM OOM banner."""
             info = (state or {}).get("alerts", {}).get("oom", {}) if isinstance(state, dict) else {}
@@ -1687,7 +1777,7 @@ def main(argv=None):
 
         def apply_global_settings_from_state(state, previous_signature: str = ""):
             """
-            Keep runtime global settings (runner/env/global.json) in sync with
+            Keep runtime global settings (runner/env/shared_state) in sync with
             universal preset loads from any tab.
             """
             seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
@@ -1706,6 +1796,7 @@ def main(argv=None):
                 bool(merged_global.get("telemetry", global_settings.get("telemetry", True))),
                 float(merged_global.get("face_strength", global_settings.get("face_strength", 0.5))),
                 bool(merged_global.get("queue_enabled", global_settings.get("queue_enabled", True))),
+                merged_global.get("global_gpu_device", global_settings.get("global_gpu_device", "cpu")),
                 str(merged_global.get("mode", global_settings.get("mode", "subprocess")) or "subprocess"),
                 merged_global.get("models_dir", global_settings.get("models_dir")),
                 merged_global.get("hf_home", global_settings.get("hf_home")),
@@ -1730,6 +1821,11 @@ def main(argv=None):
             outputs=[health_banner, health_sync_signature],
         )
         demo.load(
+            fn=update_global_gpu_dropdown,
+            inputs=[shared_state, gpu_selector_sync_signature],
+            outputs=[global_gpu_dropdown, gpu_selector_sync_signature],
+        )
+        demo.load(
             fn=update_oom_banner,
             inputs=[shared_state, oom_sync_signature],
             outputs=[oom_banner, oom_dismiss_btn, oom_sync_signature],
@@ -1745,6 +1841,11 @@ def main(argv=None):
             fn=update_health_banner,
             inputs=[shared_state, health_sync_signature],
             outputs=[health_banner, health_sync_signature],
+        )
+        shared_state.change(
+            fn=update_global_gpu_dropdown,
+            inputs=[shared_state, gpu_selector_sync_signature],
+            outputs=[global_gpu_dropdown, gpu_selector_sync_signature],
         )
         shared_state.change(
             fn=update_oom_banner,

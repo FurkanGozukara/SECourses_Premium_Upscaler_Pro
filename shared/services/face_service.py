@@ -151,7 +151,6 @@ def build_face_callbacks(
             try:
                 strength_idx = FACE_ORDER.index("face_strength")
                 global_settings["face_strength"] = float(values[strength_idx])
-                preset_manager.save_global_settings(global_settings)
             except Exception:
                 pass
 
@@ -169,7 +168,6 @@ def build_face_callbacks(
 
     def set_face_global(val, state=None):
         global_settings["face_global"] = bool(val)
-        preset_manager.save_global_settings(global_settings)
         if state and isinstance(state, dict):
             seed_controls = state.setdefault("seed_controls", {})
             if isinstance(seed_controls, dict):
@@ -192,7 +190,6 @@ def build_face_callbacks(
             strength_num = defaults.get("face_strength", 0.5)
         strength_num = max(0.0, min(1.0, strength_num))
         global_settings["face_strength"] = strength_num
-        preset_manager.save_global_settings(global_settings)
         if state and isinstance(state, dict):
             seed_controls = state.setdefault("seed_controls", {})
             if isinstance(seed_controls, dict):

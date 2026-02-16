@@ -6,6 +6,10 @@ from pathlib import Path
 import gradio as gr
 
 from shared.preset_manager import PresetManager
+from shared.gpu_utils import (
+    describe_gpu_selection,
+    resolve_global_gpu_device,
+)
 
 
 def _normalize_mode(mode_choice: str) -> str:
@@ -26,6 +30,7 @@ def _update_runtime_env(global_settings: dict):
     models_dir = str(global_settings.get("models_dir") or "").strip()
     hf_home = str(global_settings.get("hf_home") or "").strip()
     transformers_cache = str(global_settings.get("transformers_cache") or "").strip()
+    global_gpu_device = resolve_global_gpu_device(global_settings.get("global_gpu_device"))
 
     if models_dir:
         os.environ["MODELS_DIR"] = models_dir
@@ -33,6 +38,7 @@ def _update_runtime_env(global_settings: dict):
         os.environ["HF_HOME"] = hf_home
     if transformers_cache:
         os.environ["TRANSFORMERS_CACHE"] = transformers_cache
+    os.environ["SECOURSES_GLOBAL_GPU_DEVICE"] = global_gpu_device
 
 
 def _build_restart_note(changed_keys: list[str]) -> str:
@@ -52,6 +58,7 @@ def apply_global_settings_live(
     telemetry_enabled: bool,
     face_strength: float,
     queue_enabled: bool,
+    global_gpu_device_val: str,
     mode_choice: str,
     models_dir_val: str,
     hf_home_val: str,
@@ -85,6 +92,9 @@ def apply_global_settings_live(
     models_dir = _normalize_path(models_dir_val, global_settings.get("models_dir"))
     hf_home = _normalize_path(hf_home_val, global_settings.get("hf_home"))
     transformers_cache = _normalize_path(transformers_cache_val, global_settings.get("transformers_cache"))
+    global_gpu_device = resolve_global_gpu_device(
+        global_gpu_device_val if global_gpu_device_val is not None else global_settings.get("global_gpu_device")
+    )
 
     mode_requested = _normalize_mode(mode_choice)
     try:
@@ -103,6 +113,7 @@ def apply_global_settings_live(
             "face_global": face_global_enabled,
             "face_strength": float(face_strength),
             "queue_enabled": bool(queue_enabled),
+            "global_gpu_device": global_gpu_device,
             "mode": actual_mode,
             "pinned_reference_path": pinned_ref,
             "models_dir": models_dir,
@@ -121,7 +132,6 @@ def apply_global_settings_live(
             pass
 
     _update_runtime_env(global_settings)
-    preset_manager.save_global_settings(global_settings)
 
     if isinstance(state, dict):
         state.setdefault("seed_controls", {})
@@ -129,6 +139,8 @@ def apply_global_settings_live(
         state["seed_controls"] = seed_controls
         seed_controls["face_strength_val"] = float(face_strength)
         seed_controls["queue_enabled_val"] = bool(queue_enabled)
+        seed_controls["global_gpu_device_val"] = global_gpu_device
+        seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
         seed_controls["pinned_reference_path"] = pinned_ref
         seed_controls["global_settings"] = {
             "output_dir": output_dir,
@@ -137,6 +149,7 @@ def apply_global_settings_live(
             "face_global": face_global_enabled,
             "face_strength": float(face_strength),
             "queue_enabled": bool(queue_enabled),
+            "global_gpu_device": global_gpu_device,
             "mode": actual_mode,
             "models_dir": models_dir,
             "hf_home": hf_home,
@@ -153,8 +166,10 @@ def apply_global_settings_live(
         changed_restart_keys.append("TRANSFORMERS_CACHE")
 
     status = (
-        "Applied immediately and saved to global settings.\n"
-        f"Active mode: {actual_mode}"
+        "Applied immediately.\n"
+        "Save a Universal Preset to persist across restarts.\n"
+        f"Active mode: {actual_mode}\n"
+        f"Global GPU: {describe_gpu_selection(global_gpu_device)}"
         f"{_build_restart_note(changed_restart_keys)}"
     )
     return gr.update(value=status), gr.update(value=actual_mode), state
@@ -166,6 +181,7 @@ def save_global_settings(
     telemetry_enabled: bool,
     face_strength: float,
     queue_enabled: bool,
+    global_gpu_device_val: str,
     models_dir_val: str,
     hf_home_val: str,
     transformers_cache_val: str,
@@ -184,6 +200,7 @@ def save_global_settings(
         telemetry_enabled=telemetry_enabled,
         face_strength=face_strength,
         queue_enabled=queue_enabled,
+        global_gpu_device_val=global_gpu_device_val,
         mode_choice=str(global_settings.get("mode", "subprocess")),
         models_dir_val=models_dir_val,
         hf_home_val=hf_home_val,
@@ -214,6 +231,7 @@ def apply_mode_selection(
         telemetry_enabled=bool(global_settings.get("telemetry", True)),
         face_strength=float(global_settings.get("face_strength", 0.5)),
         queue_enabled=bool(global_settings.get("queue_enabled", True)),
+        global_gpu_device_val=str(global_settings.get("global_gpu_device", "")),
         mode_choice=mode_choice,
         models_dir_val=str(global_settings.get("models_dir", "")),
         hf_home_val=str(global_settings.get("hf_home", "")),

@@ -33,7 +33,7 @@ from shared.models.flashvsr_meta import (
     flashvsr_version_to_internal,
     flashvsr_version_to_ui,
 )
-from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
+from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
@@ -435,6 +435,9 @@ def build_flashvsr_callbacks(
             output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
             if not isinstance(output_settings, dict):
                 output_settings = {}
+            global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
+            seed_controls["global_gpu_device_val"] = global_gpu_device
+            seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
             seed_controls["flashvsr_chunk_preview"] = {
                 "message": "No chunk preview available yet.",
                 "gallery": [],
@@ -449,6 +452,7 @@ def build_flashvsr_callbacks(
                 settings["resume_run_dir"] = ""
             if settings.get("batch_enable"):
                 settings["resume_run_dir"] = ""
+            settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
             
             # Apply FlashVSR+ guardrails (single GPU, tile validation, etc.)
             settings = _enforce_flashvsr_guardrails(settings, defaults)

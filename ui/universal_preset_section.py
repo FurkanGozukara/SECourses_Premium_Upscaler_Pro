@@ -13,6 +13,7 @@ from pathlib import Path
 
 from shared.preset_manager import PresetManager
 from shared.models.rife_meta import get_rife_default_model
+from shared.gpu_utils import resolve_global_gpu_device
 from shared.universal_preset import (
     TAB_CONFIGS,
     values_to_dict,
@@ -469,6 +470,14 @@ def sync_tab_to_shared_state(
         seed_controls["face_strength_val"] = float(tab_dict.get("face_strength", 0.5) or 0.5)
         seed_controls["queue_enabled_val"] = bool(tab_dict.get("queue_enabled", True))
         seed_controls["pinned_reference_path"] = tab_dict.get("pinned_reference_path")
+        global_gpu_device = resolve_global_gpu_device(tab_dict.get("global_gpu_device"))
+        tab_dict["global_gpu_device"] = global_gpu_device
+        seed_controls["global_gpu_device_val"] = global_gpu_device
+        seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
+        output_settings = seed_controls.get("output_settings", {})
+        if isinstance(output_settings, dict):
+            output_settings["global_rife_cuda_device"] = seed_controls["global_rife_cuda_device_val"]
+            seed_controls["output_settings"] = output_settings
 
     if tab_name == "resolution":
         seed_controls["auto_detect_scenes"] = bool(tab_dict.get("auto_detect_scenes", True))
@@ -504,7 +513,14 @@ def sync_tab_to_shared_state(
         seed_controls["global_rife_model_val"] = model_name
         precision = str(tab_dict.get("global_rife_precision", "fp32") or "fp32").lower()
         seed_controls["global_rife_precision_val"] = "fp16" if precision == "fp16" else "fp32"
-        seed_controls["global_rife_cuda_device_val"] = tab_dict.get("global_rife_cuda_device", "") or ""
+        current_global = seed_controls.get("global_settings", {})
+        current_global = current_global if isinstance(current_global, dict) else {}
+        global_gpu_device = resolve_global_gpu_device(
+            current_global.get("global_gpu_device", seed_controls.get("global_gpu_device_val"))
+        )
+        seed_controls["global_gpu_device_val"] = global_gpu_device
+        tab_dict["global_rife_cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
+        seed_controls["global_rife_cuda_device_val"] = tab_dict["global_rife_cuda_device"]
         seed_controls["global_rife_process_chunks_val"] = bool(tab_dict.get("global_rife_process_chunks", True))
         seed_controls["output_format_val"] = tab_dict.get("output_format", "auto") or "auto"
         seed_controls["comparison_mode_val"] = tab_dict.get("comparison_mode", "slider") or "slider"

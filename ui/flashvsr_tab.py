@@ -233,14 +233,11 @@ def flashvsr_tab(
                         precision=0,
                         info="Seed for reproducibility. 0 = random"
                     )
-                    
-                    device = gr.Textbox(
-                        label="Device (Single GPU Only)",
-                        value=_value("device", "auto") if cuda_available else "cpu",
-                        placeholder="auto, cuda:0, cpu" if cuda_available else "CPU only (no CUDA)",
-                        info=f"{gpu_hint}\nauto = automatic GPU selection, cuda:0 = specific GPU, cpu = CPU mode. Multi-GPU NOT supported by FlashVSR+.",
-                        interactive=cuda_available
-                    )
+                gr.Markdown(
+                    "**GPU Device:** Controlled globally from the top app header selector. "
+                    "This tab no longer has a per-tab GPU override."
+                )
+                device = gr.State(str(_value("device", "auto") or "auto"))
             
             # Memory Optimization
             gr.Markdown("####  Memory Optimization (Tiling)")

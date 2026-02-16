@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from shared.models.rife_meta import get_rife_default_model
+from shared.gpu_utils import get_global_gpu_override
 from shared.path_utils import collision_safe_dir, collision_safe_path
 
 
@@ -127,17 +128,9 @@ def build_global_rife_settings(
         )
     )
 
-    # RIFE is single-GPU; if user provides multi-device spec, keep only first token.
-    cuda_device = str(
-        output_settings.get(
-            "global_rife_cuda_device",
-            seed_controls.get("global_rife_cuda_device_val", ""),
-        ) or ""
-    ).strip()
-    if "," in cuda_device:
-        cuda_device = cuda_device.split(",", 1)[0].strip()
-    if cuda_device.lower() == "all":
-        cuda_device = "0"
+    cuda_device = get_global_gpu_override(seed_controls)
+    if cuda_device == "cpu":
+        cuda_device = ""
 
     model_name = str(
         output_settings.get(

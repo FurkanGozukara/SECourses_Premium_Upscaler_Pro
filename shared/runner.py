@@ -526,6 +526,9 @@ class Runner:
         env["TEMP"] = str(self.temp_dir)
         env["TMP"] = str(self.temp_dir)
         env.setdefault("PYTHONWARNINGS", "ignore")
+        if str(env.get("SECOURSES_GLOBAL_GPU_DEVICE", "") or "").strip().lower() == "cpu":
+            # Force CPU visibility when global selector is set to CPU.
+            env["CUDA_VISIBLE_DEVICES"] = ""
         # Windows consoles often default to legacy code pages (cp1252) which can crash
         # SeedVR2 when it prints emojis (UnicodeEncodeError). Force UTF-8 for the CLI.
         if platform.system() == "Windows":
@@ -1548,6 +1551,16 @@ class Runner:
 
         env = os.environ.copy()
         env.setdefault("PYTHONWARNINGS", "ignore")
+        cuda_device = str(settings.get("cuda_device", "") or "").strip().lower()
+        if cuda_device.startswith("cuda:"):
+            cuda_device = cuda_device.split(":", 1)[1].strip()
+        if "," in cuda_device:
+            cuda_device = cuda_device.split(",", 1)[0].strip()
+        if cuda_device.isdigit():
+            # RIFE CLI does not expose a dedicated GPU id flag, so enforce via env.
+            env["CUDA_VISIBLE_DEVICES"] = cuda_device
+        elif cuda_device in {"cpu", "none"} or str(env.get("SECOURSES_GLOBAL_GPU_DEVICE", "")).strip().lower() == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
         creationflags = 0
         preexec_fn = None
         if platform.system() == "Windows":

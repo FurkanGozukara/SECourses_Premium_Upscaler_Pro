@@ -27,6 +27,7 @@ from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defa
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
 from shared.models.rife_meta import get_rife_default_model
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
+from shared.gpu_utils import auto_select_global_gpu_device, resolve_global_gpu_device
 
 
 GLOBAL_ORDER = [
@@ -36,6 +37,7 @@ GLOBAL_ORDER = [
     "face_global",
     "face_strength",
     "queue_enabled",
+    "global_gpu_device",
     "mode",
     "models_dir",
     "hf_home",
@@ -47,6 +49,7 @@ GLOBAL_ORDER = [
 def global_defaults(base_dir: Path = None) -> Dict[str, Any]:
     base = Path(base_dir) if base_dir else Path.cwd()
     models_dir = str(base / "models")
+    default_gpu = resolve_global_gpu_device(auto_select_global_gpu_device())
     return {
         "output_dir": str(base / "outputs"),
         "temp_dir": str(base / "temp"),
@@ -54,6 +57,7 @@ def global_defaults(base_dir: Path = None) -> Dict[str, Any]:
         "face_global": False,
         "face_strength": 0.5,
         "queue_enabled": True,
+        "global_gpu_device": default_gpu,
         "mode": "subprocess",
         "models_dir": models_dir,
         "hf_home": models_dir,
@@ -222,6 +226,9 @@ def _normalize_global_settings(data: Dict[str, Any], defaults: Dict[str, Any]) -
         face_strength = 0.5
     cfg["face_strength"] = max(0.0, min(1.0, face_strength))
     cfg["queue_enabled"] = bool(cfg.get("queue_enabled", defaults.get("queue_enabled", True)))
+    cfg["global_gpu_device"] = resolve_global_gpu_device(
+        cfg.get("global_gpu_device", defaults.get("global_gpu_device"))
+    )
     mode_raw = str(cfg.get("mode", defaults.get("mode", "subprocess")) or "subprocess").strip().lower()
     cfg["mode"] = mode_raw if mode_raw in {"subprocess", "in_app"} else "subprocess"
     cfg["models_dir"] = str(cfg.get("models_dir", defaults.get("models_dir", "")) or "").strip()
@@ -587,7 +594,10 @@ def update_shared_state_from_preset(
     seed_controls["global_rife_multiplier_val"] = out_settings.get("global_rife_multiplier", "x2")
     seed_controls["global_rife_model_val"] = out_settings.get("global_rife_model", get_rife_default_model())
     seed_controls["global_rife_precision_val"] = out_settings.get("global_rife_precision", "fp32")
-    seed_controls["global_rife_cuda_device_val"] = out_settings.get("global_rife_cuda_device", "")
+    global_gpu_device = resolve_global_gpu_device(global_settings.get("global_gpu_device"))
+    out_settings["global_rife_cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
+    seed_controls["global_gpu_device_val"] = global_gpu_device
+    seed_controls["global_rife_cuda_device_val"] = out_settings["global_rife_cuda_device"]
     seed_controls["global_rife_process_chunks_val"] = bool(out_settings.get("global_rife_process_chunks", True))
     seed_controls["output_format_val"] = out_settings.get("output_format", "auto")
     seed_controls["comparison_mode_val"] = out_settings.get("comparison_mode", "slider")

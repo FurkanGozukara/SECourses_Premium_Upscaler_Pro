@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from io import StringIO
 from threading import Lock
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Mapping, Optional, List, Tuple
 
 _GPU_INFO_LOCK = Lock()
 _GPU_INFO_CACHE_TTL_SEC = 30.0
@@ -256,6 +256,183 @@ def get_gpu_info() -> List[GPUInfo]:
     with _GPU_INFO_LOCK:
         _GPU_INFO_CACHE = (now, gpus)
     return gpus
+
+
+def normalize_global_gpu_device(value: Any) -> str:
+    """
+    Normalize persisted/user-selected global GPU device values.
+
+    Returns:
+        - "cpu" for CPU mode
+        - "<gpu_id>" for explicit GPU IDs
+        - "" for auto/invalid values
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"cpu", "none", "off"}:
+        return "cpu"
+    if text in {"auto", "all"}:
+        return ""
+    if text.startswith("cuda:"):
+        text = text.split(":", 1)[1].strip()
+    if text.isdigit():
+        try:
+            did = int(text)
+            return str(did) if did >= 0 else ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _gpu_power_score(gpu: GPUInfo) -> Tuple[float, float, float, float, float]:
+    """
+    Sorting key for "most powerful" GPU auto-selection.
+
+    Priority:
+    1. Total VRAM (largest first)
+    2. Compute capability (major/minor)
+    3. Currently free VRAM
+    4. Lower device ID as deterministic tie-breaker
+    """
+    if gpu.compute_capability:
+        major, minor = gpu.compute_capability
+    else:
+        major, minor = (-1, -1)
+    return (
+        float(gpu.total_memory_gb or 0.0),
+        float(major),
+        float(minor),
+        float(gpu.available_memory_gb or 0.0),
+        float(-int(gpu.id)),
+    )
+
+
+def get_most_powerful_gpu(gpus: Optional[List[GPUInfo]] = None) -> Optional[GPUInfo]:
+    """Return the best GPU candidate from detected devices, or None."""
+    devices = list(gpus) if gpus is not None else get_gpu_info()
+    if not devices:
+        return None
+    try:
+        return max(devices, key=_gpu_power_score)
+    except Exception:
+        return devices[0]
+
+
+def auto_select_global_gpu_device(gpus: Optional[List[GPUInfo]] = None) -> str:
+    """Auto-select best GPU id, or 'cpu' when no CUDA GPU is available."""
+    best = get_most_powerful_gpu(gpus=gpus)
+    return str(best.id) if best is not None else "cpu"
+
+
+def format_gpu_choice_label(gpu: GPUInfo) -> str:
+    """Format dropdown label with GPU name + total VRAM."""
+    vram_text = f"{float(gpu.total_memory_gb):.1f} GB" if float(gpu.total_memory_gb or 0.0) > 0 else "Unknown"
+    return f"GPU {gpu.id}: {gpu.name} ({vram_text} VRAM)"
+
+
+def build_global_gpu_dropdown_choices(
+    gpus: Optional[List[GPUInfo]] = None,
+    include_cpu: bool = True,
+) -> List[Tuple[str, str]]:
+    """
+    Build choices for the global GPU selector.
+
+    Returns:
+        List of (label, value) tuples where value is "<gpu_id>" or "cpu".
+    """
+    devices = list(gpus) if gpus is not None else get_gpu_info()
+    choices: List[Tuple[str, str]] = [
+        (format_gpu_choice_label(gpu), str(gpu.id))
+        for gpu in sorted(devices, key=lambda x: int(x.id))
+    ]
+    if include_cpu or not choices:
+        choices.append(("CPU (no CUDA acceleration)", "cpu"))
+    return choices
+
+
+def describe_gpu_selection(device_value: Any, gpus: Optional[List[GPUInfo]] = None) -> str:
+    """Human-readable description of selected global GPU device."""
+    normalized = normalize_global_gpu_device(device_value)
+    devices = list(gpus) if gpus is not None else get_gpu_info()
+
+    if normalized == "cpu":
+        return "CPU (no CUDA acceleration)"
+
+    if normalized and normalized.isdigit():
+        for gpu in devices:
+            if str(gpu.id) == normalized:
+                return format_gpu_choice_label(gpu)
+        return f"GPU {normalized} (currently unavailable)"
+
+    if devices:
+        best = get_most_powerful_gpu(devices)
+        if best is not None:
+            return f"Auto ({format_gpu_choice_label(best)})"
+    return "CPU (no CUDA acceleration)"
+
+
+def resolve_global_gpu_device(selection: Any = None, gpus: Optional[List[GPUInfo]] = None) -> str:
+    """
+    Resolve global GPU selection into a robust runtime value.
+
+    Returns:
+        - "cpu" when CPU mode should be used
+        - "<gpu_id>" for selected/auto-selected GPU
+    """
+    devices = list(gpus) if gpus is not None else get_gpu_info()
+    normalized = normalize_global_gpu_device(selection)
+
+    if normalized == "cpu":
+        return "cpu"
+
+    if not devices:
+        return "cpu"
+
+    device_ids = {str(gpu.id) for gpu in devices}
+    if normalized and normalized in device_ids:
+        return normalized
+
+    # Backward-compatible fallback if old presets stored ordinal positions.
+    if normalized and normalized.isdigit() and normalized not in device_ids:
+        try:
+            ordinal = int(normalized)
+            by_id = sorted(devices, key=lambda x: int(x.id))
+            if 0 <= ordinal < len(by_id):
+                return str(by_id[ordinal].id)
+        except Exception:
+            pass
+
+    best = get_most_powerful_gpu(devices)
+    return str(best.id) if best is not None else "cpu"
+
+
+def get_global_gpu_override(
+    seed_controls: Optional[Mapping[str, Any]] = None,
+    global_settings: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """
+    Resolve the app-wide GPU override from current state/settings.
+
+    Priority:
+    1. shared_state.seed_controls.global_settings.global_gpu_device
+    2. shared_state.seed_controls.global_gpu_device_val
+    3. global_settings.global_gpu_device
+    4. Auto-select best GPU (or CPU when none available)
+    """
+    candidate = None
+
+    if isinstance(seed_controls, Mapping):
+        state_global = seed_controls.get("global_settings")
+        if isinstance(state_global, Mapping):
+            candidate = state_global.get("global_gpu_device")
+        if candidate is None:
+            candidate = seed_controls.get("global_gpu_device_val")
+
+    if candidate is None and isinstance(global_settings, Mapping):
+        candidate = global_settings.get("global_gpu_device")
+
+    return resolve_global_gpu_device(candidate)
 
 
 def expand_cuda_device_spec(cuda_spec: str) -> str:

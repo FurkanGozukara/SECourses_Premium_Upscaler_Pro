@@ -20,7 +20,7 @@ from shared.path_utils import normalize_path, ffmpeg_set_fps, get_media_dimensio
 from shared.face_restore import restore_video
 from shared.logging_utils import RunLogger
 from shared.models.rife_meta import get_rife_metadata, get_rife_default_model
-from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
+from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.output_run_manager import prepare_single_video_run, resolve_resume_input_from_run_dir
@@ -548,16 +548,9 @@ def _apply_global_rife_override(
     ).strip().lower()
     settings["fp16_mode"] = precision == "fp16"
 
-    cuda_device = str(
-        output_settings.get(
-            "global_rife_cuda_device",
-            seed_controls.get("global_rife_cuda_device_val", ""),
-        ) or ""
-    ).strip()
-    if "," in cuda_device:
-        cuda_device = cuda_device.split(",", 1)[0].strip()
-    if cuda_device.lower() == "all":
-        cuda_device = "0"
+    cuda_device = get_global_gpu_override(seed_controls)
+    if cuda_device == "cpu":
+        cuda_device = ""
     if cuda_device:
         settings["cuda_device"] = cuda_device
 
@@ -763,6 +756,10 @@ def build_rife_callbacks(
             output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
             if not isinstance(output_settings, dict):
                 output_settings = {}
+            global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
+            seed_controls["global_gpu_device_val"] = global_gpu_device
+            seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
+            state["seed_controls"] = seed_controls
             
             raw_arg_values = list(args)
             if len(raw_arg_values) == len(RIFE_ORDER):
@@ -780,6 +777,7 @@ def build_rife_callbacks(
                 settings["resume_run_dir"] = ""
             if settings.get("batch_enable"):
                 settings["resume_run_dir"] = ""
+            settings["cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
             
             # Apply RIFE guardrails (single GPU, FPS limits, etc.)
             settings = _enforce_rife_guardrails(settings, defaults)

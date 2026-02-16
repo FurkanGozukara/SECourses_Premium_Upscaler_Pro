@@ -32,7 +32,7 @@ from shared.gan_runner import run_gan_upscale, GanResult, get_gan_model_metadata
 from shared.ffmpeg_utils import scale_video
 from shared.comparison_unified import create_unified_comparison, create_video_comparison_slider
 from shared.video_comparison_slider import create_video_comparison_html
-from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
+from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
@@ -271,7 +271,7 @@ def _apply_gan_preset(
     return [merged[k] for k in GAN_ORDER]
 
 
-from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
+from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 
 
 def _expand_cuda_spec_gan(cuda_spec: str) -> str:
@@ -814,6 +814,9 @@ def build_gan_callbacks(
             output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
             if not isinstance(output_settings, dict):
                 output_settings = {}
+            global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
+            seed_controls["global_gpu_device_val"] = global_gpu_device
+            seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
             seed_controls["gan_chunk_preview"] = {
                 "message": "No chunk preview available yet.",
                 "gallery": [],
@@ -831,7 +834,9 @@ def build_gan_callbacks(
             if settings.get("batch_enable"):
                 settings["resume_run_dir"] = ""
             settings["output_override"] = str(settings.get("output_override") or "").strip()
-            settings["cuda_device"] = settings.get("cuda_device", "")
+            resolved_cuda_device = "" if global_gpu_device == "cpu" else global_gpu_device
+            settings["cuda_device"] = resolved_cuda_device
+            settings["gpu_device"] = resolved_cuda_device
 
             # Pull latest global paths in case user changed them in Global tab
             current_output_dir = Path(global_settings.get("output_dir", output_dir))

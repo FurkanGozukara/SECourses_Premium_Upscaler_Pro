@@ -51,7 +51,7 @@ from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, sho
 from shared.video_comparison import create_comparison_selector
 from shared.global_rife import maybe_apply_global_rife, global_rife_enabled
 from shared.model_manager import get_model_manager, ModelType
-from shared.gpu_utils import expand_cuda_device_spec, validate_cuda_device_spec
+from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.models.rife_meta import get_rife_default_model
 from shared.error_handling import (
     validate_input_path,
@@ -2756,6 +2756,10 @@ def build_seedvr2_callbacks(
             output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
             if not isinstance(output_settings, dict):
                 output_settings = {}
+            global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
+            seed_controls["global_gpu_device_val"] = global_gpu_device
+            seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
+            state["seed_controls"] = seed_controls
 
             # Keep legacy cached keys synced with Output tab source-of-truth values.
             # This prevents tab switches/run starts from reverting Global RIFE state.
@@ -2769,7 +2773,7 @@ def build_seedvr2_callbacks(
                 )
                 precision = str(output_settings.get("global_rife_precision", "fp32") or "fp32").strip().lower()
                 seed_controls["global_rife_precision_val"] = "fp16" if precision == "fp16" else "fp32"
-                seed_controls["global_rife_cuda_device_val"] = str(output_settings.get("global_rife_cuda_device", "") or "")
+                seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
                 seed_controls["global_rife_process_chunks_val"] = bool(output_settings.get("global_rife_process_chunks", True))
                 state["seed_controls"] = seed_controls
 
@@ -2812,6 +2816,23 @@ def build_seedvr2_callbacks(
             if settings.get("batch_enable"):
                 # Resume folder mode is single-run only.
                 settings["resume_run_dir"] = ""
+            settings["cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
+
+            def _normalize_offload_device(value: Any) -> str:
+                text = str(value or "").strip().lower()
+                if not text:
+                    return "none"
+                if text in {"none", "cpu"}:
+                    return text
+                if text.startswith("cuda:"):
+                    text = text.split(":", 1)[1].strip()
+                if text.isdigit():
+                    return "cpu" if global_gpu_device == "cpu" else global_gpu_device
+                return "cpu" if global_gpu_device == "cpu" else "none"
+
+            settings["dit_offload_device"] = _normalize_offload_device(settings.get("dit_offload_device"))
+            settings["vae_offload_device"] = _normalize_offload_device(settings.get("vae_offload_device"))
+            settings["tensor_offload_device"] = _normalize_offload_device(settings.get("tensor_offload_device"))
 
             # Shared Output tab values are the source of truth for these cross-model controls.
             settings["save_metadata"] = bool(

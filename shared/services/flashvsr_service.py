@@ -166,7 +166,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_tile_size = 256
         default_overlap = 24
         default_attention = "sage"
-        version = "1.0"
+        version = "1.1"
         mode = "tiny"
         scale = 4
     
@@ -261,11 +261,11 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         cfg["scale"] = "2" if str(cfg.get("scale", defaults.get("scale", "4"))).strip() == "2" else "4"
     except Exception:
         cfg["scale"] = "4"
-    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.0")))
+    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
     cfg["mode"] = str(cfg.get("mode", defaults.get("mode", "tiny")) or "tiny")
     
     # Build model identifier and get metadata
-    internal_version = flashvsr_version_to_internal(cfg.get("version", "1.0"))
+    internal_version = flashvsr_version_to_internal(cfg.get("version", "1.1"))
     model_id = f"v{internal_version}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
     model_meta = get_flashvsr_metadata(model_id)
     
@@ -369,7 +369,7 @@ def build_flashvsr_callbacks(
 
         try:
             payload = _flashvsr_dict_from_args(list(args))
-            internal_version = flashvsr_version_to_internal(payload.get("version", "1.0"))
+            internal_version = flashvsr_version_to_internal(payload.get("version", "1.1"))
             model_name = f"v{internal_version}_{payload['mode']}"
             
             preset_manager.save_preset_safe("flashvsr", model_name, preset_name.strip(), payload)

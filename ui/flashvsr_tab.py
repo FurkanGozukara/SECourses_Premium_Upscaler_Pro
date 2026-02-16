@@ -145,7 +145,7 @@ def flashvsr_tab(
                         version = gr.Dropdown(
                             label="Model Version",
                             choices=["1.0", "1.1"],
-                            value=flashvsr_version_to_ui(_value("version", "1.0")),
+                            value=flashvsr_version_to_ui(_value("version", "1.1")),
                             info="1.0 = faster, 1.1 = higher quality"
                         )
                         mode = gr.Dropdown(

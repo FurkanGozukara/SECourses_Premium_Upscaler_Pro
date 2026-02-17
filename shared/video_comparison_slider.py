@@ -8,12 +8,14 @@ Notes:
 """
 
 import hashlib
+import html
 import os
 from pathlib import Path
 import random
 import shutil
+import subprocess
 import tempfile
-from typing import Optional
+from typing import Dict, Optional
 import urllib.parse
 
 
@@ -103,6 +105,156 @@ def _ensure_gradio_servable_file(file_path: str) -> str:
         return str(src)
 
 
+def _media_version_token(file_path: str) -> str:
+    """
+    Build a short deterministic token from path + stat metadata for cache busting.
+    """
+    try:
+        p = Path(file_path).resolve()
+        st = p.stat()
+        raw = f"{p.as_posix()}|{st.st_size}|{st.st_mtime_ns}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return f"rand{random.randint(100000, 999999)}"
+
+
+def _probe_video_meta(video_path: str) -> Dict[str, str]:
+    """
+    Best-effort ffprobe for codec and dimensions.
+    """
+    out: Dict[str, str] = {}
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if proc.returncode != 0:
+            return out
+        for raw in str(proc.stdout or "").splitlines():
+            line = str(raw or "").strip()
+            if not line or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = str(k).strip().lower()
+            val = str(v).strip()
+            if key and val:
+                out[key] = val
+    except Exception:
+        return out
+    return out
+
+
+def _is_browser_friendly_codec(codec_name: str) -> bool:
+    """
+    Conservative browser-safe codec check for HTML5 video playback.
+    """
+    codec = str(codec_name or "").strip().lower()
+    # Keep this strict to maximize cross-browser reliability.
+    return codec in {"h264", "vp8", "vp9", "av1"}
+
+
+def _ensure_browser_video_playable(file_path: str) -> str:
+    """
+    Ensure the comparison player receives a browser-friendly video codec.
+
+    If source codec is not broadly HTML5-compatible (e.g., mpeg4 part2),
+    create a cached H.264 preview and return that path.
+    """
+    src = Path(file_path).resolve()
+    if not src.exists() or not src.is_file():
+        return str(src)
+
+    meta = _probe_video_meta(str(src))
+    codec = str(meta.get("codec_name") or "").strip().lower()
+    if _is_browser_friendly_codec(codec):
+        return str(src)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return str(src)
+
+    try:
+        st = src.stat()
+        key = hashlib.sha256(
+            f"{src.as_posix()}|{st.st_size}|{st.st_mtime_ns}|h264_preview_v1".encode("utf-8")
+        ).hexdigest()[:20]
+        out = src.with_name(f"{src.stem}.__h264_preview_{key}.mp4")
+        if out.exists() and out.stat().st_size > 1024:
+            return str(out)
+
+        tmp = out.with_suffix(".tmp.mp4")
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
+            os.replace(tmp, out)
+            return str(out)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+    except Exception:
+        return str(src)
+    return str(src)
+
+
+def _build_video_badge(base_label: str, video_path: str) -> str:
+    meta = _probe_video_meta(video_path)
+    width = str(meta.get("width") or "").strip()
+    height = str(meta.get("height") or "").strip()
+    codec = str(meta.get("codec_name") or "").strip().lower()
+
+    extras = []
+    if width.isdigit() and height.isdigit():
+        extras.append(f"{width}x{height}")
+    if codec:
+        extras.append(codec)
+
+    if extras:
+        return f"{base_label} ({', '.join(extras)})"
+    return base_label
+
+
 def create_video_comparison_html(
     original_video: Optional[str],
     upscaled_video: Optional[str],
@@ -132,8 +284,23 @@ def create_video_comparison_html(
 
     original_path = str(Path(original_video).resolve())
     upscaled_path = str(Path(upscaled_video).resolve())
+    try:
+        if Path(original_path).resolve() == Path(upscaled_path).resolve():
+            same = html.escape(original_path)
+            return f"""
+            <div style="text-align:center;padding:24px;background:#fff4e5;border:1px solid #ffd59a;border-radius:8px;">
+                <p style="margin:0;color:#8a5300;font-size:14px;">
+                    Comparison skipped: original and upscaled paths are identical.<br>{same}
+                </p>
+            </div>
+            """
+    except Exception:
+        pass
+
     original_served_path = _ensure_gradio_servable_file(original_path)
     upscaled_served_path = _ensure_gradio_servable_file(upscaled_path)
+    original_served_path = _ensure_browser_video_playable(original_served_path)
+    upscaled_served_path = _ensure_browser_video_playable(upscaled_served_path)
 
     # Gradio 6.x file route.
     original_path_encoded = urllib.parse.quote(
@@ -142,8 +309,13 @@ def create_video_comparison_html(
     upscaled_path_encoded = urllib.parse.quote(
         upscaled_served_path.replace("\\", "/"), safe=":/"
     )
-    original_url = f"/gradio_api/file={original_path_encoded}"
-    upscaled_url = f"/gradio_api/file={upscaled_path_encoded}"
+    original_token = _media_version_token(original_served_path)
+    upscaled_token = _media_version_token(upscaled_served_path)
+    original_url = f"/gradio_api/file={original_path_encoded}?v={original_token}&side=original"
+    upscaled_url = f"/gradio_api/file={upscaled_path_encoded}?v={upscaled_token}&side=upscaled"
+
+    original_badge = html.escape(_build_video_badge("Original", original_path))
+    upscaled_badge = html.escape(_build_video_badge("Upscaled", upscaled_path))
 
     safe_height = max(260, int(height or 600))
     initial_slider = max(0.0, min(100.0, float(slider_position or 50.0)))
@@ -175,10 +347,10 @@ def create_video_comparison_html(
             </div>
 
             <div style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
-                Original
+                {original_badge}
             </div>
             <div style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
-                Upscaled
+                {upscaled_badge}
             </div>
         </div>
 

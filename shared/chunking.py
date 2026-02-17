@@ -2392,13 +2392,25 @@ def chunk_and_process(
         "vp9",
         "av1",
     }
-    if output_format != "png" and expected_codec_name:
+    strict_codec_validation = True
+    if model_type == "seedvr2":
+        # SeedVR2 with OpenCV backend can legitimately emit mp4v/mpeg4 regardless of
+        # global output codec preference. Enforcing strict codec checks here creates
+        # false "codec drift" failures even when processing succeeds.
+        seed_backend = str(settings.get("video_backend") or "").strip().lower()
+        if seed_backend != "ffmpeg":
+            strict_codec_validation = False
+            _emit_diag(
+                f"[codec] strict validation disabled for SeedVR2 backend='{seed_backend or 'opencv'}' "
+                "(OpenCV output codec may differ by runtime build).\n"
+            )
+    if output_format != "png" and expected_codec_name and strict_codec_validation:
         _emit_diag(
             f"[codec] expected output codec={expected_codec_name}, 10bit={expected_use_10bit}\n"
         )
 
     def _codec_matches_expected(media_path: Path) -> bool:
-        if output_format == "png" or not expected_codec_name:
+        if output_format == "png" or not expected_codec_name or not strict_codec_validation:
             return True
         v = _probe_video_stream_verbose(Path(media_path))
         codec = str(v.get("codec_name") or "").strip().lower()
@@ -2450,7 +2462,7 @@ def chunk_and_process(
     ) -> Tuple[bool, Path]:
         p = Path(media_path)
         _log_chunk_codec_probe(chunk_idx, label, p)
-        if output_format == "png" or not expected_codec_name:
+        if output_format == "png" or not expected_codec_name or not strict_codec_validation:
             return True, p
         if _codec_matches_expected(p):
             return True, p

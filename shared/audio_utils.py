@@ -24,6 +24,20 @@ def _format_cmd(cmd: list[str]) -> str:
     return " ".join(f"\"{c}\"" if " " in str(c) else str(c) for c in cmd)
 
 
+def _display_media_ref(path_a: Path, path_b: Path) -> tuple[str, str]:
+    """
+    Format media path labels for logs.
+
+    If both files share the same basename, return full paths so logs remain
+    unambiguous and do not look like self-muxing.
+    """
+    pa = Path(path_a)
+    pb = Path(path_b)
+    if pa.name.lower() == pb.name.lower():
+        return str(pa), str(pb)
+    return pa.name, pb.name
+
+
 def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -194,8 +208,9 @@ def mux_audio(
 
     src_has_audio = has_audio_stream(audio_source_path)
     dst_has_audio_before = has_audio_stream(video_path)
+    video_ref, source_ref = _display_media_ref(video_path, audio_source_path)
     _emit_log(
-        f"[audio] mux start: video='{video_path.name}', source='{audio_source_path.name}', "
+        f"[audio] mux start: video='{video_ref}', source='{source_ref}', "
         f"codec='{audio_codec}', bitrate='{audio_bitrate or ''}'",
         on_progress,
     )
@@ -260,8 +275,9 @@ def ensure_audio_on_video(
     codec_norm = (audio_codec or "copy").strip().lower()
     want_audio = codec_norm not in ("none", "no", "off", "disable", "disabled")
 
+    video_ref, source_ref = _display_media_ref(video_path, audio_source_path)
     _emit_log(
-        f"[audio] ensure start: video='{video_path.name}', source='{audio_source_path.name}', "
+        f"[audio] ensure start: video='{video_ref}', source='{source_ref}', "
         f"codec='{codec_norm}', force_replace={bool(force_replace)}",
         on_progress,
     )

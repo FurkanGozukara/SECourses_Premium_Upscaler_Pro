@@ -124,6 +124,176 @@ def _ffmpeg_python_api_compatible() -> bool:
         return False
 
 
+def _build_flashvsr_ffmpeg_shim_source() -> str:
+    """
+    Minimal ffmpeg-python compatibility layer for FlashVSR_plus/run.py.
+    It only implements the API surface used by `merge_video_with_audio`.
+    """
+    return """# Auto-generated compatibility shim for FlashVSR+ upstream ffmpeg import.
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+
+class Error(Exception):
+    def __init__(self, cmd=None, stdout=None, stderr=None):
+        super().__init__("ffmpeg command failed")
+        self.cmd = cmd
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run(cmd: List[str], quiet: bool = False) -> subprocess.CompletedProcess:
+    kwargs: Dict[str, Any] = {"check": False}
+    if quiet:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    proc = subprocess.run(cmd, **kwargs)
+    if proc.returncode != 0:
+        raise Error(
+            cmd=cmd,
+            stdout=getattr(proc, "stdout", None),
+            stderr=getattr(proc, "stderr", None),
+        )
+    return proc
+
+
+def probe(path: str) -> Dict[str, Any]:
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        raise Error(cmd=["ffprobe"], stderr=b"ffprobe not found in PATH")
+
+    proc = _run(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-print_format",
+            "json",
+            str(path),
+        ],
+        quiet=True,
+    )
+    raw = proc.stdout if isinstance(proc.stdout, (bytes, bytearray)) else b""
+    return json.loads(raw.decode("utf-8", errors="replace") or "{}")
+
+
+@dataclass
+class _StreamRef:
+    path: str
+    selector: str
+
+
+class _InputRef:
+    def __init__(self, path: str):
+        self.path = str(path)
+
+    def __getitem__(self, selector: str) -> _StreamRef:
+        return _StreamRef(path=self.path, selector=str(selector))
+
+
+def input(path: str) -> _InputRef:
+    return _InputRef(path)
+
+
+def _selector_with_default(selector: str, default_selector: str) -> str:
+    sel = str(selector or "").strip()
+    return sel or default_selector
+
+
+class _OutputRef:
+    def __init__(
+        self,
+        video_stream: _StreamRef,
+        audio_stream: _StreamRef,
+        output_path: str,
+        vcodec: str = "copy",
+        acodec: str = "copy",
+    ):
+        self.video_stream = video_stream
+        self.audio_stream = audio_stream
+        self.output_path = str(output_path)
+        self.vcodec = str(vcodec or "copy")
+        self.acodec = str(acodec or "copy")
+
+    def run(self, overwrite_output: bool = False, quiet: bool = False):
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            raise Error(cmd=["ffmpeg"], stderr=b"ffmpeg not found in PATH")
+
+        video_sel = _selector_with_default(self.video_stream.selector, "v:0")
+        audio_sel = _selector_with_default(self.audio_stream.selector, "a:0")
+
+        cmd = [ffmpeg_bin]
+        if overwrite_output:
+            cmd.append("-y")
+        cmd.extend(
+            [
+                "-i",
+                self.video_stream.path,
+                "-i",
+                self.audio_stream.path,
+                "-map",
+                f"0:{video_sel}",
+                "-map",
+                f"1:{audio_sel}",
+                "-c:v",
+                self.vcodec,
+                "-c:a",
+                self.acodec,
+                self.output_path,
+            ]
+        )
+        _run(cmd, quiet=quiet)
+        return None
+
+
+def output(*args, **kwargs) -> _OutputRef:
+    if len(args) < 3:
+        raise ValueError("output() expects at least: video_stream, audio_stream, output_path")
+
+    out_path = args[-1]
+    streams = args[:-1]
+    if len(streams) != 2:
+        raise ValueError("output() shim only supports one video and one audio stream")
+
+    video_stream, audio_stream = streams
+    if not isinstance(video_stream, _StreamRef) or not isinstance(audio_stream, _StreamRef):
+        raise TypeError("output() expects stream refs returned by input(...)[...]")
+
+    return _OutputRef(
+        video_stream=video_stream,
+        audio_stream=audio_stream,
+        output_path=str(out_path),
+        vcodec=str(kwargs.get("vcodec", "copy")),
+        acodec=str(kwargs.get("acodec", "copy")),
+    )
+"""
+
+
+def _prepare_flashvsr_ffmpeg_shim(base_dir: Path) -> Optional[Path]:
+    """
+    Create/update a local `ffmpeg.py` shim that emulates the tiny subset
+    of ffmpeg-python used by FlashVSR_plus/run.py.
+    """
+    try:
+        shim_dir = base_dir / "temp" / "_flashvsr_ffmpeg_shim"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim_file = shim_dir / "ffmpeg.py"
+        src = _build_flashvsr_ffmpeg_shim_source()
+        if (not shim_file.exists()) or shim_file.read_text(encoding="utf-8") != src:
+            shim_file.write_text(src, encoding="utf-8")
+        return shim_dir
+    except Exception:
+        return None
+
+
 def run_flashvsr(
     settings: Dict[str, Any],
     base_dir: Path,
@@ -316,11 +486,25 @@ def run_flashvsr(
         proc_env.setdefault("TRITON_CACHE_DIR", str(triton_cache_dir))
 
         if not _ffmpeg_python_api_compatible():
-            log(
-                "[FlashVSR] Python package 'ffmpeg' is not ffmpeg-python compatible "
-                "(missing probe/Error). Upstream audio-merge traceback can appear, "
-                "but video output is still usable."
-            )
+            shim_dir = _prepare_flashvsr_ffmpeg_shim(base_dir)
+            if shim_dir is not None:
+                existing_pythonpath = str(proc_env.get("PYTHONPATH") or "")
+                shim_path = str(shim_dir)
+                proc_env["PYTHONPATH"] = (
+                    f"{shim_path}{os.pathsep}{existing_pythonpath}"
+                    if existing_pythonpath
+                    else shim_path
+                )
+                log(
+                    "[FlashVSR] Incompatible Python 'ffmpeg' package detected; "
+                    "using compatibility shim to avoid upstream audio-merge errors."
+                )
+            else:
+                log(
+                    "[FlashVSR] Python package 'ffmpeg' is not ffmpeg-python compatible "
+                    "(missing probe/Error). Upstream audio-merge traceback can appear, "
+                    "but video output is still usable."
+                )
 
         def _build_cmd(run_dtype: str, run_tiled_dit: bool) -> List[str]:
             local_cmd = [

@@ -4380,6 +4380,10 @@ def build_seedvr2_callbacks(
                     if original_path and Path(original_path).exists():
                         # Use new video comparison slider
                         from shared.video_comparison_slider import create_video_comparison_html as create_vid_comp
+                        try:
+                            same_comp_paths = Path(original_path).resolve() == Path(output_video).resolve()
+                        except Exception:
+                            same_comp_paths = False
 
                         video_comp_html = create_vid_comp(
                             original_video=original_path,
@@ -4388,7 +4392,11 @@ def build_seedvr2_callbacks(
                             slider_position=50.0
                         )
                         video_comparison_html_update = gr.update(value=video_comp_html, visible=True)
-                        print(f"[DEBUG] Video comparison slider created (original: {original_path})", flush=True)
+                        print(
+                            f"[DEBUG] Video comparison slider created "
+                            f"(original: {original_path}, upscaled: {output_video}, same_path={same_comp_paths})",
+                            flush=True,
+                        )
                     else:
                         print(f"[DEBUG] Video comparison skipped - original path missing: {original_path}", flush=True)
                     # For videos, hide the image slider

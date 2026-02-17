@@ -198,8 +198,8 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         # vNext sizing (app-level)
         "use_resolution_tab": True,
         "upscale_factor": float(scale),
-        "max_target_resolution": 0,  # Max edge cap (0 = no cap)
-        "pre_downscale_then_upscale": False,
+        "max_target_resolution": 1920,  # Max edge cap (0 = no cap)
+        "pre_downscale_then_upscale": True,
     }
 
 

@@ -9,7 +9,7 @@ from typing import Dict, Any
 import html
 
 from shared.services.gan_service import (
-    build_gan_callbacks, GAN_ORDER
+    build_gan_callbacks, GAN_ORDER, PREFERRED_GAN_DEFAULT_MODEL
 )
 from shared.video_comparison_slider import create_video_comparison_html, get_video_comparison_js_on_load
 
@@ -91,7 +91,8 @@ def gan_tab(
 
     gan_model_value = _value("model", "")
     if gan_model_choices and gan_model_value not in gan_model_choices:
-        gan_model_value = gan_model_choices[0]
+        preferred_lookup = {str(m).lower(): str(m) for m in gan_model_choices}
+        gan_model_value = preferred_lookup.get(PREFERRED_GAN_DEFAULT_MODEL.lower(), gan_model_choices[0])
 
     from shared.gan_runner import get_gan_model_metadata
 
@@ -362,11 +363,11 @@ def gan_tab(
                     _upscale_factor_default = 4.0
                 _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
 
-                _max_resolution_default = _value("max_resolution", 0)
+                _max_resolution_default = _value("max_resolution", 1920)
                 try:
                     _max_resolution_default = int(_max_resolution_default)
                 except Exception:
-                    _max_resolution_default = 0
+                    _max_resolution_default = 1920
                 _max_resolution_default = min(8192, max(0, _max_resolution_default))
 
                 with gr.Row():
@@ -390,7 +391,7 @@ def gan_tab(
                     )
                     pre_downscale_then_upscale = gr.Checkbox(
                         label="Pre-downscale then upscale (when capped)",
-                        value=bool(_value("pre_downscale_then_upscale", False)),
+                        value=bool(_value("pre_downscale_then_upscale", True)),
                         info="If max edge would reduce effective scale, downscale input first so the model still runs at the full Upscale x.",
                         scale=1,
                     )
@@ -760,6 +761,45 @@ def gan_tab(
         )
         return gr.update(value=indicator_html, visible=True)
 
+    def _expand_service_payload(payload, live_state):
+        merged = merge_payload_state(payload, live_state)
+        safe_state = live_state if isinstance(live_state, dict) else {}
+        if not isinstance(merged, tuple) or len(merged) < 10:
+            chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)
+            return (
+                gr.update(value="ERROR: Invalid GAN payload"),
+                "",
+                gr.update(value="", visible=False),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+                "Error",
+                gr.update(value=None),
+                gr.update(value="", visible=False),
+                gr.update(value=[], visible=False),
+                chunk_status_upd,
+                chunk_gallery_upd,
+                chunk_preview_upd,
+                safe_state,
+            )
+
+        status, logs, prog_upd, img_upd, vid_upd, last_txt, slider_upd, html_upd, batch_upd, state_out = merged[:10]
+        chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(state_out)
+        return (
+            status,
+            logs,
+            prog_upd if prog_upd is not None else gr.update(value="", visible=False),
+            img_upd if img_upd is not None else gr.update(value=None, visible=False),
+            vid_upd if vid_upd is not None else gr.update(value=None, visible=False),
+            last_txt,
+            slider_upd if slider_upd is not None else gr.update(value=None),
+            html_upd if html_upd is not None else gr.update(value="", visible=False),
+            batch_upd if batch_upd is not None else gr.update(value=[], visible=False),
+            chunk_status_upd,
+            chunk_gallery_upd,
+            chunk_preview_upd,
+            state_out,
+        )
+
     def _queued_waiting_output(state, ticket_id: str, position: int):
         safe_state = state or {}
         pos = max(1, int(position)) if position else "?"
@@ -768,6 +808,7 @@ def gan_tab(
             f"Queued and waiting for active processing slot. Queue position: {pos}. "
             "Run logs and chunk previews will update once processing starts."
         )
+        chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)
         return (
             gr.update(value=title),
             gr.update(value=f"Queued and waiting for active processing slot. Queue position: {pos}."),
@@ -778,6 +819,9 @@ def gan_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            chunk_status_upd,
+            chunk_gallery_upd,
+            chunk_preview_upd,
             safe_state,
         )
 
@@ -785,6 +829,7 @@ def gan_tab(
         safe_state = state or {}
         title = f"Queue item removed: {ticket_id}"
         subtitle = "This queued request was removed before processing started."
+        chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)
         return (
             gr.update(value=title),
             gr.update(value=subtitle),
@@ -795,6 +840,9 @@ def gan_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            chunk_status_upd,
+            chunk_gallery_upd,
+            chunk_preview_upd,
             safe_state,
         )
 
@@ -802,6 +850,7 @@ def gan_tab(
         safe_state = state or {}
         title = "Processing already in progress (queue disabled)."
         subtitle = "Enable 'Enable Queue' in Global Settings to stack additional requests."
+        chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)
         return (
             gr.update(value=title),
             gr.update(value=subtitle),
@@ -812,6 +861,9 @@ def gan_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            chunk_status_upd,
+            chunk_gallery_upd,
+            chunk_preview_upd,
             safe_state,
         )
 
@@ -837,7 +889,7 @@ def gan_tab(
                     progress=progress,
                     global_settings_snapshot=queued_global_settings,
                 ):
-                    yield merge_payload_state(payload, live_state)
+                    yield _expand_service_payload(payload, live_state)
                 return
 
             wait_notice_sent = False
@@ -867,7 +919,7 @@ def gan_tab(
                 progress=progress,
                 global_settings_snapshot=queued_global_settings,
             ):
-                yield merge_payload_state(payload, live_state)
+                yield _expand_service_payload(payload, live_state)
         finally:
             if acquired_slot:
                 queue_manager.complete(ticket.job_id)
@@ -886,7 +938,7 @@ def gan_tab(
             progress=progress,
             global_settings_snapshot=queued_global_settings,
         ):
-            yield merge_payload_state(payload, live_state)
+            yield _expand_service_payload(payload, live_state)
 
     # Main processing with gr.Progress - include input_file upload
     run_evt = upscale_btn.click(
@@ -894,16 +946,12 @@ def gan_tab(
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
             status_box, log_box, progress_indicator, output_image, output_video,
-            last_processed, image_slider, video_comparison_html, batch_gallery, shared_state
+            last_processed, image_slider, video_comparison_html, batch_gallery,
+            chunk_status, chunk_gallery, chunk_preview_video, shared_state
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",
         trigger_mode="multiple",
-    )
-    run_evt.then(
-        fn=refresh_chunk_preview_ui,
-        inputs=[shared_state],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
     )
 
     preview_evt = preview_btn.click(
@@ -911,13 +959,9 @@ def gan_tab(
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
             status_box, log_box, progress_indicator, output_image, output_video,
-            last_processed, image_slider, video_comparison_html, batch_gallery, shared_state
+            last_processed, image_slider, video_comparison_html, batch_gallery,
+            chunk_status, chunk_gallery, chunk_preview_video, shared_state
         ]
-    )
-    preview_evt.then(
-        fn=refresh_chunk_preview_ui,
-        inputs=[shared_state],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
     )
     
     # NOTE: Legacy target_resolution is hidden; sizing is now driven by Upscale-x.

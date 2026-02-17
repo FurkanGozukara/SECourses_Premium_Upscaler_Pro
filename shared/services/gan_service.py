@@ -42,6 +42,7 @@ from shared.preview_utils import prepare_preview_input
 
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
 GAN_META_CACHE: Dict[str, Dict[str, Any]] = {}
+PREFERRED_GAN_DEFAULT_MODEL = "4x-UltraSharpV2.safetensors"
 
 
 def _normalize_key(name: str) -> str:
@@ -177,7 +178,8 @@ def _scan_gan_models(base_dir: Path) -> List[str]:
 
 def gan_defaults(base_dir: Path) -> Dict[str, Any]:
     models = _scan_gan_models(base_dir)
-    default_model = models[0] if models else ""
+    preferred_lookup = {str(m).lower(): str(m) for m in models}
+    default_model = preferred_lookup.get(PREFERRED_GAN_DEFAULT_MODEL.lower(), models[0] if models else "")
 
     return {
         "input_path": "",
@@ -192,8 +194,8 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "use_resolution_tab": True,  # Enable Resolution tab integration by default
         # NEW (vNext): unified Upscale-x sizing (applies to both images and videos)
         "upscale_factor": 4.0,
-        "max_resolution": 0,  # Max edge cap (0 = no cap)
-        "pre_downscale_then_upscale": False,
+        "max_resolution": 1920,  # Max edge cap (0 = no cap)
+        "pre_downscale_then_upscale": True,
         "tile_size": 0,
         "overlap": 32,
         "denoising_strength": 0.0,
@@ -1273,8 +1275,14 @@ def build_gan_callbacks(
                                 )
 
                         def _chunk_progress_cb(_progress_val, desc=""):
-                            if progress_cb and desc:
-                                progress_cb(desc)
+                            desc_s = str(desc or "").strip()
+                            if desc_s.lower().startswith("completed chunk"):
+                                try:
+                                    seed_controls["gan_chunk_preview"] = build_chunk_preview_payload(str(run_output_root))
+                                except Exception:
+                                    pass
+                            if progress_cb and desc_s:
+                                progress_cb(desc_s)
 
                         rc, clog, final_output, chunk_count = chunk_and_process(
                             runner=runner,

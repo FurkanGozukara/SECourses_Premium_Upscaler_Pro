@@ -360,11 +360,11 @@ def flashvsr_tab(
                     _upscale_factor_default = 4.0
                 _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
 
-                _max_resolution_default = _value("max_target_resolution", 0)
+                _max_resolution_default = _value("max_target_resolution", 1920)
                 try:
                     _max_resolution_default = int(_max_resolution_default)
                 except Exception:
-                    _max_resolution_default = 0
+                    _max_resolution_default = 1920
                 _max_resolution_default = min(8192, max(0, _max_resolution_default))
 
                 with gr.Row():
@@ -388,7 +388,7 @@ def flashvsr_tab(
                     )
                     pre_downscale_then_upscale = gr.Checkbox(
                         label="Pre-downscale then upscale (when capped)",
-                        value=bool(_value("pre_downscale_then_upscale", False)),
+                        value=bool(_value("pre_downscale_then_upscale", True)),
                         info="If max edge would reduce effective scale, downscale input first so the model still runs at the full Upscale x.",
                         scale=1,
                     )

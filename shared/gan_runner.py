@@ -24,6 +24,7 @@ from .path_utils import (
 from .face_restore import restore_image, restore_video
 from .command_logger import get_command_logger
 from .video_encoder import encode_video
+from .video_codec_options import build_ffmpeg_video_encode_args
 
 
 # GAN Model Metadata System
@@ -503,8 +504,14 @@ def _run_gan_video(
         png_padding = int(settings.get("png_padding", 6))
         frame_pattern = f"frame_%0{png_padding}d.png"
         
+        # Preserve one output image per decoded source frame.
+        # Without this, ffmpeg may duplicate frames for some chunk timestamps,
+        # which later appears as frozen-frame segments in GAN outputs.
         extract_cmd = [
-            "ffmpeg", "-y", "-i", str(input_path),
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-map", "0:v:0",
+            "-vsync", "0",
             str(frames_dir / frame_pattern)
         ]
         subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -523,28 +530,142 @@ def _run_gan_video(
             on_progress(f"FRAME_PROGRESS 0/{total_frames} frames completed (0%)")
 
         # Batch process frames
-        batch_size = settings.get("batch_size", 1)
+        try:
+            batch_size = int(settings.get("batch_size", 1) or 1)
+        except Exception:
+            batch_size = 1
+        batch_size = max(1, batch_size)
         processed_count = 0
         last_reported_pct = -1
-        
+
+        # Real batching path: load Spandrel model once and run N frames per forward pass.
+        # Fallback to legacy per-frame inference if unavailable or if a batch fails.
+        use_spandrel_batch = False
+        spandrel_model = None
+        spandrel_device = None
+        spandrel_torch = None
+        spandrel_image_cls = None
+        if _gan_registry and _gan_registry._spandrel_available:
+            try:
+                import spandrel
+                import torch
+                from PIL import Image
+
+                model_path = base_dir / "models" / model_name
+                if not model_path.exists():
+                    model_path = base_dir / "Image_Upscale_Models" / model_name
+                spandrel_model = spandrel.ModelLoader().load_from_file(str(model_path))
+
+                if torch.cuda.is_available():
+                    cuda_id = _resolve_cuda_device_id(settings)
+                    if cuda_id != "":
+                        try:
+                            did = int(cuda_id)
+                            if 0 <= did < torch.cuda.device_count():
+                                spandrel_device = torch.device(f"cuda:{did}")
+                            else:
+                                spandrel_device = torch.device("cuda")
+                        except Exception:
+                            spandrel_device = torch.device("cuda")
+                    else:
+                        spandrel_device = torch.device("cpu")
+                else:
+                    spandrel_device = torch.device("cpu")
+
+                spandrel_model = spandrel_model.to(spandrel_device)
+                if hasattr(spandrel_model, "eval"):
+                    spandrel_model.eval()
+
+                spandrel_torch = torch
+                spandrel_image_cls = Image
+                use_spandrel_batch = True
+
+                if on_progress and batch_size > 1:
+                    on_progress(
+                        f"Using real batch inference (batch_size={batch_size}, device={spandrel_device})"
+                    )
+            except Exception as e:
+                use_spandrel_batch = False
+                if on_progress and batch_size > 1:
+                    on_progress(f"Warning: batched inference unavailable; using per-frame fallback ({e})")
+
         for i in range(0, total_frames, batch_size):
             if cancel_event and cancel_event.is_set():
                 break
 
             batch_frames = frame_files[i:i+batch_size]
-            
-            # Process each frame in batch
+
+            batch_done = False
+            if use_spandrel_batch and spandrel_model is not None and spandrel_torch is not None and spandrel_image_cls is not None:
+                try:
+                    frame_tensors = []
+                    frame_indices = []
+                    for frame_path in batch_frames:
+                        with spandrel_image_cls.open(frame_path) as img:
+                            img_array = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+                        frame_tensors.append(
+                            spandrel_torch.from_numpy(img_array).permute(2, 0, 1)
+                        )
+                        frame_indices.append(int(re.search(r'(\d+)', frame_path.stem).group(1)))
+
+                    if frame_tensors:
+                        input_tensor = spandrel_torch.stack(frame_tensors, dim=0).to(spandrel_device)
+                        with spandrel_torch.no_grad():
+                            output_tensor = spandrel_model(input_tensor)
+
+                        if isinstance(output_tensor, (list, tuple)):
+                            output_tensor = output_tensor[0]
+                        elif isinstance(output_tensor, dict):
+                            output_tensor = (
+                                output_tensor.get("output")
+                                or output_tensor.get("out")
+                                or (next(iter(output_tensor.values())) if output_tensor else None)
+                            )
+                        if output_tensor is None:
+                            raise RuntimeError("Spandrel model returned no output tensor")
+
+                        output_tensor = output_tensor.detach().cpu()
+                        for out_idx, frame_index in enumerate(frame_indices):
+                            out_frame = output_tensor[out_idx].permute(1, 2, 0).numpy()
+                            out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
+                            out_img = spandrel_image_cls.fromarray(out_frame)
+                            out_path = frames_up_dir / f"frame_{frame_index:0{png_padding}d}_out.png"
+                            out_img.save(out_path, format="PNG")
+
+                            if settings.get("face_restore"):
+                                restored = restore_image(str(out_path), strength=settings.get("face_strength", 0.5))
+                                if restored:
+                                    try:
+                                        if Path(restored).resolve() != out_path.resolve():
+                                            shutil.copy2(restored, out_path)
+                                    except Exception:
+                                        pass
+
+                            processed_count += 1
+                            progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
+                            if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
+                                last_reported_pct = progress_pct
+                                on_progress(
+                                    f"FRAME_PROGRESS {processed_count}/{total_frames} frames completed ({progress_pct}%)"
+                                )
+                        batch_done = True
+                except Exception as e:
+                    batch_done = False
+                    use_spandrel_batch = False
+                    if on_progress and batch_size > 1:
+                        on_progress(f"Warning: batched pass failed; retrying this batch per-frame ({e})")
+
+            if batch_done:
+                continue
+
+            # Legacy fallback path: process each frame independently.
             for frame_path in batch_frames:
-                # Create temp settings for this frame
                 frame_settings = settings.copy()
                 frame_settings["input_path"] = str(frame_path)
-                
-                # CRITICAL: Override output directory to frames_up_dir for video reconstruction
-                # This ensures upscaled frames are saved with correct naming pattern for ffmpeg
                 frame_settings["_video_frame_output_dir"] = str(frames_up_dir)
                 frame_settings["_video_frame_index"] = int(re.search(r'(\d+)', frame_path.stem).group(1))
                 frame_settings["_video_frame_padding"] = png_padding
-                
+
                 result = _run_gan_image(
                     frame_path, model_name, frame_settings, base_dir, temp_dir,
                     output_dir, metadata, None, cancel_event
@@ -557,10 +678,128 @@ def _run_gan_video(
                     on_progress(
                         f"FRAME_PROGRESS {processed_count}/{total_frames} frames completed ({progress_pct}%)"
                     )
-                
-                if result.returncode != 0:
+
+                if result.returncode != 0 and on_progress:
+                    on_progress(f"Warning: Frame {frame_path.name} failed")
+
+        def _probe_video_codec_and_fps(path: Path) -> Tuple[Optional[str], Optional[float]]:
+            try:
+                proc = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-show_entries",
+                        "stream=codec_name,avg_frame_rate,r_frame_rate",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=0",
+                        str(path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                )
+                if proc.returncode != 0:
+                    return None, None
+
+                codec_name: Optional[str] = None
+                fps_val: Optional[float] = None
+                for raw in str(proc.stdout or "").splitlines():
+                    if "=" not in raw:
+                        continue
+                    key, val = raw.split("=", 1)
+                    key_l = str(key).strip().lower()
+                    val_s = str(val).strip()
+                    if key_l == "codec_name" and val_s:
+                        codec_name = val_s.lower()
+                    elif key_l in {"avg_frame_rate", "r_frame_rate"} and val_s and fps_val is None:
+                        if "/" in val_s:
+                            num_s, den_s = val_s.split("/", 1)
+                            try:
+                                num = float(num_s)
+                                den = float(den_s)
+                                if den != 0:
+                                    fps_val = num / den
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                fps_val = float(val_s)
+                            except Exception:
+                                pass
+                return codec_name, fps_val
+            except Exception:
+                return None, None
+
+        def _enforce_output_codec_and_fps(video_path: Path, desired_fps: float) -> Path:
+            if not video_path.exists() or video_path.suffix.lower() not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
+                return video_path
+
+            codec_key = _normalize_video_codec_key(settings.get("video_codec", "h264"))
+            expected_codec_name = {
+                "h264": "h264",
+                "h265": "hevc",
+                "vp9": "vp9",
+                "av1": "av1",
+                "prores": "prores",
+            }.get(codec_key, "h264")
+
+            probed_codec, probed_fps = _probe_video_codec_and_fps(video_path)
+            codec_ok = bool(probed_codec) and (
+                (expected_codec_name == "prores" and str(probed_codec).startswith("prores"))
+                or (str(probed_codec) == expected_codec_name)
+            )
+            fps_ok = (desired_fps <= 0) or (probed_fps is not None and abs(float(probed_fps) - float(desired_fps)) <= 0.05)
+            if codec_ok and fps_ok:
+                return video_path
+
+            try:
+                quality = int(settings.get("video_quality", 18) or 18)
+            except Exception:
+                quality = 18
+            preset = str(settings.get("video_preset", "medium") or "medium")
+            pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p")
+            audio_codec = str(settings.get("audio_codec") or "copy")
+            audio_bitrate = settings.get("audio_bitrate") or None
+
+            out_tmp = collision_safe_path(video_path.with_name(f"{video_path.stem}_normalized{video_path.suffix}"))
+            fps_target = float(desired_fps if desired_fps > 0 else (probed_fps or 30.0))
+            ffmpeg_args = build_ffmpeg_video_encode_args(
+                codec=codec_key,
+                quality=quality,
+                pixel_format=pixel_format,
+                preset=preset,
+                audio_codec=audio_codec,
+                audio_bitrate=audio_bitrate,
+            )
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-r", str(fps_target),
+                *ffmpeg_args,
+                "-movflags", "+faststart",
+                str(out_tmp),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and out_tmp.exists():
+                try:
+                    video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    shutil.move(str(out_tmp), str(video_path))
                     if on_progress:
-                        on_progress(f"Warning: Frame {frame_path.name} failed")
+                        on_progress(
+                            f"Normalized final video to codec={codec_key}, fps={fps_target:.3f} for output consistency."
+                        )
+                    return video_path
+                except Exception:
+                    return out_tmp
+            return video_path
 
         if cancel_event and cancel_event.is_set():
             # FIXED: Compile partial results if any frames were processed
@@ -617,6 +856,10 @@ def _run_gan_video(
                     )
                     if not ok:
                         raise RuntimeError("Frame-to-video encoding failed")
+                    partial_output_final = _enforce_output_codec_and_fps(
+                        Path(partial_output_final),
+                        float(target_fps),
+                    )
                     
                     if on_progress:
                         on_progress(f"Partial video saved: {partial_output_final}")
@@ -696,6 +939,12 @@ def _run_gan_video(
             restored = restore_video(output_path, strength=settings.get("face_strength", 0.5), on_progress=on_progress)
             if restored:
                 output_path = restored
+        output_path = str(
+            _enforce_output_codec_and_fps(
+                Path(output_path),
+                float(target_fps),
+            )
+        )
 
         return GanResult(
             0,

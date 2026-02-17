@@ -2559,6 +2559,17 @@ def chunk_and_process(
 
         if res.returncode != 0 or getattr(runner, "is_canceled", lambda: False)():
             on_progress(f"Chunk {idx} failed with code {res.returncode}\n")
+            try:
+                if int(getattr(res, "returncode", 0) or 0) != 0:
+                    err_blob = str(getattr(res, "log", "") or "").strip()
+                    if err_blob:
+                        tail_lines = [ln for ln in err_blob.splitlines() if str(ln).strip()]
+                        if tail_lines:
+                            on_progress(f"[chunk {idx}] error details (tail):\n")
+                            for ln in tail_lines[-12:]:
+                                on_progress(f"[chunk {idx}] {ln}\n")
+            except Exception:
+                pass
             is_canceled_now = bool(getattr(runner, "is_canceled", lambda: False)())
             partial_returncode = res.returncode if res.returncode != 0 else 1
             partial = _finalize_partial_output(

@@ -88,6 +88,29 @@ def _resolve_python_executable(base_dir: Path) -> str:
     return sys.executable
 
 
+def _is_known_tiled_dit_temp_name_bug(log_text: str) -> bool:
+    text = str(log_text or "").lower()
+    return (
+        "unboundlocalerror" in text
+        and "temp_name" in text
+        and "referenced before assignment" in text
+    )
+
+
+def _is_bf16_runtime_issue(log_text: str) -> bool:
+    text = str(log_text or "").lower()
+    needles = (
+        "bfloat16",
+        "bf16",
+        "not implemented for",
+        "does not support",
+        "unsupported datatype",
+        "unsupported dtype",
+        "expected scalar type",
+    )
+    return any(n in text for n in needles)
+
+
 def run_flashvsr(
     settings: Dict[str, Any],
     base_dir: Path,
@@ -123,7 +146,8 @@ def run_flashvsr(
     start_time = time.time()
     log_lines = []
     cmd: List[str] = []
-    
+    result: Optional[FlashVSRResult] = None
+
     def log(msg: str):
         log_lines.append(msg)
         if on_progress:
@@ -133,7 +157,7 @@ def run_flashvsr(
                 # Never let UI/console callback issues fail the actual run.
                 pass
     temp_input_dir: Optional[Path] = None
-    
+
     try:
         # Validate input (support preprocessed effective input path)
         original_input_path = normalize_path(settings.get("input_path", ""))
@@ -217,7 +241,7 @@ def run_flashvsr(
         tiled_dit = bool(settings.get("tiled_dit", False))
         tile_size = int(settings.get("tile_size", 256))
         overlap = int(settings.get("overlap", 24))
-        unload_dit = bool(settings.get("unload_dit", False))
+        unload_dit = bool(settings.get("unload_dit", True))
         color_fix = bool(settings.get("color_fix", False))
         
         # Build command
@@ -232,44 +256,10 @@ def run_flashvsr(
         python_exe = _resolve_python_executable(base_dir)
         if python_exe != sys.executable:
             log(f"[FlashVSR] Using venv python: {python_exe}")
-        
-        cmd = [
-            python_exe,
-            str(flashvsr_script),
-            "-i", effective_input_path,
-            "-s", str(scale),
-            "-v", version,
-            "-m", mode,
-            "-t", dtype,
-            "-d", device_arg,
-            "-f", str(fps),
-            "-q", str(quality),
-            "-a", attention,
-            "--seed", str(seed),
-            output_folder  # Positional arg
-        ]
-        
-        # Add flags
-        if tiled_vae:
-            cmd.append("--tiled-vae")
-        if tiled_dit:
-            cmd.append("--tiled-dit")
-        if tiled_dit or tiled_vae:
-            cmd.extend(["--tile-size", str(tile_size)])
-            cmd.extend(["--overlap", str(overlap)])
-        if unload_dit:
-            cmd.append("--unload-dit")
-        if color_fix:
-            cmd.append("--color-fix")
-        
-        log(f"Running FlashVSR+ with scale={scale}, mode={mode}, version={version_ui}")
-        if original_input_path != effective_input_path:
-            log(f"Preprocessed input: {effective_input_path} (original: {original_input_path})")
-        log(f"Command: {' '.join(cmd)}")
-        
+
         # Run subprocess with cancellation support
         import platform
-        
+
         # Platform-specific process group creation
         creationflags = 0
         preexec_fn = None
@@ -293,73 +283,171 @@ def run_flashvsr(
             log(gpu_note)
         proc_env.setdefault("TRITON_CACHE_DIR", str(triton_cache_dir))
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=base_dir,
-            env=proc_env,
-            creationflags=creationflags,
-            preexec_fn=preexec_fn
-        )
-        
-        # Store process handle for cancellation
-        if process_handle is not None:
-            process_handle["proc"] = proc
-        
-        # Read output with cancel checking
-        output_lines = []
-        while True:
-            # Check for cancellation
-            if cancel_event and cancel_event.is_set():
-                log("⏹️ Cancellation requested - terminating FlashVSR+ process")
-                try:
-                    if platform.system() == "Windows":
-                        proc.terminate()
-                    else:
-                        proc.kill()
-                    proc.wait(timeout=5.0)
-                except Exception:
-                    pass
-                return FlashVSRResult(
-                    returncode=1,
-                    output_path=None,
-                    log="\n".join(log_lines + output_lines + ["[Cancelled by user]"])
-                )
-            
-            line = proc.stdout.readline()
-            if not line:
-                break
-            
-            line = line.rstrip()
-            if line:
-                output_lines.append(line)
-                log(line)
-        
-        # Wait for completion
-        returncode = proc.wait()
-        
-        # Collect any remaining output
-        remaining = proc.stdout.read()
-        if remaining:
-            output_lines.append(remaining)
-        
-        # Find output file reliably (avoid lexicographic "last file" bugs).
-        output_path: Optional[str] = None
-        if expected_output_path.exists():
-            output_path = str(expected_output_path)
-        else:
+        def _build_cmd(run_dtype: str, run_tiled_dit: bool) -> List[str]:
+            local_cmd = [
+                python_exe,
+                str(flashvsr_script),
+                "-i", effective_input_path,
+                "-s", str(scale),
+                "-v", version,
+                "-m", mode,
+                "-t", str(run_dtype),
+                "-d", device_arg,
+                "-f", str(fps),
+                "-q", str(quality),
+                "-a", attention,
+                "--seed", str(seed),
+            ]
+            if tiled_vae:
+                local_cmd.append("--tiled-vae")
+            if run_tiled_dit:
+                local_cmd.append("--tiled-dit")
+            if run_tiled_dit or tiled_vae:
+                local_cmd.extend(["--tile-size", str(tile_size)])
+                local_cmd.extend(["--overlap", str(overlap)])
+            if unload_dit:
+                local_cmd.append("--unload-dit")
+            if color_fix:
+                local_cmd.append("--color-fix")
+            local_cmd.append(output_folder)  # Positional arg (must stay last)
+            return local_cmd
+
+        def _run_command(cmd_to_run: List[str]) -> tuple[int, str, bool]:
+            proc = subprocess.Popen(
+                cmd_to_run,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=base_dir,
+                env=proc_env,
+                creationflags=creationflags,
+                preexec_fn=preexec_fn,
+            )
+            if process_handle is not None:
+                process_handle["proc"] = proc
+
+            output_lines: List[str] = []
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    log("Cancellation requested - terminating FlashVSR+ process")
+                    try:
+                        if platform.system() == "Windows":
+                            proc.terminate()
+                        else:
+                            proc.kill()
+                        proc.wait(timeout=5.0)
+                    except Exception:
+                        pass
+                    if process_handle is not None:
+                        process_handle["proc"] = None
+                    return 1, "\n".join(output_lines), True
+
+                line = proc.stdout.readline()
+                if not line:
+                    break
+
+                line = line.rstrip()
+                if line:
+                    output_lines.append(line)
+                    log(line)
+
+            returncode_local = proc.wait()
+            remaining = proc.stdout.read()
+            if remaining:
+                for rem_line in str(remaining).splitlines():
+                    rem_line = rem_line.rstrip()
+                    if rem_line:
+                        output_lines.append(rem_line)
+                        log(rem_line)
+
+            if process_handle is not None:
+                process_handle["proc"] = None
+            return returncode_local, "\n".join(output_lines), False
+
+        def _discover_output_path() -> Optional[str]:
+            if expected_output_path.exists():
+                return str(expected_output_path)
             post_mp4 = {p.resolve() for p in output_folder_path.glob("*.mp4")}
             new_files = list(post_mp4 - pre_existing_mp4)
             if new_files:
                 newest = max(new_files, key=lambda p: p.stat().st_mtime)
-                output_path = str(newest)
-            elif post_mp4:
+                return str(newest)
+            if post_mp4:
                 newest = max(post_mp4, key=lambda p: p.stat().st_mtime)
-                output_path = str(newest)
+                return str(newest)
+            return None
+
+        log(f"Running FlashVSR+ with scale={scale}, mode={mode}, version={version_ui}")
+        if original_input_path != effective_input_path:
+            log(f"Preprocessed input: {effective_input_path} (original: {original_input_path})")
+
+        attempts: List[Dict[str, Any]] = [{"dtype": str(dtype), "tiled_dit": bool(tiled_dit)}]
+        attempted_signatures = {(str(dtype).lower(), bool(tiled_dit))}
+        returncode = 1
+        output_path: Optional[str] = None
+        attempt_idx = 0
+
+        while attempt_idx < len(attempts):
+            attempt = attempts[attempt_idx]
+            run_dtype = str(attempt.get("dtype") or "bf16")
+            run_tiled_dit = bool(attempt.get("tiled_dit", tiled_dit))
+            cmd = _build_cmd(run_dtype, run_tiled_dit)
+
+            if attempt_idx > 0:
+                log(
+                    "[FlashVSR] Retrying with adjusted runtime settings: "
+                    f"dtype={run_dtype}, tiled_dit={run_tiled_dit}"
+                )
+            log(f"Command: {' '.join(cmd)}")
+
+            returncode, attempt_blob, was_canceled = _run_command(cmd)
+            if was_canceled:
+                result = FlashVSRResult(
+                    returncode=1,
+                    output_path=None,
+                    log="\n".join(log_lines + ["[Cancelled by user]"]),
+                )
+                return result
+
+            output_path = _discover_output_path()
+            if output_path:
+                break
+
+            queued_retry = False
+            if (
+                returncode != 0
+                and run_tiled_dit
+                and mode != "tiny-long"
+                and _is_known_tiled_dit_temp_name_bug(attempt_blob)
+            ):
+                log(
+                    "[FlashVSR] Known upstream tiled_dit bug detected for non-tiny-long mode; "
+                    "retrying with tiled_dit disabled."
+                )
+                sig = (run_dtype.lower(), False)
+                if sig not in attempted_signatures:
+                    attempts.append({"dtype": run_dtype, "tiled_dit": False})
+                    attempted_signatures.add(sig)
+                    queued_retry = True
+
+            if (
+                not queued_retry
+                and returncode != 0
+                and run_dtype.lower() == "bf16"
+                and _is_bf16_runtime_issue(attempt_blob)
+            ):
+                log("[FlashVSR] bf16 runtime issue detected; retrying once with dtype=fp16.")
+                sig = ("fp16", run_tiled_dit)
+                if sig not in attempted_signatures:
+                    attempts.append({"dtype": "fp16", "tiled_dit": run_tiled_dit})
+                    attempted_signatures.add(sig)
+                    queued_retry = True
+
+            attempt_idx += 1
+            if not queued_retry:
+                break
 
         if output_path:
             # Optional: rename/move to an explicit file path override.
@@ -395,7 +483,7 @@ def run_flashvsr(
         else:
             log("❌ No output file generated")
             result = FlashVSRResult(
-                returncode=1,
+                returncode=int(returncode or 1),
                 output_path=None,
                 log="\n".join(log_lines)
             )
@@ -437,8 +525,8 @@ def run_flashvsr(
             log("✅ Command logged to executed_commands folder")
         except Exception as e:
             log(f"⚠️ Failed to log command: {e}")
-    
-    return result
+
+    return result if result else FlashVSRResult(returncode=1, output_path=None, log="\n".join(log_lines))
 
 
 def discover_flashvsr_models(base_dir: Path) -> List[str]:

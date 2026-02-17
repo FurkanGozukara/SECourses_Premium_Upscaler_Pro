@@ -258,7 +258,7 @@ def flashvsr_tab(
                     
                     unload_dit = gr.Checkbox(
                         label="Unload DiT Before Decoding",
-                        value=bool(_value("unload_dit", False)),
+                        value=bool(_value("unload_dit", True)),
                         info="Free VRAM before VAE decoding. Slower but uses less memory."
                     )
 

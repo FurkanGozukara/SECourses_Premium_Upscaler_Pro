@@ -181,7 +181,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "tiled_dit": True,
         "tile_size": default_tile_size,
         "overlap": default_overlap,
-        "unload_dit": False,
+        "unload_dit": True,
         "color_fix": True,
         "seed": 0,
         "dtype": default_dtype,

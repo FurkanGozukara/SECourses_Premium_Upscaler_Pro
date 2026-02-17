@@ -111,6 +111,19 @@ def _is_bf16_runtime_issue(log_text: str) -> bool:
     return any(n in text for n in needles)
 
 
+def _ffmpeg_python_api_compatible() -> bool:
+    """
+    FlashVSR_plus/run.py expects ffmpeg-python API (`probe`, `Error`).
+    Some environments have a different `ffmpeg` package installed.
+    """
+    try:
+        import ffmpeg as _ffmpeg  # type: ignore
+
+        return bool(hasattr(_ffmpeg, "probe") and hasattr(_ffmpeg, "Error"))
+    except Exception:
+        return False
+
+
 def run_flashvsr(
     settings: Dict[str, Any],
     base_dir: Path,
@@ -150,6 +163,10 @@ def run_flashvsr(
 
     def log(msg: str):
         log_lines.append(msg)
+        try:
+            print(str(msg), flush=True)
+        except Exception:
+            pass
         if on_progress:
             try:
                 on_progress(msg + "\n")
@@ -243,6 +260,16 @@ def run_flashvsr(
         overlap = int(settings.get("overlap", 24))
         unload_dit = bool(settings.get("unload_dit", True))
         color_fix = bool(settings.get("color_fix", False))
+
+        mode_norm = str(mode or "").strip().lower()
+        # Upstream FlashVSR_plus/run.py has a known bug in tiled_dit path for non tiny-long modes:
+        # `temp_name` is referenced before assignment. Disable proactively to avoid a noisy first failure.
+        if tiled_dit and mode_norm != "tiny-long":
+            log(
+                "[FlashVSR] Upstream tiled_dit bug for mode!='tiny-long' detected; "
+                "disabling tiled_dit for this run."
+            )
+            tiled_dit = False
         
         # Build command
         flashvsr_script = base_dir / "FlashVSR_plus" / "run.py"
@@ -276,12 +303,24 @@ def run_flashvsr(
             **os.environ,
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
         }
         if visible_gpu is not None:
             proc_env["CUDA_VISIBLE_DEVICES"] = visible_gpu
         if gpu_note:
             log(gpu_note)
+        legacy_alloc_conf = proc_env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        if legacy_alloc_conf and not proc_env.get("PYTORCH_ALLOC_CONF"):
+            proc_env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
+            log("[FlashVSR] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF")
         proc_env.setdefault("TRITON_CACHE_DIR", str(triton_cache_dir))
+
+        if not _ffmpeg_python_api_compatible():
+            log(
+                "[FlashVSR] Python package 'ffmpeg' is not ffmpeg-python compatible "
+                "(missing probe/Error). Upstream audio-merge traceback can appear, "
+                "but video output is still usable."
+            )
 
         def _build_cmd(run_dtype: str, run_tiled_dit: bool) -> List[str]:
             local_cmd = [
@@ -313,6 +352,9 @@ def run_flashvsr(
             return local_cmd
 
         def _run_command(cmd_to_run: List[str]) -> tuple[int, str, bool]:
+            import queue as _queue
+            import threading as _threading
+
             proc = subprocess.Popen(
                 cmd_to_run,
                 stdout=subprocess.PIPE,
@@ -329,6 +371,38 @@ def run_flashvsr(
                 process_handle["proc"] = proc
 
             output_lines: List[str] = []
+            line_queue: "_queue.Queue[Optional[str]]" = _queue.Queue()
+
+            def _reader_thread() -> None:
+                try:
+                    if proc.stdout is None:
+                        return
+                    token: List[str] = []
+                    while True:
+                        ch = proc.stdout.read(1)
+                        if ch == "":
+                            break
+                        if ch in ("\n", "\r"):
+                            line = "".join(token).strip()
+                            token = []
+                            if line:
+                                line_queue.put(line)
+                        else:
+                            token.append(ch)
+                    tail = "".join(token).strip()
+                    if tail:
+                        line_queue.put(tail)
+                except Exception:
+                    pass
+                finally:
+                    line_queue.put(None)
+
+            reader = _threading.Thread(target=_reader_thread, daemon=True)
+            reader.start()
+            attempt_started = time.time()
+            last_activity_ts = attempt_started
+            heartbeat_every_sec = 10.0
+
             while True:
                 if cancel_event and cancel_event.is_set():
                     log("Cancellation requested - terminating FlashVSR+ process")
@@ -344,23 +418,36 @@ def run_flashvsr(
                         process_handle["proc"] = None
                     return 1, "\n".join(output_lines), True
 
-                line = proc.stdout.readline()
-                if not line:
-                    break
+                try:
+                    item = line_queue.get(timeout=0.5)
+                    if item is None:
+                        if proc.poll() is not None:
+                            break
+                    else:
+                        output_lines.append(item)
+                        log(item)
+                        last_activity_ts = time.time()
+                except _queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    now = time.time()
+                    if now - last_activity_ts >= heartbeat_every_sec:
+                        elapsed = int(now - attempt_started)
+                        hb = f"[FlashVSR] still processing... {elapsed}s elapsed"
+                        output_lines.append(hb)
+                        log(hb)
+                        last_activity_ts = now
 
-                line = line.rstrip()
-                if line:
-                    output_lines.append(line)
-                    log(line)
+            while True:
+                try:
+                    item = line_queue.get_nowait()
+                except _queue.Empty:
+                    break
+                if item:
+                    output_lines.append(item)
+                    log(item)
 
             returncode_local = proc.wait()
-            remaining = proc.stdout.read()
-            if remaining:
-                for rem_line in str(remaining).splitlines():
-                    rem_line = rem_line.rstrip()
-                    if rem_line:
-                        output_lines.append(rem_line)
-                        log(rem_line)
 
             if process_handle is not None:
                 process_handle["proc"] = None

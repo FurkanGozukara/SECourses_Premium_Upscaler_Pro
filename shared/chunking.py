@@ -2,6 +2,7 @@ import os
 import math
 import json
 import re
+import inspect
 import shutil
 import subprocess
 import threading
@@ -2022,6 +2023,25 @@ def chunk_and_process(
 
     output_chunks: List[Path] = []
     chunk_logs: List[dict] = []
+    custom_process_accepts_kw_on_progress = False
+    custom_process_accepts_pos_on_progress = False
+    if process_func:
+        try:
+            sig = inspect.signature(process_func)
+            params = list(sig.parameters.values())
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+            has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+            custom_process_accepts_kw_on_progress = has_var_kw or ("on_progress" in sig.parameters)
+            positional_count = sum(
+                1
+                for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            )
+            custom_process_accepts_pos_on_progress = has_var_pos or positional_count >= 2
+        except Exception:
+            # Safe default: legacy single-arg process_func(settings) invocation.
+            custom_process_accepts_kw_on_progress = False
+            custom_process_accepts_pos_on_progress = False
 
     def _get_merge_fps_hint(paths: Optional[List[Path]] = None) -> Optional[float]:
         candidates = list(paths or [])
@@ -2540,7 +2560,12 @@ def chunk_and_process(
         
         # Use provided processing function or select based on model type
         if process_func:
-            res = process_func(chunk_settings, on_progress=None)
+            if custom_process_accepts_kw_on_progress:
+                res = process_func(chunk_settings, on_progress=on_progress)
+            elif custom_process_accepts_pos_on_progress:
+                res = process_func(chunk_settings, on_progress)
+            else:
+                res = process_func(chunk_settings)
         elif model_type == "seedvr2":
             res = runner.run_seedvr2(chunk_settings, on_progress=None, preview_only=False)
         elif model_type == "gan":

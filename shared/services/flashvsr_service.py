@@ -512,19 +512,28 @@ def build_flashvsr_callbacks(
                 settings["audio_codec"] = seed_controls.get("audio_codec_val") or "copy"
             if seed_controls.get("audio_bitrate_val") is not None:
                 settings["audio_bitrate"] = seed_controls.get("audio_bitrate_val") or ""
-            if output_settings:
-                for key in (
-                    "video_codec",
-                    "video_quality",
-                    "video_preset",
-                    "pixel_format",
-                    "two_pass_encoding",
-                    "metadata_format",
-                    "log_level",
-                    "temporal_padding",
-                ):
-                    if output_settings.get(key) is not None:
-                        settings[key] = output_settings.get(key)
+            encode_overrides = {
+                "video_codec": seed_controls.get("video_codec_val"),
+                "video_quality": seed_controls.get("video_quality_val"),
+                "video_preset": seed_controls.get("video_preset_val"),
+                "pixel_format": seed_controls.get("pixel_format_val"),
+                "two_pass_encoding": seed_controls.get("two_pass_encoding_val"),
+            }
+            for key in (
+                "video_codec",
+                "video_quality",
+                "video_preset",
+                "pixel_format",
+                "two_pass_encoding",
+                "metadata_format",
+                "log_level",
+                "temporal_padding",
+            ):
+                value = encode_overrides.get(key)
+                if value is None and output_settings:
+                    value = output_settings.get(key)
+                if value is not None:
+                    settings[key] = value
 
             face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))

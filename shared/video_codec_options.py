@@ -49,7 +49,7 @@ CODEC_PROFILES = {
         quality_param="crf",
         quality_range=(0, 51),
         quality_default=28,
-        supports_pixel_formats=["yuv420p", "yuv422p", "yuv444p"],
+        supports_pixel_formats=["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "yuv422p10le", "yuv444p10le"],
         supports_presets=True,
         recommended_for=["archival", "4k", "file_size"]
     ),

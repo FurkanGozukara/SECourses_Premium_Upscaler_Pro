@@ -1103,13 +1103,300 @@ def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) 
     except Exception:
         quality = 18
     preset = str(cfg.get("video_preset", "medium") or "medium")
-    pixel_format = str(cfg.get("pixel_format", "yuv420p") or "yuv420p")
+    pixel_format = str(cfg.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
+    use_10bit = bool(cfg.get("use_10bit", False) or cfg.get("seedvr2_use_10bit", False))
+    # SeedVR2's `--10bit` should dominate downstream ffmpeg enforcement/merge settings.
+    # Without this, a stale/default Output-tab pix_fmt (yuv420p) can silently collapse
+    # chunk/final outputs back to 8-bit during best-effort normalization.
+    if codec == "h265" and use_10bit and "10le" not in pixel_format:
+        pixel_format = "yuv420p10le"
     return {
         "codec": codec,
         "quality": quality,
         "preset": preset,
         "pixel_format": pixel_format,
+        "use_10bit": use_10bit,
     }
+
+
+def _probe_video_stream_info(video_path: Path) -> Optional[Dict[str, str]]:
+    """
+    Probe the first video stream and normalize useful codec fields.
+    """
+    try:
+        if not Path(video_path).exists() or not Path(video_path).is_file():
+            return None
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        parsed: Dict[str, str] = {}
+        for raw_line in str(proc.stdout or "").splitlines():
+            if "=" not in raw_line:
+                continue
+            key, val = raw_line.split("=", 1)
+            k = str(key or "").strip().lower()
+            v = str(val or "").strip()
+            if not k or not v:
+                continue
+            parsed[k] = v
+        codec_raw = str(parsed.get("codec_name", "")).strip().lower()
+        if not codec_raw:
+            return None
+        codec_map = {
+            "h264": "h264",
+            "avc": "h264",
+            "hevc": "h265",
+            "h265": "h265",
+            "vp9": "vp9",
+            "av1": "av1",
+            "prores": "prores",
+            "prores_ks": "prores",
+        }
+        codec_norm = codec_map.get(codec_raw, codec_raw)
+        pix_fmt = str(parsed.get("pix_fmt", "")).strip().lower()
+        info: Dict[str, str] = {"codec": codec_norm}
+        if pix_fmt:
+            info["pix_fmt"] = pix_fmt
+        return info
+    except Exception:
+        return None
+
+
+def _probe_video_codec_key(video_path: Path) -> Optional[str]:
+    info = _probe_video_stream_info(video_path)
+    if not info:
+        return None
+    return str(info.get("codec") or "").strip().lower() or None
+
+
+def _probe_video_codec_key_with_retry(
+    video_path: Path,
+    *,
+    attempts: int = 6,
+    delay_sec: float = 0.25,
+) -> Optional[str]:
+    """
+    Probe codec with short retries to avoid transient race/lock windows.
+    """
+    tries = max(1, int(attempts))
+    for i in range(tries):
+        codec = _probe_video_codec_key(video_path)
+        if codec:
+            return codec
+        if i < tries - 1:
+            time.sleep(max(0.05, float(delay_sec)))
+    return None
+
+
+def _probe_video_stream_info_with_retry(
+    video_path: Path,
+    *,
+    attempts: int = 6,
+    delay_sec: float = 0.25,
+) -> Optional[Dict[str, str]]:
+    tries = max(1, int(attempts))
+    for i in range(tries):
+        info = _probe_video_stream_info(video_path)
+        if info:
+            return info
+        if i < tries - 1:
+            time.sleep(max(0.05, float(delay_sec)))
+    return None
+
+
+def _reencode_video_to_match_settings(
+    video_path: Path,
+    encode_settings: Optional[Dict[str, Any]],
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """
+    Re-encode `video_path` in-place using requested codec settings when post-merge
+    output codec does not match the requested target.
+    """
+    src = Path(video_path)
+    if not src.exists() or not src.is_file():
+        return False
+
+    enc = _normalize_video_encode_settings(encode_settings)
+    audio_codec = str((encode_settings or {}).get("audio_codec", "copy") or "copy").strip().lower()
+    audio_bitrate_raw = str((encode_settings or {}).get("audio_bitrate", "") or "").strip()
+    audio_bitrate = audio_bitrate_raw if audio_bitrate_raw else None
+    tmp = src.with_name(f"{src.stem}.__codec_fix_tmp{src.suffix}")
+
+    def _build_cmd(audio_codec_value: str, audio_bitrate_value: Optional[str]) -> List[str]:
+        video_encode_args = build_ffmpeg_video_encode_args(
+            codec=enc["codec"],
+            quality=enc["quality"],
+            pixel_format=enc["pixel_format"],
+            preset=enc["preset"],
+            audio_codec=audio_codec_value,
+            audio_bitrate=audio_bitrate_value,
+        )
+        bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1"} else []
+        return [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            *bf_args,
+            *video_encode_args,
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ]
+
+    try:
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    proc = None
+
+    def _run_with_retry(cmd_builder: Callable[[], List[str]], attempts: int = 3, delay_sec: float = 0.35):
+        last = None
+        for i in range(max(1, int(attempts))):
+            last = _run_ffmpeg(cmd_builder())
+            if last.returncode == 0:
+                return last
+            if i < max(1, int(attempts)) - 1:
+                time.sleep(max(0.05, float(delay_sec)))
+        return last
+
+    proc = _run_with_retry(lambda: _build_cmd(audio_codec, audio_bitrate), attempts=3, delay_sec=0.35)
+    if proc.returncode != 0 and audio_codec == "copy":
+        # Copy can fail for some source/container combos. Fall back to AAC while
+        # preserving the requested video codec settings.
+        proc = _run_with_retry(lambda: _build_cmd("aac", audio_bitrate or "192k"), attempts=3, delay_sec=0.35)
+
+    if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size <= 1024:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if on_progress:
+            tail = (proc.stderr or proc.stdout or "").strip()[-300:] if proc else ""
+            if tail:
+                on_progress(f"WARN: Codec enforcement re-encode failed: {tail}\n")
+        return False
+
+    try:
+        os.replace(str(tmp), str(src))
+    except Exception as e:
+        if on_progress:
+            on_progress(f"WARN: Codec enforcement replace failed: {e}\n")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _enforce_final_video_codec(
+    video_path: Path,
+    encode_settings: Optional[Dict[str, Any]],
+    on_progress: Optional[Callable[[str], None]] = None,
+    context_label: str = "Final merged",
+) -> Path:
+    """
+    Ensure final merged video obeys requested codec setting.
+    No-op when probing is unavailable or codec already matches.
+    """
+    outp = Path(video_path)
+    if not outp.exists() or not outp.is_file():
+        return outp
+
+    # Reduce probe/encode races on freshly written files.
+    _wait_for_media_file_ready(outp, timeout_sec=8.0, poll_sec=0.2)
+
+    target = _normalize_video_encode_settings(encode_settings)
+    target_codec = str(target.get("codec", "h264") or "h264").strip().lower()
+    target_pix_fmt = str(target.get("pixel_format", "") or "").strip().lower()
+
+    actual_info = _probe_video_stream_info_with_retry(outp, attempts=6, delay_sec=0.25) or {}
+    actual_codec = str(actual_info.get("codec", "") or "").strip().lower()
+    actual_pix_fmt = str(actual_info.get("pix_fmt", "") or "").strip().lower()
+
+    codec_ok = bool(actual_codec) and actual_codec == target_codec
+    pix_ok = (not target_pix_fmt) or (actual_pix_fmt == target_pix_fmt)
+    if codec_ok and pix_ok:
+        return outp
+
+    if actual_codec or actual_pix_fmt:
+        actual_stream = f"{actual_codec or 'unknown'}/{actual_pix_fmt or 'unknown'}"
+        target_stream = f"{target_codec}/{target_pix_fmt or 'auto'}"
+        if on_progress:
+            on_progress(
+                f"WARN: {context_label} stream '{actual_stream}' does not match requested "
+                f"'{target_stream}'. Re-encoding to enforce settings...\n"
+            )
+    else:
+        if on_progress:
+            on_progress(
+                f"WARN: Could not probe {context_label.lower()} stream. "
+                f"Applying best-effort re-encode to '{target_codec}/{target_pix_fmt or 'auto'}'.\n"
+            )
+
+    if _reencode_video_to_match_settings(outp, encode_settings=encode_settings, on_progress=on_progress):
+        verified = _probe_video_stream_info_with_retry(outp, attempts=8, delay_sec=0.25) or {}
+        verified_codec = str(verified.get("codec", "") or "").strip().lower()
+        verified_pix = str(verified.get("pix_fmt", "") or "").strip().lower()
+        if on_progress and (verified_codec or verified_pix):
+            on_progress(
+                f"Codec enforcement complete: {context_label.lower()} stream is "
+                f"'{verified_codec or 'unknown'}/{verified_pix or 'unknown'}'.\n"
+            )
+    return outp
+
+
+def _enforce_merge_input_chunk_codecs(
+    chunk_paths: List[Path],
+    encode_settings: Optional[Dict[str, Any]],
+    on_progress: Optional[Callable[[str], None]] = None,
+    context_prefix: str = "Merge input chunk",
+) -> List[Path]:
+    """
+    Ensure all merge input chunk files obey requested codec settings.
+    This covers resumed/discovered chunks that may not pass through live per-chunk processing.
+    """
+    normalized: List[Path] = []
+    for idx, chunk_path in enumerate(chunk_paths, 1):
+        p = Path(chunk_path)
+        if not p.exists() or not p.is_file():
+            normalized.append(p)
+            continue
+        try:
+            p = _enforce_final_video_codec(
+                p,
+                encode_settings=encode_settings,
+                on_progress=on_progress,
+                context_label=f"{context_prefix} {idx}",
+            )
+        except Exception as e:
+            if on_progress:
+                on_progress(f"WARN: {context_prefix} {idx} codec enforcement skipped: {str(e)}\n")
+        normalized.append(p)
+    return normalized
 
 
 def concat_videos(
@@ -1950,25 +2237,43 @@ def chunk_and_process(
         """
         Resolve chunk outputs for merge using both in-memory paths and processed_chunks/ scan.
         Also waits for each candidate to be fully finalized on disk.
+        When an expected count is known, retry for a short window so late-finalizing
+        chunk files are included instead of merging only an early subset.
         """
-        candidates = _collect_merge_chunk_paths(
-            output_chunks,
-            processed_dir=processed_chunks_dir,
-            expected_count=expected_count,
-        )
-        ready: List[Path] = []
-        for p in candidates:
-            idx = _extract_chunk_index(Path(p))
-            expected_dur = None
-            if idx is not None and 1 <= idx <= len(chunk_paths):
-                try:
-                    expected_dur = get_media_duration_seconds(str(chunk_paths[idx - 1]))
-                except Exception:
-                    expected_dur = None
-            _wait_for_media_file_ready(Path(p), expected_duration=expected_dur, timeout_sec=25.0)
-            if Path(p).exists() and Path(p).is_file():
-                ready.append(Path(p))
-        return ready
+        start_ts = time.time()
+        wait_deadline = start_ts + (35.0 if expected_count and expected_count > 1 else 6.0)
+        best_ready: List[Path] = []
+
+        while True:
+            candidates = _collect_merge_chunk_paths(
+                output_chunks,
+                processed_dir=processed_chunks_dir,
+                expected_count=expected_count,
+            )
+            ready: List[Path] = []
+            for p in candidates:
+                idx = _extract_chunk_index(Path(p))
+                expected_dur = None
+                if idx is not None and 1 <= idx <= len(chunk_paths):
+                    try:
+                        expected_dur = get_media_duration_seconds(str(chunk_paths[idx - 1]))
+                    except Exception:
+                        expected_dur = None
+                # Short per-candidate wait; outer loop handles longer retries.
+                _wait_for_media_file_ready(Path(p), expected_duration=expected_dur, timeout_sec=2.0, poll_sec=0.2)
+                if Path(p).exists() and Path(p).is_file():
+                    ready.append(Path(p))
+
+            if len(ready) > len(best_ready):
+                best_ready = list(ready)
+
+            if expected_count and expected_count > 0 and len(ready) >= int(expected_count):
+                return ready[: int(expected_count)]
+
+            if time.time() >= wait_deadline:
+                return best_ready
+
+            time.sleep(0.25)
 
     def _finalize_partial_output(
         *,
@@ -2015,6 +2320,12 @@ def chunk_and_process(
         merge_chunks = _resolve_merge_chunks(expected_count=len(output_chunks))
         if not merge_chunks:
             return None
+        merge_chunks = _enforce_merge_input_chunk_codecs(
+            merge_chunks,
+            encode_settings=settings,
+            on_progress=on_progress,
+            context_prefix="Partial merge chunk",
+        )
         partial_target = partial_video_target or collision_safe_path(work_root / "partial_concat.mp4")
         merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
         overlap_frames_for_blend = int(chunk_overlap * merge_fps_hint) if chunk_overlap > 0 else 0
@@ -2042,6 +2353,15 @@ def chunk_and_process(
                     on_progress(f"Audio replacement note: {audio_err}\n")
             except Exception as e:
                 on_progress(f"Audio replacement skipped: {str(e)}\n")
+            try:
+                partial_target = _enforce_final_video_codec(
+                    Path(partial_target),
+                    encode_settings=settings,
+                    on_progress=on_progress,
+                    context_label="Partial merged",
+                )
+            except Exception as e:
+                on_progress(f"WARN: Partial codec enforcement skipped: {str(e)}\n")
             on_progress(f"Partial output stitched to {partial_target}\n")
 
         meta = {
@@ -2275,6 +2595,18 @@ def chunk_and_process(
                             on_progress(f"WARN: Chunk {idx} audio note: {audio_err}\n")
                 except Exception:
                     pass
+                # Some model backends may silently fall back codec per chunk.
+                # Enforce the requested output codec at chunk level so merge inputs are consistent.
+                try:
+                    if output_format != "png":
+                        outp = _enforce_final_video_codec(
+                            outp,
+                            encode_settings=chunk_settings,
+                            on_progress=on_progress,
+                            context_label=f"Chunk {idx} output",
+                        )
+                except Exception as e:
+                    on_progress(f"WARN: Chunk {idx} codec enforcement skipped: {str(e)}\n")
                 output_chunks.append(outp)
             else:
                 try:
@@ -2373,6 +2705,12 @@ def chunk_and_process(
     merge_chunks = _resolve_merge_chunks(expected_count=len(chunk_paths))
     if not merge_chunks:
         return 1, "Concat failed: no mergeable chunk outputs were found", str(final_path), len(chunk_paths)
+    merge_chunks = _enforce_merge_input_chunk_codecs(
+        merge_chunks,
+        encode_settings=settings,
+        on_progress=on_progress,
+        context_prefix="Final merge chunk",
+    )
     if len(merge_chunks) < len(chunk_paths):
         on_progress(
             f"WARN: Merge chunk discovery found {len(merge_chunks)}/{len(chunk_paths)} chunks; attempting best-effort merge.\n"
@@ -2413,6 +2751,15 @@ def chunk_and_process(
     except Exception as e:
         # Never fail the whole operation due to audio issues
         on_progress(f"Audio replacement skipped: {str(e)}\n")
+    try:
+        final_path = _enforce_final_video_codec(
+            Path(final_path),
+            encode_settings=settings,
+            on_progress=on_progress,
+            context_label="Final merged",
+        )
+    except Exception as e:
+        on_progress(f"WARN: Final codec enforcement skipped: {str(e)}\n")
     if per_chunk_cleanup:
         _cleanup_chunk_dirs(preserve_thumbs=True)
     # Write chunk metadata

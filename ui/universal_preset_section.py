@@ -14,6 +14,8 @@ from pathlib import Path
 from shared.preset_manager import PresetManager
 from shared.models.rife_meta import get_rife_default_model
 from shared.gpu_utils import resolve_global_gpu_device
+from shared.services.output_service import OUTPUT_ORDER
+from shared.video_codec_options import get_pixel_format_choices
 from shared.universal_preset import (
     TAB_CONFIGS,
     values_to_dict,
@@ -47,6 +49,25 @@ def create_universal_preset_callbacks(
     def get_presets_list() -> List[str]:
         """Get list of all universal presets."""
         return preset_manager.list_universal_presets()
+
+    def _coerce_tab_values_for_ui(tab_values: List[Any]) -> List[Any]:
+        """Ensure tab-specific UI invariants (choices/value compatibility)."""
+        if tab_name != "output":
+            return tab_values
+        coerced = list(tab_values)
+        try:
+            codec_idx = OUTPUT_ORDER.index("video_codec")
+            pix_idx = OUTPUT_ORDER.index("pixel_format")
+            codec_val = str(coerced[codec_idx] or "h264").strip().lower()
+            pix_choices = get_pixel_format_choices(codec_val)
+            pix_fallback = pix_choices[0] if pix_choices else "yuv420p"
+            pix_val = str(coerced[pix_idx] or pix_fallback).strip().lower()
+            if pix_val not in pix_choices:
+                pix_val = pix_fallback
+            coerced[pix_idx] = gr.update(choices=pix_choices, value=pix_val)
+        except Exception:
+            return tab_values
+        return coerced
     
     def save_preset(
         preset_name: str,
@@ -126,7 +147,7 @@ def create_universal_preset_callbacks(
                 current_tab_settings = {}
             source = current_tab_settings if current_tab_settings else defaults.get(tab_name, {})
             tab_values = dict_to_values(tab_name, source, defaults.get(tab_name, {}))
-            return (*tab_values, "ℹ️ No preset selected", state)
+            return (*_coerce_tab_values_for_ui(tab_values), "ℹ️ No preset selected", state)
         
         try:
             # Load the universal preset
@@ -140,7 +161,7 @@ def create_universal_preset_callbacks(
                     current_tab_settings = {}
                 source = current_tab_settings if current_tab_settings else defaults.get(tab_name, {})
                 tab_values = dict_to_values(tab_name, source, defaults.get(tab_name, {}))
-                return (*tab_values, f"⚠️ Preset '{preset_name}' not found", state)
+                return (*_coerce_tab_values_for_ui(tab_values), f"⚠️ Preset '{preset_name}' not found", state)
             
             # Merge with defaults to fill any missing keys
             merged_preset = merge_preset_with_defaults(preset_data, base_dir, models_list)
@@ -156,12 +177,12 @@ def create_universal_preset_callbacks(
             defaults = get_all_defaults(base_dir, models_list)
             tab_values = dict_to_values(tab_name, tab_data, defaults.get(tab_name, {}))
             
-            return (*tab_values, f"✅ Loaded universal preset '{preset_name}' (all tabs)", state)
+            return (*_coerce_tab_values_for_ui(tab_values), f"✅ Loaded universal preset '{preset_name}' (all tabs)", state)
         
         except Exception as e:
             defaults = get_all_defaults(base_dir, models_list)
             tab_values = dict_to_values(tab_name, defaults.get(tab_name, {}))
-            return (*tab_values, f"❌ Error loading preset: {str(e)}", state)
+            return (*_coerce_tab_values_for_ui(tab_values), f"❌ Error loading preset: {str(e)}", state)
     
     def reset_to_defaults(state: Dict[str, Any]) -> Tuple:
         """
@@ -187,12 +208,12 @@ def create_universal_preset_callbacks(
             # Get values for current tab
             tab_values = dict_to_values(tab_name, defaults.get(tab_name, {}))
             
-            return (*tab_values, "✅ Reset all tabs to defaults", state)
+            return (*_coerce_tab_values_for_ui(tab_values), "✅ Reset all tabs to defaults", state)
         
         except Exception as e:
             defaults = get_all_defaults(base_dir, models_list)
             tab_values = dict_to_values(tab_name, defaults.get(tab_name, {}))
-            return (*tab_values, f"❌ Error resetting: {str(e)}", state)
+            return (*_coerce_tab_values_for_ui(tab_values), f"❌ Error resetting: {str(e)}", state)
     
     def refresh_dropdown() -> gr.update:
         """Refresh the preset dropdown choices."""
@@ -414,9 +435,12 @@ def wire_universal_preset_events(
                 triggers.append(comp.change)
             if hasattr(comp, "release"):
                 triggers.append(comp.release)
+            # Textbox/Number edits should sync before blur/save-tab-switch.
+            if hasattr(comp, "input"):
+                triggers.append(comp.input)
 
         # Prefer gr.on() for a single endpoint; fall back to per-component wiring if needed.
-        if hasattr(gr, "on"):
+        if hasattr(gr, "on") and triggers:
             sync_event = gr.on(
                 triggers=triggers,
                 fn=_sync_wrapper,
@@ -431,6 +455,24 @@ def wire_universal_preset_events(
             for comp in inputs_list:
                 if hasattr(comp, "change"):
                     comp.change(
+                        fn=_sync_wrapper,
+                        inputs=inputs_list + [shared_state],
+                        outputs=[shared_state],
+                        queue=False,
+                        show_progress="hidden",
+                        trigger_mode="always_last",
+                    )
+                if hasattr(comp, "release"):
+                    comp.release(
+                        fn=_sync_wrapper,
+                        inputs=inputs_list + [shared_state],
+                        outputs=[shared_state],
+                        queue=False,
+                        show_progress="hidden",
+                        trigger_mode="always_last",
+                    )
+                if hasattr(comp, "input"):
+                    comp.input(
                         fn=_sync_wrapper,
                         inputs=inputs_list + [shared_state],
                         outputs=[shared_state],
@@ -505,6 +547,11 @@ def sync_tab_to_shared_state(
         seed_controls["image_output_quality_val"] = int(tab_dict.get("image_output_quality", 95) or 95)
         seed_controls["seedvr2_video_backend_val"] = str(tab_dict.get("seedvr2_video_backend", "opencv") or "opencv")
         seed_controls["seedvr2_use_10bit_val"] = bool(tab_dict.get("seedvr2_use_10bit", False))
+        seed_controls["video_codec_val"] = str(tab_dict.get("video_codec", "h264") or "h264")
+        seed_controls["video_quality_val"] = int(tab_dict.get("video_quality", 18) or 18)
+        seed_controls["video_preset_val"] = str(tab_dict.get("video_preset", "medium") or "medium")
+        seed_controls["two_pass_encoding_val"] = bool(tab_dict.get("two_pass_encoding", False))
+        seed_controls["pixel_format_val"] = str(tab_dict.get("pixel_format", "yuv420p") or "yuv420p")
         seed_controls["frame_interpolation_val"] = bool(tab_dict.get("frame_interpolation", False))
         seed_controls["global_rife_enabled_val"] = bool(tab_dict.get("frame_interpolation", False))
         seed_controls["global_rife_multiplier_val"] = tab_dict.get("global_rife_multiplier", "x2") or "x2"

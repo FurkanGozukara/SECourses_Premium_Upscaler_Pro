@@ -41,6 +41,7 @@ from shared.gpu_utils import (
     get_gpu_info,
     resolve_global_gpu_device,
 )
+from shared.video_codec_options import get_pixel_format_choices
 from ui.seedvr2_tab import seedvr2_tab
 from ui.resolution_tab import resolution_tab
 from ui.output_tab import output_tab
@@ -1159,6 +1160,11 @@ def main(argv=None):
                 "image_output_quality_val": startup_output_settings.get("image_output_quality", 95),
                 "seedvr2_video_backend_val": startup_output_settings.get("seedvr2_video_backend", "opencv"),
                 "seedvr2_use_10bit_val": bool(startup_output_settings.get("seedvr2_use_10bit", False)),
+                "video_codec_val": str(startup_output_settings.get("video_codec", "h264") or "h264"),
+                "video_quality_val": int(startup_output_settings.get("video_quality", 18) or 18),
+                "video_preset_val": str(startup_output_settings.get("video_preset", "medium") or "medium"),
+                "two_pass_encoding_val": bool(startup_output_settings.get("two_pass_encoding", False)),
+                "pixel_format_val": str(startup_output_settings.get("pixel_format", "yuv420p") or "yuv420p"),
                 "frame_interpolation_val": bool(startup_output_settings.get("frame_interpolation", False)),
                 "global_rife_enabled_val": bool(startup_output_settings.get("frame_interpolation", False)),
                 "global_rife_multiplier_val": startup_output_settings.get("global_rife_multiplier", "x2"),
@@ -1557,6 +1563,16 @@ def main(argv=None):
                     values[5] = get_rife_default_model()
                 if tab_name == "output":
                     try:
+                        codec_idx = OUTPUT_ORDER.index("video_codec")
+                        pix_fmt_idx = OUTPUT_ORDER.index("pixel_format")
+                        codec_val = str(values[codec_idx] or "h264").strip().lower()
+                        pix_fmt_choices = get_pixel_format_choices(codec_val)
+                        pix_fmt_fallback = pix_fmt_choices[0] if pix_fmt_choices else "yuv420p"
+                        pix_fmt_val = str(values[pix_fmt_idx] or pix_fmt_fallback).strip().lower()
+                        if pix_fmt_val not in pix_fmt_choices:
+                            pix_fmt_val = pix_fmt_fallback
+                        values[pix_fmt_idx] = gr.update(choices=pix_fmt_choices, value=pix_fmt_val)
+
                         global_rife_model_idx = OUTPUT_ORDER.index("global_rife_model")
                         if len(values) > global_rife_model_idx and not str(values[global_rife_model_idx] or "").strip():
                             values[global_rife_model_idx] = get_rife_default_model()

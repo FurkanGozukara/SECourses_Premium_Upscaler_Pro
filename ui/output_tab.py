@@ -33,6 +33,7 @@ from shared.video_comparison_slider import (
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
+    sync_tab_to_shared_state,
 )
 
 
@@ -134,10 +135,10 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     if default_codec not in codec_choices:
         default_codec = "h264"
 
-    pix_fmt_choices = get_pixel_format_choices()
-    default_pix_fmt = str(_value("pixel_format", "yuv420p") or "yuv420p")
+    pix_fmt_choices = get_pixel_format_choices(default_codec)
+    default_pix_fmt = str(_value("pixel_format", pix_fmt_choices[0] if pix_fmt_choices else "yuv420p") or "yuv420p")
     if default_pix_fmt not in pix_fmt_choices:
-        default_pix_fmt = "yuv420p"
+        default_pix_fmt = pix_fmt_choices[0] if pix_fmt_choices else "yuv420p"
 
     with gr.Tabs():
         with gr.TabItem("Global RIFE"):
@@ -590,11 +591,27 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         outputs=seedvr2_encoding_warning,
     )
 
-    # Codec info updates
+    def _sync_codec_and_pixfmt(codec_key: str, current_pix_fmt: str):
+        codec = str(codec_key or "h264").strip().lower()
+        codec_choices_local = get_codec_choices()
+        if codec not in codec_choices_local:
+            codec = "h264"
+        pix_choices_local = get_pixel_format_choices(codec)
+        pix_fallback = pix_choices_local[0] if pix_choices_local else "yuv420p"
+        pix_fmt = str(current_pix_fmt or pix_fallback).strip().lower()
+        if pix_fmt not in pix_choices_local:
+            pix_fmt = pix_fallback
+        return (
+            gr.update(value=get_codec_info(codec)),
+            gr.update(choices=pix_choices_local, value=pix_fmt),
+            gr.update(value=get_pixel_format_info(pix_fmt)),
+        )
+
+    # Codec + pixel format sync updates
     video_codec.change(
-        fn=service["update_codec_info"],
-        inputs=video_codec,
-        outputs=codec_info_display
+        fn=_sync_codec_and_pixfmt,
+        inputs=[video_codec, pixel_format],
+        outputs=[codec_info_display, pixel_format, pixel_format_info],
     )
 
     pixel_format.change(
@@ -603,29 +620,61 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         outputs=pixel_format_info
     )
 
+    codec_index = OUTPUT_ORDER.index("video_codec")
+    pix_fmt_index = OUTPUT_ORDER.index("pixel_format")
+
+    def _apply_codec_preset_with_sync(preset_name: str, *vals):
+        current_values = list(vals[:-1])
+        state = vals[-1] if isinstance(vals[-1], dict) else {"seed_controls": {}}
+        next_values = service["apply_codec_preset"](preset_name, current_values)
+
+        codec = str(next_values[codec_index] or "h264").strip().lower()
+        codec_choices_local = get_codec_choices()
+        if codec not in codec_choices_local:
+            codec = "h264"
+            next_values[codec_index] = codec
+
+        pix_choices_local = get_pixel_format_choices(codec)
+        pix_fallback = pix_choices_local[0] if pix_choices_local else "yuv420p"
+        pix_fmt = str(next_values[pix_fmt_index] or pix_fallback).strip().lower()
+        if pix_fmt not in pix_choices_local:
+            pix_fmt = pix_fallback
+            next_values[pix_fmt_index] = pix_fmt
+
+        synced_state = sync_tab_to_shared_state("output", list(next_values), state)
+        ui_values = list(next_values)
+        ui_values[pix_fmt_index] = gr.update(choices=pix_choices_local, value=pix_fmt)
+
+        return (
+            *ui_values,
+            gr.update(value=get_codec_info(codec)),
+            gr.update(value=get_pixel_format_info(pix_fmt)),
+            synced_state,
+        )
+
     # Quick codec preset buttons
     preset_youtube.click(
-        fn=lambda *vals: service["apply_codec_preset"]("youtube", list(vals)),
-        inputs=inputs_list,
-        outputs=inputs_list
+        fn=lambda *vals: _apply_codec_preset_with_sync("youtube", *vals),
+        inputs=inputs_list + [shared_state],
+        outputs=inputs_list + [codec_info_display, pixel_format_info, shared_state],
     )
 
     preset_archival.click(
-        fn=lambda *vals: service["apply_codec_preset"]("archival", list(vals)),
-        inputs=inputs_list,
-        outputs=inputs_list
+        fn=lambda *vals: _apply_codec_preset_with_sync("archival", *vals),
+        inputs=inputs_list + [shared_state],
+        outputs=inputs_list + [codec_info_display, pixel_format_info, shared_state],
     )
 
     preset_editing.click(
-        fn=lambda *vals: service["apply_codec_preset"]("editing", list(vals)),
-        inputs=inputs_list,
-        outputs=inputs_list
+        fn=lambda *vals: _apply_codec_preset_with_sync("editing", *vals),
+        inputs=inputs_list + [shared_state],
+        outputs=inputs_list + [codec_info_display, pixel_format_info, shared_state],
     )
 
     preset_web.click(
-        fn=lambda *vals: service["apply_codec_preset"]("web", list(vals)),
-        inputs=inputs_list,
-        outputs=inputs_list
+        fn=lambda *vals: _apply_codec_preset_with_sync("web", *vals),
+        inputs=inputs_list + [shared_state],
+        outputs=inputs_list + [codec_info_display, pixel_format_info, shared_state],
     )
 
     # Direct comparison events

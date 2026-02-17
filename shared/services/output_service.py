@@ -5,7 +5,11 @@ from shared.preset_manager import PresetManager
 from shared.video_codec_options import (
     get_codec_info,
     get_pixel_format_info,
-    get_recommended_settings
+    get_recommended_settings,
+    get_codec_choices,
+    get_pixel_format_choices,
+    ENCODING_PRESETS,
+    AUDIO_CODECS,
 )
 from shared.models.rife_meta import get_rife_default_model
 
@@ -122,6 +126,35 @@ def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         backend = "opencv"
     cfg["seedvr2_video_backend"] = backend
     cfg["seedvr2_use_10bit"] = bool(cfg.get("seedvr2_use_10bit", False)) and backend == "ffmpeg"
+
+    codec = str(cfg.get("video_codec", "h264") or "h264").strip().lower()
+    codec_choices = set(get_codec_choices())
+    if codec not in codec_choices:
+        codec = "h264"
+    cfg["video_codec"] = codec
+
+    try:
+        video_quality = int(float(cfg.get("video_quality", 18) or 18))
+    except Exception:
+        video_quality = 18
+    cfg["video_quality"] = max(0, min(51, video_quality))
+
+    preset = str(cfg.get("video_preset", "medium") or "medium").strip().lower()
+    cfg["video_preset"] = preset if preset in ENCODING_PRESETS else "medium"
+    cfg["two_pass_encoding"] = bool(cfg.get("two_pass_encoding", False))
+
+    pix_fmt_choices = get_pixel_format_choices(codec)
+    pix_fmt_fallback = pix_fmt_choices[0] if pix_fmt_choices else "yuv420p"
+    pix_fmt = str(cfg.get("pixel_format", pix_fmt_fallback) or pix_fmt_fallback).strip().lower()
+    if pix_fmt not in pix_fmt_choices:
+        pix_fmt = pix_fmt_fallback
+    cfg["pixel_format"] = pix_fmt
+
+    audio_codec = str(cfg.get("audio_codec", "copy") or "copy").strip().lower()
+    if audio_codec not in set(AUDIO_CODECS.keys()):
+        audio_codec = "copy"
+    cfg["audio_codec"] = audio_codec
+    cfg["audio_bitrate"] = str(cfg.get("audio_bitrate", "") or "").strip()
 
     cfg["frame_interpolation"] = bool(cfg.get("frame_interpolation", False))
 

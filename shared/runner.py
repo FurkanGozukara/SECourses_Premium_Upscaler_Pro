@@ -2174,6 +2174,27 @@ class Runner:
 
         return aliases
 
+    @staticmethod
+    def _normalize_rife_video_codec(codec_raw: Any) -> str:
+        text = str(codec_raw or "").strip().lower()
+        codec_map = {
+            "h264": "libx264",
+            "avc": "libx264",
+            "x264": "libx264",
+            "libx264": "libx264",
+            "h265": "libx265",
+            "hevc": "libx265",
+            "x265": "libx265",
+            "libx265": "libx265",
+            "vp9": "libvpx-vp9",
+            "libvpx-vp9": "libvpx-vp9",
+            "av1": "libsvtav1",
+            "libsvtav1": "libsvtav1",
+            "prores": "prores_ks",
+            "prores_ks": "prores_ks",
+        }
+        return codec_map.get(text, "libx264")
+
     def _resolve_rife_bundle_dir(self, candidate_dir: Path) -> Optional[Path]:
         """
         Resolve a model bundle dir containing flownet.pkl.
@@ -2343,6 +2364,31 @@ class Runner:
             cmd.append("--show-ffmpeg")
         if settings.get("skip_static_frames"):
             cmd.append("--skip")
+
+        # Encoding options (Output tab source-of-truth). This keeps RIFE output codec/pixfmt
+        # aligned with user-selected video settings instead of hardcoded x264 defaults.
+        video_codec = self._normalize_rife_video_codec(settings.get("video_codec", "h264"))
+        cmd.extend(["--video-codec", video_codec])
+
+        try:
+            quality_val = int(float(settings.get("video_quality", settings.get("output_quality", 23)) or 23))
+        except Exception:
+            quality_val = 23
+        quality_val = max(0, min(63, quality_val))
+        cmd.extend(["--video-crf", str(quality_val)])
+
+        video_preset = str(settings.get("video_preset", "slow") or "slow").strip().lower()
+        if not video_preset:
+            video_preset = "slow"
+        cmd.extend(["--video-preset", video_preset])
+
+        pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
+        if not pixel_format:
+            pixel_format = "yuv420p"
+        use_10bit = bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False))
+        if video_codec == "libx265" and use_10bit and "10le" not in pixel_format:
+            pixel_format = "yuv420p10le"
+        cmd.extend(["--pixel-format", pixel_format])
 
         # Frame control: skip_first_frames and load_cap are now handled via ffmpeg preprocessing
         # in run_rife() before RIFE CLI is called, so no CLI args needed here.

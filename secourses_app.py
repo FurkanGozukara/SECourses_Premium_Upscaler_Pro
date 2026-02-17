@@ -928,10 +928,30 @@ def main(argv=None):
             get_all_defaults,
             merge_preset_with_defaults,
         )
-        from shared.models import get_seedvr2_model_names, scan_gan_models, get_flashvsr_model_names, get_rife_model_names
+        from shared.models import (
+            get_seedvr2_model_names,
+            get_seedvr2_models,
+            scan_gan_models,
+            get_flashvsr_model_names,
+            get_rife_model_names,
+        )
         
         # Get models list for defaults
         seedvr2_models = get_seedvr2_model_names()
+        # Ensure separate GGUF Q8_0 variants are available in shared model choices.
+        # These are intentionally downloaded via the dedicated GGUF/FP8 downloader.
+        gguf_q8_variants = [
+            "seedvr2_ema_3b-Q8_0.gguf",
+            "seedvr2_ema_7b-Q8_0.gguf",
+            "seedvr2_ema_7b_sharp-Q8_0.gguf",
+        ]
+        try:
+            discovered_seedvr2 = {m.name for m in get_seedvr2_models()}
+        except Exception:
+            discovered_seedvr2 = set(seedvr2_models)
+        for model_name in gguf_q8_variants:
+            if model_name in discovered_seedvr2 and model_name not in seedvr2_models:
+                seedvr2_models.append(model_name)
         gan_models = scan_gan_models(BASE_DIR)
         flashvsr_models = get_flashvsr_model_names()
         rife_models = get_rife_model_names(BASE_DIR)

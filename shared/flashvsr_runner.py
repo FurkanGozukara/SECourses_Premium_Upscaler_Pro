@@ -74,6 +74,20 @@ def _resolve_flashvsr_device(device_value: Any) -> tuple[str, Optional[str], Opt
     return raw, None, None
 
 
+def _resolve_python_executable(base_dir: Path) -> str:
+    """
+    Prefer project venv Python for subprocess consistency.
+    Falls back to current interpreter when venv executable is missing.
+    """
+    if os.name == "nt":
+        candidate = base_dir / "venv" / "Scripts" / "python.exe"
+    else:
+        candidate = base_dir / "venv" / "bin" / "python"
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
 def run_flashvsr(
     settings: Dict[str, Any],
     base_dir: Path,
@@ -214,9 +228,13 @@ def run_flashvsr(
                 output_path=None,
                 log=f"FlashVSR+ script not found at {flashvsr_script}"
             )
+
+        python_exe = _resolve_python_executable(base_dir)
+        if python_exe != sys.executable:
+            log(f"[FlashVSR] Using venv python: {python_exe}")
         
         cmd = [
-            sys.executable,
+            python_exe,
             str(flashvsr_script),
             "-i", effective_input_path,
             "-s", str(scale),

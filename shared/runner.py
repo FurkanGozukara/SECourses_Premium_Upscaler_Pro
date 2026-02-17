@@ -1,6 +1,7 @@
 ﻿import io
 import os
 import platform
+import re
 import runpy
 import shutil
 import signal
@@ -240,6 +241,10 @@ class Runner:
         if not cli_path.exists():
             raise FileNotFoundError(f"SeedVR2 CLI not found at {cli_path}")
 
+        # Work with a per-run copy so fallback/guardrail mutations do not leak
+        # across queued items or future runs.
+        settings = settings.copy()
+
         input_path = normalize_path(settings.get("input_path"))
         if not input_path:
             raise ValueError("Input path is required.")
@@ -318,6 +323,16 @@ class Runner:
         if predicted_output and predicted_output.suffix:
             cli_output_arg = str(predicted_output)
 
+        # Keep app-side model selection compatible with CLI-side argparse choices.
+        # This handles custom GGUF drops and stale presets before process launch.
+        try:
+            self._prepare_seedvr2_model_selection(settings, on_progress=on_progress)
+        except Exception as e:
+            warn_msg = f"[SeedVR2] Model selection preflight warning: {e}\n"
+            print(warn_msg, end="", flush=True)
+            if on_progress:
+                on_progress(warn_msg)
+
         # FIXED: Pass cli_output_arg to command builder (not effective_output_override)
         cmd = self._build_seedvr2_cmd(cli_path, settings, format_for_cli, preview_only, output_override=cli_output_arg)
 
@@ -326,6 +341,50 @@ class Runner:
             return self._run_seedvr2_in_app(cli_path, cmd, predicted_output, settings, on_progress)
         else:
             result = self._run_seedvr2_subprocess(cli_path, cmd, predicted_output, settings, on_progress)
+
+            # -----------------------------------------------------------------
+            # CLI model-choice fallback (invalid --dit_model)
+            # -----------------------------------------------------------------
+            invalid_model, allowed_models = self._extract_seedvr2_invalid_model_error(result.log or "")
+            if result.returncode == 2 and allowed_models:
+                requested_model = str(settings.get("dit_model") or invalid_model or "").strip()
+                fallback_model = self._pick_seedvr2_fallback_model(requested_model, allowed_models)
+                if fallback_model and str(fallback_model) != requested_model:
+                    retry_msg = (
+                        "\n[SeedVR2] ⚠️ Selected model is not accepted by this CLI build.\n"
+                        f"[SeedVR2] ↻ Auto-retrying with compatible model: {fallback_model}\n"
+                    )
+                    print(retry_msg, flush=True)
+                    if on_progress:
+                        on_progress(retry_msg)
+
+                    retry_settings = settings.copy()
+                    retry_settings["dit_model"] = fallback_model
+                    fallback_path = self._resolve_seedvr2_model_file(fallback_model, retry_settings)
+                    if fallback_path:
+                        retry_settings["model_dir"] = str(fallback_path.parent)
+
+                    retry_cmd = self._build_seedvr2_cmd(
+                        cli_path,
+                        retry_settings,
+                        format_for_cli,
+                        preview_only,
+                        output_override=cli_output_arg,
+                    )
+                    retry_result = self._run_seedvr2_subprocess(
+                        cli_path, retry_cmd, predicted_output, retry_settings, on_progress
+                    )
+
+                    combined_log = "\n".join(
+                        [
+                            "=== SeedVR2 attempt 1 (invalid --dit_model) ===",
+                            result.log or "",
+                            "",
+                            f"=== SeedVR2 attempt 2 (auto-fallback: {fallback_model}) ===",
+                            retry_result.log or "",
+                        ]
+                    )
+                    return RunResult(retry_result.returncode, retry_result.output_path, combined_log)
 
             # -----------------------------------------------------------------
             # Windows vcvars/Build Tools failure auto-fallback
@@ -1290,6 +1349,302 @@ class Runner:
         
         # Fallback to sys.executable if venv not found
         return sys.executable
+
+    @staticmethod
+    def _seedvr2_supported_weight_exts() -> set[str]:
+        return {".gguf", ".safetensors"}
+
+    def _seedvr2_cli_discovery_dirs(self) -> List[Path]:
+        """
+        Mirror SeedVR2 CLI discovery fallbacks when ComfyUI `folder_paths`
+        is not present (the default for this app packaging).
+        """
+        return [
+            self.base_dir / "models" / "SEEDVR2",
+            self.base_dir / "models" / "seedvr2",
+            self.base_dir / "models" / "SeedVR2",
+        ]
+
+    def _seedvr2_runtime_model_dirs(self, settings: Dict[str, Any]) -> List[Path]:
+        dirs: List[Path] = []
+        configured = normalize_path(settings.get("model_dir"))
+        if configured:
+            dirs.append(Path(configured))
+        dirs.append(self.base_dir / "SeedVR2" / "models")
+        dirs.extend(self._seedvr2_cli_discovery_dirs())
+
+        # Preserve order but dedupe equivalent paths.
+        seen: set[str] = set()
+        unique_dirs: List[Path] = []
+        for d in dirs:
+            try:
+                key = str(d.resolve()).lower()
+            except Exception:
+                key = str(d).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_dirs.append(d)
+        return unique_dirs
+
+    def _resolve_seedvr2_model_file(self, model_name: str, settings: Dict[str, Any]) -> Optional[Path]:
+        name = str(model_name or "").strip()
+        if not name:
+            return None
+        for model_dir in self._seedvr2_runtime_model_dirs(settings):
+            try:
+                candidate = model_dir / name
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _discover_seedvr2_cli_models(self) -> List[str]:
+        """
+        Discover models likely accepted by SeedVR2 argparse:
+        - Built-in registry entries in SeedVR2/src/utils/model_registry.py
+        - Files visible under CLI discovery directories (models/SEEDVR2, etc.)
+        """
+        names: set[str] = set()
+
+        registry_path = self.base_dir / "SeedVR2" / "src" / "utils" / "model_registry.py"
+        if registry_path.exists():
+            try:
+                text = registry_path.read_text(encoding="utf-8", errors="ignore")
+                matches = re.findall(r'^\s*"([^"]+)"\s*:\s*ModelInfo\(', text, flags=re.MULTILINE)
+                for model_name in matches:
+                    suffix = Path(model_name).suffix.lower()
+                    if suffix in self._seedvr2_supported_weight_exts():
+                        names.add(model_name)
+            except Exception:
+                pass
+
+        for model_dir in self._seedvr2_cli_discovery_dirs():
+            try:
+                if not model_dir.exists():
+                    continue
+                for f in model_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in self._seedvr2_supported_weight_exts():
+                        names.add(f.name)
+            except Exception:
+                continue
+
+        return sorted(names)
+
+    def _ensure_seedvr2_model_visible_to_cli(
+        self,
+        model_name: str,
+        settings: Dict[str, Any],
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> bool:
+        """
+        Ensure custom models selected from non-CLI-scanned folders are visible to
+        CLI argparse discovery by linking/copying into models/SEEDVR2.
+        """
+        selected = str(model_name or "").strip()
+        if not selected:
+            return False
+
+        target_dir = self.base_dir / "models" / "SEEDVR2"
+        target_path = target_dir / selected
+        if target_path.exists():
+            return False
+
+        source_path = self._resolve_seedvr2_model_file(selected, settings)
+        if not source_path:
+            return False
+
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(str(source_path), str(target_path))
+                method = "hardlink"
+            except Exception:
+                shutil.copy2(source_path, target_path)
+                method = "copy"
+
+            msg = f"[SeedVR2] Synced selected model for CLI discovery via {method}: {target_path}\n"
+            print(msg, end="", flush=True)
+            if on_progress:
+                on_progress(msg)
+            return True
+        except Exception as e:
+            msg = f"[SeedVR2] Warning: failed to sync model into CLI discovery path: {e}\n"
+            print(msg, end="", flush=True)
+            if on_progress:
+                on_progress(msg)
+            return False
+
+    @staticmethod
+    def _seedvr2_model_traits(model_name: str) -> Dict[str, str]:
+        text = str(model_name or "").strip().lower()
+        if "_7b_" in text:
+            size = "7b"
+        elif "_3b_" in text:
+            size = "3b"
+        else:
+            size = ""
+        variant = "sharp" if "_sharp" in text else "standard"
+        extension = Path(text).suffix.lower()
+        precision = ""
+        if "-q8_0" in text:
+            precision = "q8"
+        elif "-q4_k_m" in text:
+            precision = "q4"
+        elif "_fp16" in text:
+            precision = "fp16"
+        elif "_fp8_" in text:
+            precision = "fp8"
+        return {
+            "size": size,
+            "variant": variant,
+            "extension": extension,
+            "precision": precision,
+        }
+
+    @classmethod
+    def _pick_seedvr2_fallback_model(cls, requested_model: str, available_models: List[str]) -> Optional[str]:
+        if not available_models:
+            return None
+
+        requested = str(requested_model or "").strip()
+        available_by_lower = {str(name).lower(): str(name) for name in available_models if str(name).strip()}
+        if requested and requested.lower() in available_by_lower:
+            return available_by_lower[requested.lower()]
+
+        # Explicit high-value aliases for common GGUF additions.
+        alias_fallbacks: Dict[str, List[str]] = {
+            "seedvr2_ema_7b_sharp-q8_0.gguf": [
+                "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
+                "seedvr2_ema_7b_sharp_fp16.safetensors",
+                "seedvr2_ema_7b_fp16.safetensors",
+            ],
+            "seedvr2_ema_7b-q8_0.gguf": [
+                "seedvr2_ema_7b-Q4_K_M.gguf",
+                "seedvr2_ema_7b_fp16.safetensors",
+            ],
+            "seedvr2_ema_3b-q8_0.gguf": [
+                "seedvr2_ema_3b-Q4_K_M.gguf",
+                "seedvr2_ema_3b_fp16.safetensors",
+            ],
+        }
+        for candidate in alias_fallbacks.get(requested.lower(), []):
+            mapped = available_by_lower.get(candidate.lower())
+            if mapped:
+                return mapped
+
+        req_traits = cls._seedvr2_model_traits(requested)
+        best_name = str(available_models[0])
+        best_score = -10**9
+        for candidate in available_models:
+            cand_name = str(candidate)
+            cand_traits = cls._seedvr2_model_traits(cand_name)
+            score = 0
+
+            if req_traits["size"] and cand_traits["size"] == req_traits["size"]:
+                score += 120
+            if cand_traits["variant"] == req_traits["variant"]:
+                score += 40
+            if req_traits["extension"] and cand_traits["extension"] == req_traits["extension"]:
+                score += 20
+
+            if req_traits["precision"] and cand_traits["precision"] == req_traits["precision"]:
+                score += 45
+            elif req_traits["precision"] == "q8" and cand_traits["precision"] == "q4":
+                score += 38
+            elif req_traits["precision"] == "q4" and cand_traits["precision"] == "q8":
+                score += 20
+            elif req_traits["precision"] in {"fp16", "fp8"} and cand_traits["precision"] in {"fp16", "fp8"}:
+                score += 18
+
+            if cand_name.lower().endswith(".safetensors"):
+                score += 5
+
+            if score > best_score:
+                best_score = score
+                best_name = cand_name
+
+        return best_name
+
+    @staticmethod
+    def _extract_seedvr2_invalid_model_error(log_text: str) -> Tuple[Optional[str], List[str]]:
+        text = str(log_text or "")
+        match = re.search(
+            r"--dit_model:\s*invalid choice:\s*'([^']+)'.*?\(choose from ([^)]+)\)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None, []
+
+        invalid_model = str(match.group(1) or "").strip()
+        raw_choices = str(match.group(2) or "")
+        choices = [choice.strip() for choice in re.findall(r"'([^']+)'", raw_choices) if choice.strip()]
+        return invalid_model, choices
+
+    def _prepare_seedvr2_model_selection(
+        self,
+        settings: Dict[str, Any],
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> bool:
+        """
+        Normalize selected model + model_dir for compatibility with CLI constraints.
+        Returns True when settings/model visibility changed.
+        """
+        selected_model = str(settings.get("dit_model") or "").strip()
+        if not selected_model:
+            return False
+
+        changed = False
+
+        # Prefer the directory that already contains the selected file.
+        selected_model_path = self._resolve_seedvr2_model_file(selected_model, settings)
+        if selected_model_path:
+            resolved_dir = str(selected_model_path.parent)
+            current_dir = str(settings.get("model_dir") or "").strip()
+            if resolved_dir and resolved_dir != current_dir:
+                settings["model_dir"] = resolved_dir
+                changed = True
+                msg = f"[SeedVR2] Using detected model directory: {resolved_dir}\n"
+                print(msg, end="", flush=True)
+                if on_progress:
+                    on_progress(msg)
+
+        # Ensure model is visible to CLI argparse discovery.
+        if self._ensure_seedvr2_model_visible_to_cli(selected_model, settings, on_progress=on_progress):
+            changed = True
+
+        available_models = self._discover_seedvr2_cli_models()
+        available_by_lower = {m.lower(): m for m in available_models}
+        canonical_match = available_by_lower.get(selected_model.lower())
+        if canonical_match:
+            if canonical_match != selected_model:
+                settings["dit_model"] = canonical_match
+                changed = True
+            return changed
+
+        fallback_model = self._pick_seedvr2_fallback_model(selected_model, available_models)
+        if fallback_model and fallback_model != selected_model:
+            settings["dit_model"] = fallback_model
+            changed = True
+            msg = (
+                f"[SeedVR2] Model '{selected_model}' is not recognized by CLI. "
+                f"Auto-selected compatible fallback: '{fallback_model}'.\n"
+            )
+            print(msg, end="", flush=True)
+            if on_progress:
+                on_progress(msg)
+
+            fallback_path = self._resolve_seedvr2_model_file(fallback_model, settings)
+            if fallback_path:
+                resolved_dir = str(fallback_path.parent)
+                current_dir = str(settings.get("model_dir") or "").strip()
+                if resolved_dir and resolved_dir != current_dir:
+                    settings["model_dir"] = resolved_dir
+                    changed = True
+
+        return changed
 
     def _build_seedvr2_cmd(
         self,

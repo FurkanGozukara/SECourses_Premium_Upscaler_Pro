@@ -111,6 +111,14 @@ def _built_ins() -> List[SeedVR2Model]:
             estimated_vram_gb=5.0, max_resolution=2160,
             notes="GGUF Q4 7B. Reduced VRAM for 7B quality, but no compile/multi-GPU."
         ),
+        SeedVR2Model(
+            name="seedvr2_ema_7b-Q8_0.gguf",
+            size="7B", precision="Q8_0", variant="standard",
+            compile_compatible=False, supports_multi_gpu=False,
+            supports_cache_dit=False, supports_cache_vae=False,
+            estimated_vram_gb=8.0, max_resolution=2160,
+            notes="GGUF Q8_0 7B. Better quality than Q4 with moderate VRAM, no compile/multi-GPU."
+        ),
         # Sharp variants - enhanced edge preservation
         SeedVR2Model(
             name="seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
@@ -135,6 +143,14 @@ def _built_ins() -> List[SeedVR2Model]:
             supports_cache_dit=False, supports_cache_vae=False,
             estimated_vram_gb=5.0, max_resolution=2160,
             notes="GGUF Q4 sharp variant. Low VRAM sharp quality, limited features."
+        ),
+        SeedVR2Model(
+            name="seedvr2_ema_7b_sharp-Q8_0.gguf",
+            size="7B", precision="Q8_0", variant="sharp",
+            compile_compatible=False, supports_multi_gpu=False,
+            supports_cache_dit=False, supports_cache_vae=False,
+            estimated_vram_gb=8.0, max_resolution=2160,
+            notes="GGUF Q8_0 sharp variant. Strong detail with lower VRAM, no compile/multi-GPU."
         ),
     ]
 
@@ -216,6 +232,9 @@ def get_seedvr2_model_names() -> List[str]:
         "seedvr2_ema_3b_fp16.safetensors",
         "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
         "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "seedvr2_ema_3b-Q8_0.gguf",
+        "seedvr2_ema_7b-Q8_0.gguf",
+        "seedvr2_ema_7b_sharp-Q8_0.gguf",
     ]
     
     # Get all available models

@@ -328,7 +328,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "temporal_overlap": 0,
         "color_correction": "lab",
         "input_noise_scale": 0.0,
-        "latent_noise_scale": 0.0,
+        "latent_noise_scale": 0.1,
         "cuda_device": cuda_default,
         "dit_offload_device": "cpu",
         "vae_offload_device": "cpu",
@@ -1899,7 +1899,15 @@ def build_seedvr2_callbacks(
                 if path and Path(path).is_file():
                     ext = Path(path).suffix.lower()
                     if ext in video_exts:
-                        return gr.update(value=path, visible=True), gr.update(value=None, visible=False)
+                        src = Path(path)
+                        preview_dir = Path(temp_dir) / "output_preview_cache"
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                        st = src.stat()
+                        preview_name = f"{src.stem}_{st.st_size}_{st.st_mtime_ns}{src.suffix}"
+                        preview_path = preview_dir / preview_name
+                        if not preview_path.exists():
+                            shutil.copy2(src, preview_path)
+                        return gr.update(value=str(preview_path), visible=True), gr.update(value=None, visible=False)
                     if ext in image_exts:
                         return gr.update(value=None, visible=False), gr.update(value=path, visible=True)
             except Exception:
@@ -2786,6 +2794,21 @@ def build_seedvr2_callbacks(
             video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
             image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
+            def _prepare_output_video_preview_copy(video_path: str) -> str:
+                """
+                Create/reuse an isolated preview copy for Gradio's Video component.
+                This prevents UI preview/transcode logic from touching the real output file.
+                """
+                src = Path(str(video_path))
+                preview_dir = Path(temp_dir) / "output_preview_cache"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                st = src.stat()
+                preview_name = f"{src.stem}_{st.st_size}_{st.st_mtime_ns}{src.suffix}"
+                preview_path = preview_dir / preview_name
+                if not preview_path.exists():
+                    shutil.copy2(src, preview_path)
+                return str(preview_path)
+
             def _media_updates(video_path: Optional[str], image_path: Optional[str]) -> tuple[Any, Any]:
                 """
                 Return (output_video_update, output_image_update) for the merged output panel.
@@ -2793,7 +2816,8 @@ def build_seedvr2_callbacks(
                 try:
                     if video_path and not Path(video_path).is_dir():
                         if Path(video_path).suffix.lower() in video_exts:
-                            return gr.update(value=video_path, visible=True), gr.update(value=None, visible=False)
+                            preview_path = _prepare_output_video_preview_copy(video_path)
+                            return gr.update(value=preview_path, visible=True), gr.update(value=None, visible=False)
                     if image_path and not Path(image_path).is_dir():
                         if Path(image_path).suffix.lower() in image_exts:
                             return gr.update(value=None, visible=False), gr.update(value=image_path, visible=True)

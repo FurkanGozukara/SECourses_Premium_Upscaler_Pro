@@ -246,13 +246,13 @@ def flashvsr_tab(
                 with gr.Row():
                     tiled_vae = gr.Checkbox(
                         label="Enable VAE Tiling",
-                        value=bool(_value("tiled_vae", False)),
+                        value=bool(_value("tiled_vae", True)),
                         info="Reduce VRAM usage during VAE encoding/decoding. Essential for high resolutions."
                     )
                     
                     tiled_dit = gr.Checkbox(
                         label="Enable DiT Tiling",
-                        value=bool(_value("tiled_dit", False)),
+                        value=bool(_value("tiled_dit", True)),
                         info="Reduce VRAM usage during diffusion inference. Enables processing larger videos."
                     )
                     

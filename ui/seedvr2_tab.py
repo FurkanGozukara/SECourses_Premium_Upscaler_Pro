@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 import copy
 import html
+import shutil
 import queue
 import threading
 import time
@@ -2145,6 +2146,21 @@ def seedvr2_tab(
     # Note: In Gradio 6.2.0, component.update() is removed
     # Components are initialized with their default values in constructors above
 
+    def _prepare_chunk_preview_copy(video_path: str) -> str:
+        """
+        Create an isolated preview copy so UI preview processing never touches
+        original processed chunk files.
+        """
+        src = Path(str(video_path))
+        preview_dir = Path(temp_dir) / "chunk_preview_cache"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        st = src.stat()
+        preview_name = f"{src.stem}_{st.st_size}_{st.st_mtime_ns}{src.suffix}"
+        preview_path = preview_dir / preview_name
+        if not preview_path.exists():
+            shutil.copy2(src, preview_path)
+        return str(preview_path)
+
     # Chunk gallery select handler - play video when thumbnail is clicked
     def on_chunk_gallery_select(evt: gr.SelectData, state):
         """Play the selected chunk video when user clicks a thumbnail"""
@@ -2155,7 +2171,8 @@ def seedvr2_tab(
             if chunk_video_paths and 0 <= selected_index < len(chunk_video_paths):
                 video_path = chunk_video_paths[selected_index]
                 if video_path and Path(video_path).exists():
-                    return gr.update(value=video_path, visible=True)
+                    preview_copy = _prepare_chunk_preview_copy(video_path)
+                    return gr.update(value=preview_copy, visible=True)
 
             return gr.update(visible=False)
         except Exception:

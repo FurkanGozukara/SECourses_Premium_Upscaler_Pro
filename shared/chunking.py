@@ -1226,90 +1226,14 @@ def _reencode_video_to_match_settings(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
-    Re-encode `video_path` in-place using requested codec settings when post-merge
-    output codec does not match the requested target.
+    Disabled by design.
+
+    Post-processing codec re-encode breaks the "no extra generation loss" contract for
+    chunk pipelines. Keep this function as an explicit no-op for backward compatibility.
     """
-    src = Path(video_path)
-    if not src.exists() or not src.is_file():
-        return False
-
-    enc = _normalize_video_encode_settings(encode_settings)
-    audio_codec = str((encode_settings or {}).get("audio_codec", "copy") or "copy").strip().lower()
-    audio_bitrate_raw = str((encode_settings or {}).get("audio_bitrate", "") or "").strip()
-    audio_bitrate = audio_bitrate_raw if audio_bitrate_raw else None
-    tmp = src.with_name(f"{src.stem}.__codec_fix_tmp{src.suffix}")
-
-    def _build_cmd(audio_codec_value: str, audio_bitrate_value: Optional[str]) -> List[str]:
-        video_encode_args = build_ffmpeg_video_encode_args(
-            codec=enc["codec"],
-            quality=enc["quality"],
-            pixel_format=enc["pixel_format"],
-            preset=enc["preset"],
-            audio_codec=audio_codec_value,
-            audio_bitrate=audio_bitrate_value,
-        )
-        bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1"} else []
-        return [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            *bf_args,
-            *video_encode_args,
-            "-movflags",
-            "+faststart",
-            str(tmp),
-        ]
-
-    try:
-        tmp.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    proc = None
-
-    def _run_with_retry(cmd_builder: Callable[[], List[str]], attempts: int = 3, delay_sec: float = 0.35):
-        last = None
-        for i in range(max(1, int(attempts))):
-            last = _run_ffmpeg(cmd_builder())
-            if last.returncode == 0:
-                return last
-            if i < max(1, int(attempts)) - 1:
-                time.sleep(max(0.05, float(delay_sec)))
-        return last
-
-    proc = _run_with_retry(lambda: _build_cmd(audio_codec, audio_bitrate), attempts=3, delay_sec=0.35)
-    if proc.returncode != 0 and audio_codec == "copy":
-        # Copy can fail for some source/container combos. Fall back to AAC while
-        # preserving the requested video codec settings.
-        proc = _run_with_retry(lambda: _build_cmd("aac", audio_bitrate or "192k"), attempts=3, delay_sec=0.35)
-
-    if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size <= 1024:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if on_progress:
-            tail = (proc.stderr or proc.stdout or "").strip()[-300:] if proc else ""
-            if tail:
-                on_progress(f"WARN: Codec enforcement re-encode failed: {tail}\n")
-        return False
-
-    try:
-        os.replace(str(tmp), str(src))
-    except Exception as e:
-        if on_progress:
-            on_progress(f"WARN: Codec enforcement replace failed: {e}\n")
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return False
-    return True
+    if on_progress:
+        on_progress("INFO: Post codec enforcement re-encode is disabled.\n")
+    return False
 
 
 def _enforce_final_video_codec(
@@ -1319,53 +1243,13 @@ def _enforce_final_video_codec(
     context_label: str = "Final merged",
 ) -> Path:
     """
-    Ensure final merged video obeys requested codec setting.
-    No-op when probing is unavailable or codec already matches.
+    Disabled by design.
+
+    Keep final video untouched to avoid hidden post re-encode quality loss.
     """
     outp = Path(video_path)
-    if not outp.exists() or not outp.is_file():
-        return outp
-
-    # Reduce probe/encode races on freshly written files.
-    _wait_for_media_file_ready(outp, timeout_sec=8.0, poll_sec=0.2)
-
-    target = _normalize_video_encode_settings(encode_settings)
-    target_codec = str(target.get("codec", "h264") or "h264").strip().lower()
-    target_pix_fmt = str(target.get("pixel_format", "") or "").strip().lower()
-
-    actual_info = _probe_video_stream_info_with_retry(outp, attempts=6, delay_sec=0.25) or {}
-    actual_codec = str(actual_info.get("codec", "") or "").strip().lower()
-    actual_pix_fmt = str(actual_info.get("pix_fmt", "") or "").strip().lower()
-
-    codec_ok = bool(actual_codec) and actual_codec == target_codec
-    pix_ok = (not target_pix_fmt) or (actual_pix_fmt == target_pix_fmt)
-    if codec_ok and pix_ok:
-        return outp
-
-    if actual_codec or actual_pix_fmt:
-        actual_stream = f"{actual_codec or 'unknown'}/{actual_pix_fmt or 'unknown'}"
-        target_stream = f"{target_codec}/{target_pix_fmt or 'auto'}"
-        if on_progress:
-            on_progress(
-                f"WARN: {context_label} stream '{actual_stream}' does not match requested "
-                f"'{target_stream}'. Re-encoding to enforce settings...\n"
-            )
-    else:
-        if on_progress:
-            on_progress(
-                f"WARN: Could not probe {context_label.lower()} stream. "
-                f"Applying best-effort re-encode to '{target_codec}/{target_pix_fmt or 'auto'}'.\n"
-            )
-
-    if _reencode_video_to_match_settings(outp, encode_settings=encode_settings, on_progress=on_progress):
-        verified = _probe_video_stream_info_with_retry(outp, attempts=8, delay_sec=0.25) or {}
-        verified_codec = str(verified.get("codec", "") or "").strip().lower()
-        verified_pix = str(verified.get("pix_fmt", "") or "").strip().lower()
-        if on_progress and (verified_codec or verified_pix):
-            on_progress(
-                f"Codec enforcement complete: {context_label.lower()} stream is "
-                f"'{verified_codec or 'unknown'}/{verified_pix or 'unknown'}'.\n"
-            )
+    if on_progress:
+        on_progress(f"INFO: {context_label} codec enforcement skipped (no post re-encode).\n")
     return outp
 
 
@@ -1376,27 +1260,13 @@ def _enforce_merge_input_chunk_codecs(
     context_prefix: str = "Merge input chunk",
 ) -> List[Path]:
     """
-    Ensure all merge input chunk files obey requested codec settings.
-    This covers resumed/discovered chunks that may not pass through live per-chunk processing.
+    Disabled by design.
+
+    Keep merge inputs untouched to avoid hidden post re-encode quality loss.
     """
-    normalized: List[Path] = []
-    for idx, chunk_path in enumerate(chunk_paths, 1):
-        p = Path(chunk_path)
-        if not p.exists() or not p.is_file():
-            normalized.append(p)
-            continue
-        try:
-            p = _enforce_final_video_codec(
-                p,
-                encode_settings=encode_settings,
-                on_progress=on_progress,
-                context_label=f"{context_prefix} {idx}",
-            )
-        except Exception as e:
-            if on_progress:
-                on_progress(f"WARN: {context_prefix} {idx} codec enforcement skipped: {str(e)}\n")
-        normalized.append(p)
-    return normalized
+    if on_progress:
+        on_progress(f"INFO: {context_prefix} codec enforcement skipped (no post re-encode).\n")
+    return [Path(p) for p in chunk_paths]
 
 
 def concat_videos(
@@ -1423,20 +1293,24 @@ def concat_videos(
         if on_progress:
             on_progress("ERROR: No stable chunk files found for merge.\n")
         return False
+    if len(stable_chunks) < len(chunk_paths):
+        if on_progress:
+            on_progress(
+                f"ERROR: Only {len(stable_chunks)}/{len(chunk_paths)} chunk file(s) are ready; "
+                "aborting merge to prevent truncated output.\n"
+            )
+        return False
 
     txt = output_path.parent / "concat.txt"
     _write_concat_list(txt, stable_chunks)
 
     expected_duration = _sum_chunk_durations(stable_chunks)
-    enc = _normalize_video_encode_settings(encode_settings)
-    video_encode_args = build_ffmpeg_video_encode_args(
-        codec=enc["codec"],
-        quality=enc["quality"],
-        pixel_format=enc["pixel_format"],
-        preset=enc["preset"],
-        audio_codec="none",
-    )
-    bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1"} else []
+    if len(stable_chunks) > 1 and (expected_duration is None or expected_duration <= 0):
+        if on_progress:
+            on_progress(
+                "ERROR: Could not probe duration for every chunk; aborting merge to prevent short output.\n"
+            )
+        return False
     if on_progress:
         on_progress(f"Concatenating {len(stable_chunks)} chunk(s) (video-only merge)...\n")
 
@@ -1456,130 +1330,114 @@ def concat_videos(
         except Exception:
             return False
 
-    # Primary path: ffmpeg concat filter (decodes each input independently and ignores source timestamps).
+    # Preferred path for H.264/H.265: convert each MP4 segment to MPEG-TS (Annex B),
+    # then concat-copy back to MP4. This avoids timestamp/PPS issues seen with direct
+    # MP4 stream-copy concat and keeps video bit-exact (no re-encode).
+    codec_keys = [_probe_video_codec_key_with_retry(p, attempts=4, delay_sec=0.15) for p in stable_chunks]
+    common_codec: Optional[str] = None
+    if codec_keys and all(k == codec_keys[0] and k for k in codec_keys):
+        common_codec = str(codec_keys[0] or "").strip().lower()
+
+    if common_codec in {"h264", "h265"}:
+        bsf = "h264_mp4toannexb" if common_codec == "h264" else "hevc_mp4toannexb"
+        output_path.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="merge_ts_copy_") as td:
+            td_path = Path(td)
+            ts_paths: List[Path] = []
+            ts_ok = True
+            for i, src in enumerate(stable_chunks, 1):
+                ts_path = td_path / f"chunk_{i:04d}.ts"
+                cmd_to_ts = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(src),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-bsf:v",
+                    bsf,
+                    "-an",
+                    "-f",
+                    "mpegts",
+                    str(ts_path),
+                ]
+                proc_to_ts = _run_ffmpeg(cmd_to_ts)
+                if proc_to_ts.returncode != 0 or not ts_path.exists() or ts_path.stat().st_size <= 512:
+                    ts_ok = False
+                    if on_progress:
+                        tail = (proc_to_ts.stderr or proc_to_ts.stdout or "").strip()[-300:]
+                        on_progress(f"WARN: TS conversion failed for chunk {i}: {tail}\n")
+                    break
+                ts_paths.append(ts_path)
+
+            if ts_ok and len(ts_paths) == len(stable_chunks):
+                ts_txt = td_path / "concat_ts.txt"
+                _write_concat_list(ts_txt, ts_paths)
+                cmd_ts_concat = [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(ts_txt),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-an",
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
+                ]
+                proc_ts_concat = _run_ffmpeg(cmd_ts_concat)
+                if proc_ts_concat.returncode == 0 and _merge_ok(output_path, ratio=0.90):
+                    if on_progress:
+                        on_progress(
+                            f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
+                        )
+                    return True
+                if on_progress:
+                    tail = (proc_ts_concat.stderr or proc_ts_concat.stdout or "").strip()[-400:]
+                    on_progress("WARN: TS stream-copy concat failed; trying generic copy merge.\n")
+                    if tail:
+                        on_progress(f"ffmpeg: {tail}\n")
+
+    # Secondary copy path: direct concat demuxer + stream copy (fast, but some files can break).
     output_path.unlink(missing_ok=True)
-    cmd_primary: List[str] = ["ffmpeg", "-y"]
-    for p in stable_chunks:
-        cmd_primary += ["-i", str(p)]
-    video_inputs = "".join([f"[{i}:v:0]" for i in range(len(stable_chunks))])
-    filter_graph = f"{video_inputs}concat=n={len(stable_chunks)}:v=1:a=0[v]"
-    cmd_primary += [
-        "-filter_complex",
-        filter_graph,
+    cmd_copy = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(txt),
         "-map",
-        "[v]",
-        *bf_args,
-        *video_encode_args,
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
         "-movflags",
         "+faststart",
         str(output_path),
     ]
-
-    cmd_primary_len = sum(len(arg) + 1 for arg in cmd_primary)
-    primary_attempted = False
-    proc_primary: Optional[subprocess.CompletedProcess] = None
-    if cmd_primary_len < 30000:
-        primary_attempted = True
-        proc_primary = _run_ffmpeg(cmd_primary)
-        if proc_primary.returncode == 0 and _merge_ok(output_path, ratio=0.93):
-            return True
-    elif on_progress:
-        on_progress("WARN: Chunk list too long for concat-filter command; using normalized fallback merge.\n")
-
-    if on_progress and primary_attempted:
-        tail = (proc_primary.stderr or proc_primary.stdout or "").strip()[-400:] if proc_primary else ""
-        on_progress("WARN: Primary concat-filter merge failed or was too short; trying normalized fallback.\n")
+    proc_copy = _run_ffmpeg(cmd_copy)
+    if proc_copy.returncode == 0 and _merge_ok(output_path, ratio=0.90):
+        if on_progress:
+            on_progress(
+                f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
+            )
+        return True
+    if on_progress:
+        tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
+        on_progress("ERROR: Direct stream-copy concat failed; merge aborted (post re-encode disabled).\n")
         if tail:
             on_progress(f"ffmpeg: {tail}\n")
-
-    # Fallback: normalize each chunk to a clean CFR video stream, then concat.
-    output_path.unlink(missing_ok=True)
-    with tempfile.TemporaryDirectory(prefix="merge_norm_") as td:
-        td_path = Path(td)
-        norm_paths: List[Path] = []
-
-        for i, src in enumerate(stable_chunks, 1):
-            norm = td_path / f"chunk_{i:04d}_norm.mp4"
-            cmd_norm = [
-                "ffmpeg",
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-                str(src),
-                "-map",
-                "0:v:0",
-                *bf_args,
-                *video_encode_args,
-                "-movflags",
-                "+faststart",
-                str(norm),
-            ]
-            proc_norm = _run_ffmpeg(cmd_norm)
-            if proc_norm.returncode == 0 and norm.exists() and norm.stat().st_size > 1024:
-                norm_paths.append(norm)
-                continue
-            if on_progress:
-                tail = (proc_norm.stderr or proc_norm.stdout or "").strip()[-300:]
-                on_progress(f"WARN: Failed to normalize chunk {i}: {tail}\n")
-
-        if not norm_paths:
-            return False
-
-        norm_txt = td_path / "concat_norm.txt"
-        _write_concat_list(norm_txt, norm_paths)
-
-        # First attempt from normalized chunks: stream copy concat.
-        cmd_norm_copy = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(norm_txt),
-            "-c:v",
-            "copy",
-            "-an",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        proc_norm_copy = _run_ffmpeg(cmd_norm_copy)
-        if proc_norm_copy.returncode == 0 and _merge_ok(output_path, ratio=0.90):
-            return True
-
-        # Final fallback from normalized chunks: re-encode once more.
-        output_path.unlink(missing_ok=True)
-        cmd_norm_reencode = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(norm_txt),
-            "-map",
-            "0:v:0",
-            *bf_args,
-            *video_encode_args,
-            "-avoid_negative_ts",
-            "make_zero",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        proc_norm_reencode = _run_ffmpeg(cmd_norm_reencode)
-        if proc_norm_reencode.returncode == 0 and _merge_ok(output_path, ratio=0.90):
-            return True
-
-        if on_progress:
-            tail = (proc_norm_reencode.stderr or proc_norm_reencode.stdout or "").strip()[-400:]
-            if tail:
-                on_progress(f"ERROR: Normalized fallback failed: {tail}\n")
-
     return False
 
 
@@ -2206,6 +2064,22 @@ def chunk_and_process(
         except Exception:
             pass
 
+    def _emit_diag(message: str) -> None:
+        """
+        Emit key diagnostics to both console (CMD) and progress callback.
+        """
+        line = str(message)
+        if not line.endswith("\n"):
+            line += "\n"
+        try:
+            print(line, end="", flush=True)
+        except Exception:
+            pass
+        try:
+            on_progress(line)
+        except Exception:
+            pass
+
     def _cleanup_chunk_dirs(preserve_thumbs: bool = True) -> None:
         """
         Best-effort cleanup for chunk artifacts when `per_chunk_cleanup` is enabled.
@@ -2320,12 +2194,6 @@ def chunk_and_process(
         merge_chunks = _resolve_merge_chunks(expected_count=len(output_chunks))
         if not merge_chunks:
             return None
-        merge_chunks = _enforce_merge_input_chunk_codecs(
-            merge_chunks,
-            encode_settings=settings,
-            on_progress=on_progress,
-            context_prefix="Partial merge chunk",
-        )
         partial_target = partial_video_target or collision_safe_path(work_root / "partial_concat.mp4")
         merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
         overlap_frames_for_blend = int(chunk_overlap * merge_fps_hint) if chunk_overlap > 0 else 0
@@ -2353,15 +2221,6 @@ def chunk_and_process(
                     on_progress(f"Audio replacement note: {audio_err}\n")
             except Exception as e:
                 on_progress(f"Audio replacement skipped: {str(e)}\n")
-            try:
-                partial_target = _enforce_final_video_codec(
-                    Path(partial_target),
-                    encode_settings=settings,
-                    on_progress=on_progress,
-                    context_label="Partial merged",
-                )
-            except Exception as e:
-                on_progress(f"WARN: Partial codec enforcement skipped: {str(e)}\n")
             on_progress(f"Partial output stitched to {partial_target}\n")
 
         meta = {
@@ -2441,19 +2300,182 @@ def chunk_and_process(
             return None
         return None
 
+    def _probe_video_stream_verbose(path: Path) -> Dict[str, str]:
+        info: Dict[str, str] = {}
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,profile,pix_fmt,codec_tag_string:stream_tags=encoder",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            if proc.returncode != 0:
+                return info
+            for raw in str(proc.stdout or "").splitlines():
+                line = str(raw or "").strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                key = str(k).strip().lower()
+                val = str(v).strip()
+                if not val:
+                    continue
+                if key.startswith("tag:"):
+                    key = key[4:]
+                info[key] = val
+        except Exception:
+            return info
+        return info
+
+    def _log_chunk_codec_probe(chunk_idx: int, label: str, media_path: Path) -> None:
+        try:
+            p = Path(media_path)
+            if not p.exists() or not p.is_file():
+                _emit_diag(f"[chunk {chunk_idx}] codec probe ({label}): missing file: {p}\n")
+                return
+            v = _probe_video_stream_verbose(p)
+            codec = str(v.get("codec_name") or "unknown").strip().lower()
+            profile = str(v.get("profile") or "unknown").strip()
+            pix_fmt = str(v.get("pix_fmt") or "unknown").strip().lower()
+            encoder = str(v.get("encoder") or "unknown").strip()
+            has_aud = has_audio_stream(p)
+            _emit_diag(
+                f"[chunk {chunk_idx}] codec probe ({label}): "
+                f"codec={codec}, profile={profile}, pix_fmt={pix_fmt}, encoder={encoder}, has_audio={has_aud}\n"
+            )
+        except Exception as e:
+            _emit_diag(f"[chunk {chunk_idx}] codec probe ({label}) failed: {str(e)}\n")
+
+    expected_encode = _normalize_video_encode_settings(settings)
+    expected_codec_key = str(expected_encode.get("codec") or "").strip().lower()
+    expected_codec_name = {
+        "h264": "h264",
+        "h265": "hevc",
+        "vp9": "vp9",
+        "av1": "av1",
+        "prores": "prores",
+    }.get(expected_codec_key, "")
+    expected_use_10bit = bool(expected_encode.get("use_10bit", False)) and expected_codec_key in {
+        "h264",
+        "h265",
+        "vp9",
+        "av1",
+    }
+    if output_format != "png" and expected_codec_name:
+        _emit_diag(
+            f"[codec] expected output codec={expected_codec_name}, 10bit={expected_use_10bit}\n"
+        )
+
+    def _codec_matches_expected(media_path: Path) -> bool:
+        if output_format == "png" or not expected_codec_name:
+            return True
+        v = _probe_video_stream_verbose(Path(media_path))
+        codec = str(v.get("codec_name") or "").strip().lower()
+        pix_fmt = str(v.get("pix_fmt") or "").strip().lower()
+        if expected_codec_name == "prores":
+            codec_ok = codec.startswith("prores")
+        else:
+            codec_ok = codec == expected_codec_name
+        if not codec_ok:
+            return False
+        if expected_use_10bit and "10" not in pix_fmt:
+            return False
+        return True
+
+    def _find_expected_codec_sibling(media_path: Path) -> Optional[Path]:
+        try:
+            p = Path(media_path)
+            if not p.exists() and not p.parent.exists():
+                return None
+            suffix = p.suffix if p.suffix else ".mp4"
+            stem = p.stem
+            candidates = sorted(
+                p.parent.glob(f"{stem}*{suffix}"),
+                key=lambda x: x.stat().st_mtime if x.exists() else 0.0,
+                reverse=True,
+            )
+            for cand in candidates:
+                if not cand.exists() or not cand.is_file():
+                    continue
+                name_lc = cand.name.lower()
+                if "__audio_tmp" in name_lc or "__noaudio_tmp" in name_lc:
+                    continue
+                try:
+                    if cand.resolve() == p.resolve():
+                        continue
+                except Exception:
+                    if str(cand) == str(p):
+                        continue
+                if _codec_matches_expected(cand):
+                    return cand
+        except Exception:
+            return None
+        return None
+
+    def _ensure_expected_chunk_codec(
+        chunk_idx: int,
+        label: str,
+        media_path: Path,
+    ) -> Tuple[bool, Path]:
+        p = Path(media_path)
+        _log_chunk_codec_probe(chunk_idx, label, p)
+        if output_format == "png" or not expected_codec_name:
+            return True, p
+        if _codec_matches_expected(p):
+            return True, p
+        alt = _find_expected_codec_sibling(p)
+        if alt is not None:
+            _emit_diag(
+                f"[chunk {chunk_idx}] codec mismatch at {label}; "
+                f"switching to sibling output: {alt.name}\n"
+            )
+            _log_chunk_codec_probe(chunk_idx, f"{label}/sibling", alt)
+            if _codec_matches_expected(alt):
+                return True, alt
+        _emit_diag(
+            f"[chunk {chunk_idx}] ERROR: codec drift at {label}. "
+            f"Expected codec={expected_codec_name}, 10bit={expected_use_10bit}.\n"
+        )
+        return False, p
+
     # If resuming, load existing completed chunks and skip them
     if resuming and existing_chunks:
-        output_chunks = existing_chunks.copy()
+        validated_existing_chunks: List[Path] = []
         for i, chunk_path in enumerate(existing_chunks, 1):
+            ok_codec, resolved_chunk = _ensure_expected_chunk_codec(
+                i,
+                "resume_existing",
+                Path(chunk_path),
+            )
+            if not ok_codec:
+                return (
+                    1,
+                    f"Resume blocked: existing chunk {i} does not match requested output codec settings.",
+                    str(chunk_path),
+                    len(chunk_paths),
+                )
+            validated_existing_chunks.append(Path(resolved_chunk))
             chunk_logs.append({
                 "chunk_index": i,
                 "input": "resumed",
-                "output": str(chunk_path),
+                "output": str(resolved_chunk),
                 "returncode": 0,
                 "resumed": True,
             })
+        output_chunks = validated_existing_chunks.copy()
         on_progress(f"✅ Loaded {len(existing_chunks)} completed chunks from previous run - skipping to chunk {start_chunk_idx + 1}\n")
-        for i, chunk_path in enumerate(existing_chunks, 1):
+        for i, chunk_path in enumerate(validated_existing_chunks, 1):
             _notify_progress(
                 i / max(1, len(chunk_paths)),
                 desc=f"Completed chunk {i}/{len(chunk_paths)} (resumed)",
@@ -2577,36 +2599,64 @@ def chunk_and_process(
                         break
 
             if outp.exists() and outp.is_file():
-                # Keep per-chunk outputs user-friendly by restoring chunk-local audio.
-                # Final merged audio still comes from the original full input.
-                try:
-                    if output_format != "png" and Path(chunk).is_file():
-                        _changed, maybe_final, audio_err = ensure_audio_on_video(
-                            video_path=outp,
+                codec_ok, resolved_outp = _ensure_expected_chunk_codec(
+                    idx,
+                    "post_model",
+                    Path(outp),
+                )
+                if not codec_ok:
+                    return (
+                        1,
+                        f"Chunk {idx} codec drift detected immediately after model output.",
+                        str(outp),
+                        len(chunk_paths),
+                    )
+                outp = Path(resolved_outp)
+                # Keep each processed chunk muxed with its own source-chunk audio.
+                # Video stays bit-exact via -c:v copy in ensure_audio_on_video/mux_audio.
+                if output_format != "png" and Path(chunk).is_file():
+                    try:
+                        on_progress(
+                            f"[chunk {idx}] Post-processing audio transfer "
+                            f"(codec={str(settings.get('audio_codec') or 'copy')})...\n"
+                        )
+                        _changed, maybe_chunk_final, chunk_audio_err = ensure_audio_on_video(
+                            video_path=Path(outp),
                             audio_source_path=Path(chunk),
                             audio_codec=str(settings.get("audio_codec") or "copy"),
                             audio_bitrate=str(settings.get("audio_bitrate")) if settings.get("audio_bitrate") else None,
                             force_replace=True,
-                            on_progress=None,
-                        )
-                        if maybe_final and Path(maybe_final).exists():
-                            outp = Path(maybe_final)
-                        if audio_err:
-                            on_progress(f"WARN: Chunk {idx} audio note: {audio_err}\n")
-                except Exception:
-                    pass
-                # Some model backends may silently fall back codec per chunk.
-                # Enforce the requested output codec at chunk level so merge inputs are consistent.
-                try:
-                    if output_format != "png":
-                        outp = _enforce_final_video_codec(
-                            outp,
-                            encode_settings=chunk_settings,
                             on_progress=on_progress,
-                            context_label=f"Chunk {idx} output",
                         )
-                except Exception as e:
-                    on_progress(f"WARN: Chunk {idx} codec enforcement skipped: {str(e)}\n")
+                        if maybe_chunk_final and Path(maybe_chunk_final).exists():
+                            outp = Path(maybe_chunk_final)
+                        if chunk_audio_err:
+                            on_progress(f"[chunk {idx}] Audio transfer note: {chunk_audio_err}\n")
+                    except Exception as e:
+                        on_progress(f"[chunk {idx}] Audio transfer skipped: {str(e)}\n")
+                codec_ok, resolved_outp = _ensure_expected_chunk_codec(
+                    idx,
+                    "post_audio",
+                    Path(outp),
+                )
+                if not codec_ok:
+                    return (
+                        1,
+                        f"Chunk {idx} codec drift detected after audio transfer.",
+                        str(outp),
+                        len(chunk_paths),
+                    )
+                outp = Path(resolved_outp)
+                try:
+                    st = Path(outp).stat()
+                    saved_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+                    _emit_diag(
+                        f"[chunk {idx}] final chunk file saved: "
+                        f"name={Path(outp).name}, size={st.st_size}, mtime={saved_ts}\n"
+                    )
+                except Exception:
+                    _emit_diag(f"[chunk {idx}] final chunk file saved: name={Path(outp).name}\n")
+                _log_chunk_codec_probe(idx, "ready_for_next_chunk", Path(outp))
                 output_chunks.append(outp)
             else:
                 try:
@@ -2705,16 +2755,30 @@ def chunk_and_process(
     merge_chunks = _resolve_merge_chunks(expected_count=len(chunk_paths))
     if not merge_chunks:
         return 1, "Concat failed: no mergeable chunk outputs were found", str(final_path), len(chunk_paths)
-    merge_chunks = _enforce_merge_input_chunk_codecs(
-        merge_chunks,
-        encode_settings=settings,
-        on_progress=on_progress,
-        context_prefix="Final merge chunk",
-    )
     if len(merge_chunks) < len(chunk_paths):
-        on_progress(
-            f"WARN: Merge chunk discovery found {len(merge_chunks)}/{len(chunk_paths)} chunks; attempting best-effort merge.\n"
+        return (
+            1,
+            f"Concat failed: discovered {len(merge_chunks)}/{len(chunk_paths)} chunk outputs; refusing best-effort merge.",
+            str(final_path),
+            len(chunk_paths),
         )
+    validated_merge_chunks: List[Path] = []
+    for merge_idx, merge_path in enumerate(merge_chunks, 1):
+        idx_hint = _extract_chunk_index(Path(merge_path)) or merge_idx
+        ok_codec, resolved_merge = _ensure_expected_chunk_codec(
+            int(idx_hint),
+            "pre_merge",
+            Path(merge_path),
+        )
+        if not ok_codec:
+            return (
+                1,
+                f"Concat blocked: chunk {idx_hint} codec mismatch before merge.",
+                str(final_path),
+                len(chunk_paths),
+            )
+        validated_merge_chunks.append(Path(resolved_merge))
+    merge_chunks = validated_merge_chunks
 
     # Use blending concat if overlap specified.
     merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
@@ -2731,11 +2795,23 @@ def chunk_and_process(
     if not ok:
         return 1, "Concat failed", str(final_path), len(chunk_paths)
     on_progress(f"Chunks concatenated with blending to {final_path}\n")
+    final_codec_ok, _final_probe_path = _ensure_expected_chunk_codec(
+        0,
+        "post_merge_video",
+        Path(final_path),
+    )
+    if not final_codec_ok:
+        return (
+            1,
+            "Concat failed: merged video codec drift detected before final audio mux.",
+            str(final_path),
+            len(chunk_paths),
+        )
 
     # Audio normalization for merged output using user-configured codec/bitrate.
     # This is robust: if source has no audio, output remains valid.
     try:
-        on_progress("Replacing audio from original input...\n")
+        on_progress(f"Replacing audio from original input (codec={str(settings.get('audio_codec') or 'copy')})...\n")
         _changed, maybe_final, audio_err = ensure_audio_on_video(
             video_path=Path(final_path),
             audio_source_path=Path(audio_source_for_mux),
@@ -2751,15 +2827,18 @@ def chunk_and_process(
     except Exception as e:
         # Never fail the whole operation due to audio issues
         on_progress(f"Audio replacement skipped: {str(e)}\n")
-    try:
-        final_path = _enforce_final_video_codec(
-            Path(final_path),
-            encode_settings=settings,
-            on_progress=on_progress,
-            context_label="Final merged",
+    final_codec_ok, _final_probe_path = _ensure_expected_chunk_codec(
+        0,
+        "post_merge_audio",
+        Path(final_path),
+    )
+    if not final_codec_ok:
+        return (
+            1,
+            "Final output codec drift detected after audio mux.",
+            str(final_path),
+            len(chunk_paths),
         )
-    except Exception as e:
-        on_progress(f"WARN: Final codec enforcement skipped: {str(e)}\n")
     if per_chunk_cleanup:
         _cleanup_chunk_dirs(preserve_thumbs=True)
     # Write chunk metadata

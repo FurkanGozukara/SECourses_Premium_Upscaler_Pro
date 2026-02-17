@@ -951,6 +951,11 @@ def build_rife_callbacks(
                     settings["output_format"] = cached_fmt
                 elif png_seq_enabled:
                     settings["output_format"] = "png"
+            output_format_pref = str(settings.get("output_format") or "").strip().lower()
+            if output_format_pref == "png":
+                settings["png_output"] = True
+            elif output_format_pref in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"}:
+                settings["png_output"] = False
 
             # Audio preferences (used by chunking + final muxing). "Remove Audio" overrides everything.
             audio_codec = str(seed_controls.get("audio_codec_val") or "copy")
@@ -981,6 +986,18 @@ def build_rife_callbacks(
                     value = output_settings.get(key)
                 if value is not None:
                     settings[key] = value
+
+            use_10bit_val = seed_controls.get("seedvr2_use_10bit_val")
+            if use_10bit_val is None and output_settings:
+                use_10bit_val = output_settings.get("seedvr2_use_10bit", output_settings.get("use_10bit"))
+            if use_10bit_val is not None:
+                settings["use_10bit"] = bool(use_10bit_val)
+
+            codec_norm = str(settings.get("video_codec", "h264") or "h264").strip().lower()
+            if codec_norm in {"h265", "hevc", "x265", "libx265"} and bool(settings.get("use_10bit", False)):
+                pix_fmt = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
+                if "10le" not in pix_fmt:
+                    settings["pixel_format"] = "yuv420p10le"
 
             # Global RIFE override:
             # If user enabled Global RIFE and local RIFE settings would skip processing,

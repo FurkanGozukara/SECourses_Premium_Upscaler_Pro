@@ -35,7 +35,7 @@ from shared.path_utils import (
     resolve_batch_output_dir,
 )
 from shared.resolution_calculator import estimate_seedvr2_upscale_plan_from_dims
-from shared.chunking import chunk_and_process, check_resume_available, _enforce_final_video_codec
+from shared.chunking import chunk_and_process, check_resume_available
 from shared.output_run_manager import (
     prepare_single_video_run,
     downscaled_video_path,
@@ -1606,21 +1606,27 @@ def _process_single_file(
             except Exception as e:
                 local_logs.append(f"FPS override failed: {str(e)}")
 
-        # Robust audio replacement: copy audio from original input to final output.
-        # This ensures 100% accurate audio from the original source.
+        # Audio replacement is controlled by user-selected Output settings.
+        # Do not force hidden fallback codecs here.
         if (not audio_already_replaced) and output_video and Path(output_video).exists():
             try:
-                from shared.audio_utils import replace_audio_from_original
-
+                from shared.audio_utils import ensure_audio_on_video
                 audio_src = settings.get("_original_input_path_before_preprocess") or settings.get("input_path")
-                if audio_src:
-                    audio_ok, audio_err = replace_audio_from_original(
-                        video_path=Path(output_video),
-                        original_input_path=Path(audio_src),
-                        on_progress=(lambda x: progress_cb(x) if progress_cb else None),
-                    )
-                    if not audio_ok and audio_err:
-                        local_logs.append(f"Audio note: {audio_err}")
+                audio_codec = str(settings.get("audio_codec") or "copy")
+                audio_bitrate = str(settings.get("audio_bitrate")) if settings.get("audio_bitrate") else None
+                src_for_mux = Path(audio_src) if audio_src and Path(audio_src).exists() else Path(output_video)
+                _changed, maybe_final, audio_err = ensure_audio_on_video(
+                    video_path=Path(output_video),
+                    audio_source_path=src_for_mux,
+                    audio_codec=audio_codec,
+                    audio_bitrate=audio_bitrate,
+                    force_replace=True,
+                    on_progress=(lambda x: progress_cb(x) if progress_cb else None),
+                )
+                if maybe_final and Path(maybe_final).exists():
+                    output_video = str(maybe_final)
+                if audio_err:
+                    local_logs.append(f"Audio note: {audio_err}")
             except Exception as e:
                 # Never fail the whole operation due to audio issues
                 local_logs.append(f"Audio replacement skipped: {str(e)}")
@@ -1662,20 +1668,6 @@ def _process_single_file(
                     local_logs.append(rife_msg)
             except Exception as e:
                 local_logs.append(f"Global RIFE skipped: {str(e)}")
-
-        # Final safety-net: ensure the returned video obeys Output tab codec settings.
-        # This runs after all post-processing so no later step silently reverts codec.
-        if output_video and Path(output_video).exists():
-            try:
-                enforced_path = _enforce_final_video_codec(
-                    Path(output_video),
-                    encode_settings=settings,
-                    on_progress=(lambda m: progress_cb(m) if progress_cb and m else None),
-                )
-                if enforced_path and Path(enforced_path).exists():
-                    output_video = str(enforced_path)
-            except Exception as e:
-                local_logs.append(f"Final codec enforcement skipped: {str(e)}")
 
         # Generate comparison video if enabled (new input vs output comparison feature)
         generate_comparison_video = seed_controls.get("generate_comparison_video_val", True)
@@ -4142,19 +4134,18 @@ def build_seedvr2_callbacks(
                                         continue
                                     item_path = Path(item)
                                     if item_path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
-                                        chunk_video_paths.append(item)
                                         thumb_path = thumb_cache.get(item)
                                         if thumb_path and Path(thumb_path).exists():
                                             gallery_display_items.append((thumb_path, f"Chunk {idx+1}"))
+                                            chunk_video_paths.append(item)
                                         elif extract_video_thumbnail:
                                             ok, generated_thumb, _ = extract_video_thumbnail(item, width=280)
                                             if ok and generated_thumb:
                                                 thumb_cache[item] = generated_thumb
                                                 gallery_display_items.append((generated_thumb, f"Chunk {idx+1}"))
-                                            else:
-                                                gallery_display_items.append((item, f"Chunk {idx+1}"))
-                                        else:
-                                            gallery_display_items.append((item, f"Chunk {idx+1}"))
+                                                chunk_video_paths.append(item)
+                                        # Never pass live chunk video paths to Gallery during processing.
+                                        # Some UI stacks may transcode/normalize video for preview and mutate files.
                                     else:
                                         gallery_display_items.append((item, f"Chunk {idx+1}"))
                                         chunk_video_paths.append(None)
@@ -4164,20 +4155,19 @@ def build_seedvr2_callbacks(
 
                             chunk_gallery_update = (
                                 gr.update(
-                                    value=gallery_display_items if gallery_display_items else current_chunk_items,
-                                    visible=len(gallery_display_items) > 0 or len(current_chunk_items) > 0,
+                                    value=gallery_display_items,
+                                    visible=len(gallery_display_items) > 0,
                                     columns=4,
                                     rows=2,
                                     height=200,
                                 )
-                                if gallery_display_items or current_chunk_items
+                                if gallery_display_items
                                 else gr.update(visible=False)
                             )
 
-                            if chunk_video_paths and chunk_video_paths[0]:
-                                chunk_preview_update = gr.update(value=chunk_video_paths[0], visible=True)
-                            else:
-                                chunk_preview_update = gr.update(visible=False)
+                            # Keep chunk preview video hidden during processing to avoid any
+                            # Gradio-side preview re-encode touching chunk outputs.
+                            chunk_preview_update = gr.update(visible=False)
                             last_gallery_signature = current_signature
                             last_gallery_update_time = current_time
 
@@ -4414,18 +4404,16 @@ def build_seedvr2_callbacks(
                             success, thumb_path, _ = extract_video_thumbnail(item, width=320)
                             if success and thumb_path:
                                 final_gallery_display.append((thumb_path, f"Chunk {idx+1}"))
-                            else:
-                                final_gallery_display.append((item, f"Chunk {idx+1}"))
                         else:
                             final_gallery_display.append((item, f"Chunk {idx+1}"))
 
             final_chunk_gallery = gr.update(
-                value=final_gallery_display if final_gallery_display else final_chunk_items,
-                visible=len(final_gallery_display) > 0 or len(final_chunk_items) > 0,
+                value=final_gallery_display,
+                visible=len(final_gallery_display) > 0,
                 columns=4,
                 rows=2,
                 height=320
-            ) if final_gallery_display or final_chunk_items else gr.update(visible=False)
+            ) if final_gallery_display else gr.update(visible=False)
             
             # Debug final state before yielding
             print(f"[DEBUG] Final output_video: {output_video}", flush=True)

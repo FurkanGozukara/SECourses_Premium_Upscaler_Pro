@@ -139,6 +139,19 @@ def build_global_rife_settings(
         ) or ""
     ).strip() or get_rife_default_model()
 
+    video_codec = str(output_settings.get("video_codec", "h264") or "h264").strip().lower()
+    pixel_format = str(output_settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower() or "yuv420p"
+    use_10bit = bool(
+        output_settings.get(
+            "seedvr2_use_10bit",
+            seed_controls.get("seedvr2_use_10bit_val", False),
+        )
+    )
+    if video_codec not in {"h265", "hevc", "x265", "libx265"}:
+        use_10bit = False
+    if use_10bit and "10le" not in pixel_format:
+        pixel_format = "yuv420p10le"
+
     settings: Dict[str, Any] = {
         "input_path": str(input_path),
         "rife_enabled": True,
@@ -169,10 +182,11 @@ def build_global_rife_settings(
         "start_time": "",
         "end_time": "",
         "speed_factor": 1.0,
-        "video_codec": output_settings.get("video_codec", "h264"),
+        "video_codec": video_codec,
         "output_quality": output_settings.get("video_quality", 18),
         "video_preset": output_settings.get("video_preset", "medium"),
-        "pixel_format": output_settings.get("pixel_format", "yuv420p"),
+        "pixel_format": pixel_format,
+        "use_10bit": use_10bit,
         "two_pass_encoding": bool(output_settings.get("two_pass_encoding", False)),
         "concat_videos": "",
         "save_metadata": bool(seed_controls.get("save_metadata_val", True)),

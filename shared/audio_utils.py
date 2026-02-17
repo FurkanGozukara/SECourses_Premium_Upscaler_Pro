@@ -5,6 +5,25 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 
+def _emit_log(message: str, on_progress: Optional[Callable[[str], None]] = None) -> None:
+    line = str(message)
+    if not line.endswith("\n"):
+        line += "\n"
+    try:
+        print(line, end="", flush=True)
+    except Exception:
+        pass
+    if on_progress:
+        try:
+            on_progress(line)
+        except Exception:
+            pass
+
+
+def _format_cmd(cmd: list[str]) -> str:
+    return " ".join(f"\"{c}\"" if " " in str(c) else str(c) for c in cmd)
+
+
 def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
@@ -45,6 +64,71 @@ def has_audio_stream(path: Path) -> bool:
         return False
 
 
+def _probe_stream_fields(path: Path, select_streams: str, fields: str) -> dict[str, str]:
+    """
+    Best-effort ffprobe helper used only for logging diagnostics.
+    """
+    out: dict[str, str] = {}
+    try:
+        if not path.exists() or path.stat().st_size < 1024:
+            return out
+    except Exception:
+        return out
+    if not _has_ffmpeg():
+        return out
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                select_streams,
+                "-show_entries",
+                fields,
+                "-of",
+                "default=noprint_wrappers=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return out
+        for raw in str(proc.stdout or "").splitlines():
+            line = str(raw or "").strip()
+            if not line or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = str(key).strip().lower()
+            if key.startswith("tag:"):
+                key = key[4:]
+            val = str(val).strip()
+            if not key or not val:
+                continue
+            out[key] = val
+    except Exception:
+        return {}
+    return out
+
+
+def _probe_video_stream(path: Path) -> dict[str, str]:
+    return _probe_stream_fields(
+        path,
+        "v:0",
+        "stream=codec_name,profile,pix_fmt,codec_tag_string:stream_tags=encoder",
+    )
+
+
+def _probe_audio_stream(path: Path) -> dict[str, str]:
+    return _probe_stream_fields(
+        path,
+        "a:0",
+        "stream=codec_name,profile,sample_rate,channel_layout,channels",
+    )
+
+
 def _build_audio_args(audio_codec: str, audio_bitrate: Optional[str]) -> list[str]:
     codec = (audio_codec or "copy").strip().lower()
     if codec in ("none", "no", "off", "disable", "disabled"):
@@ -74,6 +158,7 @@ def mux_audio(
     Keeps video stream bit-exact via `-c:v copy`.
     """
     if not _has_ffmpeg():
+        _emit_log("[audio] ffmpeg/ffprobe not available; mux skipped.", on_progress)
         return False, "ffmpeg/ffprobe not available"
 
     try:
@@ -107,15 +192,45 @@ def mux_audio(
 
     cmd.append(str(output_path))
 
-    if on_progress:
-        on_progress(f"🔊 Muxing audio ({audio_codec}) -> {output_path.name}\n")
+    src_has_audio = has_audio_stream(audio_source_path)
+    dst_has_audio_before = has_audio_stream(video_path)
+    _emit_log(
+        f"[audio] mux start: video='{video_path.name}', source='{audio_source_path.name}', "
+        f"codec='{audio_codec}', bitrate='{audio_bitrate or ''}'",
+        on_progress,
+    )
+    _emit_log(
+        f"[audio] probe: source_has_audio={src_has_audio}, target_has_audio_before={dst_has_audio_before}",
+        on_progress,
+    )
+    _emit_log(f"[audio] ffmpeg cmd: {_format_cmd(cmd)}", on_progress)
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode == 0 and output_path.exists():
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
+            out_has_audio = has_audio_stream(output_path)
+            out_video_info = _probe_video_stream(output_path)
+            _emit_log(
+                f"[audio] mux success: output='{output_path.name}', has_audio={out_has_audio}",
+                on_progress,
+            )
+            if out_video_info:
+                _emit_log(
+                    "[audio] mux output video stream: "
+                    f"codec={out_video_info.get('codec_name', 'unknown')}, "
+                    f"profile={out_video_info.get('profile', 'unknown')}, "
+                    f"pix_fmt={out_video_info.get('pix_fmt', 'unknown')}, "
+                    f"encoder={out_video_info.get('encoder', 'unknown')}",
+                    on_progress,
+                )
             return True, ""
-        return False, (proc.stderr or proc.stdout or "ffmpeg mux failed").strip()
+        err = (proc.stderr or proc.stdout or "ffmpeg mux failed").strip()
+        if err:
+            err = err[-1200:]
+        _emit_log(f"[audio] mux failed (code={proc.returncode}): {err}", on_progress)
+        return False, err
     except Exception as e:
+        _emit_log(f"[audio] mux exception: {e}", on_progress)
         return False, str(e)
 
 
@@ -145,14 +260,53 @@ def ensure_audio_on_video(
     codec_norm = (audio_codec or "copy").strip().lower()
     want_audio = codec_norm not in ("none", "no", "off", "disable", "disabled")
 
+    _emit_log(
+        f"[audio] ensure start: video='{video_path.name}', source='{audio_source_path.name}', "
+        f"codec='{codec_norm}', force_replace={bool(force_replace)}",
+        on_progress,
+    )
+
     if not _has_ffmpeg():
+        _emit_log("[audio] ffmpeg/ffprobe not available; ensure skipped.", on_progress)
         return False, None, "ffmpeg/ffprobe not available"
 
     video_has_audio = has_audio_stream(video_path)
     src_has_audio = has_audio_stream(audio_source_path)
+    _emit_log(
+        f"[audio] ensure probe: source_has_audio={src_has_audio}, target_has_audio={video_has_audio}",
+        on_progress,
+    )
+    target_video_info = _probe_video_stream(video_path)
+    if target_video_info:
+        _emit_log(
+            "[audio] ensure target video before mux: "
+            f"codec={target_video_info.get('codec_name', 'unknown')}, "
+            f"profile={target_video_info.get('profile', 'unknown')}, "
+            f"pix_fmt={target_video_info.get('pix_fmt', 'unknown')}, "
+            f"encoder={target_video_info.get('encoder', 'unknown')}",
+            on_progress,
+        )
+    else:
+        _emit_log("[audio] ensure target video before mux: probe unavailable", on_progress)
+
+    if src_has_audio:
+        source_audio_info = _probe_audio_stream(audio_source_path)
+        if source_audio_info:
+            _emit_log(
+                "[audio] ensure source audio before mux: "
+                f"codec={source_audio_info.get('codec_name', 'unknown')}, "
+                f"profile={source_audio_info.get('profile', 'unknown')}, "
+                f"sample_rate={source_audio_info.get('sample_rate', 'unknown')}, "
+                f"channels={source_audio_info.get('channels', 'unknown')}, "
+                f"layout={source_audio_info.get('channel_layout', 'unknown')}",
+                on_progress,
+            )
+        else:
+            _emit_log("[audio] ensure source audio before mux: probe unavailable", on_progress)
 
     if not want_audio:
         if not video_has_audio:
+            _emit_log("[audio] ensure no-op: target already has no audio.", on_progress)
             return False, video_path, ""
         tmp = video_path.with_name(f"{video_path.stem}.__noaudio_tmp{video_path.suffix}")
         ok, err = mux_audio(
@@ -169,7 +323,9 @@ def ensure_audio_on_video(
         try:
             os.replace(str(tmp), str(video_path))
         except Exception:
+            _emit_log(f"[audio] ensure complete via temp path: {tmp.name}", on_progress)
             return True, tmp, ""
+        _emit_log("[audio] ensure complete: stripped audio.", on_progress)
         return True, video_path, ""
 
     # want audio
@@ -177,6 +333,7 @@ def ensure_audio_on_video(
         # Match source exactly for robust final muxing.
         if not src_has_audio:
             if not video_has_audio:
+                _emit_log("[audio] ensure no-op: source and target both have no audio.", on_progress)
                 return False, video_path, ""
             tmp = video_path.with_name(f"{video_path.stem}.__noaudio_tmp{video_path.suffix}")
             ok, err = mux_audio(
@@ -193,12 +350,16 @@ def ensure_audio_on_video(
             try:
                 os.replace(str(tmp), str(video_path))
             except Exception:
+                _emit_log(f"[audio] ensure complete via temp path: {tmp.name}", on_progress)
                 return True, tmp, ""
+            _emit_log("[audio] ensure complete: source has no audio, target audio stripped.", on_progress)
             return True, video_path, ""
     else:
         if video_has_audio:
+            _emit_log("[audio] ensure no-op: target already has audio and force_replace is False.", on_progress)
             return False, video_path, ""
         if not src_has_audio:
+            _emit_log("[audio] ensure no-op: source has no audio.", on_progress)
             return False, video_path, ""
 
     tmp = video_path.with_name(f"{video_path.stem}.__audio_tmp{video_path.suffix}")
@@ -211,21 +372,6 @@ def ensure_audio_on_video(
         audio_bitrate=audio_bitrate,
         on_progress=on_progress,
     )
-    if not ok and codec_norm == "copy":
-        # Robust fallback for incompatible audio codecs/containers.
-        ok, err2 = mux_audio(
-            video_path=video_path,
-            audio_source_path=audio_source_path,
-            output_path=tmp,
-            audio_codec="aac",
-            audio_bitrate=audio_bitrate or "192k",
-            on_progress=on_progress,
-        )
-        if ok:
-            err = ""
-        else:
-            err = err2 or err
-
     if not ok:
         tmp.unlink(missing_ok=True)
         return False, None, err
@@ -234,7 +380,19 @@ def ensure_audio_on_video(
         os.replace(str(tmp), str(video_path))
     except Exception:
         # As a fallback, keep the muxed file as a sibling and return it.
+        _emit_log(f"[audio] ensure complete via sibling temp: {tmp.name}", on_progress)
         return True, tmp, ""
+    final_video_info = _probe_video_stream(video_path)
+    if final_video_info:
+        _emit_log(
+            "[audio] ensure final target video stream: "
+            f"codec={final_video_info.get('codec_name', 'unknown')}, "
+            f"profile={final_video_info.get('profile', 'unknown')}, "
+            f"pix_fmt={final_video_info.get('pix_fmt', 'unknown')}, "
+            f"encoder={final_video_info.get('encoder', 'unknown')}",
+            on_progress,
+        )
+    _emit_log("[audio] ensure complete: audio applied to target.", on_progress)
     return True, video_path, ""
 
 

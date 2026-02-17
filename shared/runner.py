@@ -596,6 +596,37 @@ class Runner:
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
 
+        # Runtime ffmpeg diagnostics (printed to CMD + UI log) to trace codec issues.
+        try:
+            ffmpeg_bin = shutil.which("ffmpeg", path=env.get("PATH"))
+            ffprobe_bin = shutil.which("ffprobe", path=env.get("PATH"))
+            if ffmpeg_bin:
+                log_output(f"[SeedVR2] ffmpeg resolved to: {ffmpeg_bin}\n")
+            else:
+                log_output("[SeedVR2] ffmpeg not found in subprocess PATH.\n")
+            if ffprobe_bin:
+                log_output(f"[SeedVR2] ffprobe resolved to: {ffprobe_bin}\n")
+            else:
+                log_output("[SeedVR2] ffprobe not found in subprocess PATH.\n")
+
+            if ffmpeg_bin:
+                enc_probe = subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", "-encoders"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                    timeout=12,
+                )
+                enc_text = f"{enc_probe.stdout or ''}\n{enc_probe.stderr or ''}".lower()
+                has_x264 = "libx264" in enc_text
+                has_x265 = "libx265" in enc_text
+                log_output(
+                    f"[SeedVR2] ffmpeg encoder support: libx264={has_x264}, libx265={has_x265}\n"
+                )
+        except Exception as ff_diag_exc:
+            log_output(f"[SeedVR2] ffmpeg probe warning: {ff_diag_exc}\n")
+
         # Ensure base dirs exist
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1760,6 +1791,61 @@ class Runner:
         if settings.get("use_10bit"):
             cmd.append("--10bit")
 
+        # Explicit SeedVR2 ffmpeg encoder settings from Output tab.
+        # This avoids per-chunk codec drift when relying on CLI defaults.
+        codec_raw = str(settings.get("video_codec", "") or "").strip().lower()
+        codec_map = {
+            "h264": "libx264",
+            "avc": "libx264",
+            "x264": "libx264",
+            "libx264": "libx264",
+            "h265": "libx265",
+            "hevc": "libx265",
+            "x265": "libx265",
+            "libx265": "libx265",
+            "vp9": "libvpx-vp9",
+            "libvpx-vp9": "libvpx-vp9",
+            "av1": "libsvtav1",
+            "libsvtav1": "libsvtav1",
+            "prores": "prores_ks",
+            "prores_ks": "prores_ks",
+        }
+        seed_codec = codec_map.get(codec_raw, "")
+        if not seed_codec:
+            if bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False)):
+                seed_codec = "libx265"
+            elif codec_raw not in ("", "auto", "default"):
+                seed_codec = codec_raw
+        if seed_codec:
+            cmd.extend(["--video_codec", seed_codec])
+
+        quality_raw = settings.get("video_quality", settings.get("output_quality", None))
+        quality_val: Optional[int] = None
+        try:
+            if quality_raw is not None and str(quality_raw).strip() != "":
+                quality_val = int(float(quality_raw))
+        except Exception:
+            quality_val = None
+        if quality_val is not None:
+            # Keep in broad ffmpeg CRF range to avoid invalid CLI values.
+            quality_val = max(0, min(63, quality_val))
+            cmd.extend(["--video_quality", str(quality_val)])
+
+        preset_raw = str(settings.get("video_preset", "") or "").strip().lower()
+        allowed_presets = {
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+        }
+        if preset_raw in allowed_presets:
+            cmd.extend(["--video_preset", preset_raw])
+
         # Preview: prefer PNG for quick visualization
         if preview_only and not output_format:
             cmd.extend(["--output_format", "png"])
@@ -1964,7 +2050,14 @@ class Runner:
                 # Fall back to original if trim fails
                 effective_input = input_path
 
-        png_output = bool(settings.get("png_output"))
+        output_format_pref = str(settings.get("output_format") or "").strip().lower()
+        if output_format_pref == "png":
+            png_output = True
+        elif output_format_pref in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"}:
+            png_output = False
+        else:
+            png_output = bool(settings.get("png_output"))
+        settings["png_output"] = bool(png_output)
         output_override = settings.get("output_override") or None
         predicted_output = rife_output_path(
             effective_input,  # Use trimmed input for output naming

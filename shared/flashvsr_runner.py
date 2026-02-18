@@ -2,7 +2,7 @@
 FlashVSR+ Runner - Interface for FlashVSR+ Video Super-Resolution
 
 Provides subprocess wrapper for FlashVSR+ CLI (run.py) with:
-- Automatic model download from HuggingFace
+- Local model directory resolution for offline use
 - Support for video and image sequence inputs
 - Tiled processing for memory efficiency
 - Color correction and FPS control
@@ -86,6 +86,55 @@ def _resolve_python_executable(base_dir: Path) -> str:
     if candidate.exists():
         return str(candidate)
     return sys.executable
+
+
+_FLASHVSR_REQUIRED_FILES = (
+    "diffusion_pytorch_model_streaming_dmd.safetensors",
+    "Wan2.1_VAE.pth",
+    "LQ_proj_in.ckpt",
+    "TCDecoder.ckpt",
+)
+
+
+def _expected_flashvsr_model_dir_name(version_internal: str) -> str:
+    return "FlashVSR-v1.1" if str(version_internal) == "11" else "FlashVSR"
+
+
+def _missing_required_model_files(model_dir: Path) -> List[str]:
+    missing: List[str] = []
+    for name in _FLASHVSR_REQUIRED_FILES:
+        if not (model_dir / name).exists():
+            missing.append(name)
+    return missing
+
+
+def _ensure_local_flashvsr_model_layout(base_dir: Path, version_internal: str) -> tuple[bool, str]:
+    """
+    Validate local FlashVSR model folders expected by upstream FlashVSR_plus/run.py:
+    - FlashVSR_plus/models/FlashVSR
+    - FlashVSR_plus/models/FlashVSR-v1.1
+    """
+    models_root = base_dir / "FlashVSR_plus" / "models"
+    target_name = _expected_flashvsr_model_dir_name(version_internal)
+    target_dir = models_root / target_name
+
+    if not models_root.exists():
+        return False, f"[FlashVSR] models root not found: {models_root}"
+
+    if not target_dir.exists():
+        return False, (
+            f"[FlashVSR] Local model folder missing: {target_dir}. "
+            f"Expected files: {', '.join(_FLASHVSR_REQUIRED_FILES)}"
+        )
+
+    missing = _missing_required_model_files(target_dir)
+    if missing:
+        return False, (
+            f"[FlashVSR] Local model folder is incomplete: {target_dir}. "
+            f"Missing: {', '.join(missing)}"
+        )
+
+    return True, f"[FlashVSR] Using local model folder: {target_dir}"
 
 
 def _is_known_tiled_dit_temp_name_bug(log_text: str) -> bool:
@@ -417,6 +466,15 @@ def run_flashvsr(
         attention = settings.get("attention", "sage")
         seed = int(settings.get("seed", 0))
 
+        layout_ok, layout_msg = _ensure_local_flashvsr_model_layout(base_dir, version)
+        log(layout_msg)
+        if not layout_ok:
+            return FlashVSRResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(log_lines),
+            )
+
         # FlashVSR+ naming (mirrors FlashVSR_plus/run.py):
         #   FlashVSR_{mode}_{name.split('.')[0]}_{seed}.mp4
         base_name = os.path.basename(original_input_path.rstrip("/\\"))
@@ -475,6 +533,9 @@ def run_flashvsr(
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
         }
+        # Force offline/local model usage for FlashVSR+ to avoid HuggingFace fetch.
+        proc_env.setdefault("HF_HUB_OFFLINE", "1")
+        proc_env.setdefault("TRANSFORMERS_OFFLINE", "1")
         if visible_gpu is not None:
             proc_env["CUDA_VISIBLE_DEVICES"] = visible_gpu
         if gpu_note:
@@ -810,20 +871,13 @@ def discover_flashvsr_models(base_dir: Path) -> List[str]:
     Returns:
         List of available model versions
     """
-    # FlashVSR+ has versioned models
+    # FlashVSR+ runtime uses these model folder names
     models_dir = base_dir / "FlashVSR_plus" / "models"
-    
-    available = []
-    
-    # Check for downloaded models
-    if models_dir.exists():
-        for item in models_dir.iterdir():
-            if item.is_dir() and not item.name.startswith("_"):
-                available.append(item.name)
-    
-    # Fallback to known versions if nothing found
-    if not available:
-        available = ["FlashVSR"]  # Default model from HuggingFace
-    
-    return sorted(available)
+    expected = ["FlashVSR", "FlashVSR-v1.1"]
+
+    if not models_dir.exists():
+        return ["FlashVSR"]
+
+    available = [name for name in expected if (models_dir / name).is_dir()]
+    return available if available else ["FlashVSR"]
 

@@ -167,7 +167,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_overlap = 24
         default_attention = "sage"
         version = "1.1"
-        mode = "tiny"
+        mode = "tiny-long"
         scale = 4
     
     return {
@@ -262,11 +262,11 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     except Exception:
         cfg["scale"] = "4"
     cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
-    cfg["mode"] = str(cfg.get("mode", defaults.get("mode", "tiny")) or "tiny")
+    cfg["mode"] = str(cfg.get("mode", defaults.get("mode", "tiny-long")) or "tiny-long")
     
     # Build model identifier and get metadata
     internal_version = flashvsr_version_to_internal(cfg.get("version", "1.1"))
-    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
+    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny-long')}_{cfg.get('scale', '4')}x"
     model_meta = get_flashvsr_metadata(model_id)
     
     if model_meta:

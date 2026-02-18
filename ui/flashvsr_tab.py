@@ -8,12 +8,14 @@ import gradio as gr
 from pathlib import Path
 from typing import Dict, Any
 import html
+import threading
+import time
 
 from shared.services.flashvsr_service import (
     build_flashvsr_callbacks, FLASHVSR_ORDER
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
-from shared.models.flashvsr_meta import flashvsr_version_to_internal, flashvsr_version_to_ui
+from shared.models.flashvsr_meta import flashvsr_version_to_ui
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -152,14 +154,17 @@ def flashvsr_tab(
                         mode = gr.Dropdown(
                             label="Pipeline Mode",
                             choices=["tiny", "tiny-long", "full"],
-                            value=str(_value("mode", "tiny")) if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"} else "tiny",
+                            value=(
+                                str(_value("mode", "tiny-long"))
+                                if str(_value("mode", "tiny-long")) in {"tiny", "tiny-long", "full"}
+                                else "tiny-long"
+                            ),
                             info=(
                                 "All modes use streaming temporal steps (warmup about 25 frames, then ~8-frame advances). "
                                 "tiny/full keep the whole clip or chunk in RAM, while tiny-long streams input/output with a small frame buffer "
                                 "(better for long clips). For long videos, use Resolution tab chunking (auto scenes or fixed seconds)."
                             )
                         )
-                        model_info_display = gr.Markdown("")
 
                     with gr.Column(scale=2):
                         input_image_preview = gr.Image(
@@ -182,36 +187,6 @@ def flashvsr_tab(
 
             # vNext sizing controls are placed in the right column to mirror SeedVR2 layout.
 
-            def update_flashvsr_model_info(version_val, mode_val, scale_val):
-                """Display model metadata information"""
-                from shared.models.flashvsr_meta import get_flashvsr_metadata
-
-                model_id = f"v{flashvsr_version_to_internal(version_val)}_{mode_val}_{scale_val}x"
-                metadata = get_flashvsr_metadata(model_id)
-
-                if metadata:
-                    info_lines = [
-                        f"** Model: {metadata.name}**",
-                        f"**VRAM Estimate:** ~{metadata.estimated_vram_gb:.1f}GB",
-                        f"**Speed:** {metadata.speed_tier.title()} | **Quality:** {metadata.quality_tier.replace('_', ' ').title()}",
-                        f"**Multi-GPU:** {' Not supported' if not metadata.supports_multi_gpu else ' Supported'}",
-                        f"**Compile:** {' Compatible' if metadata.compile_compatible else ' Not supported'}",
-                    ]
-                    if metadata.notes:
-                        info_lines.append(f"\n {metadata.notes}")
-
-                    return gr.update(value="\n".join(info_lines), visible=True)
-                else:
-                    return gr.update(value="Model metadata not available", visible=False)
-
-            # Wire up model info updates
-            for component in [version, mode, scale]:
-                component.change(
-                    fn=update_flashvsr_model_info,
-                    inputs=[version, mode, scale],
-                    outputs=model_info_display
-                )
-            
             # Processing Settings
             gr.Markdown("####  Processing Settings")
             
@@ -230,8 +205,6 @@ def flashvsr_tab(
                         value=str(_value("attention", "sage")) if str(_value("attention", "sage")) in {"sage", "block"} else "sage",
                         info="sage = default, block = alternative implementation"
                     )
-
-                with gr.Row():
                     seed = gr.Number(
                         label="Random Seed",
                         value=_value("seed", 0),
@@ -577,24 +550,34 @@ def flashvsr_tab(
         )
     
     # Wire up events
-    def cache_input(val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        try:
-            state = state or {}
-            state.setdefault("seed_controls", {})
-            state["seed_controls"]["last_input_path"] = val if val else ""
-        except Exception:
-            pass
-        det = _build_input_detection_md(val or "")
-        info = _build_sizing_info(val or "", int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
-        img_prev, vid_prev = preview_updates(val)
+    def _analysis_progress_note(state: Dict[str, Any], pct: int) -> str:
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
+        if pct < 15:
+            return "Reading media metadata..."
+        if pct < 35:
+            return "Computing resize target..."
+        if pct < 70:
+            return "Scanning scenes for chunk stats..." if scene_mode else "Building runtime summary..."
+        if pct < 95:
+            return "Preparing analysis panel..."
+        return "Finalizing analysis..."
+
+    def _analysis_banner_html(state: Dict[str, Any], progress_pct: int, progress_note: str = "") -> str:
+        safe_pct = max(0, min(100, int(progress_pct)))
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
+        title = "Analyzing input (resolution + scene detection)" if scene_mode else "Analyzing input"
+        sub = f"{safe_pct}%"
+        if progress_note:
+            sub = f"{sub}<br>{html.escape(str(progress_note))}"
         return (
-            val or "",
-            gr.update(value="OK: Input cached for processing.", visible=True),
-            img_prev,
-            vid_prev,
-            det,
-            info,
-            state,
+            '<div class="processing-banner">'
+            '<div class="processing-spinner"></div>'
+            '<div class="processing-col">'
+            f'<div class="processing-text">{html.escape(title)}</div>'
+            f'<div class="processing-sub">{sub}</div>'
+            "</div></div>"
         )
 
     def _build_input_detection_md(path_val: str) -> gr.update:
@@ -635,18 +618,120 @@ def flashvsr_tab(
             auto_scene_scan=True,
         )
 
+    def _run_analysis_payload(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
+        det = _build_input_detection_md(path_val or "")
+        info = _build_sizing_info(path_val or "", int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
+        img_prev, vid_prev = preview_updates(path_val)
+        return img_prev, vid_prev, det, info, state
+
+    def _iter_analysis_with_progress(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
+        result: Dict[str, Any] = {}
+
+        def _worker():
+            try:
+                result["payload"] = _run_analysis_payload(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state)
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        fallback_steps = [4, 10, 18, 26, 35, 46, 58, 70, 80, 88, 94]
+        step_idx = 0
+        last_emit = 0.0
+
+        while worker.is_alive():
+            now = time.monotonic()
+            if now - last_emit >= 0.2:
+                pct = fallback_steps[min(step_idx, len(fallback_steps) - 1)]
+                if step_idx < len(fallback_steps) - 1:
+                    step_idx += 1
+                yield "progress", pct, _analysis_progress_note(state, pct)
+                last_emit = now
+            time.sleep(0.05)
+
+        worker.join()
+        if "error" in result:
+            raise result["error"]
+        yield "progress", 100, _analysis_progress_note(state, 100)
+        yield "result", result.get("payload"), ""
+
+    def cache_input_upload(val, scale_val, use_global, scale_x, max_edge, pre_down, state):
+        try:
+            state = state or {}
+            state.setdefault("seed_controls", {})
+            state["seed_controls"]["last_input_path"] = val if val else ""
+        except Exception:
+            pass
+
+        if not val:
+            img_prev, vid_prev = preview_updates(None)
+            yield (
+                "",
+                gr.update(value="", visible=False),
+                img_prev,
+                vid_prev,
+                gr.update(value="", visible=False),
+                gr.update(value="", visible=False),
+                state,
+            )
+            return
+
+        yield (
+            val or "",
+            gr.update(value="", visible=False),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.update(value=_analysis_banner_html(state, 0, _analysis_progress_note(state, 0)), visible=True),
+            state,
+        )
+
+        try:
+            for event_type, payload_a, _ in _iter_analysis_with_progress(
+                val, scale_val, use_global, scale_x, max_edge, pre_down, state
+            ):
+                if event_type == "progress":
+                    pct = int(payload_a)
+                    yield (
+                        val or "",
+                        gr.update(value="", visible=False),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.update(value=_analysis_banner_html(state, pct, _analysis_progress_note(state, pct)), visible=True),
+                        state,
+                    )
+                    continue
+
+                img_prev, vid_prev, det, info, state_out = payload_a
+                yield (
+                    val or "",
+                    gr.update(value="OK: Input cached for processing.", visible=True),
+                    img_prev,
+                    vid_prev,
+                    det,
+                    info,
+                    state_out,
+                )
+                return
+        except Exception as e:
+            img_prev, vid_prev = preview_updates(val)
+            yield (
+                val or "",
+                gr.update(value=f"Input cached (analysis error: {str(e)[:120]})", visible=True),
+                img_prev,
+                vid_prev,
+                _build_input_detection_md(val or ""),
+                gr.update(value="", visible=False),
+                state,
+            )
+
     input_file.upload(
-        fn=cache_input,
+        fn=cache_input_upload,
         inputs=[input_file, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
     )
-
-    # Preview + sizing + detection refresh on input changes
-    def refresh_panels(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        img_prev, vid_prev = preview_updates(path_val)
-        det = _build_input_detection_md(path_val or "")
-        info = _build_sizing_info(path_val, int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
-        return img_prev, vid_prev, det, info, state
 
     # When upload is cleared, also clear the textbox path and hide dependent panels.
     def clear_input_path_on_upload_clear(file_path, state):
@@ -675,25 +760,76 @@ def flashvsr_tab(
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
-    def cache_input_path_only(path_val, state):
+    def cache_input_path(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
         try:
             state = state or {}
             state.setdefault("seed_controls", {})
             state["seed_controls"]["last_input_path"] = path_val if path_val else ""
         except Exception:
             pass
-        return gr.update(value="OK: Input path updated.", visible=True), state
+
+        if not path_val or not str(path_val).strip():
+            img_prev, vid_prev = preview_updates(None)
+            yield (
+                gr.update(value="", visible=False),
+                img_prev,
+                vid_prev,
+                gr.update(value="", visible=False),
+                gr.update(value="", visible=False),
+                state,
+            )
+            return
+
+        yield (
+            gr.update(value="", visible=False),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.update(value=_analysis_banner_html(state, 0, _analysis_progress_note(state, 0)), visible=True),
+            state,
+        )
+
+        try:
+            for event_type, payload_a, _ in _iter_analysis_with_progress(
+                path_val, scale_val, use_global, scale_x, max_edge, pre_down, state
+            ):
+                if event_type == "progress":
+                    pct = int(payload_a)
+                    yield (
+                        gr.update(value="", visible=False),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.update(value=_analysis_banner_html(state, pct, _analysis_progress_note(state, pct)), visible=True),
+                        state,
+                    )
+                    continue
+
+                img_prev, vid_prev, det, info, state_out = payload_a
+                yield (
+                    gr.update(value="OK: Input path updated.", visible=True),
+                    img_prev,
+                    vid_prev,
+                    det,
+                    info,
+                    state_out,
+                )
+                return
+        except Exception as e:
+            img_prev, vid_prev = preview_updates(path_val)
+            yield (
+                gr.update(value=f"Input path updated (analysis error: {str(e)[:120]})", visible=True),
+                img_prev,
+                vid_prev,
+                _build_input_detection_md(path_val or ""),
+                gr.update(value="", visible=False),
+                state,
+            )
 
     input_path.change(
-        fn=cache_input_path_only,
-        inputs=[input_path, shared_state],
-        outputs=[input_cache_msg, shared_state],
-    )
-
-    input_path.change(
-        fn=refresh_panels,
+        fn=cache_input_path,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
+        outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
     for comp in [scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale]:
@@ -1032,10 +1168,16 @@ def flashvsr_tab(
         outputs=[chunk_status, chunk_gallery, chunk_preview_video],
     )
 
+    def _cancel_with_confirmation_reset(ok):
+        if ok:
+            status_upd, log_msg = service["cancel_action"]()
+            return status_upd, log_msg, gr.update(value=False)
+        return gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), "", gr.update(value=False)
+
     cancel_btn.click(
-        fn=lambda ok: service["cancel_action"]() if ok else (gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), ""),
+        fn=_cancel_with_confirmation_reset,
         inputs=[cancel_confirm],
-        outputs=[status_box, log_box]
+        outputs=[status_box, log_box, cancel_confirm]
     )
     
     open_outputs_btn.click(

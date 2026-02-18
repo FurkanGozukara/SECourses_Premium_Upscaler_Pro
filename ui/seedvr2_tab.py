@@ -306,18 +306,35 @@ def seedvr2_tab(
                 )
 
             # Noise controls
+            allow_custom_image_latent_noise_value = False
+            if "force_latent_noise_zero_for_images" in SEEDVR2_ORDER:
+                force_noise_idx = SEEDVR2_ORDER.index("force_latent_noise_zero_for_images")
+                if len(values) > force_noise_idx:
+                    force_noise_raw = values[force_noise_idx]
+                    if isinstance(force_noise_raw, str):
+                        allow_custom_image_latent_noise_value = force_noise_raw.strip().lower() in ("1", "true", "yes", "on")
+                    else:
+                        allow_custom_image_latent_noise_value = bool(force_noise_raw)
             with gr.Row():
                 input_noise_scale = gr.Slider(
                     label="Input Noise Scale",
                     minimum=0.0, maximum=1.0, step=0.01,
                     value=values[19],  # Was 22, now 19
-                    info="Add noise to input before encoding. Can help with smooth gradients but may reduce sharpness. 0.0 = no noise. Try 0.0-0.1."
+                    info="Add noise to input before encoding. Can help with smooth gradients but may reduce sharpness. 0.0 = no noise. Try 0.0-0.1.",
+                    scale=2,
                 )
                 latent_noise_scale = gr.Slider(
                     label="Latent Noise Scale",
                     minimum=0.0, maximum=1.0, step=0.01,
                     value=values[20],  # Was 23, now 20
-                    info="Add noise in latent space during diffusion. Can improve detail generation. 0.0 = no noise. Typical: 0.0-0.05. Default: 0.1."
+                    info="Add noise in latent space during diffusion. Can improve detail generation. 0.0 = no noise. Typical: 0.0-0.05. Default: 0.1.",
+                    scale=2,
+                )
+                allow_custom_image_latent_noise = gr.Checkbox(
+                    label="Allow Custom Noise On Images",
+                    value=allow_custom_image_latent_noise_value,
+                    info="Default is safeguarded (images force Latent Noise Scale = 0). Enable this to use the slider value for images.",
+                    scale=1,
                 )
 
             # Device configuration
@@ -965,7 +982,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 51, len(inputs_list) must also = 51
+    # Current count: len(SEEDVR2_ORDER) = 52, len(inputs_list) must also = 52
     # ============================================================================
     
     inputs_list = [
@@ -988,6 +1005,8 @@ def seedvr2_tab(
         face_restore_chk,
         # Resume path (chunk/scene mode)
         resume_run_dir,
+        # Optional image safeguard
+        allow_custom_image_latent_noise,
     ]
     
     # Validate synchronization at tab initialization (development-time check)
@@ -1146,7 +1165,7 @@ def seedvr2_tab(
         calc_msg, updated_state = result_box.get("value", (gr.update(value="Analysis failed."), state))
         yield ("result", calc_msg, updated_state)
 
-    def cache_path_value(val, scale_x, max_res_val, pre_down, state):
+    def cache_path_value(val, scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         """Cache input path and refresh sizing info panel."""
         try:
             state["seed_controls"]["upscale_factor_val"] = float(scale_x) if scale_x is not None else float(
@@ -1164,6 +1183,7 @@ def seedvr2_tab(
         except Exception:
             pass
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
+        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
 
         state["seed_controls"]["last_input_path"] = val if val else ""
         if val and str(val).strip():
@@ -1206,7 +1226,7 @@ def seedvr2_tab(
         yield gr.update(value="", visible=False), state, gr.update(value="", visible=False)
         return
 
-    def cache_upload(val, scale_x, max_res_val, pre_down, state):
+    def cache_upload(val, scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         """Cache uploaded file path and refresh sizing info panel."""
         try:
             state["seed_controls"]["upscale_factor_val"] = float(scale_x) if scale_x is not None else float(
@@ -1224,6 +1244,7 @@ def seedvr2_tab(
         except Exception:
             pass
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
+        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
 
         state["seed_controls"]["last_input_path"] = val if val else ""
         if val:
@@ -1272,18 +1293,18 @@ def seedvr2_tab(
     # Wire up input events with resolution auto-calculation
     input_file.upload(
         fn=cache_upload,
-        inputs=[input_file, upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[input_file, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[input_path, input_cache_msg, shared_state, auto_res_msg]
     )
 
     input_path.change(
         fn=cache_path_value,
-        inputs=[input_path, upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[input_path, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[input_cache_msg, shared_state, auto_res_msg]
     )
     
     # Recalculate sizing info when any sizing control changes
-    def recalculate_sizing_info(scale_x, max_res_val, pre_down, state):
+    def recalculate_sizing_info(scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         try:
             scale_f = float(scale_x) if scale_x is not None else None
             max_i = int(max_res_val) if max_res_val is not None else None
@@ -1299,6 +1320,7 @@ def seedvr2_tab(
         state["seed_controls"]["upscale_factor_val"] = scale_f
         state["seed_controls"]["max_resolution_val"] = max_i
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
+        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
         # vNext UX: a non-zero max_resolution means "cap enabled". Ensure the legacy flag can't block it.
         if max_i and max_i > 0:
             state["seed_controls"]["enable_max_target"] = True
@@ -1312,6 +1334,7 @@ def seedvr2_tab(
                 model_cache["upscale_factor_val"] = scale_f
                 model_cache["max_resolution_val"] = max_i
                 model_cache["ratio_downscale"] = bool(pre_down)
+                model_cache["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
                 if max_i and max_i > 0:
                     model_cache["enable_max_target"] = True
         except Exception:
@@ -1332,21 +1355,21 @@ def seedvr2_tab(
 
     upscale_factor.change(
         fn=recalculate_sizing_info,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
         trigger_mode="always_last",
     )
 
     pre_downscale_then_upscale.change(
         fn=recalculate_sizing_info,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
         trigger_mode="always_last",
     )
 
     max_resolution.release(
         fn=recalculate_sizing_info,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
         preprocess=False,
         trigger_mode="always_last",
@@ -1355,7 +1378,14 @@ def seedvr2_tab(
     # Also respond to typed value changes (release may not fire when user edits the number field directly)
     max_resolution.change(
         fn=recalculate_sizing_info,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
+        outputs=[auto_res_msg, shared_state],
+        trigger_mode="always_last",
+    )
+
+    allow_custom_image_latent_noise.change(
+        fn=recalculate_sizing_info,
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
         trigger_mode="always_last",
     )
@@ -1801,14 +1831,14 @@ def seedvr2_tab(
     )
     
     # Recalculate sizing info after preset changes (upscale/max/pre-downscale may have changed)
-    def recalc_after_preset_change(scale_x, max_res_val, pre_down, state):
+    def recalc_after_preset_change(scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         """Recalculate sizing info after preset load/reset"""
-        return recalculate_sizing_info(scale_x, max_res_val, pre_down, state)
+        return recalculate_sizing_info(scale_x, max_res_val, pre_down, allow_custom_image_noise, state)
     
     # Trigger recalculation when resolution values change from preset loading
     load_preset_btn.click(
         fn=recalc_after_preset_change,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state]
     ).then(
         fn=None,  # Just trigger the update
@@ -1818,7 +1848,7 @@ def seedvr2_tab(
     
     reset_defaults_btn.click(
         fn=recalc_after_preset_change,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state]
     ).then(
         fn=None,

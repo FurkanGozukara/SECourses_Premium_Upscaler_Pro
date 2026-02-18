@@ -80,6 +80,23 @@ def _largest_4n_plus_1_leq(n: int) -> int:
     return int(((n_i - 1) // 4) * 4 + 1)
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Parse booleans safely from bool/int/float/string values."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(default)
+
+
 def _estimate_seedvr2_output_dims(in_w: int, in_h: int, resolution_short: int, max_edge: int = 0) -> Tuple[int, int]:
     """
     Mirror the SeedVR2 CLI sizing logic sufficiently for batch-safety checks.
@@ -123,6 +140,33 @@ def _predict_batch_video_output_path(item_out_dir: Path, input_file: Path, outpu
     fmt = "png" if str(output_format or "auto").lower() == "png" else "mp4"
     stem = input_file.stem or "output"
     return item_out_dir / stem if fmt == "png" else item_out_dir / f"{stem}.mp4"
+
+
+def _looks_like_image_input(path_value: Any, original_name: Any = None) -> bool:
+    """
+    Robust image-input detection for upload temp paths that may not keep extension.
+    """
+    path_text = str(path_value or "").strip()
+    if path_text:
+        try:
+            ext = Path(path_text).suffix.lower()
+            if ext in SEEDVR2_IMAGE_EXTS:
+                return True
+        except Exception:
+            pass
+        try:
+            if detect_input_type(path_text) == "image":
+                return True
+        except Exception:
+            pass
+
+    original_text = str(original_name or "").strip()
+    if original_text:
+        try:
+            return Path(original_text).suffix.lower() in SEEDVR2_IMAGE_EXTS
+        except Exception:
+            return False
+    return False
 
 
 def _apply_image_output_preferences(
@@ -329,6 +373,9 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "color_correction": "lab",
         "input_noise_scale": 0.0,
         "latent_noise_scale": 0.1,
+        # UI semantics: False = keep default safeguard (force 0 for images),
+        # True = allow custom latent-noise slider value for images.
+        "force_latent_noise_zero_for_images": False,
         "cuda_device": cuda_default,
         "dit_offload_device": "cpu",
         "vae_offload_device": "cpu",
@@ -585,6 +632,8 @@ SEEDVR2_ORDER: List[str] = [
     "face_restore_after_upscale",
     # Resume from an existing chunk run folder (shared across chunk-capable upscalers).
     "resume_run_dir",
+    # Optional image latent-noise policy (see default key notes above).
+    "force_latent_noise_zero_for_images",
 ]
 
 
@@ -659,6 +708,13 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
     
     # Migrate old preset values to new ones for backward compatibility
     _migrate_preset_values(cfg, defaults, silent=silent_migration)
+
+    # Optional image latent-noise policy:
+    # False => safeguard ON (force 0 for images), True => allow custom image latent noise.
+    cfg["force_latent_noise_zero_for_images"] = _coerce_bool(
+        cfg.get("force_latent_noise_zero_for_images", defaults.get("force_latent_noise_zero_for_images", False)),
+        default=bool(defaults.get("force_latent_noise_zero_for_images", False)),
+    )
     
     # Apply model-specific metadata constraints
     model_name = cfg.get("dit_model", "")
@@ -1025,6 +1081,27 @@ def _process_single_file(
                 # For images, just process normally with load_cap=1
                 settings["load_cap"] = 1
                 settings["output_format"] = "png"
+
+        # Optional image latent-noise policy:
+        # safeguard ON by default; checkbox can allow custom image latent noise.
+        try:
+            allow_custom_image_latent_noise = _coerce_bool(
+                settings.get("force_latent_noise_zero_for_images"),
+                default=False,
+            )
+            input_is_image = _looks_like_image_input(
+                settings.get("input_path"),
+                settings.get("_original_filename"),
+            )
+            if (not allow_custom_image_latent_noise) and input_is_image:
+                prev_latent_noise = settings.get("latent_noise_scale")
+                settings["latent_noise_scale"] = 0.0
+                if prev_latent_noise not in (None, 0, 0.0, "0", "0.0"):
+                    local_logs.append(
+                        f"Image safeguard active: forcing latent_noise_scale 0 (was {prev_latent_noise})."
+                    )
+        except Exception:
+            pass
 
         # -----------------------------------------------------------------
         #  Upscale-x sizing (compute SeedVR2 CLI params + optional pre-downscale)
@@ -2295,8 +2372,17 @@ def build_seedvr2_callbacks(
         out_long = max(out_w, out_h)
 
         input_kind = detect_input_type(str(p))
+        if input_kind == "unknown" and _looks_like_image_input(str(p), seed_controls.get("_original_filename")):
+            input_kind = "image"
         is_video_input = input_kind == "video"
         input_format = (p.suffix or "").replace(".", "").upper() if p.suffix else "N/A"
+        allow_custom_image_latent_noise = _coerce_bool(
+            seed_controls.get(
+                "force_latent_noise_zero_for_images_val",
+                defaults.get("force_latent_noise_zero_for_images", False),
+            ),
+            default=bool(defaults.get("force_latent_noise_zero_for_images", False)),
+        )
 
         def _safe(text: Any) -> str:
             return html.escape(str(text))
@@ -2709,6 +2795,17 @@ def build_seedvr2_callbacks(
         else:
             _emit_progress(74, "Input is not a video; scene detection skipped.")
             chunk_rows.append(_stat_row("Chunk Stats", "Chunk frame stats are available for video inputs."))
+            if input_kind == "image":
+                chunk_rows.append(
+                    _stat_row(
+                        "Latent Noise Scale",
+                        (
+                            "Custom mode ON: using configured slider value for image inputs."
+                            if allow_custom_image_latent_noise
+                            else "Default safeguard ON: forced to 0 for image inputs."
+                        ),
+                    )
+                )
 
         left_cards = [
             _build_card("Sizing", sizing_rows),
@@ -2840,6 +2937,11 @@ def build_seedvr2_callbacks(
 
             # Parse settings
             settings = dict(zip(SEEDVR2_ORDER, list(args)))
+            settings["force_latent_noise_zero_for_images"] = _coerce_bool(
+                settings.get("force_latent_noise_zero_for_images"),
+                default=bool(defaults.get("force_latent_noise_zero_for_images", False)),
+            )
+            seed_controls["force_latent_noise_zero_for_images_val"] = settings["force_latent_noise_zero_for_images"]
             if preview_only:
                 # Preview should never trigger run-folder resume semantics.
                 settings["resume_run_dir"] = ""

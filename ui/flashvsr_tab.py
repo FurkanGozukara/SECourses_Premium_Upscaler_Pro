@@ -152,7 +152,11 @@ def flashvsr_tab(
                             label="Pipeline Mode",
                             choices=["tiny", "tiny-long", "full"],
                             value=str(_value("mode", "tiny")) if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"} else "tiny",
-                            info="tiny = fastest (4-6GB VRAM), tiny-long = balanced (5-7GB), full = best quality (8-12GB)"
+                            info=(
+                                "All modes use streaming temporal steps (warmup about 25 frames, then ~8-frame advances). "
+                                "tiny/full keep the whole clip or chunk in RAM, while tiny-long streams input/output with a small frame buffer "
+                                "(better for long clips). For long videos, use Resolution tab chunking (auto scenes or fixed seconds)."
+                            )
                         )
                         model_info_display = gr.Markdown("")
 
@@ -543,7 +547,8 @@ def flashvsr_tab(
             - Automatic model download from HuggingFace
             
             **Recommended Settings:**
-            - Mode: `tiny` for real-time, `full` for best quality
+            - Mode: `tiny` = fastest, `tiny-long` = safer for long clips, `full` = highest quality/heaviest
+            - For long videos, enable Resolution tab chunking (Auto Chunk by scenes, or fixed Chunk Size in seconds)
             - Enable tiling for high-res or limited VRAM
             - Use color fix for accurate colors
             """)

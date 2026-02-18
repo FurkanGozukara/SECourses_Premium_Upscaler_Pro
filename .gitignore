@@ -23,6 +23,7 @@ open-model-database
 *.jpg
 *.mp4
 tests
+ComfyUI-FlashVSR_Stable
 *.pyc
 *__pycache__*
 outputs/

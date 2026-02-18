@@ -105,7 +105,7 @@ def queue_tab(queue_tab_component) -> None:
             gr.update(value=active_text),
             gr.update(value=waiting_table),
             gr.update(choices=choices, value=valid_selected),
-            gr.update(label=f"Queue ({waiting_count})"),
+            gr.update(label=f"⏳ Queue ({waiting_count})"),
             signature,
         )
 

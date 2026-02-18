@@ -155,8 +155,9 @@ def gan_tab(
         gpu_hint = f"CUDA detection failed: {str(e)}"
         cuda_available = False
 
-    gr.Markdown("### Image-Based (GAN) Upscaling")
-    gr.Markdown("*High-quality image and video upscaling using fixed-scale GAN models.*")
+    with gr.Row(equal_height=True):
+        gr.Markdown("### Image-Based (GAN) Upscaling")
+        gr.Markdown("*High-quality image and video upscaling using fixed-scale GAN models.*")
 
     if not cuda_available:
         gr.Markdown(
@@ -353,6 +354,9 @@ def gan_tab(
             )
 
         with gr.Column(scale=2):
+            status_box = gr.Markdown(value="Ready for processing.")
+            progress_indicator = gr.Markdown(value="", visible=True)
+
             gr.Markdown("### Output / Actions")
 
             with gr.Group():
@@ -401,9 +405,34 @@ def gan_tab(
                     value=bool(_value("use_resolution_tab", True)),
                     info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from the Resolution tab. Recommended ON.",
                 )
+                with gr.Row():
+                    upscale_btn = gr.Button(
+                        "Start Upscaling",
+                        variant="primary",
+                        size="lg",
+                        elem_classes=["action-btn", "action-btn-upscale"],
+                    )
+                    preview_btn = gr.Button(
+                        "Preview First Frame",
+                        size="lg",
+                        elem_classes=["action-btn", "action-btn-preview"],
+                    )
 
-            status_box = gr.Markdown(value="Ready for processing.")
-            progress_indicator = gr.Markdown(value="", visible=True)
+                with gr.Row():
+                    cancel_confirm = gr.Checkbox(
+                        label="Confirm cancel (required for safety)",
+                        value=False,
+                        info="Enable this checkbox to confirm cancellation of processing",
+                        scale=3,
+                    )
+                    cancel_btn = gr.Button(
+                        "Cancel",
+                        variant="stop",
+                        size="md",
+                        min_width=170,
+                        scale=1,
+                        elem_classes=["action-btn", "action-btn-cancel"],
+                    )
 
             output_override = gr.Textbox(
                 label="Output Override (single run)",
@@ -484,30 +513,6 @@ def gan_tab(
             )
 
             last_processed = gr.Markdown("Batch processing results will appear here.")
-
-            with gr.Row():
-                upscale_btn = gr.Button(
-                    "Start Upscaling",
-                    variant="primary",
-                    size="lg",
-                    elem_classes=["action-btn", "action-btn-upscale"],
-                )
-                cancel_btn = gr.Button(
-                    "Cancel",
-                    variant="stop",
-                    elem_classes=["action-btn", "action-btn-cancel"],
-                )
-                preview_btn = gr.Button(
-                    "Preview First Frame",
-                    size="lg",
-                    elem_classes=["action-btn", "action-btn-preview"],
-                )
-
-            cancel_confirm = gr.Checkbox(
-                label="Confirm cancel (required for safety)",
-                value=False,
-                info="Enable this checkbox to confirm cancellation of processing"
-            )
 
             with gr.Row():
                 open_outputs_btn = gr.Button(

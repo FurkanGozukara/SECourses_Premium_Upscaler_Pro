@@ -835,8 +835,104 @@ def main(argv=None):
       max-height: 230px;
       overflow: auto;
     }
+    /* Main navigation tabs (Gradio Tabs.svelte): always visible in two rows */
+    #secourses-main-tabs {
+      --main-tab-col-count: 5;
+      --main-tab-gap: 8px;
+      --main-tab-min-height: 46px;
+      --main-tab-row-slack: 2px;
+    }
+    #secourses-main-tabs .tab-wrapper {
+      height: auto;
+      min-height: 0;
+      align-items: stretch;
+      justify-content: flex-start;
+      padding: 10px 10px 12px;
+      border: 1px solid rgba(59, 130, 246, 0.26);
+      border-radius: 14px;
+      background: linear-gradient(130deg, rgba(15, 23, 42, 0.42), rgba(14, 116, 144, 0.20) 48%, rgba(5, 150, 105, 0.20));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 18px rgba(2, 6, 23, 0.20);
+    }
+    #secourses-main-tabs .tab-container {
+      height: auto;
+      overflow: visible;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: var(--main-tab-gap);
+    }
+    #secourses-main-tabs .tab-container::after {
+      bottom: -1px;
+      border-radius: 9999px;
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.68), rgba(16, 185, 129, 0.68));
+      opacity: 0.7;
+    }
+    #secourses-main-tabs .tab-container.visually-hidden {
+      left: 0 !important;
+      top: 0 !important;
+      width: 100% !important;
+      height: auto !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      clip: auto !important;
+      white-space: normal !important;
+      overflow: visible !important;
+      visibility: hidden !important;
+    }
+    #secourses-main-tabs .tab-container button {
+      flex: 0 0 calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
+      max-width: calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
+      min-width: 0;
+      min-height: var(--main-tab-min-height);
+      height: auto;
+      margin: 0;
+      padding: 8px 10px;
+      line-height: 1.24;
+      white-space: normal;
+      text-align: center;
+      justify-content: center;
+      border: 1px solid rgba(148, 163, 184, 0.30);
+      border-radius: 12px;
+      background: linear-gradient(160deg, rgba(15, 23, 42, 0.56), rgba(30, 41, 59, 0.44));
+      box-shadow: 0 4px 11px rgba(2, 6, 23, 0.14);
+      font-weight: 740;
+      font-size: 13.5px;
+    }
+    #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected) {
+      transform: translateY(-1px);
+      border-color: rgba(125, 211, 252, 0.66);
+      background: linear-gradient(160deg, rgba(14, 116, 144, 0.44), rgba(15, 23, 42, 0.58));
+    }
+    #secourses-main-tabs .tab-container button.selected {
+      color: #e0f2fe;
+      border-color: rgba(45, 212, 191, 0.92);
+      background: linear-gradient(145deg, rgba(30, 64, 175, 0.72), rgba(13, 148, 136, 0.76));
+      box-shadow: 0 8px 18px rgba(15, 118, 110, 0.32);
+    }
+    #secourses-main-tabs .tab-container button.selected::after {
+      left: 14%;
+      width: 72%;
+      bottom: 3px;
+      height: 3px;
+      border-radius: 999px;
+      background-color: rgba(240, 253, 250, 0.96);
+    }
+    #secourses-main-tabs .overflow-menu {
+      display: none !important;
+    }
 
     @media (max-width: 768px) {
+      #secourses-main-tabs {
+        --main-tab-gap: 6px;
+        --main-tab-min-height: 42px;
+      }
+      #secourses-main-tabs .tab-wrapper {
+        padding: 8px 8px 10px;
+      }
+      #secourses-main-tabs .tab-container button {
+        padding: 7px 8px;
+        font-size: 12.5px;
+      }
       .action-btn button,
       button.action-btn {
         border-radius: 12px !important;
@@ -1245,7 +1341,7 @@ def main(argv=None):
 
         # Global settings tab (rendered LAST for a cleaner workflow)
         def render_global_settings_tab():
-            with gr.Tab("Global Settings", render_children=True) as tab_global:
+            with gr.Tab("⚙️ Global Settings", render_children=True) as tab_global:
                 gr.Markdown("### 📁 Output & Temp Directories")
                 with gr.Row():
                     output_dir_box = gr.Textbox(
@@ -1597,179 +1693,180 @@ def main(argv=None):
         seedvr2_auto_res_sync = gr.State(value="")
 
         # Self-contained tabs following SECourses pattern
-        with gr.Tab("🎬 SeedVR2 (Video/Image)", render_children=True) as tab_seedvr2:
-            seedvr2_ui = seedvr2_tab(
-                preset_manager=preset_manager,
-                runner=runner,
-                run_logger=run_logger,
-                global_settings=global_settings,
-                shared_state=shared_state,
-                base_dir=BASE_DIR,
-                temp_dir=active_temp_dir,
-                output_dir=active_output_dir
+        with gr.Tabs(elem_id="secourses-main-tabs", elem_classes=["secourses-main-tabs"]):
+            with gr.Tab("🎬 SeedVR2", render_children=True) as tab_seedvr2:
+                seedvr2_ui = seedvr2_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir
+                )
+            seedvr2_tab_select_evt = tab_seedvr2.select(
+                fn=_make_tab_sync("seedvr2"),
+                inputs=[shared_state, tab_sync_seedvr2],
+                outputs=seedvr2_ui["inputs_list"] + [seedvr2_ui["preset_dropdown"], seedvr2_ui["preset_status"], tab_sync_seedvr2],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
             )
-        seedvr2_tab_select_evt = tab_seedvr2.select(
-            fn=_make_tab_sync("seedvr2"),
-            inputs=[shared_state, tab_sync_seedvr2],
-            outputs=seedvr2_ui["inputs_list"] + [seedvr2_ui["preset_dropdown"], seedvr2_ui["preset_status"], tab_sync_seedvr2],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-        # Ensure sizing panel (including Output FPS + Global RIFE forecast) is refreshed
-        # when navigating back to SeedVR2 after changing Output-tab settings.
-        def _refresh_seedvr2_auto_res_if_needed(state: Dict[str, Any], previous_signature: str = ""):
-            seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-            refresh_signature = _sync_signature(
-                {
-                    "last_input_path": seed_controls.get("last_input_path"),
-                    "upscale_factor_val": seed_controls.get("upscale_factor_val"),
-                    "max_resolution_val": seed_controls.get("max_resolution_val"),
-                    "resolution_settings": seed_controls.get("resolution_settings", {}),
-                    "output_settings": seed_controls.get("output_settings", {}),
-                }
-            )
-            if refresh_signature == str(previous_signature or ""):
-                return gr.skip(), previous_signature
-            return seedvr2_ui["refresh_auto_res"](state), refresh_signature
+            # Ensure sizing panel (including Output FPS + Global RIFE forecast) is refreshed
+            # when navigating back to SeedVR2 after changing Output-tab settings.
+            def _refresh_seedvr2_auto_res_if_needed(state: Dict[str, Any], previous_signature: str = ""):
+                seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+                refresh_signature = _sync_signature(
+                    {
+                        "last_input_path": seed_controls.get("last_input_path"),
+                        "upscale_factor_val": seed_controls.get("upscale_factor_val"),
+                        "max_resolution_val": seed_controls.get("max_resolution_val"),
+                        "resolution_settings": seed_controls.get("resolution_settings", {}),
+                        "output_settings": seed_controls.get("output_settings", {}),
+                    }
+                )
+                if refresh_signature == str(previous_signature or ""):
+                    return gr.skip(), previous_signature
+                return seedvr2_ui["refresh_auto_res"](state), refresh_signature
 
-        seedvr2_tab_select_evt.then(
-            fn=_refresh_seedvr2_auto_res_if_needed,
-            inputs=[shared_state, seedvr2_auto_res_sync],
-            outputs=[seedvr2_ui["auto_res_msg"], seedvr2_auto_res_sync],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("📐 Resolution & Scene Split", render_children=True) as tab_resolution:
-            resolution_ui = resolution_tab(
-                preset_manager=preset_manager,
-                shared_state=shared_state,
-                base_dir=BASE_DIR
-            )
-        tab_resolution.select(
-            fn=_make_tab_sync("resolution"),
-            inputs=[shared_state, tab_sync_resolution],
-            outputs=resolution_ui["inputs_list"] + [resolution_ui["preset_dropdown"], resolution_ui["preset_status"], tab_sync_resolution],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("🎭 Output & Comparison", render_children=True) as tab_output:
-            output_ui = output_tab(
-                preset_manager=preset_manager,
-                shared_state=shared_state,
-                base_dir=BASE_DIR,
-                global_settings=global_settings
-            )
-        tab_output.select(
-            fn=_make_tab_sync("output"),
-            inputs=[shared_state, tab_sync_output],
-            outputs=output_ui["inputs_list"] + [output_ui["preset_dropdown"], output_ui["preset_status"], tab_sync_output],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("👤 Face Restoration", render_children=True) as tab_face:
-            face_ui = face_tab(
-                preset_manager=preset_manager,
-                global_settings=global_settings,
-                shared_state=shared_state,
-                base_dir=BASE_DIR
-            )
-        tab_face.select(
-            fn=_make_tab_sync("face"),
-            inputs=[shared_state, tab_sync_face],
-            outputs=face_ui["inputs_list"] + [face_ui["preset_dropdown"], face_ui["preset_status"], tab_sync_face],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("⏱️ RIFE / FPS / Edit Videos", render_children=True) as tab_rife:
-            rife_ui = rife_tab(
-                preset_manager=preset_manager,
-                runner=runner,
-                run_logger=run_logger,
-                global_settings=global_settings,
-                shared_state=shared_state,
-                base_dir=BASE_DIR,
-                temp_dir=active_temp_dir,
-                output_dir=active_output_dir
-            )
-        tab_rife.select(
-            fn=_make_tab_sync("rife"),
-            inputs=[shared_state, tab_sync_rife],
-            outputs=rife_ui["inputs_list"] + [rife_ui["preset_dropdown"], rife_ui["preset_status"], tab_sync_rife],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("🖼️ Image-Based (GAN)", render_children=True) as tab_gan:
-            gan_ui = gan_tab(
-                preset_manager=preset_manager,
-                runner=runner,
-                run_logger=run_logger,
-                global_settings=global_settings,
-                shared_state=shared_state,
-                base_dir=BASE_DIR,
-                temp_dir=active_temp_dir,
-                output_dir=active_output_dir
-            )
-        tab_gan.select(
-            fn=_make_tab_sync("gan"),
-            inputs=[shared_state, tab_sync_gan],
-            outputs=gan_ui["inputs_list"] + [gan_ui["preset_dropdown"], gan_ui["preset_status"], tab_sync_gan],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("⚡ FlashVSR+ (Real-Time Diffusion)", render_children=True) as tab_flashvsr:
-            flashvsr_ui = flashvsr_tab(
-                preset_manager=preset_manager,
-                runner=runner,
-                run_logger=run_logger,
-                global_settings=global_settings,
-                shared_state=shared_state,
-                base_dir=BASE_DIR,
-                temp_dir=active_temp_dir,
-                output_dir=active_output_dir
-            )
-        tab_flashvsr.select(
-            fn=_make_tab_sync("flashvsr"),
-            inputs=[shared_state, tab_sync_flashvsr],
-            outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-
-        with gr.Tab("Queue (0)", render_children=True) as tab_queue:
-            queue_tab(tab_queue)
-
-        with gr.Tab("🏥 Health Check", render_children=True):
-            health_tab(
-                global_settings=global_settings,
-                shared_state=shared_state,
-                temp_dir=active_temp_dir,
-                output_dir=active_output_dir
+            seedvr2_tab_select_evt.then(
+                fn=_refresh_seedvr2_auto_res_if_needed,
+                inputs=[shared_state, seedvr2_auto_res_sync],
+                outputs=[seedvr2_ui["auto_res_msg"], seedvr2_auto_res_sync],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
             )
 
-        # Global Settings should be the last tab (far-right)
-        global_ui = render_global_settings_tab()
-        global_ui["tab"].select(
-            fn=_make_tab_sync("global"),
-            inputs=[shared_state, tab_sync_global],
-            outputs=global_ui["inputs_list"] + [global_ui["preset_dropdown"], global_ui["preset_status"], tab_sync_global],
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
+            with gr.Tab("⚡ FlashVSR+", render_children=True) as tab_flashvsr:
+                flashvsr_ui = flashvsr_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir
+                )
+            tab_flashvsr.select(
+                fn=_make_tab_sync("flashvsr"),
+                inputs=[shared_state, tab_sync_flashvsr],
+                outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("📐 Resolution & Scene Split", render_children=True) as tab_resolution:
+                resolution_ui = resolution_tab(
+                    preset_manager=preset_manager,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR
+                )
+            tab_resolution.select(
+                fn=_make_tab_sync("resolution"),
+                inputs=[shared_state, tab_sync_resolution],
+                outputs=resolution_ui["inputs_list"] + [resolution_ui["preset_dropdown"], resolution_ui["preset_status"], tab_sync_resolution],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🖼️ Image-Based (GAN)", render_children=True) as tab_gan:
+                gan_ui = gan_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir
+                )
+            tab_gan.select(
+                fn=_make_tab_sync("gan"),
+                inputs=[shared_state, tab_sync_gan],
+                outputs=gan_ui["inputs_list"] + [gan_ui["preset_dropdown"], gan_ui["preset_status"], tab_sync_gan],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🔍 Output & Comparison", render_children=True) as tab_output:
+                output_ui = output_tab(
+                    preset_manager=preset_manager,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    global_settings=global_settings
+                )
+            tab_output.select(
+                fn=_make_tab_sync("output"),
+                inputs=[shared_state, tab_sync_output],
+                outputs=output_ui["inputs_list"] + [output_ui["preset_dropdown"], output_ui["preset_status"], tab_sync_output],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("⏱️ RIFE / FPS / Edit Videos", render_children=True) as tab_rife:
+                rife_ui = rife_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir
+                )
+            tab_rife.select(
+                fn=_make_tab_sync("rife"),
+                inputs=[shared_state, tab_sync_rife],
+                outputs=rife_ui["inputs_list"] + [rife_ui["preset_dropdown"], rife_ui["preset_status"], tab_sync_rife],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("👤 Face Restoration", render_children=True) as tab_face:
+                face_ui = face_tab(
+                    preset_manager=preset_manager,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR
+                )
+            tab_face.select(
+                fn=_make_tab_sync("face"),
+                inputs=[shared_state, tab_sync_face],
+                outputs=face_ui["inputs_list"] + [face_ui["preset_dropdown"], face_ui["preset_status"], tab_sync_face],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
+                queue_tab(tab_queue)
+
+            with gr.Tab("🏥 Health Check", render_children=True):
+                health_tab(
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir
+                )
+
+            # Global Settings should be the last tab (far-right)
+            global_ui = render_global_settings_tab()
+            global_ui["tab"].select(
+                fn=_make_tab_sync("global"),
+                inputs=[shared_state, tab_sync_global],
+                outputs=global_ui["inputs_list"] + [global_ui["preset_dropdown"], global_ui["preset_status"], tab_sync_global],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
 
         # Update health banner on load and changes
         def update_health_banner(state, previous_signature: str = ""):

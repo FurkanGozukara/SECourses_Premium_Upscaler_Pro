@@ -98,8 +98,9 @@ def flashvsr_tab(
         cuda_available = False
 
     # Layout
-    gr.Markdown("###  FlashVSR+ - Real-Time Diffusion Video Super-Resolution")
-    gr.Markdown("*High-quality real-time video upscaling with diffusion models*")
+    with gr.Row(equal_height=True):
+        gr.Markdown("###  FlashVSR+ - Real-Time Diffusion Video Super-Resolution")
+        gr.Markdown("*High-quality real-time video upscaling with diffusion models*")
     
     # Show GPU warning if not available
     if not cuda_available:
@@ -354,6 +355,9 @@ def flashvsr_tab(
         
         # Right Column: Output & Controls
         with gr.Column(scale=2):
+            status_box = gr.Markdown(value="Ready.")
+            progress_indicator = gr.Markdown(value="", visible=True)
+
             gr.Markdown("####  Output & Actions")
 
             with gr.Group():
@@ -402,9 +406,35 @@ def flashvsr_tab(
                     value=bool(_value("use_resolution_tab", True)),
                     info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from Resolution tab. Recommended ON.",
                 )
-            
-            status_box = gr.Markdown(value="Ready.")
-            progress_indicator = gr.Markdown(value="", visible=True)
+
+                with gr.Row():
+                    upscale_btn = gr.Button(
+                        " Start Upscaling",
+                        variant="primary",
+                        size="lg",
+                        elem_classes=["action-btn", "action-btn-upscale"],
+                    )
+                    preview_btn = gr.Button(
+                        "Preview First Frame",
+                        size="lg",
+                        elem_classes=["action-btn", "action-btn-preview"],
+                    )
+
+                with gr.Row():
+                    cancel_confirm = gr.Checkbox(
+                        label=" Confirm cancel (required for safety)",
+                        value=False,
+                        info="Enable this checkbox to confirm cancellation of processing",
+                        scale=3,
+                    )
+                    cancel_btn = gr.Button(
+                        " Cancel",
+                        variant="stop",
+                        size="md",
+                        min_width=170,
+                        scale=1,
+                        elem_classes=["action-btn", "action-btn-cancel"],
+                    )
 
             resume_run_dir = gr.Textbox(
                 label="Resume Run Folder (chunk/scene resume)",
@@ -477,30 +507,6 @@ def flashvsr_tab(
                 buttons=["download"],
             )
             last_processed = gr.Markdown("Batch processing results will appear here.")
-
-            # Action buttons
-            with gr.Row():
-                upscale_btn = gr.Button(
-                    " Start Upscaling",
-                    variant="primary",
-                    size="lg",
-                    elem_classes=["action-btn", "action-btn-upscale"],
-                )
-                preview_btn = gr.Button(
-                    "Preview First Frame",
-                    size="lg",
-                    elem_classes=["action-btn", "action-btn-preview"],
-                )
-                cancel_btn = gr.Button(
-                    " Cancel",
-                    variant="stop",
-                    elem_classes=["action-btn", "action-btn-cancel"],
-                )
-            cancel_confirm = gr.Checkbox(
-                label=" Confirm cancel (required for safety)",
-                value=False,
-                info="Enable this checkbox to confirm cancellation of processing"
-            )
             
             # Utility buttons
             with gr.Row():

@@ -1,6 +1,5 @@
 """
-FlashVSR+ Model Metadata Registry
-Provides comprehensive model metadata with VRAM, compile, and multi-GPU constraints
+FlashVSR metadata registry for UI defaults and guardrails.
 """
 
 from dataclasses import dataclass
@@ -12,11 +11,11 @@ def flashvsr_version_to_internal(version: Any) -> str:
     Normalize FlashVSR version to internal/CLI form.
 
     Supported inputs:
-    - "10", "v10", "1.0", "v1.0"
-    - "11", "v11", "1.1", "v1.1"
+    - "10", "v10", "1.0", "v1.0", "FlashVSR"
+    - "11", "v11", "1.1", "v1.1", "FlashVSR-v1.1"
     """
     raw = str(version or "").strip().lower()
-    if raw in {"11", "v11", "1.1", "v1.1"}:
+    if raw in {"11", "v11", "1.1", "v1.1", "flashvsr-v1.1"}:
         return "11"
     return "10"
 
@@ -26,132 +25,131 @@ def flashvsr_version_to_ui(version: Any) -> str:
     return "1.1" if flashvsr_version_to_internal(version) == "11" else "1.0"
 
 
+def flashvsr_internal_to_model_name(version_internal: Any) -> str:
+    """Convert internal version ('10'/'11') to CLI model name."""
+    return "FlashVSR-v1.1" if str(version_internal) == "11" else "FlashVSR"
+
+
 @dataclass
 class FlashVSRModel:
-    """Comprehensive metadata for FlashVSR+ model configurations"""
-    name: str  # e.g., "v10_tiny_4x"
-    version: str  # "10" or "11"
-    mode: str  # "tiny", "tiny-long", "full"
-    scale: int  # 2 or 4
-    
-    # Multi-GPU support
-    supports_multi_gpu: bool = False  # FlashVSR+ is primarily single-GPU optimized
-    
-    # Performance characteristics
-    estimated_vram_gb: float = 6.0
-    supports_fp16: bool = True
-    supports_bf16: bool = True
-    default_dtype: str = "bf16"
-    
-    # Compilation support
-    compile_compatible: bool = True
-    preferred_compile_backend: str = "inductor"
-    
-    # Tiling support
+    name: str
+    version: str
+    mode: str
+    scale: int
+    estimated_vram_gb: float = 8.0
+    supports_multi_gpu: bool = False
     supports_tiled_vae: bool = True
     supports_tiled_dit: bool = True
     default_tile_size: int = 256
     default_overlap: int = 24
-    
-    # Quality vs Speed trade-offs
-    speed_tier: str = "medium"  # "fast", "medium", "slow"
-    quality_tier: str = "high"  # "medium", "high", "very_high"
-    
-    # Resolution constraints
-    max_resolution: int = 0  # 0 = no cap
-    min_resolution: int = 256
-    
-    # Attention mode
-    default_attention: str = "sage"  # "sage" or "block"
-    
-    # Description
+    default_precision: str = "auto"
+    default_attention_mode: str = "sparse_sage_attention"
+    default_vae_model: str = "Wan2.1"
+    default_keep_models_on_cpu: bool = True
+    recommended_frame_chunk_size: int = 0
+    recommended_resize_factor: float = 1.0
+    speed_tier: str = "medium"
+    quality_tier: str = "high"
     notes: str = ""
 
 
+def _build_model(
+    version: str,
+    mode: str,
+    scale: int,
+    estimated_vram_gb: float,
+    *,
+    default_vae_model: str,
+    recommended_frame_chunk_size: int,
+    recommended_resize_factor: float,
+    default_precision: str = "auto",
+    default_keep_models_on_cpu: bool = True,
+    tiled_vae: bool = True,
+    tiled_dit: bool = True,
+    speed_tier: str = "medium",
+    quality_tier: str = "high",
+    notes: str = "",
+) -> FlashVSRModel:
+    return FlashVSRModel(
+        name=f"v{version}_{mode}_{int(scale)}x",
+        version=str(version),
+        mode=str(mode),
+        scale=int(scale),
+        estimated_vram_gb=float(estimated_vram_gb),
+        default_vae_model=str(default_vae_model),
+        recommended_frame_chunk_size=int(recommended_frame_chunk_size),
+        recommended_resize_factor=float(recommended_resize_factor),
+        default_precision=str(default_precision),
+        default_keep_models_on_cpu=bool(default_keep_models_on_cpu),
+        supports_tiled_vae=bool(tiled_vae),
+        supports_tiled_dit=bool(tiled_dit),
+        speed_tier=str(speed_tier),
+        quality_tier=str(quality_tier),
+        notes=str(notes or ""),
+    )
+
+
 def _get_flashvsr_models() -> List[FlashVSRModel]:
-    """
-    Define all FlashVSR+ model configurations with comprehensive metadata.
-    
-    FlashVSR+ offers multiple versions and modes:
-    - v10: Original release, stable
-    - v11: Latest, improved quality
-    - Modes:
-      - tiny: Fastest, lowest VRAM (4-6GB)
-      - tiny-long: Balanced temporal consistency
-      - full: Highest quality, more VRAM (8-12GB)
-    """
-    models = []
-    
-    # v10 models - Original release
-    for scale in [2, 4]:
-        models.append(FlashVSRModel(
-            name=f"v10_tiny_{scale}x",
-            version="10",
-            mode="tiny",
-            scale=scale,
-            estimated_vram_gb=4.0 if scale == 2 else 6.0,
-            speed_tier="fast",
-            quality_tier="high",
-            notes=f"v10 tiny {scale}x - Fastest mode, lowest VRAM. Good for real-time or batch processing."
-        ))
-        
-        models.append(FlashVSRModel(
-            name=f"v10_tiny-long_{scale}x",
-            version="10",
-            mode="tiny-long",
-            scale=scale,
-            estimated_vram_gb=5.0 if scale == 2 else 7.0,
-            speed_tier="medium",
-            quality_tier="high",
-            notes=f"v10 tiny-long {scale}x - Balanced mode with better temporal consistency."
-        ))
-        
-        models.append(FlashVSRModel(
-            name=f"v10_full_{scale}x",
-            version="10",
-            mode="full",
-            scale=scale,
-            estimated_vram_gb=8.0 if scale == 2 else 10.0,
-            speed_tier="slow",
-            quality_tier="very_high",
-            notes=f"v10 full {scale}x - Highest quality, more VRAM required. Best results for archival."
-        ))
-    
-    # v11 models - Latest release with improvements
-    for scale in [2, 4]:
-        models.append(FlashVSRModel(
-            name=f"v11_tiny_{scale}x",
-            version="11",
-            mode="tiny",
-            scale=scale,
-            estimated_vram_gb=4.5 if scale == 2 else 6.5,
-            speed_tier="fast",
-            quality_tier="high",
-            notes=f"v11 tiny {scale}x - Latest fast mode with quality improvements over v10."
-        ))
-        
-        models.append(FlashVSRModel(
-            name=f"v11_tiny-long_{scale}x",
-            version="11",
-            mode="tiny-long",
-            scale=scale,
-            estimated_vram_gb=5.5 if scale == 2 else 7.5,
-            speed_tier="medium",
-            quality_tier="high",
-            notes=f"v11 tiny-long {scale}x - Enhanced temporal consistency, balanced performance."
-        ))
-        
-        models.append(FlashVSRModel(
-            name=f"v11_full_{scale}x",
-            version="11",
-            mode="full",
-            scale=scale,
-            estimated_vram_gb=9.0 if scale == 2 else 12.0,
-            speed_tier="slow",
-            quality_tier="very_high",
-            notes=f"v11 full {scale}x - Latest highest quality mode. Recommended for final output."
-        ))
-    
+    models: List[FlashVSRModel] = []
+    for version in ("10", "11"):
+        for scale in (2, 4):
+            # tiny
+            models.append(
+                _build_model(
+                    version,
+                    "tiny",
+                    scale,
+                    9.0 if scale == 4 else 6.5,
+                    default_vae_model="Wan2.1",
+                    recommended_frame_chunk_size=64 if scale == 4 else 0,
+                    recommended_resize_factor=1.0,
+                    default_precision="auto",
+                    default_keep_models_on_cpu=True,
+                    tiled_vae=True,
+                    tiled_dit=False,
+                    speed_tier="fast",
+                    quality_tier="high",
+                    notes=f"v{version} tiny {scale}x: balanced quality and speed.",
+                )
+            )
+            # tiny-long
+            models.append(
+                _build_model(
+                    version,
+                    "tiny-long",
+                    scale,
+                    7.0 if scale == 4 else 5.0,
+                    default_vae_model="LightVAE_W2.1",
+                    recommended_frame_chunk_size=24 if scale == 4 else 40,
+                    recommended_resize_factor=0.8 if scale == 4 else 1.0,
+                    default_precision="fp16",
+                    default_keep_models_on_cpu=True,
+                    tiled_vae=True,
+                    tiled_dit=True,
+                    speed_tier="medium",
+                    quality_tier="high",
+                    notes=f"v{version} tiny-long {scale}x: lowest VRAM profile for long clips.",
+                )
+            )
+            # full
+            models.append(
+                _build_model(
+                    version,
+                    "full",
+                    scale,
+                    13.0 if scale == 4 else 10.0,
+                    default_vae_model="Wan2.2",
+                    recommended_frame_chunk_size=0,
+                    recommended_resize_factor=1.0,
+                    default_precision="auto",
+                    default_keep_models_on_cpu=False,
+                    tiled_vae=False,
+                    tiled_dit=False,
+                    speed_tier="slow",
+                    quality_tier="very_high",
+                    notes=f"v{version} full {scale}x: highest quality, highest VRAM usage.",
+                )
+            )
     return models
 
 
@@ -160,34 +158,17 @@ _FLASHVSR_MODEL_MAP = {m.name: m for m in _FLASHVSR_MODELS}
 
 
 def get_flashvsr_model_names() -> List[str]:
-    """
-    Get available FlashVSR+ model identifiers.
-    
-    Returns:
-        List of model identifier strings (e.g., "v10_tiny_2x", "v11_full_4x")
-    """
     return [m.name for m in _FLASHVSR_MODELS]
 
 
 def get_flashvsr_default_model() -> str:
-    """Get default FlashVSR+ model identifier."""
-    return "v11_tiny-long_4x"
+    return "v11_tiny_4x"
 
 
 def get_flashvsr_metadata(model_name: str) -> Optional[FlashVSRModel]:
-    """
-    Get comprehensive metadata for a FlashVSR+ model.
-    
-    Args:
-        model_name: Model identifier (e.g., "v10_tiny_4x")
-        
-    Returns:
-        FlashVSRModel metadata or None if not found
-    """
     return _FLASHVSR_MODEL_MAP.get(model_name)
 
 
 def flashvsr_model_map() -> Dict[str, FlashVSRModel]:
-    """Get mapping of model names to metadata."""
     return dict(_FLASHVSR_MODEL_MAP)
 

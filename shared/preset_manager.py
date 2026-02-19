@@ -513,42 +513,18 @@ class PresetManager:
         - Valid version/mode/scale combinations
         """
         validated = preset.copy()
-        
-        # Import metadata functions
-        from shared.models.flashvsr_meta import (
-            get_flashvsr_metadata,
-            flashvsr_version_to_internal,
-            flashvsr_version_to_ui,
-        )
-        validated["version"] = flashvsr_version_to_ui(validated.get("version", "1.0"))
-        
-        # Build model identifier
-        internal_version = flashvsr_version_to_internal(validated.get("version", "1.0"))
-        model_id = f"v{internal_version}_{validated.get('mode', 'tiny')}_{validated.get('scale', 4)}x"
-        model_meta = get_flashvsr_metadata(model_id)
-        
-        if model_meta:
-            # Enforce single GPU
-            device_str = str(validated.get("device", "auto"))
-            if device_str not in ("auto", "cpu", ""):
-                devices = [d.strip() for d in device_str.replace(" ", "").split(",") if d.strip()]
-                if len(devices) > 1:
-                    validated["device"] = devices[0]  # Use first GPU only
-                    print(f"WARNING: FlashVSR+ preset: Multi-GPU not supported, using single GPU: {devices[0]}")
-            
-            # Validate tile constraints
-            if validated.get("tiled_vae") or validated.get("tiled_dit"):
-                tile_size = int(validated.get("tile_size", 256))
-                overlap = int(validated.get("overlap", 24))
-                
-                if overlap >= tile_size:
-                    validated["overlap"] = max(0, tile_size - 1)
-                    print(f"WARNING: FlashVSR+ preset: Tile overlap >= tile size, correcting to {validated['overlap']}")
-                
-                if tile_size < 64:
-                    validated["tile_size"] = model_meta.default_tile_size
-                    print(f"WARNING: FlashVSR+ preset: Tile size too small, resetting to {validated['tile_size']}")
-        
+        try:
+            from shared.services.flashvsr_service import _enforce_flashvsr_guardrails, flashvsr_defaults
+
+            validated = _enforce_flashvsr_guardrails(validated, flashvsr_defaults())
+        except Exception:
+            # Fallback to minimal safe normalization
+            from shared.models.flashvsr_meta import flashvsr_version_to_ui
+
+            validated["version"] = flashvsr_version_to_ui(validated.get("version", "1.0"))
+            validated["scale"] = "2" if str(validated.get("scale", "4")).strip() == "2" else "4"
+            mode = str(validated.get("mode", "tiny") or "tiny").strip().lower()
+            validated["mode"] = mode if mode in ("tiny", "tiny-long", "full") else "tiny"
         return validated
     
     def _validate_rife_constraints(self, preset: Dict[str, Any]) -> Dict[str, Any]:

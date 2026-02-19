@@ -2405,16 +2405,17 @@ def chunk_and_process(
                 "(OpenCV output codec may differ by runtime build).\n"
             )
     elif model_type == "flashvsr":
-        # FlashVSR_plus/run.py currently writes H.264 output and does not expose
-        # app-level control for alternate final codecs (HEVC/AV1/etc.). If the
-        # global Output tab requests a different codec, strict validation would
-        # incorrectly fail successful runs.
-        if expected_codec_name and (expected_codec_name != "h264" or expected_use_10bit):
-            strict_codec_validation = False
-            _emit_diag(
-                f"[codec] strict validation disabled for FlashVSR "
-                f"(native codec=h264, requested codec={expected_codec_name}, 10bit={expected_use_10bit}).\n"
-            )
+        # FlashVSR backends can emit different codecs depending on runtime path:
+        # - Legacy FlashVSR_plus often emits h264
+        # - ComfyUI-FlashVSR_Stable CLI can emit mpeg4/mp4v via OpenCV writer
+        # Enforcing strict codec equality here causes false failures even when the
+        # chunk output is valid and mergeable.
+        strict_codec_validation = False
+        _emit_diag(
+            "[codec] strict validation disabled for FlashVSR "
+            f"(backend output codec may vary by runtime; requested codec={expected_codec_name or 'auto'}, "
+            f"10bit={expected_use_10bit}).\n"
+        )
     if output_format != "png" and expected_codec_name and strict_codec_validation:
         _emit_diag(
             f"[codec] expected output codec={expected_codec_name}, 10bit={expected_use_10bit}\n"

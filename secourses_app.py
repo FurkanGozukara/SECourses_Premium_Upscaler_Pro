@@ -612,6 +612,35 @@ def main(argv=None):
       box-shadow: 0 12px 28px rgba(194, 65, 12, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
     }
 
+    /* FlashVSR Auto Set by VRAM */
+    .action-btn-auto-vram button,
+    button.action-btn-auto-vram {
+      background: linear-gradient(135deg, #0f766e 0%, #0891b2 45%, #1d4ed8 100%) !important;
+      border-color: rgba(125, 211, 252, 0.96) !important;
+      box-shadow: 0 12px 28px rgba(2, 132, 199, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.26) !important;
+      text-shadow: 0 1px 0 rgba(15, 23, 42, 0.45);
+    }
+    .action-btn-auto-vram button::after,
+    button.action-btn-auto-vram::after {
+      content: "";
+      position: absolute;
+      inset: -45% auto -45% -30%;
+      width: 34%;
+      transform: rotate(18deg);
+      background: linear-gradient(90deg, rgba(255, 255, 255, 0.0), rgba(224, 242, 254, 0.52), rgba(255, 255, 255, 0.0));
+      animation: actionSweep 2.4s linear infinite;
+      pointer-events: none;
+    }
+    .action-btn-auto-vram button:hover,
+    button.action-btn-auto-vram:hover {
+      box-shadow: 0 16px 34px rgba(3, 105, 161, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.3) !important;
+      border-color: rgba(186, 230, 253, 1) !important;
+    }
+    .action-btn-auto-vram button:active,
+    button.action-btn-auto-vram:active {
+      box-shadow: 0 9px 20px rgba(3, 105, 161, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+    }
+
     /* Resolution tab quick source buttons */
     .quick-actions-row {
       gap: 10px;

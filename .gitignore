@@ -33,3 +33,4 @@ global_config/
 global.json
 temp/
 __pycache__/
+executed_commands

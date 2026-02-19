@@ -4,6 +4,7 @@ Handles FlashVSR+ processing logic, presets, and callbacks
 """
 
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -135,41 +136,146 @@ def _apply_image_output_preferences(
         return image_path
 
 
-def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Get default FlashVSR+ settings aligned with CLI defaults.
-    Applies model-specific metadata when model_name is provided.
-    """
-    # IMPORTANT: do not import torch in the parent Gradio process.
-    # Use NVML-based detection (nvidia-smi) via shared.gpu_utils instead.
+FLASHVSR_VAE_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
+FLASHVSR_PRECISION_OPTIONS = ["auto", "bf16", "fp16"]
+FLASHVSR_ATTENTION_OPTIONS = ["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"]
+FLASHVSR_CODEC_OPTIONS = ["libx264", "libx265", "h264_nvenc"]
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _nearest_supported_scale(value: Any, default: int = 4) -> int:
+    raw = _to_float(value, float(default))
+    return 2 if raw <= 3.0 else 4
+
+
+def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
+    if vram_gb >= 24.0:
+        return {
+            "tiled_vae": False,
+            "tiled_dit": False,
+            "frame_chunk_size": 0,
+            "resize_factor": 1.0,
+            "keep_models_on_cpu": False,
+        }
+    if vram_gb >= 16.0:
+        return {
+            "tiled_vae": True,
+            "tiled_dit": False,
+            "frame_chunk_size": 80,
+            "resize_factor": 1.0,
+            "keep_models_on_cpu": True,
+        }
+    if vram_gb >= 12.0:
+        return {
+            "tiled_vae": True,
+            "tiled_dit": True,
+            "frame_chunk_size": 48,
+            "resize_factor": 1.0,
+            "keep_models_on_cpu": True,
+        }
+    return {
+        "tiled_vae": True,
+        "tiled_dit": True,
+        "frame_chunk_size": 20,
+        "resize_factor": 0.6,
+        "keep_models_on_cpu": True,
+    }
+
+
+def _resolve_selected_gpu_vram_gb(device_value: Any) -> Optional[float]:
     try:
         from shared.gpu_utils import get_gpu_info
+
+        gpus = get_gpu_info()
+        if not gpus:
+            return None
+        raw = str(device_value or "auto").strip().lower()
+        if raw in {"", "auto", "cuda", "cuda:0"}:
+            return float(gpus[0].total_memory_gb)
+        if raw.startswith("cuda:"):
+            idx = raw.split(":", 1)[1].strip()
+            if idx.isdigit():
+                gpu_idx = int(idx)
+                if 0 <= gpu_idx < len(gpus):
+                    return float(gpus[gpu_idx].total_memory_gb)
+        if raw.isdigit():
+            gpu_idx = int(raw)
+            if 0 <= gpu_idx < len(gpus):
+                return float(gpus[gpu_idx].total_memory_gb)
+        return float(gpus[0].total_memory_gb)
+    except Exception:
+        return None
+
+
+def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Defaults aligned to ComfyUI-FlashVSR_Stable with quality-first tuning.
+    """
+    try:
+        from shared.gpu_utils import get_gpu_info
+
         cuda_default = "auto" if get_gpu_info() else "cpu"
     except Exception:
         cuda_default = "cpu"
-    
-    # Get model metadata if specific model is provided
+
     default_model = model_name or get_flashvsr_default_model()
     model_meta = get_flashvsr_metadata(default_model)
-    
-    # Apply model-specific defaults if metadata available
+
     if model_meta:
-        default_dtype = model_meta.default_dtype
+        default_precision = "bf16"
         default_tile_size = model_meta.default_tile_size
         default_overlap = model_meta.default_overlap
-        default_attention = model_meta.default_attention
-        version = flashvsr_version_to_ui(model_meta.version)
+        default_attention = model_meta.default_attention_mode
+        default_vae = "Wan2.2"
         mode = model_meta.mode
-        scale = model_meta.scale
+        scale = int(model_meta.scale)
+        frame_chunk_size = int(model_meta.recommended_frame_chunk_size)
+        resize_factor = float(model_meta.recommended_resize_factor)
+        keep_models_on_cpu = bool(model_meta.default_keep_models_on_cpu)
+        version = flashvsr_version_to_ui(model_meta.version)
+        tiled_vae = bool(model_meta.supports_tiled_vae)
+        tiled_dit = bool(model_meta.supports_tiled_dit) if mode == "tiny-long" else False
     else:
-        default_dtype = "bf16"
+        default_precision = "bf16"
         default_tile_size = 256
         default_overlap = 24
-        default_attention = "sage"
+        default_attention = "sparse_sage_attention"
+        default_vae = "Wan2.2"
         version = "1.1"
-        mode = "tiny-long"
+        mode = "tiny"
         scale = 4
-    
+        frame_chunk_size = 64
+        resize_factor = 1.0
+        keep_models_on_cpu = True
+        tiled_vae = True
+        tiled_dit = False
+
     return {
         "input_path": "",
         "output_override": "",
@@ -177,28 +283,43 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "scale": scale,
         "version": version,
         "mode": mode,
-        "tiled_vae": True,
-        "tiled_dit": True,
+        "vae_model": default_vae,
+        "precision": default_precision,
+        "attention_mode": default_attention,
+        "tiled_vae": tiled_vae,
+        "tiled_dit": tiled_dit,
         "tile_size": default_tile_size,
         "overlap": default_overlap,
-        "unload_dit": True,
+        "unload_dit": False,
+        "sparse_ratio": 2.0,
+        "kv_ratio": 3.0,
+        "local_range": 11,
+        "frame_chunk_size": frame_chunk_size,
+        "resize_factor": resize_factor,
+        "keep_models_on_cpu": keep_models_on_cpu,
+        "force_offload": True,
+        "enable_debug": False,
         "color_fix": True,
         "seed": 0,
-        "dtype": default_dtype,
         "device": cuda_default,
-        "fps": 30,
-        "quality": 6,
-        "attention": default_attention,
+        "fps": 0.0,
+        "codec": "libx264",
+        "crf": 18,
+        "start_frame": 0,
+        "end_frame": -1,
+        "models_dir": str((Path(__file__).resolve().parents[2] / "ComfyUI-FlashVSR_Stable" / "models")),
+        # Deprecated runtime toggle. Kept in payload schema for backward compatibility.
+        # VRAM auto-tuning is now applied manually from the UI "Auto Set by VRAM" button.
+        "auto_vram_profile": False,
         "save_metadata": True,
         "face_restore_after_upscale": False,
         "batch_enable": False,
         "batch_input_path": "",
         "batch_output_path": "",
         "resume_run_dir": "",
-        # vNext sizing (app-level)
         "use_resolution_tab": True,
         "upscale_factor": float(scale),
-        "max_target_resolution": 1920,  # Max edge cap (0 = no cap)
+        "max_target_resolution": 1920,
         "pre_downscale_then_upscale": True,
     }
 
@@ -210,29 +331,41 @@ FLASHVSR_ORDER: List[str] = [
     "scale",
     "version",
     "mode",
+    "vae_model",
+    "precision",
+    "attention_mode",
     "tiled_vae",
     "tiled_dit",
     "tile_size",
     "overlap",
     "unload_dit",
+    "sparse_ratio",
+    "kv_ratio",
+    "local_range",
+    "frame_chunk_size",
+    "resize_factor",
+    "keep_models_on_cpu",
+    "force_offload",
+    "enable_debug",
     "color_fix",
     "seed",
-    "dtype",
     "device",
     "fps",
-    "quality",
-    "attention",
+    "codec",
+    "crf",
+    "start_frame",
+    "end_frame",
+    "models_dir",
+    "auto_vram_profile",
     "save_metadata",
     "face_restore_after_upscale",
     "batch_enable",
     "batch_input_path",
     "batch_output_path",
-    # vNext sizing
     "use_resolution_tab",
     "upscale_factor",
     "max_target_resolution",
     "pre_downscale_then_upscale",
-    # Resume from an existing chunk run folder.
     "resume_run_dir",
 ]
 
@@ -242,87 +375,111 @@ def _flashvsr_dict_from_args(args: List[Any]) -> Dict[str, Any]:
 
 
 def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply FlashVSR+-specific validation rules using metadata registry.
-    
-    Enforces:
-    - Single GPU requirement (FlashVSR+ doesn't support multi-GPU well)
-    - Valid CUDA device IDs (checks against available devices)
-    - VRAM-based tile size recommendations
-    - Resolution constraints from model metadata
-    - Valid version/mode/scale combinations
-    """
-    cfg = cfg.copy()
-    cfg["output_format"] = "mp4"
-    cfg["save_metadata"] = bool(cfg.get("save_metadata", defaults.get("save_metadata", True)))
-    cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", defaults.get("face_restore_after_upscale", False)))
-    # Dropdown-safe normalization to avoid Gradio choice mismatches.
-    try:
-        cfg["scale"] = "2" if str(cfg.get("scale", defaults.get("scale", "4"))).strip() == "2" else "4"
-    except Exception:
-        cfg["scale"] = "4"
-    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
-    cfg["mode"] = str(cfg.get("mode", defaults.get("mode", "tiny-long")) or "tiny-long")
-    
-    # Build model identifier and get metadata
-    internal_version = flashvsr_version_to_internal(cfg.get("version", "1.1"))
-    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny-long')}_{cfg.get('scale', '4')}x"
-    model_meta = get_flashvsr_metadata(model_id)
-    
-    if model_meta:
-        # Enforce single GPU (FlashVSR+ doesn't support multi-GPU)
-        device_str = str(cfg.get("device", "auto"))
-        if device_str not in ("auto", "cpu", ""):
-            # Parse device specification
-            devices = [d.strip() for d in device_str.replace(" ", "").split(",") if d.strip()]
-            if len(devices) > 1:
-                error_logger.warning(f"FlashVSR+ doesn't support multi-GPU - forcing single GPU (using first: {devices[0]})")
-                cfg["device"] = devices[0]
-                cfg["_multi_gpu_disabled_reason"] = "FlashVSR+ is single-GPU optimized"
-            
-            # Validate CUDA device ID is actually available
-            try:
-                from shared.gpu_utils import get_gpu_info
+    cfg = {**defaults, **(cfg or {})}
 
-                device_count = len(get_gpu_info())
-                device_id_str = str(cfg.get("device", "")).replace("cuda:", "").strip()
-                if device_id_str.isdigit():
-                    device_id = int(device_id_str)
-                    if device_count == 0 or device_id >= device_count:
-                        error_logger.warning(
-                            f"Device ID {device_id} not available (detected {device_count} GPU(s)) - falling back to auto"
-                        )
-                        cfg["device"] = "auto"
-                        cfg["_device_validation_warning"] = f"Requested GPU {device_id} not found, using auto-select"
-            except Exception as e:
-                error_logger.warning(f"Failed to validate device ID: {e}")
-        
-        # Apply model-specific defaults if not set
-        if not cfg.get("dtype"):
-            cfg["dtype"] = model_meta.default_dtype
-        
-        if cfg.get("tile_size", 0) == 0:
-            cfg["tile_size"] = model_meta.default_tile_size
-        
-        if cfg.get("overlap", 0) == 0:
-            cfg["overlap"] = model_meta.default_overlap
-        
-        if not cfg.get("attention"):
-            cfg["attention"] = model_meta.default_attention
-        
-        # Validate tile overlap constraint
-        if cfg.get("tiled_vae") or cfg.get("tiled_dit"):
-            tile_size = int(cfg.get("tile_size", model_meta.default_tile_size))
-            overlap = int(cfg.get("overlap", model_meta.default_overlap))
-            
-            if overlap >= tile_size:
-                cfg["overlap"] = max(0, tile_size - 1)
-                error_logger.warning(f"Tile overlap ({overlap}) >= tile size ({tile_size}), correcting to {cfg['overlap']}")
-            
-            if tile_size < 64:
-                cfg["tile_size"] = model_meta.default_tile_size
-                error_logger.warning(f"Tile size too small, resetting to {cfg['tile_size']}")
-    
+    cfg["output_format"] = "mp4"
+    cfg["save_metadata"] = _to_bool(cfg.get("save_metadata"), _to_bool(defaults.get("save_metadata", True), True))
+    cfg["face_restore_after_upscale"] = _to_bool(
+        cfg.get("face_restore_after_upscale"),
+        _to_bool(defaults.get("face_restore_after_upscale", False), False),
+    )
+
+    cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
+    mode = str(cfg.get("mode", defaults.get("mode", "tiny")) or "tiny").strip().lower()
+    cfg["mode"] = mode if mode in {"tiny", "tiny-long", "full"} else "tiny"
+    scale = _nearest_supported_scale(cfg.get("scale", defaults.get("scale", 4)), 4)
+    cfg["scale"] = str(scale)
+    cfg["upscale_factor"] = float(scale)
+
+    precision = str(cfg.get("precision", cfg.get("dtype", defaults.get("precision", "auto")))).strip().lower()
+    cfg["precision"] = precision if precision in {"auto", "bf16", "fp16"} else "auto"
+
+    att_raw = str(cfg.get("attention_mode", cfg.get("attention", defaults.get("attention_mode", "sparse_sage_attention")))).strip().lower()
+    att_map = {
+        "sage": "sparse_sage_attention",
+        "sparse_sage": "sparse_sage_attention",
+        "sparse_sage_attention": "sparse_sage_attention",
+        "block": "block_sparse_attention",
+        "block_sparse": "block_sparse_attention",
+        "block_sparse_attention": "block_sparse_attention",
+        "flash_attn_2": "flash_attention_2",
+        "flash_attention_2": "flash_attention_2",
+        "sdpa": "sdpa",
+    }
+    cfg["attention_mode"] = att_map.get(att_raw, "sparse_sage_attention")
+
+    vae_model = str(cfg.get("vae_model", defaults.get("vae_model", "Wan2.2"))).strip()
+    cfg["vae_model"] = vae_model if vae_model in FLASHVSR_VAE_OPTIONS else str(defaults.get("vae_model", "Wan2.2"))
+
+    cfg["tiled_vae"] = _to_bool(cfg.get("tiled_vae"), _to_bool(defaults.get("tiled_vae", True), True))
+    cfg["tiled_dit"] = _to_bool(cfg.get("tiled_dit"), _to_bool(defaults.get("tiled_dit", False), False))
+    cfg["unload_dit"] = _to_bool(cfg.get("unload_dit"), _to_bool(defaults.get("unload_dit", False), False))
+    cfg["color_fix"] = _to_bool(cfg.get("color_fix"), _to_bool(defaults.get("color_fix", True), True))
+    cfg["keep_models_on_cpu"] = _to_bool(
+        cfg.get("keep_models_on_cpu"),
+        _to_bool(defaults.get("keep_models_on_cpu", True), True),
+    )
+    cfg["force_offload"] = _to_bool(cfg.get("force_offload"), _to_bool(defaults.get("force_offload", True), True))
+    cfg["enable_debug"] = _to_bool(cfg.get("enable_debug"), _to_bool(defaults.get("enable_debug", False), False))
+    cfg["auto_vram_profile"] = _to_bool(
+        cfg.get("auto_vram_profile"),
+        _to_bool(defaults.get("auto_vram_profile", True), True),
+    )
+
+    cfg["seed"] = max(0, _to_int(cfg.get("seed"), 0))
+    cfg["tile_size"] = max(32, min(1024, _to_int(cfg.get("tile_size"), 256)))
+    cfg["overlap"] = max(8, min(512, _to_int(cfg.get("overlap"), 24)))
+    if cfg["overlap"] >= cfg["tile_size"]:
+        cfg["overlap"] = max(8, cfg["tile_size"] - 8)
+
+    cfg["sparse_ratio"] = max(1.5, min(2.0, _to_float(cfg.get("sparse_ratio"), 2.0)))
+    cfg["kv_ratio"] = max(1.0, min(3.0, _to_float(cfg.get("kv_ratio"), 3.0)))
+    cfg["local_range"] = 9 if _to_int(cfg.get("local_range"), 11) == 9 else 11
+    cfg["frame_chunk_size"] = max(0, _to_int(cfg.get("frame_chunk_size"), 0))
+    cfg["resize_factor"] = max(0.1, min(1.0, _to_float(cfg.get("resize_factor"), 1.0)))
+
+    cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
+    codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()
+    cfg["codec"] = codec if codec else "libx264"
+    cfg["crf"] = max(0, min(51, _to_int(cfg.get("crf"), 18)))
+    cfg["start_frame"] = max(0, _to_int(cfg.get("start_frame"), 0))
+    cfg["end_frame"] = _to_int(cfg.get("end_frame"), -1)
+
+    cfg["models_dir"] = str(cfg.get("models_dir", defaults.get("models_dir", "")) or "").strip()
+    cfg["batch_enable"] = _to_bool(cfg.get("batch_enable"), _to_bool(defaults.get("batch_enable", False), False))
+    cfg["use_resolution_tab"] = _to_bool(
+        cfg.get("use_resolution_tab"),
+        _to_bool(defaults.get("use_resolution_tab", True), True),
+    )
+    cfg["max_target_resolution"] = max(0, min(8192, _to_int(cfg.get("max_target_resolution"), 1920)))
+    cfg["pre_downscale_then_upscale"] = _to_bool(
+        cfg.get("pre_downscale_then_upscale"),
+        _to_bool(defaults.get("pre_downscale_then_upscale", True), True),
+    )
+
+    # Single-GPU guardrail
+    device_str = str(cfg.get("device", defaults.get("device", "auto")) or "auto").strip()
+    if "," in device_str:
+        cfg["device"] = device_str.split(",")[0].strip() or "auto"
+        cfg["_multi_gpu_disabled_reason"] = "FlashVSR is single-GPU."
+    else:
+        cfg["device"] = device_str or "auto"
+
+    # Apply metadata defaults for selected version/mode/scale.
+    internal_version = flashvsr_version_to_internal(cfg.get("version", "1.1"))
+    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
+    model_meta = get_flashvsr_metadata(model_id)
+    if model_meta:
+        if cfg.get("tile_size", 0) <= 0:
+            cfg["tile_size"] = int(model_meta.default_tile_size)
+        if cfg.get("overlap", 0) <= 0:
+            cfg["overlap"] = int(model_meta.default_overlap)
+
+    # Compatibility aliases for older presets/components.
+    cfg["dtype"] = cfg.get("precision", "auto")
+    cfg["attention"] = cfg.get("attention_mode", "sparse_sage_attention")
+    cfg["quality"] = cfg.get("crf", 18)
+
     return cfg
 
 
@@ -460,11 +617,19 @@ def build_flashvsr_callbacks(
                 settings["batch_enable"] = False
             use_global_resolution = bool(settings.get("use_resolution_tab", True))
             
-            # Apply shared Resolution & Scene Split tab settings (vNext Upscale-x)
+            # Apply shared Resolution tab scale with FlashVSR backend limits (2x or 4x only).
             if use_global_resolution:
                 if seed_controls.get("upscale_factor_val") is not None:
                     try:
-                        settings["upscale_factor"] = float(seed_controls["upscale_factor_val"])
+                        global_scale = float(seed_controls["upscale_factor_val"])
+                        fixed_scale = _nearest_supported_scale(global_scale, _to_int(settings.get("scale", 4), 4))
+                        settings["scale"] = str(fixed_scale)
+                        settings["upscale_factor"] = float(fixed_scale)
+                        if abs(global_scale - float(fixed_scale)) > 0.01:
+                            settings["_scale_clamp_note"] = (
+                                f"Resolution tab requested {global_scale:.2f}x; FlashVSR supports only 2x/4x, "
+                                f"so {fixed_scale}x will be used."
+                            )
                     except Exception:
                         pass
                 if seed_controls.get("max_resolution_val") is not None:
@@ -472,6 +637,14 @@ def build_flashvsr_callbacks(
                 # Repurposed global flag: "pre-downscale then upscale when capped"
                 if "ratio_downscale" in seed_controls:
                     settings["pre_downscale_then_upscale"] = bool(seed_controls.get("ratio_downscale", False))
+
+            # Runtime auto-VRAM override is intentionally disabled.
+            # Users now apply VRAM recommendations explicitly via the UI button.
+            if settings.get("auto_vram_profile"):
+                settings["_vram_profile_note"] = (
+                    "Auto VRAM Profile checkbox is deprecated. "
+                    "Use 'Auto Set by VRAM' in the UI to apply recommendations."
+                )
             
             # Apply Output tab cached settings
             if seed_controls.get("fps_override_val") is not None and seed_controls["fps_override_val"] > 0:
@@ -1321,12 +1494,22 @@ def build_flashvsr_callbacks(
                             )
                             return RunResult(r.returncode, r.output_path, r.log)
 
-                        def _chunk_progress_cb(progress_val, desc=""):
+                        def _chunk_progress_cb(progress_val, desc="", **kwargs):
                             try:
                                 pct = int(float(progress_val) * 100)
                                 progress_queue.put(f"{pct}% {desc}".strip())
                             except Exception:
                                 pass
+                            if str(kwargs.get("phase", "")).strip().lower() == "completed":
+                                try:
+                                    run_root = Path(
+                                        settings.get("_run_dir")
+                                        or global_settings.get("output_dir", output_dir)
+                                    )
+                                    seed_controls["flashvsr_chunk_preview"] = build_chunk_preview_payload(str(run_root))
+                                    state["seed_controls"] = dict(seed_controls)
+                                except Exception:
+                                    pass
 
                         rc, clog, final_output, chunk_count = chunk_and_process(
                             runner=_CancelProbe(),
@@ -1366,8 +1549,55 @@ def build_flashvsr_callbacks(
             # Apply face restoration if enabled (per-run toggle OR global setting)
             
             # Stream progress updates
+            run_started_ts = time.time()
             last_update = time.time()
             log_buffer = []
+            live_progress_pct: Optional[float] = None
+            live_progress_desc = ""
+
+            def _strip_ansi(text: str) -> str:
+                try:
+                    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+                except Exception:
+                    return text
+
+            def _extract_progress(msg_text: str) -> Tuple[Optional[float], str]:
+                text = _strip_ansi(str(msg_text or "")).strip()
+                if not text:
+                    return None, ""
+
+                pct: Optional[float] = None
+                m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+                if m:
+                    try:
+                        pct = max(0.0, min(100.0, float(m.group(1)))) / 100.0
+                    except Exception:
+                        pct = None
+                else:
+                    m = re.search(r"Processed:\s*(\d+)\s*/\s*(\d+)", text, flags=re.IGNORECASE)
+                    if m:
+                        try:
+                            num = int(m.group(1))
+                            den = max(1, int(m.group(2)))
+                            pct = max(0.0, min(1.0, float(num) / float(den)))
+                        except Exception:
+                            pct = None
+                    else:
+                        m = re.search(r"Processing:\s*(\d+)\s*/\s*(\d+)", text, flags=re.IGNORECASE)
+                        if m:
+                            try:
+                                num = int(m.group(1))
+                                den = max(1, int(m.group(2)))
+                                pct = max(0.0, min(1.0, float(num) / float(den)))
+                            except Exception:
+                                pct = None
+
+                return pct, text
+
+            if settings.get("_vram_profile_note"):
+                log_buffer.append(str(settings.get("_vram_profile_note")))
+            if settings.get("_scale_clamp_note"):
+                log_buffer.append(str(settings.get("_scale_clamp_note")))
             
             while thread.is_alive() or not progress_queue.empty():
                 # Check for cancellation
@@ -1431,14 +1661,27 @@ def build_flashvsr_callbacks(
                 try:
                     msg = progress_queue.get(timeout=0.1)
                     log_buffer.append(msg)
-                    
-                    # Update gr.Progress from messages
-                    if progress and "%" in msg:
-                        import re
-                        match = re.search(r'(\d+)%', msg)
-                        if match:
-                            pct = int(match.group(1)) / 100.0
-                            progress(pct, desc=msg[:100])
+                    pct_val, msg_clean = _extract_progress(msg)
+
+                    if msg_clean:
+                        msg_lc = msg_clean.lower()
+                        has_real_hint = (
+                            pct_val is not None
+                            or "processed:" in msg_lc
+                            or msg_lc.startswith("processing:")
+                            or "eta:" in msg_lc
+                            or "speed:" in msg_lc
+                        )
+                        if has_real_hint:
+                            live_progress_desc = msg_clean
+
+                    if pct_val is not None:
+                        if live_progress_pct is None:
+                            live_progress_pct = pct_val
+                        else:
+                            live_progress_pct = max(live_progress_pct, pct_val)
+                        if progress:
+                            progress(pct_val, desc=(msg_clean or str(msg))[:100])
                     
                 except queue.Empty:
                     pass
@@ -1448,8 +1691,15 @@ def build_flashvsr_callbacks(
                 if now - last_update > 0.5:
                     last_update = now
                     vid_upd, img_upd = _media_updates(None)
+                    elapsed_s = int(now - run_started_ts)
+                    if live_progress_desc:
+                        status_live = f"⚙️ {live_progress_desc} | UI elapsed {elapsed_s}s"
+                    elif live_progress_pct is not None:
+                        status_live = f"⚙️ FlashVSR processing... {int(live_progress_pct * 100)}% ({elapsed_s}s)"
+                    else:
+                        status_live = f"⚙️ FlashVSR processing... {elapsed_s}s elapsed"
                     yield (
-                        "⚙️ Processing with FlashVSR+...",
+                        status_live,
                         "\n".join(log_buffer[-50:]),
                         vid_upd,
                         img_upd,

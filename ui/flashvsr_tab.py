@@ -12,7 +12,12 @@ import threading
 import time
 
 from shared.services.flashvsr_service import (
-    build_flashvsr_callbacks, FLASHVSR_ORDER
+    build_flashvsr_callbacks,
+    FLASHVSR_ORDER,
+    FLASHVSR_VAE_OPTIONS,
+    FLASHVSR_PRECISION_OPTIONS,
+    FLASHVSR_ATTENTION_OPTIONS,
+    FLASHVSR_CODEC_OPTIONS,
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
@@ -29,6 +34,7 @@ from shared.queue_state import (
     snapshot_global_settings,
     merge_payload_state,
 )
+from shared.gpu_utils import get_gpu_info, get_global_gpu_override
 
 
 def flashvsr_tab(
@@ -92,7 +98,7 @@ def flashvsr_tab(
         cuda_available = cuda_count > 0
         
         if cuda_available:
-            gpu_hint = f" Detected {cuda_count} CUDA GPU(s) - GPU acceleration available\n FlashVSR+ uses single GPU only (multi-GPU not supported)"
+            gpu_hint = f" Detected {cuda_count} CUDA GPU(s) - GPU acceleration available\n FlashVSR uses single GPU only (multi-GPU not supported)"
         else:
             gpu_hint = " CUDA not detected (nvidia-smi unavailable or no NVIDIA GPU) - Processing will use CPU (significantly slower)"
     except Exception as e:
@@ -101,8 +107,8 @@ def flashvsr_tab(
 
     # Layout
     with gr.Row(equal_height=True):
-        gr.Markdown("###  FlashVSR+ - Real-Time Diffusion Video Super-Resolution")
-        gr.Markdown("*High-quality real-time video upscaling with diffusion models*")
+        gr.Markdown("### FlashVSR Stable - Diffusion Video Super-Resolution (ComfyUI Backend)")
+        gr.Markdown("*2x/4x upscaling with 5 VAE options, VRAM-aware tuning, and advanced controls*")
     
     # Show GPU warning if not available
     if not cuda_available:
@@ -110,7 +116,7 @@ def flashvsr_tab(
             f'<div style="background: #fff3cd; padding: 12px; border-radius: 8px; border: 1px solid #ffc107;">'
             f'<strong> GPU Acceleration Unavailable</strong><br>'
             f'{gpu_hint}<br><br>'
-            f'FlashVSR+ requires CUDA for optimal performance. CPU mode is extremely slow.'
+            f'FlashVSR is designed for CUDA GPUs. CPU mode is possible but very slow.'
             f'</div>',
             elem_classes="warning-text"
         )
@@ -136,34 +142,44 @@ def flashvsr_tab(
                         )
 
                     with gr.Column(scale=2):
-                        # Hidden model scale: FlashVSR pipeline runs fixed model scale internally.
-                        # UI keeps only Upscale-x controls in the right column as requested.
                         scale = gr.Dropdown(
-                            label="Upscale Factor",
+                            label="Backend Upscale Factor (2x/4x)",
                             choices=["2", "4"],
-                            value="4",
+                            value="2" if str(_value("scale", "4")).strip() == "2" else "4",
                             visible=False,
-                            interactive=False,
+                            interactive=True,
                         )
                         version = gr.Dropdown(
                             label="Model Version",
                             choices=["1.0", "1.1"],
                             value=flashvsr_version_to_ui(_value("version", "1.1")),
-                            info="1.0 = faster, 1.1 = higher quality"
+                            info="1.1 = latest recommended model folder (`FlashVSR-v1.1`), 1.0 = legacy (`FlashVSR`)."
                         )
                         mode = gr.Dropdown(
                             label="Pipeline Mode",
                             choices=["tiny", "tiny-long", "full"],
                             value=(
-                                str(_value("mode", "tiny-long"))
-                                if str(_value("mode", "tiny-long")) in {"tiny", "tiny-long", "full"}
-                                else "tiny-long"
+                                str(_value("mode", "tiny"))
+                                if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"}
+                                else "tiny"
                             ),
                             info=(
-                                "All modes use streaming temporal steps (warmup about 25 frames, then ~8-frame advances). "
-                                "tiny/full keep the whole clip or chunk in RAM, while tiny-long streams input/output with a small frame buffer "
-                                "(better for long clips). For long videos, use Resolution tab chunking (auto scenes or fixed seconds)."
+                                "`tiny` = best default balance. `tiny-long` = lowest VRAM for long clips. "
+                                "`full` = maximum quality but highest VRAM usage."
                             )
+                        )
+                        vae_model = gr.Dropdown(
+                            label="VAE Model",
+                            choices=list(FLASHVSR_VAE_OPTIONS),
+                            value=(
+                                str(_value("vae_model", "Wan2.2"))
+                                if str(_value("vae_model", "Wan2.2")) in set(FLASHVSR_VAE_OPTIONS)
+                                else "Wan2.2"
+                            ),
+                            info=(
+                                "Choose quality vs VRAM tradeoff: Wan2.1/Wan2.2 = highest quality; "
+                                "LightVAE/LightTAE = much lower VRAM and faster."
+                            ),
                         )
 
                     with gr.Column(scale=2):
@@ -188,28 +204,103 @@ def flashvsr_tab(
             # vNext sizing controls are placed in the right column to mirror SeedVR2 layout.
 
             # Processing Settings
-            gr.Markdown("####  Processing Settings")
+            gr.Markdown("#### Core Runtime Settings")
             
             with gr.Group():
                 with gr.Row():
-                    dtype = gr.Dropdown(
+                    precision = gr.Dropdown(
                         label="Precision",
-                        choices=["fp16", "bf16"],
-                        value=str(_value("dtype", "bf16")) if str(_value("dtype", "bf16")) in {"fp16", "bf16"} else "bf16",
-                        info="bf16 = faster, more stable. fp16 = broader compatibility"
+                        choices=list(FLASHVSR_PRECISION_OPTIONS),
+                        value=(
+                            str(_value("precision", _value("dtype", "bf16")))
+                            if str(_value("precision", _value("dtype", "bf16"))) in set(FLASHVSR_PRECISION_OPTIONS)
+                            else "bf16"
+                        ),
+                        info="Default is `bf16`. Use `auto` to let backend fall back to fp16 when needed."
                     )
                     
-                    attention = gr.Dropdown(
-                        label="Attention Mode",
-                        choices=["sage", "block"],
-                        value=str(_value("attention", "sage")) if str(_value("attention", "sage")) in {"sage", "block"} else "sage",
-                        info="sage = default, block = alternative implementation"
+                    attention_mode = gr.Dropdown(
+                        label="Attention Backend",
+                        choices=list(FLASHVSR_ATTENTION_OPTIONS),
+                        value=(
+                            str(_value("attention_mode", _value("attention", "sparse_sage_attention")))
+                            if str(_value("attention_mode", _value("attention", "sparse_sage_attention"))) in set(FLASHVSR_ATTENTION_OPTIONS)
+                            else "sparse_sage_attention"
+                        ),
+                        info="Recommended: `sparse_sage_attention` for VRAM/speed balance."
                     )
                     seed = gr.Number(
                         label="Random Seed",
                         value=_value("seed", 0),
                         precision=0,
-                        info="Seed for reproducibility. 0 = random"
+                        info="Seed for reproducibility."
+                    )
+
+                with gr.Row():
+                    frame_chunk_size = gr.Slider(
+                        label="Frame Chunk Size",
+                        minimum=0,
+                        maximum=10000,
+                        step=1,
+                        value=int(_value("frame_chunk_size", 0) or 0),
+                        info="0 = process all frames at once. Use 16-100 to reduce VRAM usage on long clips.",
+                    )
+                    resize_factor = gr.Slider(
+                        label="Resize Factor (Preprocess)",
+                        minimum=0.1,
+                        maximum=1.0,
+                        step=0.1,
+                        value=float(_value("resize_factor", 1.0) or 1.0),
+                        info="Downscale input before FlashVSR. 0.5 can significantly reduce VRAM usage.",
+                    )
+                    local_range = gr.Dropdown(
+                        label="Local Range",
+                        choices=[9, 11],
+                        value=9 if str(_value("local_range", 11)).strip() == "9" else 11,
+                        info="9 = sharper details, 11 = more stable temporal consistency.",
+                    )
+
+                with gr.Row():
+                    sparse_ratio = gr.Slider(
+                        label="Sparse Ratio",
+                        minimum=1.5,
+                        maximum=2.0,
+                        step=0.1,
+                        value=float(_value("sparse_ratio", 2.0) or 2.0),
+                        info="Sparse attention control. 2.0 recommended for quality/stability.",
+                    )
+                    kv_ratio = gr.Slider(
+                        label="KV Ratio",
+                        minimum=1.0,
+                        maximum=3.0,
+                        step=0.1,
+                        value=float(_value("kv_ratio", 3.0) or 3.0),
+                        info="KV cache ratio. Higher values preserve more detail but use more memory.",
+                    )
+                    auto_set_vram_btn = gr.Button(
+                        "Auto Set by VRAM",
+                        variant="secondary",
+                        elem_classes=["action-btn", "action-btn-auto-vram"],
+                    )
+                auto_set_status = gr.Markdown("", visible=False)
+                # Deprecated schema field kept for preset/backward compatibility.
+                auto_vram_profile = gr.State(False)
+
+                with gr.Row():
+                    keep_models_on_cpu = gr.Checkbox(
+                        label="Keep Models on CPU",
+                        value=bool(_value("keep_models_on_cpu", True)),
+                        info="Recommended ON for 8-16GB GPUs to reduce VRAM pressure.",
+                    )
+                    force_offload = gr.Checkbox(
+                        label="Force Offload After Run",
+                        value=bool(_value("force_offload", True)),
+                        info="Force model offload to system RAM after execution.",
+                    )
+                    enable_debug = gr.Checkbox(
+                        label="Enable Debug Logging",
+                        value=bool(_value("enable_debug", False)),
+                        info="Verbose backend logging (timings, memory behavior, diagnostics).",
                     )
                 gr.Markdown(
                     "**GPU Device:** Controlled globally from the top app header selector. "
@@ -218,67 +309,101 @@ def flashvsr_tab(
                 device = gr.State(str(_value("device", "auto") or "auto"))
             
             # Memory Optimization
-            gr.Markdown("####  Memory Optimization (Tiling)")
+            gr.Markdown("#### Memory Optimization (Tiling)")
             
             with gr.Group():
                 with gr.Row():
                     tiled_vae = gr.Checkbox(
                         label="Enable VAE Tiling",
                         value=bool(_value("tiled_vae", True)),
-                        info="Reduce VRAM usage during VAE encoding/decoding. Essential for high resolutions."
+                        info="Splits VAE processing into tiles to reduce VRAM. Usually recommended."
                     )
                     
                     tiled_dit = gr.Checkbox(
                         label="Enable DiT Tiling",
                         value=bool(_value("tiled_dit", True)),
-                        info="Reduce VRAM usage during diffusion inference. Enables processing larger videos."
+                        info="Splits diffusion transformer inference into tiles. Useful for limited VRAM and 4x runs."
                     )
                     
                     unload_dit = gr.Checkbox(
                         label="Unload DiT Before Decoding",
-                        value=bool(_value("unload_dit", True)),
-                        info="Free VRAM before VAE decoding. Slower but uses less memory."
+                        value=bool(_value("unload_dit", False)),
+                        info="Releases DiT from VRAM before VAE decode. Slower, but helps avoid OOM."
                     )
 
                 with gr.Row():
                     tile_size = gr.Slider(
                         label="Tile Size",
-                        minimum=128, maximum=512, step=32,
+                        minimum=32, maximum=1024, step=32,
                         value=int(_value("tile_size", 256) or 256),
-                        info="Size of each tile. Larger = faster but more VRAM"
+                        info="Larger tiles are faster but use more VRAM. 256 is a balanced default."
                     )
                     
                     overlap = gr.Slider(
                         label="Tile Overlap",
-                        minimum=8, maximum=64, step=8,
+                        minimum=8, maximum=512, step=8,
                         value=int(_value("overlap", 24) or 24),
-                        info="Overlap between tiles to reduce seams. Higher = smoother"
+                        info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
                     )
             
-            # Quality Settings
-            gr.Markdown("####  Quality Settings")
+            # Quality / I/O Settings
+            gr.Markdown("#### Output / I/O Settings")
             
             with gr.Group():
                 with gr.Row():
                     color_fix = gr.Checkbox(
                         label="Color Correction",
                         value=bool(_value("color_fix", True)),
-                        info="Maintain color accuracy. Recommended ON."
+                        info="Wavelet color transfer. Recommended ON unless you intentionally want different colors."
                     )
                     
                     fps_flashvsr = gr.Number(
-                        label="Output FPS (image sequences only)",
-                        value=int(_value("fps", 30) or 30),
-                        precision=0,
-                        info="Frame rate for image sequence outputs. Ignored for video inputs."
+                        label="Output FPS Override",
+                        value=float(_value("fps", 0.0) or 0.0),
+                        precision=2,
+                        info="0 = keep source FPS. Set a positive value to force output FPS."
                     )
                     
-                    quality = gr.Slider(
-                        label="Video Quality",
-                        minimum=1, maximum=10, step=1,
-                        value=int(_value("quality", 6) or 6),
-                        info="Output quality. 1 = lowest, 10 = highest. 6 is recommended."
+                    codec = gr.Dropdown(
+                        label="Video Codec",
+                        choices=list(FLASHVSR_CODEC_OPTIONS),
+                        value=(
+                            str(_value("codec", "libx264"))
+                            if str(_value("codec", "libx264")) in set(FLASHVSR_CODEC_OPTIONS)
+                            else "libx264"
+                        ),
+                        info="Encoder backend used by FlashVSR CLI for generated video.",
                     )
+
+                with gr.Row():
+                    crf = gr.Slider(
+                        label="CRF Quality (Lower = Better)",
+                        minimum=0, maximum=51, step=1,
+                        value=int(_value("crf", _value("quality", 18)) or 18),
+                        info="Typical range: 16-22. Lower values increase quality and file size."
+                    )
+                    start_frame = gr.Number(
+                        label="Start Frame",
+                        value=int(_value("start_frame", 0) or 0),
+                        precision=0,
+                        info="0-indexed start frame for partial processing."
+                    )
+                    end_frame = gr.Number(
+                        label="End Frame",
+                        value=int(_value("end_frame", -1) or -1),
+                        precision=0,
+                        info="-1 = process until the end of input."
+                    )
+
+                models_dir = gr.Textbox(
+                    label="FlashVSR Models Directory",
+                    value=str(_value("models_dir", str(base_dir / "ComfyUI-FlashVSR_Stable" / "models")) or ""),
+                    placeholder="G:/.../ComfyUI-FlashVSR_Stable/models",
+                    info=(
+                        "Folder containing `FlashVSR` and/or `FlashVSR-v1.1` subfolders. "
+                        "VAE files can auto-download if missing."
+                    ),
+                )
 
                 output_override = gr.Textbox(
                     label="Output Override (folder or .mp4 file)",
@@ -292,7 +417,7 @@ def flashvsr_tab(
                         label="Output Format",
                         choices=["mp4"],
                         value=str(_value("output_format", "mp4") or "mp4"),
-                        info="FlashVSR+ currently outputs MP4.",
+                        info="FlashVSR Stable CLI outputs MP4.",
                         interactive=False,
                     )
                     save_metadata = gr.Checkbox(
@@ -339,7 +464,7 @@ def flashvsr_tab(
                     _upscale_factor_default = float(_upscale_factor_default)
                 except Exception:
                     _upscale_factor_default = 4.0
-                _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
+                _upscale_factor_default = 2.0 if _upscale_factor_default <= 3.0 else 4.0
 
                 _max_resolution_default = _value("max_target_resolution", 1920)
                 try:
@@ -350,12 +475,12 @@ def flashvsr_tab(
 
                 with gr.Row():
                     upscale_factor = gr.Slider(
-                        label="Upscale x (any factor)",
-                        minimum=1.0,
-                        maximum=9.9,
-                        step=0.1,
+                        label="FlashVSR Upscale Factor",
+                        minimum=2.0,
+                        maximum=4.0,
+                        step=2.0,
                         value=_upscale_factor_default,
-                        info="e.g., 4.0 = 4x. Target size is computed from input, then capped by Max Resolution (max edge).",
+                        info="FlashVSR backend supports only 2x or 4x.",
                         scale=2,
                     )
                     max_target_resolution = gr.Slider(
@@ -377,7 +502,7 @@ def flashvsr_tab(
                 use_resolution_tab = gr.Checkbox(
                     label="Use Resolution & Scene Split Tab Settings",
                     value=bool(_value("use_resolution_tab", True)),
-                    info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from Resolution tab. Recommended ON.",
+                    info="Apply Resolution tab sizing controls. Non-2x/4x global ratios are auto-clamped to 2x or 4x.",
                 )
 
                 with gr.Row():
@@ -518,26 +643,35 @@ def flashvsr_tab(
             
             # Info
             gr.Markdown("""
-            ####  About FlashVSR+
-            
-            **Real-time Diffusion Video SR:**
-            - Streaming processing for memory efficiency
-            - Multiple pipeline modes for speed/quality tradeoff
-            - Automatic model download from HuggingFace
-            
-            **Recommended Settings:**
-            - Mode: `tiny` = fastest, `tiny-long` = safer for long clips, `full` = highest quality/heaviest
-            - For long videos, enable Resolution tab chunking (Auto Chunk by scenes, or fixed Chunk Size in seconds)
-            - Enable tiling for high-res or limited VRAM
-            - Use color fix for accurate colors
+            #### FlashVSR Stable Guide
+
+            **VAE selection**
+            - `Wan2.1` / `Wan2.2`: best quality, highest VRAM demand.
+            - `LightVAE_W2.1`: lower VRAM + faster; strong default for 8-16GB GPUs.
+            - `TAE_W2.2` / `LightTAE_HY1.5`: strong temporal consistency and low VRAM variants.
+
+            **VRAM profile recommendations**
+            - `24GB+`: `full`, Wan2.x, tiling OFF, chunk size 0.
+            - `16GB`: `tiny`, Wan2.1, VAE tiling ON, optional chunking.
+            - `12GB`: `tiny`, LightVAE, VAE+DiT tiling ON, chunk size around 32-64.
+            - `8GB`: `tiny-long`, LightVAE/LightTAE, tiling ON, chunk size around 16-32, resize factor 0.5-0.8.
+            - Use **Auto Set by VRAM** to apply these recommendations once, then fine-tune manually.
+
+            **Important backend limits**
+            - FlashVSR supports only **2x** or **4x** upscale factors.
+            - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
+            - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
             """)
     
     # Collect inputs
     inputs_list = [
         input_path, output_override, output_format, scale, version, mode,
+        vae_model, precision, attention_mode,
         tiled_vae, tiled_dit, tile_size, overlap, unload_dit,
-        color_fix, seed, dtype, device, fps_flashvsr,
-        quality, attention, save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
+        sparse_ratio, kv_ratio, local_range, frame_chunk_size, resize_factor,
+        keep_models_on_cpu, force_offload, enable_debug,
+        color_fix, seed, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir, auto_vram_profile,
+        save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
     ]
@@ -613,8 +747,8 @@ def flashvsr_tab(
             local_max_edge=int(local_max_edge or 0),
             local_pre_down=bool(local_pre_down),
             state=state,
-            model_label="FlashVSR+",
-            runtime_label=f"FlashVSR+ pipeline (fixed {ms}x pass)",
+            model_label="FlashVSR Stable",
+            runtime_label=f"FlashVSR Stable pipeline (fixed {ms}x pass)",
             auto_scene_scan=True,
         )
 
@@ -840,14 +974,15 @@ def flashvsr_tab(
             trigger_mode="always_last",
         )
 
-    def _lock_flashvsr_scale(scale_val):
-        if str(scale_val).strip() == "4":
-            return gr.skip()
-        return gr.update(value="4")
+    def _sync_scale_from_upscale(local_x):
+        try:
+            return gr.update(value=("2" if float(local_x) <= 3.0 else "4"))
+        except Exception:
+            return gr.update(value="4")
 
-    scale.change(
-        fn=_lock_flashvsr_scale,
-        inputs=[scale],
+    upscale_factor.change(
+        fn=_sync_scale_from_upscale,
+        inputs=[upscale_factor],
         outputs=[scale],
         queue=False,
         show_progress="hidden",
@@ -872,6 +1007,120 @@ def flashvsr_tab(
             gr.update(value=message, visible=bool(message or gallery)),
             gr.update(value=gallery, visible=bool(gallery)),
             gr.update(value=first_video, visible=bool(first_video)),
+        )
+
+    def _resolve_vram_for_selected_device(state: Dict[str, Any]) -> tuple[str, float | None]:
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        device_value = str(get_global_gpu_override(seed_controls, global_settings) or "auto").strip().lower()
+        if device_value == "cpu":
+            return "cpu", None
+        try:
+            gpus = get_gpu_info()
+        except Exception:
+            gpus = []
+        if not gpus:
+            return device_value or "auto", None
+        if device_value in {"", "auto", "cuda"}:
+            return "cuda:0", float(gpus[0].total_memory_gb)
+        if device_value.startswith("cuda:"):
+            idx = device_value.split(":", 1)[1].strip()
+            if idx.isdigit():
+                gpu_idx = int(idx)
+                if 0 <= gpu_idx < len(gpus):
+                    return f"cuda:{gpu_idx}", float(gpus[gpu_idx].total_memory_gb)
+        if device_value.isdigit():
+            gpu_idx = int(device_value)
+            if 0 <= gpu_idx < len(gpus):
+                return f"cuda:{gpu_idx}", float(gpus[gpu_idx].total_memory_gb)
+        return "cuda:0", float(gpus[0].total_memory_gb)
+
+    def _auto_set_by_vram(state, scale_val):
+        scale_i = 2 if str(scale_val).strip() == "2" else 4
+        device_label, vram_gb = _resolve_vram_for_selected_device(state)
+
+        if device_label == "cpu":
+            mode_val = "tiny-long"
+            vae_val = "LightVAE_W2.1"
+            precision_val = "auto"
+            tiled_vae_val = True
+            tiled_dit_val = True
+            frame_chunk_val = 20 if scale_i == 4 else 40
+            resize_val = 0.6 if scale_i == 4 else 0.8
+            keep_cpu_val = True
+            force_offload_val = True
+            msg = (
+                "Auto set applied for CPU mode: `tiny-long`, `LightVAE_W2.1`, aggressive memory settings."
+            )
+        elif vram_gb is None:
+            mode_val = "tiny"
+            vae_val = "Wan2.1"
+            precision_val = "auto"
+            tiled_vae_val = True
+            tiled_dit_val = False
+            frame_chunk_val = 64 if scale_i == 4 else 0
+            resize_val = 1.0
+            keep_cpu_val = True
+            force_offload_val = True
+            msg = (
+                "Auto set used safe defaults (VRAM unknown): `tiny`, `Wan2.1`, VAE tiling ON."
+            )
+        elif vram_gb >= 24.0:
+            mode_val = "full"
+            vae_val = "Wan2.2"
+            precision_val = "auto"
+            tiled_vae_val = False
+            tiled_dit_val = False
+            frame_chunk_val = 0
+            resize_val = 1.0
+            keep_cpu_val = False
+            force_offload_val = False
+            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): high-quality `full` profile."
+        elif vram_gb >= 16.0:
+            mode_val = "tiny"
+            vae_val = "Wan2.1"
+            precision_val = "auto"
+            tiled_vae_val = True
+            tiled_dit_val = False
+            frame_chunk_val = 64 if scale_i == 4 else 0
+            resize_val = 1.0
+            keep_cpu_val = True
+            force_offload_val = True
+            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): balanced `tiny` profile."
+        elif vram_gb >= 12.0:
+            mode_val = "tiny"
+            vae_val = "LightVAE_W2.1"
+            precision_val = "fp16"
+            tiled_vae_val = True
+            tiled_dit_val = True
+            frame_chunk_val = 48 if scale_i == 4 else 80
+            resize_val = 1.0
+            keep_cpu_val = True
+            force_offload_val = True
+            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): low-VRAM quality profile."
+        else:
+            mode_val = "tiny-long"
+            vae_val = "LightVAE_W2.1"
+            precision_val = "fp16"
+            tiled_vae_val = True
+            tiled_dit_val = True
+            frame_chunk_val = 20 if scale_i == 4 else 40
+            resize_val = 0.6 if scale_i == 4 else 0.8
+            keep_cpu_val = True
+            force_offload_val = True
+            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): conservative `tiny-long` profile."
+
+        return (
+            gr.update(value=mode_val),
+            gr.update(value=vae_val),
+            gr.update(value=precision_val),
+            gr.update(value=tiled_vae_val),
+            gr.update(value=tiled_dit_val),
+            gr.update(value=frame_chunk_val),
+            gr.update(value=resize_val),
+            gr.update(value=keep_cpu_val),
+            gr.update(value=force_offload_val),
+            False,
+            gr.update(value=msg, visible=True),
         )
 
     def on_chunk_gallery_select(evt: gr.SelectData, state):
@@ -1166,6 +1415,34 @@ def flashvsr_tab(
         fn=refresh_chunk_preview_ui,
         inputs=[shared_state],
         outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+    )
+
+    shared_state.change(
+        fn=refresh_chunk_preview_ui,
+        inputs=[shared_state],
+        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    auto_set_vram_btn.click(
+        fn=_auto_set_by_vram,
+        inputs=[shared_state, scale],
+        outputs=[
+            mode,
+            vae_model,
+            precision,
+            tiled_vae,
+            tiled_dit,
+            frame_chunk_size,
+            resize_factor,
+            keep_models_on_cpu,
+            force_offload,
+            auto_vram_profile,
+            auto_set_status,
+        ],
+        queue=False,
+        show_progress="hidden",
     )
 
     def _cancel_with_confirmation_reset(ok):

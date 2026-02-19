@@ -126,12 +126,36 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Dropdown-safe values to avoid Gradio "value not in choices" errors.
     cfg["output_format"] = "mp4"
     scale_raw = str(cfg.get("scale", "4")).strip()
     cfg["scale"] = "2" if scale_raw == "2" else "4"
+    cfg["upscale_factor"] = 2.0 if cfg["scale"] == "2" else 4.0
     cfg["version"] = flashvsr_version_to_ui(cfg.get("version", "1.0"))
-    cfg["mode"] = str(cfg.get("mode", "tiny") or "tiny")
+    mode_raw = str(cfg.get("mode", "tiny") or "tiny").strip().lower()
+    cfg["mode"] = mode_raw if mode_raw in {"tiny", "tiny-long", "full"} else "tiny"
+    precision_raw = str(cfg.get("precision", cfg.get("dtype", "auto")) or "auto").strip().lower()
+    cfg["precision"] = precision_raw if precision_raw in {"auto", "bf16", "fp16"} else "auto"
+    cfg["dtype"] = cfg["precision"]
+    att_raw = str(cfg.get("attention_mode", cfg.get("attention", "sparse_sage_attention")) or "sparse_sage_attention").strip().lower()
+    if att_raw in {"sage", "sparse_sage", "sparse_sage_attention"}:
+        cfg["attention_mode"] = "sparse_sage_attention"
+    elif att_raw in {"block", "block_sparse", "block_sparse_attention"}:
+        cfg["attention_mode"] = "block_sparse_attention"
+    elif att_raw in {"flash_attn_2", "flash_attention_2"}:
+        cfg["attention_mode"] = "flash_attention_2"
+    else:
+        cfg["attention_mode"] = "sdpa" if att_raw == "sdpa" else "sparse_sage_attention"
+    cfg["attention"] = cfg["attention_mode"]
+    vae_raw = str(cfg.get("vae_model", "Wan2.1") or "Wan2.1").strip()
+    if vae_raw not in {"Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"}:
+        vae_raw = "Wan2.1"
+    cfg["vae_model"] = vae_raw
+    cfg["codec"] = str(cfg.get("codec", "libx264") or "libx264").strip() or "libx264"
+    try:
+        cfg["crf"] = max(0, min(51, int(float(cfg.get("crf", cfg.get("quality", 18)) or 18))))
+    except Exception:
+        cfg["crf"] = 18
+    cfg["quality"] = cfg["crf"]
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
     return cfg

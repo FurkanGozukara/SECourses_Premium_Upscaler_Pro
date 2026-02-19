@@ -228,10 +228,10 @@ def seedvr2_tab(
             # with old presets, but hide it from the UI. The runtime `resolution`
             # passed to SeedVR2 CLI is computed from `upscale_factor` + input size.
             resolution = gr.Number(
-                label="(Legacy) Target Resolution (short side) [internal]",
+                label="Legacy Target Resolution (short side)",
                 value=values[9],  # Kept for old presets; NOT used for sizing anymore
                 precision=0,
-                visible=False,
+                info="Legacy preset field retained for backward compatibility. Active sizing is driven by Upscale-x controls.",
                 interactive=False,
             )
 
@@ -1173,15 +1173,9 @@ def seedvr2_tab(
             )
         except Exception:
             pass
-        try:
-            max_i = int(max_res_val) if max_res_val is not None else int(
-                state.get("seed_controls", {}).get("max_resolution_val", 0) or 0
-            )
-            state["seed_controls"]["max_resolution_val"] = max_i
-            if max_i > 0:
-                state["seed_controls"]["enable_max_target"] = True
-        except Exception:
-            pass
+        # Global max-resolution propagation is removed; keep max cap local to each upscaler tab.
+        state["seed_controls"].pop("max_resolution_val", None)
+        state["seed_controls"].pop("enable_max_target", None)
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
         state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
 
@@ -1234,15 +1228,9 @@ def seedvr2_tab(
             )
         except Exception:
             pass
-        try:
-            max_i = int(max_res_val) if max_res_val is not None else int(
-                state.get("seed_controls", {}).get("max_resolution_val", 0) or 0
-            )
-            state["seed_controls"]["max_resolution_val"] = max_i
-            if max_i > 0:
-                state["seed_controls"]["enable_max_target"] = True
-        except Exception:
-            pass
+        # Global max-resolution propagation is removed; keep max cap local to each upscaler tab.
+        state["seed_controls"].pop("max_resolution_val", None)
+        state["seed_controls"].pop("enable_max_target", None)
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
         state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
 
@@ -1316,14 +1304,12 @@ def seedvr2_tab(
         if max_i is None or max_i < 0 or max_i > 8192:
             return gr.update(), state
 
-        # Cache globally (used by other tabs/services)
+        # Cache shared non-max values. Max cap remains local per upscaler tab.
         state["seed_controls"]["upscale_factor_val"] = scale_f
-        state["seed_controls"]["max_resolution_val"] = max_i
+        state["seed_controls"].pop("max_resolution_val", None)
+        state["seed_controls"].pop("enable_max_target", None)
         state["seed_controls"]["ratio_downscale"] = bool(pre_down)
         state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
-        # vNext UX: a non-zero max_resolution means "cap enabled". Ensure the legacy flag can't block it.
-        if max_i and max_i > 0:
-            state["seed_controls"]["enable_max_target"] = True
 
         # Also mirror into per-model cache for consistency when model-specific settings are used.
         try:

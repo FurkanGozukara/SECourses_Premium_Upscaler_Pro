@@ -22,7 +22,6 @@ def face_defaults(models: List[str]) -> Dict[str, Any]:
     default_backend = available[0] if available else "auto"
     
     return {
-        "model": models[0] if models else "",
         "face_detector": "retinaface",
         "detection_confidence": 0.7,
         "min_face_size": 64,
@@ -52,31 +51,30 @@ def face_defaults(models: List[str]) -> Dict[str, Any]:
 
 FACE_ORDER: List[str] = [
     # IMPORTANT: This order MUST match inputs_list in ui/face_tab.py exactly!
-    # The UI creates components in this exact sequence (lines 344-349 in face_tab.py)
-    "model",                  # 0: model_selector
-    "face_detector",          # 1: face_detector (Face Detection tab)
-    "detection_confidence",   # 2: detection_confidence
-    "min_face_size",          # 3: min_face_size
-    "max_faces",              # 4: max_faces
-    "restoration_model",      # 5: restoration_model (Restoration tab)
-    "face_strength",          # 6: face_strength (Restoration tab)
-    "restore_blindly",        # 7: restore_blindly
-    "upscale_faces",          # 8: upscale_faces
-    "face_padding",           # 9: face_padding (Advanced tab)
-    "use_landmarks",          # 10: face_landmarks (UI name differs)
-    "color_correction",       # 11: color_correction
-    "gpu_acceleration",       # 12: gpu_acceleration
-    "batch_faces",            # 13: batch_face_processing (UI name differs)
-    "output_quality",         # 14: output_quality (Quality tab)
-    "preserve_original",      # 15: preserve_original
-    "artifact_reduction",     # 16: artifact_reduction
-    "save_face_masks",        # 17: save_face_masks
+    # The UI creates components in this exact sequence.
+    "face_detector",          # 0: face_detector (Face Detection tab)
+    "detection_confidence",   # 1: detection_confidence
+    "min_face_size",          # 2: min_face_size
+    "max_faces",              # 3: max_faces
+    "restoration_model",      # 4: restoration_model (Restoration tab)
+    "face_strength",          # 5: face_strength (Restoration tab)
+    "restore_blindly",        # 6: restore_blindly
+    "upscale_faces",          # 7: upscale_faces
+    "face_padding",           # 8: face_padding (Advanced tab)
+    "use_landmarks",          # 9: face_landmarks (UI name differs)
+    "color_correction",       # 10: color_correction
+    "gpu_acceleration",       # 11: gpu_acceleration
+    "batch_faces",            # 12: batch_face_processing (UI name differs)
+    "output_quality",         # 13: output_quality (Quality tab)
+    "preserve_original",      # 14: preserve_original
+    "artifact_reduction",     # 15: artifact_reduction
+    "save_face_masks",        # 16: save_face_masks
     # Standalone processing controls (Face tab)
-    "input_path",             # 18: input_path (standalone)
-    "output_override",        # 19: output_override (standalone)
-    "batch_enable",           # 20: batch_enable (standalone)
-    "batch_input_path",       # 21: batch_input_path (standalone)
-    "batch_output_path",      # 22: batch_output_path (standalone)
+    "input_path",             # 17: input_path (standalone)
+    "output_override",        # 18: output_override (standalone)
+    "batch_enable",           # 19: batch_enable (standalone)
+    "batch_input_path",       # 20: batch_input_path (standalone)
+    "batch_output_path",      # 21: batch_output_path (standalone)
 ]
 
 
@@ -118,7 +116,7 @@ def build_face_callbacks(
 
         try:
             payload = _face_dict_from_args(list(args))
-            model_name = payload["model"]
+            model_name = "default"
             preset_manager.save_preset_safe("face", model_name, preset_name.strip(), payload)
             dropdown = refresh_presets(model_name, select_name=preset_name.strip())
 
@@ -134,16 +132,14 @@ def build_face_callbacks(
         Load a preset.
         
         FIXED: Now returns (*values, status_message) to match UI output expectations.
-        Note: Face tab has special logic - skips model_selector in outputs.
         """
         try:
-            model_name = model_name or defaults["model"]
+            model_name = model_name or "default"
             preset = preset_manager.load_preset_safe("face", model_name, preset_name)
             if preset:
                 preset_manager.set_last_used("face", model_name, preset_name)
 
             defaults_with_model = defaults.copy()
-            defaults_with_model["model"] = model_name
             current_map = dict(zip(FACE_ORDER, current_values))
             values = _apply_face_preset(preset or {}, defaults_with_model, preset_manager, current=current_map)
 
@@ -155,13 +151,13 @@ def build_face_callbacks(
                 pass
 
             # Return values + status message (status is LAST)
-            # Face tab skips model_selector in outputs, so return values[1:] + status
+            
             status_msg = f"✅ Loaded preset '{preset_name}'" if preset else "ℹ️ Preset not found"
-            return (*values[1:], gr.update(value=status_msg))
+            return (*values, gr.update(value=status_msg))
         except Exception as e:
             print(f"Error loading preset {preset_name}: {e}")
-            # Return current values + error status (skip first value for model_selector)
-            return (*current_values[1:], gr.update(value=f"❌ Error: {str(e)}"))
+            # Return current values + error status
+            return (*current_values, gr.update(value=f"❌ Error: {str(e)}"))
 
     def safe_defaults():
         return [defaults[k] for k in FACE_ORDER]
@@ -459,4 +455,5 @@ def build_face_callbacks(
         "cache_strength": lambda *args: cache_strength(*args[:-1], args[-1]) if len(args) > 1 else cache_strength(args[0]),
         "run_action": run_action,
     }
+
 

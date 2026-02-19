@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .path_utils import ensure_dir, sanitize_filename, normalize_path
+from .path_utils import ensure_dir, sanitize_filename, normalize_path, collision_safe_path
 
 
 RUN_CONTEXT_FILENAME = "run_context.json"
@@ -241,6 +241,139 @@ def init_existing_video_run_dir(
         thumbs_dir=thumbs_dir,
         context_path=context_path,
     )
+
+
+def ensure_image_input_artifact(
+    run_dir: Path,
+    image_path: Optional[str],
+    *,
+    preferred_stem: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Ensure the effective image input used for processing is saved under:
+      <run_dir>/pre_processed/
+
+    If the source image is already inside the run directory, it is returned as-is.
+    """
+    if not image_path:
+        return None
+
+    src = Path(normalize_path(str(image_path)))
+    if not src.exists() or (not src.is_file()):
+        return None
+
+    image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+    if src.suffix.lower() not in image_exts:
+        return None
+
+    run_dir = Path(run_dir)
+    ensure_dir(run_dir)
+
+    try:
+        src_resolved = src.resolve()
+        run_resolved = run_dir.resolve()
+        src_resolved.relative_to(run_resolved)
+        return src
+    except Exception:
+        pass
+
+    pre_dir = run_dir / "pre_processed"
+    pre_dir.mkdir(parents=True, exist_ok=True)
+    base_stem = sanitize_filename(str(preferred_stem or src.stem) or "used_input")
+    if not base_stem:
+        base_stem = "used_input"
+    dest = collision_safe_path(pre_dir / f"{base_stem}{src.suffix.lower()}")
+    shutil.copy2(src, dest)
+    return dest
+
+
+def finalize_run_context(
+    run_dir: Path,
+    *,
+    pipeline: str,
+    status: str,
+    returncode: Optional[int],
+    output_path: Optional[str],
+    original_input_path: Optional[str] = None,
+    effective_input_path: Optional[str] = None,
+    preprocessed_input_path: Optional[str] = None,
+    input_kind: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Update/extend run_context.json with final execution details.
+
+    This keeps run folders self-describing for both video and image runs.
+    """
+    run_dir = Path(run_dir)
+    ensure_dir(run_dir)
+    context_path = run_dir / RUN_CONTEXT_FILENAME
+
+    payload: Dict[str, Any] = {}
+    try:
+        if context_path.exists():
+            with context_path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                payload = loaded
+    except Exception:
+        payload = {}
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload.setdefault("created_at", now)
+    if original_input_path:
+        payload.setdefault("input_path", str(original_input_path))
+        payload["original_input_path"] = str(original_input_path)
+    if effective_input_path:
+        payload["effective_input_path"] = str(effective_input_path)
+    if preprocessed_input_path:
+        payload["preprocessed_input_path"] = str(preprocessed_input_path)
+    if input_kind:
+        payload["input_kind"] = str(input_kind)
+
+    payload["pipeline"] = str(pipeline or payload.get("pipeline") or "")
+    payload["last_updated_at"] = now
+    payload["last_status"] = str(status or "")
+    if returncode is not None:
+        try:
+            payload["last_returncode"] = int(returncode)
+        except Exception:
+            payload["last_returncode"] = str(returncode)
+    if output_path:
+        payload["last_output_path"] = str(output_path)
+        try:
+            payload["last_output_exists"] = bool(Path(str(output_path)).exists())
+        except Exception:
+            payload["last_output_exists"] = False
+
+    summary_path = run_dir / "run_summary.json"
+    if summary_path.exists():
+        payload["run_summary_path"] = str(summary_path)
+
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    entry: Dict[str, Any] = {
+        "timestamp": now,
+        "pipeline": payload.get("pipeline", ""),
+        "status": str(status or ""),
+    }
+    if returncode is not None:
+        entry["returncode"] = payload.get("last_returncode")
+    if output_path:
+        entry["output_path"] = str(output_path)
+    if effective_input_path:
+        entry["effective_input_path"] = str(effective_input_path)
+    if preprocessed_input_path:
+        entry["preprocessed_input_path"] = str(preprocessed_input_path)
+    runs.append(entry)
+    payload["runs"] = runs[-25:]
+
+    try:
+        with context_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return context_path
+    except Exception:
+        return None
 
 
 def resolve_resume_input_from_run_dir(run_dir: Path) -> tuple[Optional[Path], Optional[str], str]:

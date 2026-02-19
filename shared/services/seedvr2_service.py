@@ -39,8 +39,9 @@ from shared.chunking import chunk_and_process, check_resume_available
 from shared.output_run_manager import (
     prepare_single_video_run,
     downscaled_video_path,
-    numbered_single_image_output_path,
     resolve_resume_input_from_run_dir,
+    ensure_image_input_artifact,
+    finalize_run_context,
 )
 from shared.ffmpeg_utils import scale_video
 from shared.face_restore import restore_image, restore_video
@@ -769,11 +770,6 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
                 cfg["upscale_factor"] = float(seed_controls["upscale_factor_val"])
             except Exception:
                 pass
-        if seed_controls.get("max_resolution_val") is not None:
-            try:
-                cfg["max_resolution"] = int(seed_controls["max_resolution_val"] or 0)
-            except Exception:
-                pass
         # Repurposed global flag: "pre-downscale then upscale when capped"
         if "ratio_downscale" in seed_controls:
             cfg["pre_downscale_then_upscale"] = bool(seed_controls.get("ratio_downscale", True))
@@ -1006,6 +1002,7 @@ def _process_single_file(
     chunk_progress_msg = ""
     status = "Processing exited unexpectedly"
     audio_already_replaced = False
+    final_returncode: Optional[int] = None
 
     # CONSOLE LOGGING: Print startup info so users can see what's happening
     print("\n" + "=" * 70, flush=True)
@@ -1106,10 +1103,11 @@ def _process_single_file(
         # -----------------------------------------------------------------
         #  Upscale-x sizing (compute SeedVR2 CLI params + optional pre-downscale)
         # -----------------------------------------------------------------
-        # Single-image outputs: enforce sequential numbering in output root
-        # (0001_<orig_stem>.png, 0002_<orig_stem>.png, ...) to avoid overwrites across app instances.
+        # Single-image outputs: keep artifacts inside the per-run output folder.
         try:
             if (not preview_only) and detect_input_type(settings["input_path"]) == "image":
+                run_root = Path(settings.get("_run_dir") or output_dir)
+                run_root.mkdir(parents=True, exist_ok=True)
                 override_raw = (settings.get("output_override") or "").strip()
                 orig_name = settings.get("_original_filename") or Path(settings["input_path"]).name
                 if override_raw:
@@ -1118,30 +1116,22 @@ def _process_single_file(
                         # Explicit file path provided by the user -> honor as-is.
                         settings["output_override"] = str(override_path)
                     else:
-                        # Directory override -> create numbered file inside that directory.
+                        # Directory/root override -> use run-local file name.
                         settings["output_override"] = str(
-                            numbered_single_image_output_path(Path(override_path), str(orig_name), ext=".png")
+                            collision_safe_path(Path(override_path) / f"{Path(orig_name).stem}.png")
                         )
                 else:
-                    # Default outputs folder -> numbered output file.
+                    # Default: per-run folder output path.
                     settings["output_override"] = str(
-                        numbered_single_image_output_path(Path(output_dir), str(orig_name), ext=".png")
+                        collision_safe_path(run_root / f"{Path(orig_name).stem}.png")
                     )
         except Exception:
             pass
 
         try:
-            enable_max_target = bool(seed_controls.get("enable_max_target", True))
             max_edge = int(settings.get("max_resolution", 0) or 0)
-            # vNext UX: non-zero max_resolution means the cap is enabled.
-            # Do NOT let the legacy enable_max_target flag silently disable a user-provided max_resolution.
-            if max_edge > 0:
-                enable_max_target = True
-            if not enable_max_target:
-                max_edge = 0
-
             scale_x = float(settings.get("upscale_factor") or seed_controls.get("upscale_factor_val") or 4.0)
-            pre_down = bool(settings.get("pre_downscale_then_upscale") or seed_controls.get("ratio_downscale", True))
+            pre_down = bool(settings.get("pre_downscale_then_upscale", True))
 
             dims = get_media_dimensions(settings["input_path"])
             if dims:
@@ -1163,8 +1153,8 @@ def _process_single_file(
                 if plan.pre_downscale_then_upscale and plan.preprocess_scale < 0.999999:
                     in_path = settings["input_path"]
                     in_type = detect_input_type(in_path)
-                    temp_root = Path(global_settings.get("temp_dir") or str(Path.cwd() / "temp"))
-                    temp_root.mkdir(parents=True, exist_ok=True)
+                    pre_root = Path(output_dir) / "pre_processed"
+                    pre_root.mkdir(parents=True, exist_ok=True)
 
                     if progress_cb:
                         progress_cb(
@@ -1199,7 +1189,7 @@ def _process_single_file(
                                     interpolation=cv2.INTER_LANCZOS4,
                                 )
                                 pre_out = collision_safe_path(
-                                    temp_root / f"{Path(in_path).stem}_pre{plan.preprocess_width}x{plan.preprocess_height}{Path(in_path).suffix}"
+                                    pre_root / f"{Path(in_path).stem}_pre{plan.preprocess_width}x{plan.preprocess_height}{Path(in_path).suffix}"
                                 )
                                 cv2.imwrite(str(pre_out), resized)
                                 if not pre_out.exists():
@@ -1556,6 +1546,7 @@ def _process_single_file(
                         progress_cb(f"Chunk output discovery failed: {str(e)}\n")
             
             result = RunResult(rc, output_path, clog)
+            final_returncode = int(rc)
         else:
             # Process without external chunking
             # NOTE: SeedVR2 native streaming (--chunk_size in frames) is handled
@@ -1566,6 +1557,7 @@ def _process_single_file(
                 on_progress=lambda x: progress_cb(x) if progress_cb else None,
                 preview_only=preview_only
             )
+            final_returncode = int(result.returncode)
             runner_canceled = bool(getattr(runner, "is_canceled", lambda: False)())
             
             # Add informative message if native streaming is being used
@@ -1802,6 +1794,41 @@ def _process_single_file(
         chunk_summary = "Failed"
         chunk_info_msg = f"Error: {error_msg}"
         chunk_progress_msg = "Error occurred"
+
+    # Keep run folder self-documented for both video and image runs.
+    try:
+        run_dir_raw = settings.get("_run_dir")
+        if run_dir_raw and (not preview_only):
+            final_output_path = output_video or output_image
+            effective_input = settings.get("_effective_input_path") or settings.get("input_path")
+            input_kind_for_ctx = detect_input_type(str(effective_input or ""))
+            pre_in = settings.get("_preprocessed_input_path")
+            if input_kind_for_ctx == "image" and (not pre_in):
+                snap = ensure_image_input_artifact(
+                    Path(run_dir_raw),
+                    str(effective_input or ""),
+                    preferred_stem=Path(settings.get("_original_filename") or "used_input").stem,
+                )
+                if snap:
+                    pre_in = str(snap)
+                    settings["_preprocessed_input_path"] = pre_in
+            finalize_run_context(
+                Path(run_dir_raw),
+                pipeline="seedvr2",
+                status=str(status or ""),
+                returncode=final_returncode,
+                output_path=str(final_output_path) if final_output_path else None,
+                original_input_path=str(
+                    settings.get("_original_input_path_before_preprocess")
+                    or settings.get("input_path")
+                    or ""
+                ),
+                effective_input_path=str(effective_input) if effective_input else None,
+                preprocessed_input_path=str(pre_in) if pre_in else None,
+                input_kind=input_kind_for_ctx,
+            )
+    except Exception:
+        pass
 
     return status, "\n".join(local_logs), output_video, output_image, chunk_info_msg, chunk_summary, chunk_progress_msg
 
@@ -2338,17 +2365,7 @@ def build_seedvr2_callbacks(
         # 1) live seed_controls (SeedVR2/Resolution tab current UI state),
         # 2) per-model cache fallback,
         # 3) service defaults.
-        enable_max = bool(seed_controls.get("enable_max_target", model_cache.get("enable_max_target", True)))
-        max_edge_raw = seed_controls.get("max_resolution_val")
-        if max_edge_raw is None:
-            max_edge_raw = model_cache.get("max_resolution_val", defaults.get("max_resolution", 0))
-        max_edge = int(max_edge_raw or 0)
-        # vNext UX: non-zero max_edge means the cap is enabled.
-        # Do NOT let the legacy enable_max_target flag silently disable a user-provided max_edge.
-        if max_edge > 0:
-            enable_max = True
-        if not enable_max:
-            max_edge = 0
+        max_edge = int(model_cache.get("max_resolution_val", defaults.get("max_resolution", 0)) or 0)
 
         scale_raw = seed_controls.get("upscale_factor_val")
         if scale_raw is None:
@@ -3009,9 +3026,9 @@ def build_seedvr2_callbacks(
                 pass
             try:
                 live_max_res = int(settings.get("max_resolution") or 0)
-                seed_controls["max_resolution_val"] = live_max_res
-                if live_max_res > 0:
-                    seed_controls["enable_max_target"] = True
+                if live_max_res >= 0:
+                    seed_controls.pop("max_resolution_val", None)
+                    seed_controls.pop("enable_max_target", None)
             except Exception:
                 pass
             seed_controls["ratio_downscale"] = bool(
@@ -3216,15 +3233,9 @@ def build_seedvr2_callbacks(
                     settings["upscale_factor"] = float(seed_controls["upscale_factor_val"])
                 except Exception:
                     pass
-            if seed_controls.get("max_resolution_val") is not None:
-                try:
-                    settings["max_resolution"] = int(seed_controls["max_resolution_val"] or 0)
-                except Exception:
-                    pass
             if "ratio_downscale" in seed_controls:
                 settings["pre_downscale_then_upscale"] = bool(seed_controls.get("ratio_downscale", True))
 
-            enable_max_target = seed_controls.get("enable_max_target", True)
             chunk_size_sec = float(seed_controls.get("chunk_size_sec", 0) or 0)
             chunk_overlap_sec = float(seed_controls.get("chunk_overlap_sec", 0) or 0)
             per_chunk_cleanup = seed_controls.get("per_chunk_cleanup", False)
@@ -3316,7 +3327,6 @@ def build_seedvr2_callbacks(
                 "two_pass_encoding",
                 "metadata_format",
                 "log_level",
-                "temporal_padding",
             ):
                 value = encode_overrides.get(key)
                 if value is None and isinstance(output_settings, dict):
@@ -3792,9 +3802,10 @@ def build_seedvr2_callbacks(
             # Start processing with progress tracking
             effective_output_dir = Path(global_settings.get("output_dir", output_dir))
 
-            # NEW: Per-run output folder for videos (0001/0002/...) to avoid collisions
-            # and to store chunk artifacts in user-visible locations.
-            if (not preview_only) and detect_input_type(settings["input_path"]) == "video":
+            # Per-run output folder for single video/image runs (0001/0002/...) to avoid collisions
+            # and to keep all artifacts in one user-visible location.
+            input_kind_single = detect_input_type(settings["input_path"])
+            if (not preview_only) and input_kind_single in {"video", "image"}:
                 resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
                 if resume_run_dir_raw:
                     resume_run_dir = Path(normalize_path(resume_run_dir_raw))
@@ -3825,10 +3836,12 @@ def build_seedvr2_callbacks(
                     seed_controls["processed_chunks_dir"] = str(processed_chunks_dir)
                     settings["_run_dir"] = str(effective_output_dir)
                     settings["_processed_chunks_dir"] = str(processed_chunks_dir)
-                    settings["_resume_run_requested"] = True
+                    settings["_resume_run_requested"] = bool(input_kind_single == "video")
                     settings["_user_output_override_raw"] = settings.get("output_override") or ""
                     # Resume mode ignores fresh output overrides and keeps writing into the selected run folder.
                     settings["output_override"] = str(effective_output_dir)
+                    if input_kind_single != "video":
+                        settings["resume_run_dir"] = ""
                     prepare_log_msg = (
                         f"Resuming from run folder {effective_output_dir} "
                         "(continuing from last processed chunk; keep same settings)."

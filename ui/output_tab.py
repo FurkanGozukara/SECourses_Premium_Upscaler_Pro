@@ -330,7 +330,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         preset_web = gr.Button("Web", size="lg")
 
         with gr.TabItem("Frame Processing"):
-            gr.Markdown("#### Frame Range and Temporal Options")
+            gr.Markdown("#### Frame Range Controls")
 
             with gr.Row(equal_height=True):
                 with gr.Column(scale=1):
@@ -338,21 +338,13 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         label="Skip First Frames",
                         value=int(_value("skip_first_frames", 0) or 0),
                         precision=0,
-                        info="Frames to skip from the start of input."
+                        info="Skip N frames from the beginning before processing. Useful for intros, logos, or dead lead-in frames."
                     )
                     load_cap = gr.Number(
                         label="Frame Load Cap",
                         value=int(_value("load_cap", 0) or 0),
                         precision=0,
-                        info="Maximum frames to process (0 = all)."
-                    )
-
-                with gr.Column(scale=1):
-                    temporal_padding = gr.Number(
-                        label="Temporal Padding",
-                        value=int(_value("temporal_padding", 0) or 0),
-                        precision=0,
-                        info="Extra context frames for temporal pipelines."
+                        info="Process only the first N frames after skipping. Use small values for quick tests (0 = process entire input)."
                     )
                     gr.Markdown("Global RIFE controls are in the **Global RIFE** tab.")
 
@@ -530,7 +522,6 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         pixel_format,
         audio_codec,
         audio_bitrate,
-        temporal_padding,
         frame_interpolation,
         global_rife_multiplier,
         global_rife_model,

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import math
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from .path_utils import (
     IMAGE_EXTENSIONS,
     collision_safe_path,
     detect_input_type,
+    get_media_dimensions,
     get_media_fps,
     normalize_path,
     resolve_output_location,
@@ -43,6 +45,8 @@ _FLASHVSR_REQUIRED_FILES = (
     "LQ_proj_in.ckpt",
     "TCDecoder.ckpt",
 )
+_SINGLE_IMAGE_FAST_TARGET_PIXELS = 4_194_304  # 2048 x 2048
+_SINGLE_IMAGE_REPEAT_FRAMES = 21
 
 
 def _normalize_cuda_token(value: Any) -> str:
@@ -247,10 +251,74 @@ def _build_temp_video_from_frames(
     return True, ""
 
 
+def _extract_single_image_from_video(
+    video_path: Path,
+    image_format: str = "png",
+    image_quality: int = 95,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract a high-quality representative frame from a single-image FlashVSR run.
+    For multi-frame outputs, use pixel-wise median across the decoded frames.
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as e:
+        return None, f"OpenCV/numpy are required for single-image postprocess: {e}"
+
+    if not video_path.exists():
+        return None, f"Output video not found for single-image extraction: {video_path}"
+
+    fmt = str(image_format or "png").strip().lower()
+    if fmt not in {"png", "jpg", "webp"}:
+        fmt = "png"
+    quality = max(1, min(100, int(image_quality)))
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None, f"Failed to open output video for single-image extraction: {video_path}"
+
+    frames_bgr = []
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame is not None:
+                frames_bgr.append(frame)
+            if len(frames_bgr) >= 64:
+                break
+    finally:
+        cap.release()
+
+    if not frames_bgr:
+        return None, f"No frames decoded from output video: {video_path}"
+
+    if len(frames_bgr) == 1:
+        out_frame = frames_bgr[0]
+    else:
+        stack = np.stack(frames_bgr, axis=0).astype(np.float32)
+        out_frame = np.median(stack, axis=0).astype(np.uint8)
+
+    ext = ".jpg" if fmt == "jpg" else f".{fmt}"
+    out_path = collision_safe_path(video_path.with_name(f"{video_path.stem}_image{ext}"))
+    imwrite_params: List[int] = []
+    if fmt == "jpg":
+        imwrite_params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    elif fmt == "webp":
+        imwrite_params = [int(cv2.IMWRITE_WEBP_QUALITY), quality]
+
+    ok = cv2.imwrite(str(out_path), out_frame, imwrite_params)
+    if not ok:
+        return None, f"Failed to save extracted single-image output: {out_path}"
+    return str(out_path), None
+
+
 def _prepare_cli_input(
     input_path: str,
     fps_hint: float,
     log: Callable[[str], None],
+    single_image_repeat_frames: int = 1,
 ) -> tuple[Optional[str], Optional[Path], Optional[str]]:
     kind = detect_input_type(input_path)
     if kind == "video":
@@ -260,11 +328,19 @@ def _prepare_cli_input(
     temp_video = tmp_root / "input_video.mp4"
 
     if kind == "image":
-        ok, err = _build_temp_video_from_frames([Path(input_path)], temp_video, fps_hint)
+        repeat = max(1, int(single_image_repeat_frames or 1))
+        image_frames = [Path(input_path)] * repeat
+        ok, err = _build_temp_video_from_frames(image_frames, temp_video, fps_hint)
         if not ok:
             shutil.rmtree(tmp_root, ignore_errors=True)
             return None, None, err
-        log(f"[FlashVSR] Converted single image to temporary video input: {temp_video}")
+        if repeat > 1:
+            log(
+                f"[FlashVSR] Converted single image to temporary video input "
+                f"with {repeat} repeated frames: {temp_video}"
+            )
+        else:
+            log(f"[FlashVSR] Converted single image to temporary video input: {temp_video}")
         return str(temp_video), tmp_root, None
 
     if kind == "directory":
@@ -317,16 +393,11 @@ def run_flashvsr(
     try:
         original_input_path = normalize_path(settings.get("input_path", ""))
         effective_input_path = normalize_path(settings.get("_effective_input_path") or original_input_path)
+        original_input_kind = detect_input_type(original_input_path or effective_input_path)
         if not effective_input_path or not Path(effective_input_path).exists():
             return FlashVSRResult(returncode=1, output_path=None, log="Invalid input path")
 
         fps_hint = _parse_float(settings.get("fps"), 30.0)
-        prepared_input_path, tmp_root, prep_err = _prepare_cli_input(effective_input_path, fps_hint, log)
-        if prep_err:
-            return FlashVSRResult(returncode=1, output_path=None, log=prep_err)
-        if not prepared_input_path:
-            return FlashVSRResult(returncode=1, output_path=None, log="Failed to prepare input for FlashVSR CLI.")
-        temp_input_dir = tmp_root
 
         scale = 2 if str(settings.get("scale", "2")).strip() == "2" else 4
         raw_version = str(settings.get("version", "1.1"))
@@ -343,12 +414,19 @@ def run_flashvsr(
         tiled_vae = _bool(settings.get("tiled_vae", True), default=True)
         tiled_dit = _bool(settings.get("tiled_dit", True), default=True)
         unload_dit = _bool(settings.get("unload_dit", False), default=False)
+        stream_decode = _bool(settings.get("stream_decode", False), default=False)
         keep_models_on_cpu = _bool(settings.get("keep_models_on_cpu", True), default=True)
         force_offload = _bool(settings.get("force_offload", True), default=True)
         enable_debug = _bool(settings.get("enable_debug", False), default=False)
 
         tile_size = max(32, min(1024, _parse_int(settings.get("tile_size"), 256)))
         overlap = max(8, min(512, _parse_int(settings.get("overlap", settings.get("tile_overlap")), 24)))
+        if tiled_dit and tile_size < 128:
+            log(
+                f"[FlashVSR] tile_size={tile_size} is too small for stable DiT tiling. "
+                "Using tile_size=128."
+            )
+            tile_size = 128
         if overlap >= tile_size:
             overlap = max(8, tile_size - 8)
 
@@ -363,6 +441,60 @@ def run_flashvsr(
         codec = str(settings.get("codec", "libx264") or "libx264").strip()
         crf = max(0, min(51, _parse_int(settings.get("crf"), 18)))
         fps = _parse_float(settings.get("fps"), 0.0)
+        single_image_profile_applied = False
+        single_image_repeat_frames = 1
+
+        if original_input_kind == "image":
+            single_image_profile_applied = True
+            single_image_repeat_frames = _SINGLE_IMAGE_REPEAT_FRAMES
+            log("[FlashVSR] Single-image input detected. Applying automatic one-frame profile.")
+            frame_chunk_size = 0
+            start_frame = 0
+            end_frame = -1
+            if not unload_dit:
+                unload_dit = True
+                log("[FlashVSR] Single-image profile: enabling unload_dit to reduce peak VRAM.")
+
+            if mode == "tiny-long":
+                mode = "tiny"
+                log("[FlashVSR] Single-image profile: switching mode tiny-long -> tiny for one-frame throughput.")
+
+            target_pixels: Optional[int] = None
+            try:
+                dim_probe_path = effective_input_path or original_input_path
+                dims = get_media_dimensions(dim_probe_path)
+                if dims:
+                    in_w, in_h = int(dims[0]), int(dims[1])
+                    target_pixels = max(1, in_w * scale) * max(1, in_h * scale)
+            except Exception:
+                target_pixels = None
+
+            if mode in {"tiny", "tiny-long"}:
+                if target_pixels is not None and target_pixels <= _SINGLE_IMAGE_FAST_TARGET_PIXELS:
+                    if tiled_dit:
+                        log("[FlashVSR] Single-image fast path: disabling DiT tiling for better GPU utilization.")
+                    tiled_dit = False
+                    stream_decode = True
+                else:
+                    if target_pixels is not None:
+                        log(
+                            "[FlashVSR] Single-image profile: target is large; keeping DiT tiling "
+                            "to avoid OOM."
+                        )
+                    stream_decode = False
+                    tiled_dit = True
+
+        prepared_input_path, tmp_root, prep_err = _prepare_cli_input(
+            effective_input_path,
+            fps_hint,
+            log,
+            single_image_repeat_frames=single_image_repeat_frames,
+        )
+        if prep_err:
+            return FlashVSRResult(returncode=1, output_path=None, log=prep_err)
+        if not prepared_input_path:
+            return FlashVSRResult(returncode=1, output_path=None, log="Failed to prepare input for FlashVSR CLI.")
+        temp_input_dir = tmp_root
 
         models_root = _resolve_models_root(base_dir, settings)
         layout_ok, layout_msg, _ = _ensure_local_flashvsr_model_layout(models_root, version_internal)
@@ -410,6 +542,43 @@ def run_flashvsr(
             log(f"[FlashVSR] Using venv python: {python_exe}")
         if gpu_note:
             log(gpu_note)
+
+        if stream_decode:
+            if mode in {"tiny", "tiny-long"}:
+                if tiled_dit:
+                    log(
+                        "[FlashVSR] stream_decode enabled. "
+                        "Disabling DiT tiling to activate CLI streaming decode path."
+                    )
+                    tiled_dit = False
+            else:
+                log("[FlashVSR] stream_decode is only supported in tiny/tiny-long modes; ignoring for full mode.")
+
+        dit_tiling_lines: List[str] = []
+        if tiled_dit:
+            dims_for_tiling = get_media_dimensions(prepared_input_path)
+            if dims_for_tiling:
+                in_w, in_h = int(dims_for_tiling[0]), int(dims_for_tiling[1])
+                stride = max(1, int(tile_size - overlap))
+                rows = max(1, int(math.ceil((in_h - overlap) / float(stride))))
+                cols = max(1, int(math.ceil((in_w - overlap) / float(stride))))
+                total_tiles = int(rows * cols)
+                dit_tiling_lines = [
+                    "[FlashVSR] DiT tiling math (applies to both image and video):",
+                    f"  - tile_size={tile_size}",
+                    f"  - overlap={overlap}",
+                    (
+                        f"  - stride={stride}  "
+                        "(stride = tile_size - overlap; distance between neighboring tile starts)"
+                    ),
+                    f"  - input_for_tiling={in_w}x{in_h} (before upscale)",
+                    f"  - rows=ceil((H-overlap)/stride)=ceil(({in_h}-{overlap})/{stride})={rows}",
+                    f"  - cols=ceil((W-overlap)/stride)=ceil(({in_w}-{overlap})/{stride})={cols}",
+                    f"  - total_tiles=rows*cols={rows}*{cols}={total_tiles}",
+                    "  - Note: tile count uses input size at DiT stage, not final output size.",
+                ]
+                for line in dit_tiling_lines:
+                    log(line)
 
         def _build_cmd(run_precision: str) -> List[str]:
             local_cmd = [
@@ -522,6 +691,7 @@ def run_flashvsr(
             output_lines: List[str] = []
             line_queue: "_queue.Queue[Optional[str]]" = _queue.Queue()
             last_progress_hint: str = ""
+            preflight_tiling_emitted = False
 
             def _reader_thread() -> None:
                 try:
@@ -576,6 +746,15 @@ def run_flashvsr(
                         log(item)
                         try:
                             text = str(item)
+                            if (
+                                (not preflight_tiling_emitted)
+                                and dit_tiling_lines
+                                and ("PRE-FLIGHT RESOURCE CHECK" in text.upper())
+                            ):
+                                preflight_tiling_emitted = True
+                                for math_line in dit_tiling_lines:
+                                    output_lines.append(math_line)
+                                    log(math_line)
                             if "%" in text or "Processed:" in text or "Processing:" in text:
                                 last_progress_hint = text
                         except Exception:
@@ -653,6 +832,19 @@ def run_flashvsr(
                 input_fps=get_media_fps(original_input_path or prepared_input_path) or 30.0,
                 output_fps=(fps if fps > 0 else (get_media_fps(prepared_input_path) or 30.0)),
             )
+            if original_input_kind == "image" and output_path:
+                fmt_pref = str(settings.get("image_output_format", "png") or "png").strip().lower()
+                quality_pref = max(1, min(100, _parse_int(settings.get("image_output_quality"), 95)))
+                img_path, img_err = _extract_single_image_from_video(
+                    Path(output_path),
+                    image_format=fmt_pref,
+                    image_quality=quality_pref,
+                )
+                if img_path:
+                    log(f"[FlashVSR] Single-image input detected. Exported image output: {img_path}")
+                    result.output_path = str(img_path)
+                elif img_err:
+                    log(f"[FlashVSR] Single-image export skipped: {img_err}")
         else:
             log("No output file generated")
             result = FlashVSRResult(
@@ -683,10 +875,13 @@ def run_flashvsr(
                     error_logs=log_lines[-50:] if result and result.returncode != 0 else None,
                     execution_time=execution_time,
                     additional_info={
-                        "scale": settings.get("scale", "unknown"),
-                        "version": settings.get("version", "unknown"),
-                        "mode": settings.get("mode", "unknown"),
-                        "vae_model": settings.get("vae_model", "unknown"),
+                        "scale": scale if "scale" in locals() else settings.get("scale", "unknown"),
+                        "version": version_ui if "version_ui" in locals() else settings.get("version", "unknown"),
+                        "mode": mode if "mode" in locals() else settings.get("mode", "unknown"),
+                        "vae_model": vae_model if "vae_model" in locals() else settings.get("vae_model", "unknown"),
+                        "stream_decode": bool(stream_decode) if "stream_decode" in locals() else bool(settings.get("stream_decode", False)),
+                        "single_image_profile": bool(single_image_profile_applied) if "single_image_profile_applied" in locals() else False,
+                        "single_image_repeat_frames": int(single_image_repeat_frames) if "single_image_repeat_frames" in locals() else 1,
                     },
                 )
                 log_lines.append("Command logged to executed_commands folder")

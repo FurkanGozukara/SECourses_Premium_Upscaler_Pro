@@ -76,44 +76,6 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         "Upscale factor / max resolution are now configured directly in each upscaler tab.*"
     )
 
-    # Legacy model/sizing fields are hidden but retained for RESOLUTION_ORDER compatibility.
-    model_selector_value = values[0]
-    if model_selector_value not in combined_models:
-        model_selector_value = combined_models[0] if combined_models else "default"
-
-    model_selector = gr.Textbox(
-        value=model_selector_value,
-        visible=False,
-        interactive=False,
-    )
-    auto_resolution = gr.Checkbox(
-        value=values[1],
-        visible=False,
-        interactive=False,
-    )
-    enable_max_target = gr.Checkbox(
-        value=values[2],
-        visible=False,
-        interactive=False,
-    )
-    upscale_factor = gr.Number(
-        value=values[4],
-        precision=2,
-        visible=False,
-        interactive=False,
-    )
-    max_target_resolution = gr.Number(
-        value=values[5],
-        precision=0,
-        visible=False,
-        interactive=False,
-    )
-    ratio_downscale_then_upscale = gr.Checkbox(
-        value=values[6],
-        visible=False,
-        interactive=False,
-    )
-
     with gr.Row():
         # Left Column: Settings
         with gr.Column(scale=2):
@@ -123,7 +85,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 with gr.Row():
                     auto_detect_scenes = gr.Checkbox(
                         label="Auto Detect Scenes (on input)",
-                        value=values[3],
+                        value=values[0],
                         info="When Auto Chunk is ON and input is a video, auto-scan scene cuts to show the scene count. Can be slow for long videos."
                     )
             
@@ -131,19 +93,19 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 with gr.Row():
                     auto_chunk = gr.Checkbox(
                         label="Auto Chunk (PySceneDetect Scenes)",
-                        value=values[7],
+                        value=values[1],
                         info="Recommended. Splits by detected scene cuts (content-based). Uses scene sensitivity + minimum scene length."
                     )
 
                     frame_accurate_split = gr.Checkbox(
                         label="Frame-Accurate Split (Lossless)",
-                        value=values[8],
+                        value=values[2],
                         info="Enabled: frame-accurate splitting via lossless re-encode (slower). Disabled: fast stream-copy splitting (keyframe-limited)."
                     )
 
                     per_chunk_cleanup = gr.Checkbox(
                         label="Delete Chunk Files After Processing",
-                        value=values[9],
+                        value=values[3],
                         info="Deletes chunk artifacts from the run output folder (input_chunks/processed_chunks) to save disk space. Thumbnails are kept for the chunk gallery."
                     )
 
@@ -151,16 +113,16 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                     chunk_size = gr.Slider(
                         label="Chunk Size (seconds, 0=disabled)",
                         minimum=0, maximum=600, step=10,
-                        value=values[10],
-                        interactive=not bool(values[7]),
+                        value=values[4],
+                        interactive=not bool(values[1]),
                         info="Static chunking only (when Auto Chunk is OFF). 0=off, 60=1min chunks, 300=5min chunks."
                     )
 
                     chunk_overlap = gr.Slider(
                         label="Chunk Overlap (seconds)",
                         minimum=0.0, maximum=5.0, step=0.1,
-                        value=0.0 if bool(values[7]) else values[11],
-                        interactive=not bool(values[7]),
+                        value=0.0 if bool(values[1]) else values[5],
+                        interactive=not bool(values[1]),
                         info="Static chunking only. Auto Chunk forces overlap to 0 to avoid blending across scene cuts."
                     )
 
@@ -168,16 +130,16 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                     scene_threshold = gr.Slider(
                         label="Scene Detection Sensitivity",
                         minimum=5.0, maximum=50.0, step=1.0,
-                        value=values[12],
-                        interactive=bool(values[7]),
+                        value=values[6],
+                        interactive=bool(values[1]),
                         info="PySceneDetect ContentDetector threshold. Lower = more cuts, higher = fewer. 27 is a balanced default."
                     )
 
                     min_scene_len = gr.Slider(
                         label="Minimum Scene Length (seconds)",
                         minimum=0.5, maximum=10.0, step=0.5,
-                        value=values[13],
-                        interactive=bool(values[7]),
+                        value=values[7],
+                        interactive=bool(values[1]),
                         info="Minimum duration for a detected scene. Prevents very short chunks. 1.0s recommended."
                     )
 
@@ -272,9 +234,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
     )
     # Collect inputs - MUST match RESOLUTION_ORDER exactly
     inputs_list = [
-        model_selector, auto_resolution, enable_max_target, auto_detect_scenes, upscale_factor,
-        max_target_resolution, ratio_downscale_then_upscale,
-        auto_chunk, frame_accurate_split, per_chunk_cleanup,
+        auto_detect_scenes, auto_chunk, frame_accurate_split, per_chunk_cleanup,
         chunk_size, chunk_overlap,
         scene_threshold, min_scene_len
     ]

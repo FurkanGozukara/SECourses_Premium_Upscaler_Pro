@@ -57,7 +57,6 @@ def rife_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     
     return {
         "input_path": "",
-        "rife_enabled": True,
         "output_override": "",
         "output_format": "mp4",
         "model_dir": "",
@@ -75,7 +74,6 @@ def rife_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "img_mode": False,
         "skip_static_frames": False,
         "exp": 1,
-        "multi": 2,
         "batch_enable": False,
         "batch_input_path": "",
         "batch_output_path": "",
@@ -103,7 +101,6 @@ Current count: 33 components
 
 RIFE_ORDER: List[str] = [
     "input_path",
-    "rife_enabled",
     "output_override",
     "output_format",
     "model_dir",
@@ -120,7 +117,6 @@ RIFE_ORDER: List[str] = [
     "img_mode",
     "skip_static_frames",
     "exp",
-    "multi",
     "batch_enable",
     "batch_input_path",
     "batch_output_path",
@@ -911,10 +907,8 @@ def build_rife_callbacks(
 
             # Apply cached values from Resolution & Scene Split tab (vNext Upscale-x)
             scale_x = seed_controls.get("upscale_factor_val")
-            max_edge = int(seed_controls.get("max_resolution_val", 0) or 0)
-            enable_max = seed_controls.get("enable_max_target", True)
-            if not enable_max:
-                max_edge = 0
+            # Global max-edge cap is removed; keep per-upscaler sizing local.
+            max_edge = 0
 
             if scale_x is not None:
                 try:
@@ -979,7 +973,6 @@ def build_rife_callbacks(
                 "two_pass_encoding",
                 "metadata_format",
                 "log_level",
-                "temporal_padding",
             ):
                 value = encode_overrides.get(key)
                 if value is None and output_settings:

@@ -146,18 +146,18 @@ def rife_tab(
                 # Batch processing controls
                 batch_enable = gr.Checkbox(
                     label="Enable Batch Processing",
-                    value=values[19],
+                    value=values[17],
                     info="Process multiple files from directory"
                 )
                 batch_input = gr.Textbox(
                     label="Batch Input Folder",
-                    value=values[20],
+                    value=values[18],
                     placeholder="Folder containing videos",
                     info="Directory with files to process in batch mode"
                 )
                 batch_output = gr.Textbox(
                     label="Batch Output Folder Override",
-                    value=values[21],
+                    value=values[19],
                     placeholder="Optional override for batch outputs",
                     info="Custom output directory for batch results"
                 )
@@ -174,7 +174,7 @@ def rife_tab(
                         
                         output_override = gr.Textbox(
                             label="Output Override (custom path)",
-                            value=values[2],
+                            value=values[1],
                             placeholder="Leave empty for auto naming",
                             info="Specify custom output path. Auto-naming creates files in output folder."
                         )
@@ -182,13 +182,13 @@ def rife_tab(
                         output_format_rife = gr.Dropdown(
                             label="Output Format",
                             choices=["auto", "mp4", "avi", "mov", "webm"],
-                            value=values[3],
+                            value=values[2],
                             info="Container format for output video"
                         )
                         
                         png_output = gr.Checkbox(
                             label="Export as PNG Sequence",
-                            value=values[11],
+                            value=values[10],
                             info="Save output as numbered PNG frames instead of video file. Useful for further editing."
                         )
                     
@@ -206,13 +206,13 @@ def rife_tab(
                         
                         model_dir = gr.Textbox(
                             label="Model Directory Override",
-                            value=values[4],
+                            value=values[3],
                             placeholder="Leave empty for default (RIFE/train_log)",
                             info="Custom path to RIFE model directory. Only needed if models are in non-standard location."
                         )
                         
                         _rife_model_choices = list(shared_rife_models) if shared_rife_models else _discover_rife_models()
-                        _rife_model_value = str(values[5] or "").strip()
+                        _rife_model_value = str(values[4] or "").strip()
                         if _rife_model_value not in _rife_model_choices:
                             preferred_default = get_rife_default_model()
                             if preferred_default in _rife_model_choices:
@@ -263,13 +263,13 @@ def rife_tab(
                         fps_multiplier = gr.Dropdown(
                             label="FPS Multiplier",
                             choices=["x1", "x2", "x4", "x8"],
-                            value=values[6],
+                            value=values[5],
                             info="Multiply original FPS. x2 = double smoothness (30→60fps). x4 = 4x smoother. x8 = extreme slow-mo. Higher = more processing time."
                         )
                         
                         target_fps = gr.Number(
                             label="Target FPS Override",
-                            value=values[7],
+                            value=values[6],
                             precision=1,
                             info="Desired output frame rate. 0 = use multiplier instead. 60 = smooth 60fps. 120 = ultra-smooth. Higher FPS = larger file size."
                         )
@@ -277,13 +277,13 @@ def rife_tab(
                         scale = gr.Slider(
                             label="Spatial Scale Factor",
                             minimum=0.5, maximum=4.0, step=0.1,
-                            value=values[8],
+                            value=values[7],
                             info="Scale video resolution. 1.0 = original size, 2.0 = double resolution. Can combine with interpolation. >1.0 significantly increases processing time."
                         )
                         
                         uhd_mode = gr.Checkbox(
                             label="UHD Mode (4K+ Processing)",
-                            value=values[9] if cuda_available else False,  # Force False if no CUDA
+                            value=values[8] if cuda_available else False,  # Force False if no CUDA
                             info=f"{gpu_hint} | Enable optimizations for 4K/8K videos. Uses more memory. Enable for 3840x2160+ inputs.",
                             interactive=cuda_available  # Disable if no CUDA
                         )
@@ -292,7 +292,7 @@ def rife_tab(
                             label="Precision",
                             choices=["fp16", "fp32"],
                             value=(
-                                ("fp16" if str(values[10]).strip().lower() in {"fp16", "true", "1", "yes", "on"} else "fp32")
+                                ("fp16" if str(values[9]).strip().lower() in {"fp16", "true", "1", "yes", "on"} else "fp32")
                                 if cuda_available else "fp32"
                             ),
                             info=f"fp16 = half precision, 2x faster, less VRAM. fp32 = full precision. {'(fp16 requires GPU)' if not cuda_available else 'Use fp16 for speed.'}",
@@ -301,25 +301,25 @@ def rife_tab(
                         
                         montage = gr.Checkbox(
                             label="📊 Create Montage (Side-by-Side Comparison)",
-                            value=values[14],
+                            value=values[13],
                             info="Generate side-by-side comparison video showing original vs interpolated. Useful for quality checking."
                         )
                         
                         img_mode = gr.Checkbox(
                             label="🖼️ Image Sequence Mode",
-                            value=values[15],
+                            value=values[14],
                             info="Process image sequence instead of video. Automatically enabled when input is folder of images."
                         )
                         
                         skip_static_frames = gr.Checkbox(
                             label="Skip Static Frames (Auto-Detect)",
-                            value=values[16],
+                            value=values[15],
                             info="Automatically skip static/duplicate frames. Saves processing time for videos with static scenes. May miss subtle motion."
                         )
                         
                         exp = gr.Number(
                             label="Temporal Recursion Depth",
-                            value=values[17],
+                            value=values[16],
                             precision=0,
                             info="Exponential frame generation depth. 1 = direct interpolation, 2+ = recursive. Higher = smoother but exponentially slower. Use 1 for most cases."
                         )
@@ -328,7 +328,7 @@ def rife_tab(
                             "**GPU Device:** Controlled globally from the top app header selector. "
                             "This tab no longer has a per-tab GPU override."
                         )
-                        rife_gpu = gr.State(values[24] if len(values) > 24 else "")
+                        rife_gpu = gr.State(values[22] if len(values) > 22 else "")
 
                 # Video Editing
                 with gr.TabItem("✂️ Video Editing"):
@@ -338,20 +338,20 @@ def rife_tab(
                         edit_mode = gr.Dropdown(
                             label="Edit Mode",
                             choices=["none", "trim", "concatenate", "speed_change", "effects"],
-                            value=values[25],
+                            value=values[23],
                             info="Type of video editing to perform"
                         )
 
                         start_time = gr.Textbox(
                             label="Start Time (HH:MM:SS or seconds)",
-                            value=values[26],
+                            value=values[24],
                             placeholder="00:00:30 or 30",
                             info="Where to start the edit"
                         )
 
                         end_time = gr.Textbox(
                             label="End Time (HH:MM:SS or seconds)",
-                            value=values[27],
+                            value=values[25],
                             placeholder="00:01:30 or 90",
                             info="Where to end the edit"
                         )
@@ -359,13 +359,13 @@ def rife_tab(
                         speed_factor = gr.Slider(
                             label="Speed Factor",
                             minimum=0.25, maximum=4.0, step=0.25,
-                            value=values[28],
+                            value=values[26],
                             info="1.0 = normal speed, 2.0 = 2x faster, 0.5 = 2x slower"
                         )
 
                         concat_videos = gr.Textbox(
                             label="Additional Videos for Concatenation",
-                            value=values[31],  # Fixed: concat_videos is at index 31 in RIFE_ORDER
+                            value=values[29],
                             placeholder="C:/path/to/video1.mp4, C:/path/to/video2.mp4",
                             info="Comma-separated list of video files to concatenate with the main input",
                             lines=2
@@ -378,14 +378,14 @@ def rife_tab(
                     with gr.Group():
                         skip_first_frames = gr.Number(
                             label="Skip First Frames",
-                            value=values[22],
+                            value=values[20],
                             precision=0,
                             info="Skip N frames from start of video. Useful to skip intros/logos. 0 = process from beginning."
                         )
 
                         load_cap = gr.Number(
                             label="Frame Load Cap (0 = all)",
-                            value=values[23],
+                            value=values[21],
                             precision=0,
                             info="Process only first N frames. Useful for quick tests. 0 = process entire video. Combine with skip for specific range."
                         )
@@ -398,26 +398,26 @@ def rife_tab(
                         video_codec_rife = gr.Dropdown(
                             label="Video Codec",
                             choices=["libx264", "libx265", "libvpx-vp9"],
-                            value=values[29],
+                            value=values[27],
                             info="Compression codec"
                         )
 
                         output_quality_rife = gr.Slider(
                             label="Quality (CRF)",
                             minimum=0, maximum=51, step=1,
-                            value=values[30],
+                            value=values[28],
                             info="Lower = higher quality, larger file"
                         )
 
                         no_audio = gr.Checkbox(
                             label="Remove Audio",
-                            value=values[12],
+                            value=values[11],
                             info="Strip audio track from output"
                         )
 
                         show_ffmpeg_output = gr.Checkbox(
                             label="Show FFmpeg Output",
-                            value=values[13],
+                            value=values[12],
                             info="Display detailed processing logs"
                         )
         
@@ -562,43 +562,38 @@ def rife_tab(
     # Current count: 33 components
     # ============================================================================
 
-    # Kept for ORDER compatibility with persisted presets; no longer exposed as a UI toggle.
-    rife_enabled = gr.State(True)
-
     inputs_list = [
         input_path,           # 0: input_path
-        rife_enabled,         # 1: rife_enabled  
-        output_override,      # 2: output_override (NOW SEPARATE!)
-        output_format_rife,   # 3: output_format
-        model_dir,            # 4: model_dir (NOW EXPOSED!)
-        rife_model,           # 5: model
-        fps_multiplier,       # 6: fps_multiplier
-        target_fps,           # 7: fps_override
-        scale,                # 8: scale (NOW EXPOSED!)
-        uhd_mode,             # 9: uhd_mode (NOW EXPOSED!)
-        rife_precision,       # 10: fp16_mode
-        png_output,           # 11: png_output (NOW EXPOSED!)
-        no_audio,             # 12: no_audio
-        show_ffmpeg_output,   # 13: show_ffmpeg
-        montage,              # 14: montage
-        img_mode,             # 15: img_mode
-        skip_static_frames,   # 16: skip_static_frames (NOW EXPOSED!)
-        exp,                  # 17: exp (NOW EXPOSED!)
-        gr.State(2),          # 18: multi (internal - fps_multiplier handles this)
-        batch_enable,         # 19: batch_enable (NOW EXPOSED!)
-        batch_input,          # 20: batch_input_path (NOW EXPOSED!)
-        batch_output,         # 21: batch_output_path (NOW EXPOSED!)
-        skip_first_frames,    # 22: skip_first_frames (NOW EXPOSED!)
-        load_cap,             # 23: load_cap (NOW EXPOSED!)
-        rife_gpu,             # 24: cuda_device
-        edit_mode,            # 25: edit_mode
-        start_time,           # 26: start_time
-        end_time,             # 27: end_time
-        speed_factor,         # 28: speed_factor
-        video_codec_rife,     # 29: video_codec
-        output_quality_rife,  # 30: output_quality
-        concat_videos,        # 31: concat_videos
-        resume_run_dir,       # 32: resume_run_dir
+        output_override,      # 1: output_override
+        output_format_rife,   # 2: output_format
+        model_dir,            # 3: model_dir
+        rife_model,           # 4: model
+        fps_multiplier,       # 5: fps_multiplier
+        target_fps,           # 6: fps_override
+        scale,                # 7: scale
+        uhd_mode,             # 8: uhd_mode
+        rife_precision,       # 9: fp16_mode
+        png_output,           # 10: png_output
+        no_audio,             # 11: no_audio
+        show_ffmpeg_output,   # 12: show_ffmpeg
+        montage,              # 13: montage
+        img_mode,             # 14: img_mode
+        skip_static_frames,   # 15: skip_static_frames
+        exp,                  # 16: exp
+        batch_enable,         # 17: batch_enable
+        batch_input,          # 18: batch_input_path
+        batch_output,         # 19: batch_output_path
+        skip_first_frames,    # 20: skip_first_frames
+        load_cap,             # 21: load_cap
+        rife_gpu,             # 22: cuda_device
+        edit_mode,            # 23: edit_mode
+        start_time,           # 24: start_time
+        end_time,             # 25: end_time
+        speed_factor,         # 26: speed_factor
+        video_codec_rife,     # 27: video_codec
+        output_quality_rife,  # 28: output_quality
+        concat_videos,        # 29: concat_videos
+        resume_run_dir,       # 30: resume_run_dir
     ]
     
     # Development validation
@@ -821,3 +816,4 @@ def rife_tab(
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }
+

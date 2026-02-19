@@ -247,17 +247,13 @@ def build_fixed_scale_analysis_update(
         ms = 4
 
     if use_global:
-        enable_max = bool(seed_controls.get("enable_max_target", True))
+        # Global Resolution tab can still provide shared upscale ratio,
+        # but max-edge capping is now local per upscaler tab.
         scale_x = float(seed_controls.get("upscale_factor_val", local_scale_x or 4.0) or (local_scale_x or 4.0))
-        max_edge = int(seed_controls.get("max_resolution_val", local_max_edge or 0) or (local_max_edge or 0))
-        pre_down = bool(seed_controls.get("ratio_downscale", local_pre_down))
     else:
-        enable_max = True
         scale_x = float(local_scale_x or 4.0)
-        max_edge = int(local_max_edge or 0)
-        pre_down = bool(local_pre_down)
-    if not enable_max:
-        max_edge = 0
+    max_edge = int(local_max_edge or 0)
+    pre_down = bool(local_pre_down)
 
     w, h, rep = _resolve_dims_for_preview(input_path_val)
     if not w or not h:

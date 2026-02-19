@@ -28,6 +28,7 @@ ComfyUI-FlashVSR_Stable
 *__pycache__*
 outputs/
 tmp/
+Video_Comparison_Slider_v2
 global_config/
 /models
 global.json

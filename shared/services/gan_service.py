@@ -26,6 +26,8 @@ from shared.output_run_manager import (
     prepare_single_video_run,
     downscaled_video_path,
     resolve_resume_input_from_run_dir,
+    ensure_image_input_artifact,
+    finalize_run_context,
 )
 from shared.realesrgan_runner import run_realesrgan
 from shared.gan_runner import run_gan_upscale, GanResult, get_gan_model_metadata
@@ -188,9 +190,6 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "batch_input_path": "",
         "batch_output_path": "",
         "model": default_model,
-        "target_resolution": 1920,
-        "downscale_first": True,
-        "auto_calculate_input": True,
         "use_resolution_tab": True,  # Enable Resolution tab integration by default
         # NEW (vNext): unified Upscale-x sizing (applies to both images and videos)
         "upscale_factor": 4.0,
@@ -233,9 +232,6 @@ GAN_ORDER: List[str] = [
     "batch_input_path",
     "batch_output_path",
     "model",
-    "target_resolution",
-    "downscale_first",
-    "auto_calculate_input",
     "use_resolution_tab",  # Added to support Resolution tab integration
     "tile_size",
     "overlap",
@@ -381,10 +377,6 @@ def build_gan_callbacks(
         s["model_name"] = meta.get("canonical", s.get("model", ""))
         # PNG padding (from Output tab cache if present)
         s["png_padding"] = int(seed_controls_local.get("png_padding_val", 6))  # Match CLI default
-        # vNext: disable legacy downscale system in gan_runner (we do all preprocessing here)
-        s["target_resolution"] = 0
-        s["downscale_first"] = False
-        s["auto_calculate_input"] = False
         return s
 
     def maybe_downscale(
@@ -411,27 +403,17 @@ def build_gan_callbacks(
             model_cache = seed_controls_local.get("resolution_cache", {}).get(s.get("model"), {}) if use_global else {}
 
             if use_global:
-                enable_max = model_cache.get("enable_max_target", seed_controls_local.get("enable_max_target", True))
                 scale_raw = model_cache.get("upscale_factor_val")
                 if scale_raw is None:
                     scale_raw = seed_controls_local.get("upscale_factor_val")
                 if scale_raw is None:
                     scale_raw = s.get("upscale_factor", 4.0)
-
-                max_raw = model_cache.get("max_resolution_val")
-                if max_raw is None:
-                    max_raw = seed_controls_local.get("max_resolution_val")
-                if max_raw is None:
-                    max_raw = s.get("max_resolution", 0)
             else:
-                enable_max = True
                 scale_raw = s.get("upscale_factor", 4.0)
-                max_raw = s.get("max_resolution", 0)
 
             scale_x = float(scale_raw or 4.0)
-            max_edge = int(max_raw or 0)
-            if not enable_max:
-                max_edge = 0
+            # Max-edge cap is local to GAN settings (no global max propagation).
+            max_edge = int(s.get("max_resolution", 0) or 0)
 
             # Get input dimensions
             dims = get_media_dimensions(s["input_path"])
@@ -482,7 +464,11 @@ def build_gan_callbacks(
                     img = cv2.imread(s["input_path"], cv2.IMREAD_UNCHANGED)
                     if img is not None:
                         adjusted = cv2.resize(img, (optimal_w, optimal_h), interpolation=cv2.INTER_AREA)
-                        tmp_path = Path(current_temp_dir_local) / f"gan_input_adjust_{Path(s['input_path']).stem}{Path(s['input_path']).suffix}"
+                        pre_dir = Path(s.get("_run_dir") or current_output_dir_local) / "pre_processed"
+                        pre_dir.mkdir(parents=True, exist_ok=True)
+                        tmp_path = collision_safe_path(
+                            pre_dir / f"gan_input_adjust_{Path(s['input_path']).stem}_{optimal_w}x{optimal_h}{Path(s['input_path']).suffix}"
+                        )
                         cv2.imwrite(str(tmp_path), adjusted)
                         if tmp_path.exists():
                             s["_original_input_path_before_preprocess"] = s["input_path"]
@@ -500,7 +486,8 @@ def build_gan_callbacks(
                         return s
 
                     tmp_dir = collision_safe_dir(
-                        Path(current_temp_dir_local) / f"gan_input_adjust_{src_dir.name}_pre{optimal_w}x{optimal_h}"
+                        (Path(s.get("_run_dir") or current_output_dir_local) / "pre_processed")
+                        / f"gan_input_adjust_{src_dir.name}_pre{optimal_w}x{optimal_h}"
                     )
                     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1044,7 +1031,6 @@ def build_gan_callbacks(
                 "two_pass_encoding",
                 "metadata_format",
                 "log_level",
-                "temporal_padding",
             ):
                 value = encode_overrides.get(key)
                 if value is None and output_settings:
@@ -1191,6 +1177,41 @@ def build_gan_callbacks(
                     run_output_root.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     pass
+
+                def _finalize_run_context(status_text: str, output_path_text: Optional[str], rc_value: Optional[int], cfg: Dict[str, Any]) -> None:
+                    try:
+                        run_dir_raw = cfg.get("_run_dir")
+                        if not run_dir_raw:
+                            return
+                        effective_input = cfg.get("_effective_input_path") or cfg.get("input_path")
+                        input_kind_for_ctx = detect_input_type(str(effective_input or ""))
+                        pre_in = cfg.get("_preprocessed_input_path")
+                        if input_kind_for_ctx == "image" and (not pre_in):
+                            snap = ensure_image_input_artifact(
+                                Path(run_dir_raw),
+                                str(effective_input or ""),
+                                preferred_stem=Path(cfg.get("_original_filename") or "used_input").stem,
+                            )
+                            if snap:
+                                pre_in = str(snap)
+                                cfg["_preprocessed_input_path"] = pre_in
+                        finalize_run_context(
+                            Path(run_dir_raw),
+                            pipeline="gan",
+                            status=str(status_text or ""),
+                            returncode=(int(rc_value) if rc_value is not None else None),
+                            output_path=str(output_path_text) if output_path_text else None,
+                            original_input_path=str(
+                                cfg.get("_original_input_path_before_preprocess")
+                                or cfg.get("input_path")
+                                or ""
+                            ),
+                            effective_input_path=str(effective_input) if effective_input else None,
+                            preprocessed_input_path=str(pre_in) if pre_in else None,
+                            input_kind=input_kind_for_ctx,
+                        )
+                    except Exception:
+                        pass
 
                 runtime_settings = prepped_settings
                 runtime_input_type = detect_input_type(prepped_settings.get("input_path", ""))
@@ -1411,6 +1432,7 @@ def build_gan_callbacks(
                                 cmp_html = f"<p>PNG frames saved to {outp}</p>"
                             else:
                                 slider_update = gr.update(value=(src, outp), visible=True)
+                        _finalize_run_context(status, outp, rc, runtime_settings)
                         return status, full_log, outp, cmp_html, slider_update
                     
                     # Use GAN runner with proper backend integration
@@ -1589,6 +1611,7 @@ def build_gan_callbacks(
                             # For images, use ImageSlider directly
                             slider_update = gr.update(value=(src, outp), visible=True)
                             cmp_html = ""  # No HTML comparison for images, use slider instead
+                _finalize_run_context(status, final_out_path, result.returncode, runtime_settings)
                 return status, full_log, final_out_path, cmp_html, slider_update
 
             # Kick off worker thread
@@ -1621,9 +1644,9 @@ def build_gan_callbacks(
                     return
                 t = threading.Thread(target=worker_batch, args=(items,), daemon=True)
             else:
-                # NEW: Per-run output folder for single video runs (0001/0002/...)
-                # Keeps chunk artifacts user-visible and prevents collisions between app instances.
-                if input_type == "video":
+                # Per-run output folder for single video/image runs (0001/0002/...)
+                # Keeps all artifacts user-visible and prevents collisions between app instances.
+                if input_type in {"video", "image"}:
                     resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
                     if resume_run_dir_raw:
                         resume_run_dir = Path(normalize_path(resume_run_dir_raw))
@@ -1647,10 +1670,12 @@ def build_gan_callbacks(
                         seed_controls["last_run_dir"] = str(current_output_dir)
                         settings["_run_dir"] = str(current_output_dir)
                         settings["_processed_chunks_dir"] = str(processed_chunks_dir)
-                        settings["_resume_run_requested"] = True
+                        settings["_resume_run_requested"] = bool(input_type == "video")
                         settings["_user_output_override_raw"] = settings.get("output_override") or ""
                         # Resume mode ignores new output overrides and keeps writing in the selected run folder.
                         settings["output_override"] = str(current_output_dir)
+                        if input_type != "video":
+                            settings["resume_run_dir"] = ""
                         progress_q.put(
                             f"Resume run folder detected: {current_output_dir}. "
                             "Processing will continue from the next chunk (same settings required)."
@@ -1680,10 +1705,8 @@ def build_gan_callbacks(
                     current_output_dir,
                     current_temp_dir,
                 )
-                # Single-image runs: enforce sequential numbering in output root (0001_<orig>.<ext>, ...).
+                # Single-image runs: save final output inside the per-run folder with original filename.
                 try:
-                    from shared.output_run_manager import numbered_single_image_output_path
-
                     if detect_input_type(prepped.get("input_path") or "") == "image":
                         fmt = str(prepped.get("output_format") or "auto").lower()
                         if fmt in ("", "auto"):
@@ -1693,8 +1716,9 @@ def build_gan_callbacks(
                         if ext.lower() == ".jpeg":
                             ext = ".jpg"
                         orig_name = prepped.get("_original_filename") or Path(prepped["input_path"]).name
+                        stem = Path(orig_name).stem or "image"
                         prepped["_desired_output_path"] = str(
-                            numbered_single_image_output_path(Path(current_output_dir), str(orig_name), ext=str(ext))
+                            collision_safe_path(Path(current_output_dir) / f"{stem}{ext}")
                         )
                 except Exception:
                     pass

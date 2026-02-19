@@ -38,7 +38,6 @@ def output_defaults(models: List[str]) -> Dict[str, Any]:
         "audio_codec": "copy",
         "audio_bitrate": "",
         "load_cap": 0,
-        "temporal_padding": 0,
         # Repurposed legacy key as global cross-model RIFE switch.
         "frame_interpolation": False,
         "global_rife_multiplier": "x2",
@@ -79,7 +78,6 @@ OUTPUT_ORDER: List[str] = [
     "pixel_format",
     "audio_codec",
     "audio_bitrate",
-    "temporal_padding",
     "frame_interpolation",
     "global_rife_multiplier",
     "global_rife_model",
@@ -107,6 +105,8 @@ def _output_dict_from_args(args: List[Any]) -> Dict[str, Any]:
 
 def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    # Removed setting: do not carry forward from legacy presets.
+    cfg.pop("temporal_padding", None)
     cfg["output_format"] = str(cfg.get("output_format", "auto") or "auto").strip().lower()
     if cfg["output_format"] not in {"auto", "mp4", "png"}:
         cfg["output_format"] = "auto"

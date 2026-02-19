@@ -197,6 +197,8 @@ def _normalize_rife_settings(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    # Removed setting: keep universal preset schema clean when loading old presets.
+    cfg.pop("temporal_padding", None)
     cfg["output_format"] = str(cfg.get("output_format", "auto") or "auto").strip().lower()
     if cfg["output_format"] not in {"auto", "mp4", "png"}:
         cfg["output_format"] = "auto"
@@ -353,9 +355,6 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
             "batch_input_path": "",
             "batch_output_path": "",
             "model": "",
-            "target_resolution": 1080,
-            "downscale_first": False,
-            "auto_calculate_input": True,
             "use_resolution_tab": True,
             "tile_size": 0,
             "overlap": 32,

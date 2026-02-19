@@ -657,8 +657,23 @@ def create_video_comparison_html(
 
         if (fullscreenBtn) {{
             fullscreenBtn.addEventListener("click", () => {{
+                const fsEl =
+                    document.fullscreenElement ||
+                    document.webkitFullscreenElement ||
+                    document.msFullscreenElement ||
+                    null;
+
+                // If already fullscreen, behave like ESC and exit.
+                if (fsEl) {{
+                    if (document.exitFullscreen) document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                    else if (document.msExitFullscreen) document.msExitFullscreen();
+                    return;
+                }}
+
                 if (container.requestFullscreen) container.requestFullscreen();
                 else if (container.webkitRequestFullscreen) container.webkitRequestFullscreen();
+                else if (container.msRequestFullscreen) container.msRequestFullscreen();
             }});
         }}
 

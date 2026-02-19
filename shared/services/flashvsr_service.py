@@ -43,6 +43,8 @@ from shared.output_run_manager import (
     batch_item_dir,
     downscaled_video_path,
     resolve_resume_input_from_run_dir,
+    ensure_image_input_artifact,
+    finalize_run_context,
 )
 from shared.ffmpeg_utils import scale_video
 from shared.global_rife import maybe_apply_global_rife
@@ -180,7 +182,6 @@ def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
             "tiled_vae": False,
             "tiled_dit": False,
             "frame_chunk_size": 0,
-            "resize_factor": 1.0,
             "keep_models_on_cpu": False,
         }
     if vram_gb >= 16.0:
@@ -188,7 +189,6 @@ def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
             "tiled_vae": True,
             "tiled_dit": False,
             "frame_chunk_size": 80,
-            "resize_factor": 1.0,
             "keep_models_on_cpu": True,
         }
     if vram_gb >= 12.0:
@@ -196,14 +196,12 @@ def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
             "tiled_vae": True,
             "tiled_dit": True,
             "frame_chunk_size": 48,
-            "resize_factor": 1.0,
             "keep_models_on_cpu": True,
         }
     return {
         "tiled_vae": True,
         "tiled_dit": True,
         "frame_chunk_size": 20,
-        "resize_factor": 1.0,
         "keep_models_on_cpu": True,
     }
 
@@ -256,7 +254,6 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         mode = model_meta.mode
         scale = int(model_meta.scale)
         frame_chunk_size = int(model_meta.recommended_frame_chunk_size)
-        resize_factor = 1.0
         keep_models_on_cpu = bool(model_meta.default_keep_models_on_cpu)
         version = flashvsr_version_to_ui(model_meta.version)
         tiled_vae = False
@@ -271,7 +268,6 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         mode = "tiny"
         scale = 4
         frame_chunk_size = 64
-        resize_factor = 1.0
         keep_models_on_cpu = True
         tiled_vae = False
         tiled_dit = True
@@ -291,11 +287,11 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "tile_size": default_tile_size,
         "overlap": default_overlap,
         "unload_dit": True,
+        "stream_decode": False,
         "sparse_ratio": 2.0,
         "kv_ratio": 3.0,
         "local_range": 11,
         "frame_chunk_size": frame_chunk_size,
-        "resize_factor": resize_factor,
         "keep_models_on_cpu": keep_models_on_cpu,
         "force_offload": True,
         "enable_debug": False,
@@ -308,9 +304,6 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "start_frame": 0,
         "end_frame": -1,
         "models_dir": str((Path(__file__).resolve().parents[2] / "ComfyUI-FlashVSR_Stable" / "models")),
-        # Deprecated runtime toggle. Kept in payload schema for backward compatibility.
-        # VRAM auto-tuning is now applied manually from the UI "Auto Set by VRAM" button.
-        "auto_vram_profile": False,
         "save_metadata": True,
         "face_restore_after_upscale": False,
         "batch_enable": False,
@@ -339,11 +332,11 @@ FLASHVSR_ORDER: List[str] = [
     "tile_size",
     "overlap",
     "unload_dit",
+    "stream_decode",
     "sparse_ratio",
     "kv_ratio",
     "local_range",
     "frame_chunk_size",
-    "resize_factor",
     "keep_models_on_cpu",
     "force_offload",
     "enable_debug",
@@ -356,7 +349,6 @@ FLASHVSR_ORDER: List[str] = [
     "start_frame",
     "end_frame",
     "models_dir",
-    "auto_vram_profile",
     "save_metadata",
     "face_restore_after_upscale",
     "batch_enable",
@@ -414,6 +406,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["tiled_vae"] = _to_bool(cfg.get("tiled_vae"), _to_bool(defaults.get("tiled_vae", True), True))
     cfg["tiled_dit"] = _to_bool(cfg.get("tiled_dit"), _to_bool(defaults.get("tiled_dit", False), False))
     cfg["unload_dit"] = _to_bool(cfg.get("unload_dit"), _to_bool(defaults.get("unload_dit", False), False))
+    cfg["stream_decode"] = _to_bool(cfg.get("stream_decode"), _to_bool(defaults.get("stream_decode", False), False))
     cfg["color_fix"] = _to_bool(cfg.get("color_fix"), _to_bool(defaults.get("color_fix", True), True))
     cfg["keep_models_on_cpu"] = _to_bool(
         cfg.get("keep_models_on_cpu"),
@@ -421,10 +414,6 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     )
     cfg["force_offload"] = _to_bool(cfg.get("force_offload"), _to_bool(defaults.get("force_offload", True), True))
     cfg["enable_debug"] = _to_bool(cfg.get("enable_debug"), _to_bool(defaults.get("enable_debug", False), False))
-    cfg["auto_vram_profile"] = _to_bool(
-        cfg.get("auto_vram_profile"),
-        _to_bool(defaults.get("auto_vram_profile", True), True),
-    )
 
     cfg["seed"] = max(0, _to_int(cfg.get("seed"), 0))
     cfg["tile_size"] = max(32, min(1024, _to_int(cfg.get("tile_size"), 256)))
@@ -436,9 +425,6 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["kv_ratio"] = max(1.0, min(3.0, _to_float(cfg.get("kv_ratio"), 3.0)))
     cfg["local_range"] = 9 if _to_int(cfg.get("local_range"), 11) == 9 else 11
     cfg["frame_chunk_size"] = max(0, _to_int(cfg.get("frame_chunk_size"), 0))
-    # Deprecated manual preprocess control: keep payload key for compatibility,
-    # but always disable it so Resolution tab cap logic is the only pre-scale path.
-    cfg["resize_factor"] = 1.0
 
     cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
     codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()
@@ -634,20 +620,23 @@ def build_flashvsr_callbacks(
                             )
                     except Exception:
                         pass
-                if seed_controls.get("max_resolution_val") is not None:
-                    settings["max_target_resolution"] = int(seed_controls["max_resolution_val"] or 0)
-                # Repurposed global flag: "pre-downscale then upscale when capped"
-                if "ratio_downscale" in seed_controls:
-                    settings["pre_downscale_then_upscale"] = bool(seed_controls.get("ratio_downscale", False))
+                # Max-edge cap and pre-downscale toggle are local to FlashVSR tab.
+                # Do NOT override them from Resolution-tab defaults (which are chunking-focused).
+                # Legacy bridge: only use a global max if local max is unset (<= 0) and a legacy
+                # explicit value is present in shared state.
+                try:
+                    local_max_edge = int(settings.get("max_target_resolution", 0) or 0)
+                    legacy_max_edge = seed_controls.get("max_resolution_val")
+                    if local_max_edge <= 0 and legacy_max_edge is not None:
+                        merged_max = max(0, min(8192, int(float(legacy_max_edge or 0))))
+                        settings["max_target_resolution"] = merged_max
+                        settings["_max_edge_merge_note"] = (
+                            f"Applied legacy shared max edge fallback: {merged_max}px "
+                            "(local max was unset)."
+                        )
+                except Exception:
+                    pass
 
-            # Runtime auto-VRAM override is intentionally disabled.
-            # Users now apply VRAM recommendations explicitly via the UI button.
-            if settings.get("auto_vram_profile"):
-                settings["_vram_profile_note"] = (
-                    "Auto VRAM Profile checkbox is deprecated. "
-                    "Use 'Auto Set by VRAM' in the UI to apply recommendations."
-                )
-            
             # Apply Output tab cached settings
             fps_override_val = seed_controls.get("fps_override_val")
             if fps_override_val is None and isinstance(output_settings, dict):
@@ -709,7 +698,6 @@ def build_flashvsr_callbacks(
                 "two_pass_encoding",
                 "metadata_format",
                 "log_level",
-                "temporal_padding",
             ):
                 value = encode_overrides.get(key)
                 if value is None and output_settings:
@@ -758,6 +746,7 @@ def build_flashvsr_callbacks(
 
                 Supports:
                 - Video files (ffmpeg scale)
+                - Single image files (resize to temporary image)
                 - Frame directories (resize images into a temp directory)
                 """
                 try:
@@ -768,10 +757,7 @@ def build_flashvsr_callbacks(
                     model_scale = int(cfg.get("scale", 4) or 4)
                     requested_scale = float(cfg.get("upscale_factor") or float(model_scale))
                     max_edge = int(cfg.get("max_target_resolution", 0) or 0)
-
-                    # Respect global enable_max_target when using Resolution tab
-                    if use_global_resolution and not bool(seed_controls.get("enable_max_target", True)):
-                        max_edge = 0
+                    pre_downscale_enabled = bool(cfg.get("pre_downscale_then_upscale", True))
 
                     plan = estimate_fixed_scale_upscale_plan_from_dims(
                         int(w),
@@ -779,7 +765,14 @@ def build_flashvsr_callbacks(
                         requested_scale=requested_scale,
                         model_scale=model_scale,
                         max_edge=max_edge,
-                        force_pre_downscale=True,
+                        force_pre_downscale=pre_downscale_enabled,
+                    )
+
+                    cfg["_preprocess_plan_note"] = (
+                        f"Sizing plan: input={int(w)}x{int(h)}, model_scale={int(model_scale)}x, "
+                        f"requested_scale={float(requested_scale):.3f}x, max_edge={int(max_edge)}, "
+                        f"pre_scale={float(plan.preprocess_scale):.6f}, "
+                        f"target={int(plan.resize_width)}x{int(plan.resize_height)}."
                     )
 
                     if plan.preprocess_scale >= 0.999999:
@@ -807,6 +800,65 @@ def build_flashvsr_callbacks(
                             cfg["_original_input_path_before_preprocess"] = src_input_path
                             cfg["_preprocessed_input_path"] = str(pre_out)
                             cfg["_effective_input_path"] = str(pre_out)
+                            cfg["_preprocess_note"] = (
+                                f"Pre-downscale applied: {int(w)}x{int(h)} → "
+                                f"{int(plan.preprocess_width)}x{int(plan.preprocess_height)} "
+                                f"(max edge cap {int(max_edge) if int(max_edge) > 0 else 'off'})."
+                            )
+                        return
+
+                    if in_type == "image":
+                        out_root = Path(
+                            cfg.get("_run_dir") or cfg.get("global_output_dir") or global_settings.get("output_dir", output_dir)
+                        )
+                        pre_dir = out_root / "pre_processed"
+                        pre_dir.mkdir(parents=True, exist_ok=True)
+                        src_file = Path(src_input_path)
+                        pre_file = collision_safe_path(
+                            pre_dir / f"{src_file.stem}_pre{int(plan.preprocess_width)}x{int(plan.preprocess_height)}{src_file.suffix}"
+                        )
+
+                        if progress:
+                            progress(0, desc=f"Preprocessing image → {int(plan.preprocess_width)}×{int(plan.preprocess_height)}")
+
+                        saved = False
+                        try:
+                            import cv2  # type: ignore
+
+                            img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                            if img is not None:
+                                resized = cv2.resize(
+                                    img,
+                                    (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                                saved = bool(cv2.imwrite(str(pre_file), resized))
+                        except Exception:
+                            saved = False
+
+                        if not saved:
+                            try:
+                                from PIL import Image  # type: ignore
+
+                                with Image.open(src_file) as im:
+                                    im2 = im.resize(
+                                        (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                        resample=Image.LANCZOS,
+                                    )
+                                    im2.save(pre_file)
+                                    saved = True
+                            except Exception:
+                                saved = False
+
+                        if saved and pre_file.exists():
+                            cfg["_original_input_path_before_preprocess"] = src_input_path
+                            cfg["_preprocessed_input_path"] = str(pre_file)
+                            cfg["_effective_input_path"] = str(pre_file)
+                            cfg["_preprocess_note"] = (
+                                f"Pre-downscale applied: {int(w)}x{int(h)} → "
+                                f"{int(plan.preprocess_width)}x{int(plan.preprocess_height)} "
+                                f"(max edge cap {int(max_edge) if int(max_edge) > 0 else 'off'})."
+                            )
                         return
 
                     if in_type == "directory":
@@ -856,9 +908,216 @@ def build_flashvsr_callbacks(
                             cfg["_original_input_path_before_preprocess"] = src_input_path
                             cfg["_preprocessed_input_path"] = str(pre_dir)
                             cfg["_effective_input_path"] = str(pre_dir)
+                            cfg["_preprocess_note"] = (
+                                f"Pre-downscale applied: {int(w)}x{int(h)} → "
+                                f"{int(plan.preprocess_width)}x{int(plan.preprocess_height)} "
+                                f"(max edge cap {int(max_edge) if int(max_edge) > 0 else 'off'})."
+                            )
                         return
                 except Exception:
                     return
+
+            def _enforce_preprocess_requirements(cfg: Dict[str, Any], src_input_path: str) -> None:
+                """
+                Verify preprocess actually took effect when a max-edge cap requires it.
+                If missing, run a robust fallback preprocess (ffmpeg/cv2/Pillow) and
+                mark the run as failed if we still cannot enforce the cap path.
+                """
+                cfg["_preprocess_required_but_missing"] = False
+                try:
+                    dims = get_media_dimensions(src_input_path)
+                    if not dims:
+                        return
+                    w, h = int(dims[0]), int(dims[1])
+                    model_scale = int(cfg.get("scale", 4) or 4)
+                    requested_scale = float(cfg.get("upscale_factor") or float(model_scale))
+                    max_edge = int(cfg.get("max_target_resolution", 0) or 0)
+                    pre_downscale_enabled = bool(cfg.get("pre_downscale_then_upscale", True))
+
+                    plan = estimate_fixed_scale_upscale_plan_from_dims(
+                        w,
+                        h,
+                        requested_scale=requested_scale,
+                        model_scale=model_scale,
+                        max_edge=max_edge,
+                        force_pre_downscale=pre_downscale_enabled,
+                    )
+                    if plan.preprocess_scale >= 0.999999:
+                        return
+
+                    src_norm = normalize_path(src_input_path) or str(src_input_path)
+                    eff_norm = normalize_path(cfg.get("_effective_input_path")) or src_norm
+                    if eff_norm != src_norm and Path(eff_norm).exists():
+                        return
+
+                    in_type = detect_input_type(src_input_path)
+                    fallback_done = False
+
+                    def _mark_applied(preprocessed_path: str) -> None:
+                        cfg["_original_input_path_before_preprocess"] = src_input_path
+                        cfg["_preprocessed_input_path"] = str(preprocessed_path)
+                        cfg["_effective_input_path"] = str(preprocessed_path)
+                        cfg["_preprocess_note"] = (
+                            f"Pre-downscale applied (fallback): {int(w)}x{int(h)} -> "
+                            f"{int(plan.preprocess_width)}x{int(plan.preprocess_height)} "
+                            f"(max edge cap {int(max_edge) if int(max_edge) > 0 else 'off'})."
+                        )
+
+                    if in_type == "video":
+                        out_root = Path(
+                            cfg.get("_run_dir") or cfg.get("global_output_dir") or global_settings.get("output_dir", output_dir)
+                        )
+                        original_name = cfg.get("_original_filename") or Path(src_input_path).name
+                        pre_out = downscaled_video_path(out_root, str(original_name))
+                        ok, err = scale_video(
+                            Path(src_input_path),
+                            Path(pre_out),
+                            int(plan.preprocess_width),
+                            int(plan.preprocess_height),
+                            lossless=True,
+                            audio_copy_first=True,
+                        )
+                        if ok and Path(pre_out).exists():
+                            _mark_applied(str(pre_out))
+                            fallback_done = True
+                        else:
+                            cfg["_preprocess_error_note"] = (
+                                "Pre-downscale fallback failed for video input: "
+                                f"{str(err or 'ffmpeg scale failed').strip()}"
+                            )
+                    elif in_type in {"image", "unknown"} and Path(src_input_path).is_file():
+                        out_root = Path(
+                            cfg.get("_run_dir") or cfg.get("global_output_dir") or global_settings.get("output_dir", output_dir)
+                        )
+                        pre_dir = out_root / "pre_processed"
+                        pre_dir.mkdir(parents=True, exist_ok=True)
+                        src_file = Path(src_input_path)
+                        pre_file = collision_safe_path(
+                            pre_dir / f"{src_file.stem}_pre{int(plan.preprocess_width)}x{int(plan.preprocess_height)}{src_file.suffix}"
+                        )
+
+                        saved = False
+                        ffmpeg_err = ""
+                        try:
+                            ff = subprocess.run(
+                                [
+                                    "ffmpeg",
+                                    "-y",
+                                    "-i",
+                                    str(src_file),
+                                    "-vf",
+                                    f"scale={int(plan.preprocess_width)}:{int(plan.preprocess_height)}:flags=lanczos",
+                                    "-frames:v",
+                                    "1",
+                                    str(pre_file),
+                                ],
+                                capture_output=True,
+                                text=True,
+                            )
+                            saved = bool(ff.returncode == 0 and pre_file.exists() and pre_file.stat().st_size > 0)
+                            if not saved:
+                                ffmpeg_err = (ff.stderr or ff.stdout or "").strip()
+                        except Exception as e:
+                            ffmpeg_err = str(e)
+
+                        if not saved:
+                            try:
+                                import cv2  # type: ignore
+
+                                img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                                if img is not None:
+                                    resized = cv2.resize(
+                                        img,
+                                        (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                        interpolation=cv2.INTER_AREA,
+                                    )
+                                    saved = bool(cv2.imwrite(str(pre_file), resized))
+                            except Exception:
+                                saved = False
+
+                        if not saved:
+                            try:
+                                from PIL import Image  # type: ignore
+
+                                with Image.open(src_file) as im:
+                                    im2 = im.resize(
+                                        (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                        resample=Image.LANCZOS,
+                                    )
+                                    im2.save(pre_file)
+                                    saved = True
+                            except Exception:
+                                saved = False
+
+                        if saved and pre_file.exists():
+                            _mark_applied(str(pre_file))
+                            fallback_done = True
+                        else:
+                            cfg["_preprocess_error_note"] = (
+                                "Pre-downscale fallback failed for image input. "
+                                + (
+                                    f"ffmpeg error: {ffmpeg_err}"
+                                    if ffmpeg_err
+                                    else "Unable to resize with ffmpeg/cv2/Pillow."
+                                )
+                            )
+                    elif in_type == "directory":
+                        temp_root = Path(global_settings.get("temp_dir", temp_dir))
+                        temp_root.mkdir(parents=True, exist_ok=True)
+                        src_dir = Path(src_input_path)
+                        img_files = [p for p in sorted(src_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+                        if img_files:
+                            pre_dir = collision_safe_dir(
+                                temp_root / f"{src_dir.name}_pre{int(plan.preprocess_width)}x{int(plan.preprocess_height)}"
+                            )
+                            pre_dir.mkdir(parents=True, exist_ok=True)
+
+                            try:
+                                import cv2  # type: ignore
+                                for f in img_files:
+                                    img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                                    if img is None:
+                                        continue
+                                    resized = cv2.resize(
+                                        img,
+                                        (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                        interpolation=cv2.INTER_AREA,
+                                    )
+                                    cv2.imwrite(str(pre_dir / f.name), resized)
+                            except Exception:
+                                try:
+                                    from PIL import Image  # type: ignore
+                                    for f in img_files:
+                                        with Image.open(f) as im:
+                                            im2 = im.resize(
+                                                (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                                resample=Image.LANCZOS,
+                                            )
+                                            im2.save(pre_dir / f.name)
+                                except Exception as e:
+                                    cfg["_preprocess_error_note"] = (
+                                        "Pre-downscale fallback failed for frame directory input: "
+                                        f"{str(e)}"
+                                    )
+                            try:
+                                if any(pre_dir.iterdir()):
+                                    _mark_applied(str(pre_dir))
+                                    fallback_done = True
+                            except Exception:
+                                pass
+
+                    if fallback_done:
+                        return
+
+                    cfg["_preprocess_required_but_missing"] = True
+                    if not cfg.get("_preprocess_error_note"):
+                        cfg["_preprocess_error_note"] = (
+                            "Pre-downscale was required to enforce Max Resolution, but preprocessing did not produce "
+                            "a valid capped input."
+                        )
+                except Exception as e:
+                    cfg["_preprocess_required_but_missing"] = True
+                    cfg["_preprocess_error_note"] = f"Pre-downscale fallback failed with unexpected error: {str(e)}"
             
             # Initialize progress
             if progress:
@@ -1052,6 +1311,13 @@ def build_flashvsr_callbacks(
                     item_settings["output_override"] = str(predicted_output_file)
 
                     _apply_vnext_preprocess(item_settings, item_path)
+                    _enforce_preprocess_requirements(item_settings, item_path)
+                    if item_settings.get("_preprocess_required_but_missing"):
+                        logs.append(
+                            f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed: "
+                            f"{item_settings.get('_preprocess_error_note') or 'required pre-downscale failed'}"
+                        )
+                        continue
 
                     effective_for_chunk = normalize_path(item_settings.get("_effective_input_path") or item_path)
                     should_chunk_video = (detect_input_type(effective_for_chunk) == "video") and (auto_chunk or chunk_size_sec > 0)
@@ -1375,9 +1641,10 @@ def build_flashvsr_callbacks(
                     except Exception:
                         pass
 
-            # NEW: Per-run output folder for videos (0001/0002/...) to avoid collisions and
-            # to keep chunk artifacts user-visible.
-            if detect_input_type(settings["input_path"]) == "video":
+            # Per-run output folder for single video/image runs (0001/0002/...) to avoid collisions
+            # and keep all artifacts user-visible in one folder.
+            input_kind_single = detect_input_type(settings["input_path"])
+            if input_kind_single in {"video", "image"}:
                 resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
                 if resume_run_dir_raw:
                     resume_run_dir = Path(normalize_path(resume_run_dir_raw))
@@ -1399,7 +1666,7 @@ def build_flashvsr_callbacks(
                     seed_controls["last_run_dir"] = str(run_dir)
                     settings["_run_dir"] = str(run_dir)
                     settings["_processed_chunks_dir"] = str(processed_chunks_dir)
-                    settings["_resume_run_requested"] = True
+                    settings["_resume_run_requested"] = bool(input_kind_single == "video")
                     settings["_user_output_override_raw"] = settings.get("output_override") or ""
 
                     base_stem = Path(settings.get("_original_filename") or input_path).stem
@@ -1408,6 +1675,8 @@ def build_flashvsr_callbacks(
                     default_final = run_dir / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4"
                     # Resume mode ignores new output override paths and keeps output in the selected run folder.
                     settings["output_override"] = str(default_final)
+                    if input_kind_single != "video":
+                        settings["resume_run_dir"] = ""
                 else:
                     try:
                         base_out_root = Path(global_settings.get("output_dir", output_dir))
@@ -1436,6 +1705,22 @@ def build_flashvsr_callbacks(
             # Output root for artifacts + preprocessing
             settings["global_output_dir"] = str(Path(settings.get("_run_dir") or output_dir))
             _apply_vnext_preprocess(settings, input_path)
+            _enforce_preprocess_requirements(settings, input_path)
+            if settings.get("_preprocess_required_but_missing"):
+                vid_upd, img_upd = _media_updates(None)
+                yield (
+                    "❌ Max resolution preprocess failed",
+                    str(
+                        settings.get("_preprocess_error_note")
+                        or "Pre-downscale was required but failed, so FlashVSR run was stopped to avoid uncapped output."
+                    ),
+                    vid_upd,
+                    img_upd,
+                    gr.update(visible=False),
+                    gr.update(value="", visible=False),
+                    state,
+                )
+                return
 
             # Pull universal PySceneDetect chunking settings from Resolution tab (global).
             auto_chunk = bool(seed_controls.get("auto_chunk", True))
@@ -1633,6 +1918,14 @@ def build_flashvsr_callbacks(
                 log_buffer.append(str(settings.get("_vram_profile_note")))
             if settings.get("_scale_clamp_note"):
                 log_buffer.append(str(settings.get("_scale_clamp_note")))
+            if settings.get("_max_edge_merge_note"):
+                log_buffer.append(str(settings.get("_max_edge_merge_note")))
+            if settings.get("_preprocess_plan_note"):
+                log_buffer.append(str(settings.get("_preprocess_plan_note")))
+            if settings.get("_preprocess_note"):
+                log_buffer.append(str(settings.get("_preprocess_note")))
+            if settings.get("_preprocess_error_note"):
+                log_buffer.append(str(settings.get("_preprocess_error_note")))
             if settings.get("_output_codec_note"):
                 log_buffer.append(str(settings.get("_output_codec_note")))
             
@@ -1662,17 +1955,17 @@ def build_flashvsr_callbacks(
                     if temp_chunks_dir.exists():
                         try:
                             from shared.chunking import detect_resume_state, concat_videos
-                            from shared.path_utils import collision_safe_path
+                            from shared.path_utils import collision_safe_path as _collision_safe_path_local
                             import shutil
                             
                             # Check for completed video chunks
                             partial_video, completed_chunks = detect_resume_state(temp_chunks_dir, "mp4")
                             
                             if completed_chunks and len(completed_chunks) > 0:
-                                partial_target = collision_safe_path(temp_chunks_dir / "cancelled_flashvsr_partial.mp4")
+                                partial_target = _collision_safe_path_local(temp_chunks_dir / "cancelled_flashvsr_partial.mp4")
                                 if concat_videos(completed_chunks, partial_target, encode_settings=settings):
                                     final_output = Path(output_dir) / f"cancelled_flashvsr_partial_upscaled.mp4"
-                                    final_output = collision_safe_path(final_output)
+                                    final_output = _collision_safe_path_local(final_output)
                                     shutil.copy2(partial_target, final_output)
                                     compiled_output = str(final_output)
                                     log_buffer.append(f"\n✅ Partial output salvaged: {final_output.name}")
@@ -1941,7 +2234,6 @@ def build_flashvsr_callbacks(
                         ),
                     }
                 )
-            
             if chunk_count > 0:
                 status = (
                     f"✅ FlashVSR+ chunked upscale complete ({chunk_count} chunks)"
@@ -1959,9 +2251,42 @@ def build_flashvsr_callbacks(
                     status = "Preview failed"
 
             if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=result.log, settings=settings):
-                status = "🚫 Out of VRAM (GPU) — see banner above"
-                show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR+", duration=None)
-            
+                status = "Out of VRAM (GPU) - see banner above"
+                show_vram_oom_modal(state, title="Out of VRAM (GPU) - FlashVSR+", duration=None)
+
+            # Keep run folder self-documented for both video and image runs.
+            try:
+                run_dir_raw = settings.get("_run_dir")
+                if run_dir_raw:
+                    effective_input = settings.get("_effective_input_path") or settings.get("input_path")
+                    input_kind_for_ctx = detect_input_type(effective_input or "")
+                    pre_in = settings.get("_preprocessed_input_path")
+                    if input_kind_for_ctx == "image" and (not pre_in):
+                        snap = ensure_image_input_artifact(
+                            Path(run_dir_raw),
+                            str(effective_input or ""),
+                            preferred_stem=Path(settings.get("_original_filename") or "used_input").stem,
+                        )
+                        if snap:
+                            pre_in = str(snap)
+                            settings["_preprocessed_input_path"] = pre_in
+                    finalize_run_context(
+                        Path(run_dir_raw),
+                        pipeline="flashvsr",
+                        status=str(status or ""),
+                        returncode=int(result.returncode),
+                        output_path=str(output_path) if output_path else None,
+                        original_input_path=str(
+                            settings.get("_original_input_path_before_preprocess")
+                            or settings.get("_preview_original_input")
+                            or input_path
+                        ),
+                        effective_input_path=str(effective_input) if effective_input else None,
+                        preprocessed_input_path=str(pre_in) if pre_in else None,
+                        input_kind=input_kind_for_ctx,
+                    )
+            except Exception:
+                pass
             vid_upd, img_upd = _media_updates(output_path)
             yield (
                 status,
@@ -2015,3 +2340,4 @@ def build_flashvsr_callbacks(
         "open_outputs_folder": open_outputs_folder_flashvsr,
         "clear_temp_folder": clear_temp_folder_flashvsr,
     }
+

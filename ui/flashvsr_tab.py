@@ -157,7 +157,7 @@ def flashvsr_tab(
                             label="Backend Upscale Factor (2x/4x)",
                             choices=["2", "4"],
                             value="2" if str(_value("scale", "4")).strip() == "2" else "4",
-                            visible=False,
+                            visible=True,
                             interactive=True,
                         )
                         version = gr.Dropdown(
@@ -277,9 +277,6 @@ def flashvsr_tab(
                             "Limited impact on dense backends."
                         ),
                     )
-                # Deprecated UI control kept as hidden field for payload/preset compatibility.
-                # Runtime guardrails force this to 1.0 so Resolution tab cap logic is the sole pre-scale path.
-                resize_factor = gr.Number(value=1.0, precision=2, visible=False, interactive=False)
 
                 with gr.Row():
                     sparse_ratio = gr.Slider(
@@ -312,8 +309,6 @@ def flashvsr_tab(
                         elem_classes=["action-btn", "action-btn-auto-vram"],
                     )
                 auto_set_status = gr.Markdown("", visible=False)
-                # Deprecated schema field kept for preset/backward compatibility.
-                auto_vram_profile = gr.State(False)
 
                 with gr.Row():
                     keep_models_on_cpu = gr.Checkbox(
@@ -366,6 +361,16 @@ def flashvsr_tab(
                         label="Unload DiT Before Decoding",
                         value=bool(_value("unload_dit", True)),
                         info="Releases DiT from VRAM before decoder step (TCDecoder in tiny modes, VAE in full mode). Default ON."
+                    )
+
+                with gr.Row():
+                    stream_decode = gr.Checkbox(
+                        label="Enable Stream Decode (Tiny/Tiny-Long)",
+                        value=bool(_value("stream_decode", False)),
+                        info=(
+                            "Forces streaming decode path in tiny modes by disabling DiT tiling at runtime. "
+                            "Can improve responsiveness and lower host RAM, but typically increases peak VRAM."
+                        ),
                     )
 
                 with gr.Row():
@@ -684,16 +689,17 @@ def flashvsr_tab(
             - `Local Range` is truly `9` or `11` only. `Sparse Ratio` is `1.5-2.0`. `KV Ratio` is `1.0-3.0`.
             - `Sparse Ratio`/`Local Range` matter most on sparse attention backends; on `flash_attention_2`/`sdpa` their effect is limited.
             - `Force Offload After Run` is most useful in long-lived processes; in subprocess-per-job flows it usually has smaller impact.
+            - `Enable Stream Decode` works only in tiny modes and automatically disables DiT tiling for that run.
             """)
     
     # Collect inputs
     inputs_list = [
         input_path, output_override, output_format, scale, version, mode,
         vae_model, precision, attention_mode,
-        tiled_vae, tiled_dit, tile_size, overlap, unload_dit,
-        sparse_ratio, kv_ratio, local_range, frame_chunk_size, resize_factor,
+        tiled_vae, tiled_dit, tile_size, overlap, unload_dit, stream_decode,
+        sparse_ratio, kv_ratio, local_range, frame_chunk_size,
         keep_models_on_cpu, force_offload, enable_debug,
-        color_fix, seed, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir, auto_vram_profile,
+        color_fix, seed, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir,
         save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
@@ -1067,6 +1073,8 @@ def flashvsr_tab(
             precision_val = "auto"
             tiled_vae_val = True
             tiled_dit_val = True
+            tile_size_val = 128
+            overlap_val = 16
             frame_chunk_val = 20 if scale_i == 4 else 40
             keep_cpu_val = True
             force_offload_val = True
@@ -1080,6 +1088,8 @@ def flashvsr_tab(
             precision_val = "auto"
             tiled_vae_val = True
             tiled_dit_val = False
+            tile_size_val = 256
+            overlap_val = 24
             frame_chunk_val = 64 if scale_i == 4 else 0
             keep_cpu_val = True
             force_offload_val = True
@@ -1092,6 +1102,8 @@ def flashvsr_tab(
             precision_val = "auto"
             tiled_vae_val = False
             tiled_dit_val = False
+            tile_size_val = 384
+            overlap_val = 32
             frame_chunk_val = 0
             keep_cpu_val = False
             force_offload_val = False
@@ -1102,6 +1114,8 @@ def flashvsr_tab(
             precision_val = "auto"
             tiled_vae_val = True
             tiled_dit_val = False
+            tile_size_val = 320
+            overlap_val = 24
             frame_chunk_val = 64 if scale_i == 4 else 0
             keep_cpu_val = True
             force_offload_val = True
@@ -1112,6 +1126,8 @@ def flashvsr_tab(
             precision_val = "fp16"
             tiled_vae_val = True
             tiled_dit_val = True
+            tile_size_val = 256
+            overlap_val = 24
             frame_chunk_val = 48 if scale_i == 4 else 80
             keep_cpu_val = True
             force_offload_val = True
@@ -1122,6 +1138,8 @@ def flashvsr_tab(
             precision_val = "fp16"
             tiled_vae_val = True
             tiled_dit_val = True
+            tile_size_val = 192
+            overlap_val = 24
             frame_chunk_val = 20 if scale_i == 4 else 40
             keep_cpu_val = True
             force_offload_val = True
@@ -1136,11 +1154,11 @@ def flashvsr_tab(
             gr.update(value=precision_val),
             gr.update(value=tiled_vae_val),
             gr.update(value=tiled_dit_val),
+            gr.update(value=tile_size_val),
+            gr.update(value=overlap_val),
             gr.update(value=frame_chunk_val),
-            gr.update(value=1.0),
             gr.update(value=keep_cpu_val),
             gr.update(value=force_offload_val),
-            False,
             gr.update(value=msg, visible=True),
             gr.update(value=_vae_mode_note(mode_val)),
         )
@@ -1464,11 +1482,11 @@ def flashvsr_tab(
             precision,
             tiled_vae,
             tiled_dit,
+            tile_size,
+            overlap,
             frame_chunk_size,
-            resize_factor,
             keep_models_on_cpu,
             force_offload,
-            auto_vram_profile,
             auto_set_status,
             vae_mode_note,
         ],

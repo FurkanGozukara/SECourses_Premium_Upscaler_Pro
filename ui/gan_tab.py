@@ -237,30 +237,6 @@ def gan_tab(
 
             gr.Markdown("#### Processing Settings")
             with gr.Group():
-                # Legacy controls (kept for old presets, no longer used by vNext sizing)
-                target_resolution = gr.Slider(
-                    label="(Legacy) Target Resolution (longest side) [internal]",
-                    minimum=512, maximum=4096, step=64,
-                    value=_value("target_resolution", 1920),
-                    visible=False,
-                    interactive=False,
-                )
-                target_res_warning = gr.Markdown("", visible=False)
-
-                downscale_first = gr.Checkbox(
-                    label="(Legacy) Downscale First if Needed [internal]",
-                    value=bool(_value("downscale_first", True)),
-                    visible=False,
-                    interactive=False,
-                )
-
-                auto_calculate_input = gr.Checkbox(
-                    label="(Legacy) Auto-Calculate Input Resolution [internal]",
-                    value=bool(_value("auto_calculate_input", True)),
-                    visible=False,
-                    interactive=False,
-                )
-
                 with gr.Row():
                     tile_size = gr.Number(
                         label="Tile Size",
@@ -559,7 +535,7 @@ def gan_tab(
     
     inputs_list = [
         input_path, output_override, batch_enable, batch_input, batch_output, gan_model,
-        target_resolution, downscale_first, auto_calculate_input, use_resolution_tab, tile_size, overlap,
+        use_resolution_tab, tile_size, overlap,
         denoising_strength, sharpening, color_correction, gpu_acceleration, gpu_device,
         batch_size, face_restore_after_upscale, create_subfolders,
         # vNext sizing
@@ -969,7 +945,7 @@ def gan_tab(
         ]
     )
     
-    # NOTE: Legacy target_resolution is hidden; sizing is now driven by Upscale-x.
+    # vNext sizing is driven by Upscale-x + max-edge cap + optional pre-downscale.
 
     cancel_btn.click(
         fn=lambda ok, state: service["cancel_action"](state) if ok else (gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), "", state),

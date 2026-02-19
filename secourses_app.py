@@ -1476,13 +1476,14 @@ def main(argv=None):
                 )
 
                 face_global_hidden = gr.Checkbox(
+                    label="Global Face Restore (synced from Face tab)",
                     value=bool(global_settings.get("face_global", False)),
-                    visible=False,
                     interactive=False,
                 )
                 pinned_reference_path_hidden = gr.Textbox(
+                    label="Pinned Reference Path",
                     value=str(global_settings.get("pinned_reference_path", "") or ""),
-                    visible=False,
+                    info="Current pinned comparison reference. Managed from Output & Comparison actions.",
                     interactive=False,
                 )
 

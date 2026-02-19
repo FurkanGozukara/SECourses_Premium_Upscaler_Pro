@@ -226,7 +226,11 @@ def flashvsr_tab(
                             if str(_value("attention_mode", _value("attention", "flash_attention_2"))) in set(FLASHVSR_ATTENTION_OPTIONS)
                             else "flash_attention_2"
                         ),
-                        info="Default is `flash_attention_2`."
+                        info=(
+                            "Default `flash_attention_2` (dense, fast on modern NVIDIA). "
+                            "`Local Range` / `Sparse Ratio` / `KV Ratio` mainly affect sparse backends "
+                            "(`sparse_sage_attention`, `block_sparse_attention`)."
+                        )
                     )
                     seed = gr.Number(
                         label="Random Seed",
@@ -244,20 +248,19 @@ def flashvsr_tab(
                         value=int(_value("frame_chunk_size", 0) or 0),
                         info="0 = process all frames at once. Use 16-100 to reduce VRAM usage on long clips.",
                     )
-                    resize_factor = gr.Slider(
-                        label="Resize Factor (Preprocess)",
-                        minimum=0.1,
-                        maximum=1.0,
-                        step=0.1,
-                        value=float(_value("resize_factor", 1.0) or 1.0),
-                        info="Downscale input before FlashVSR. 0.5 can significantly reduce VRAM usage.",
-                    )
                     local_range = gr.Dropdown(
                         label="Local Range",
                         choices=[9, 11],
                         value=9 if str(_value("local_range", 11)).strip() == "9" else 11,
-                        info="9 = sharper details, 11 = more stable temporal consistency.",
+                        info=(
+                            "Backend-supported values: `9` or `11` only. Sparse local window size: "
+                            "`9` = tighter/sharper and slightly lighter, `11` = wider/stabler motion and slightly heavier. "
+                            "Limited impact on dense backends."
+                        ),
                     )
+                # Deprecated UI control kept as hidden field for payload/preset compatibility.
+                # Runtime guardrails force this to 1.0 so Resolution tab cap logic is the sole pre-scale path.
+                resize_factor = gr.Number(value=1.0, precision=2, visible=False, interactive=False)
 
                 with gr.Row():
                     sparse_ratio = gr.Slider(
@@ -266,7 +269,11 @@ def flashvsr_tab(
                         maximum=2.0,
                         step=0.1,
                         value=float(_value("sparse_ratio", 2.0) or 2.0),
-                        info="Sparse attention control. 2.0 recommended for quality/stability.",
+                        info=(
+                            "True range in this build: `1.5-2.0` (not `1-3`). Controls sparse top-k density: "
+                            "lower = less compute/VRAM and faster, higher = more detail/stability and slower. "
+                            "Primarily affects sparse backends."
+                        ),
                     )
                     kv_ratio = gr.Slider(
                         label="KV Ratio",
@@ -274,10 +281,14 @@ def flashvsr_tab(
                         maximum=3.0,
                         step=0.1,
                         value=float(_value("kv_ratio", 3.0) or 3.0),
-                        info="KV cache ratio. Higher values preserve more detail but use more memory.",
+                        info=(
+                            "True range in this build: `1.0-3.0` (not `1-5`). Controls temporal KV cache length. "
+                            "Higher keeps more history (better consistency, more VRAM/time). Internally cast to int "
+                            "(effective levels are roughly `1`, `2`, `3`)."
+                        ),
                     )
                     auto_set_vram_btn = gr.Button(
-                        "Auto Set by VRAM",
+                        "Set Low VRAM",
                         variant="secondary",
                         elem_classes=["action-btn", "action-btn-auto-vram"],
                     )
@@ -289,12 +300,20 @@ def flashvsr_tab(
                     keep_models_on_cpu = gr.Checkbox(
                         label="Keep Models on CPU",
                         value=bool(_value("keep_models_on_cpu", True)),
-                        info="Recommended ON for 8-16GB GPUs to reduce VRAM pressure.",
+                        info=(
+                            "Keeps idle model parts in system RAM and moves them to GPU only when needed. "
+                            "Reduces peak VRAM but adds transfer overhead (can lower FPS). Usually good for low-VRAM "
+                            "or multi-job stability."
+                        ),
                     )
                     force_offload = gr.Checkbox(
                         label="Force Offload After Run",
                         value=bool(_value("force_offload", True)),
-                        info="Force model offload to system RAM after execution.",
+                        info=(
+                            "After processing, explicitly offloads models from VRAM to CPU RAM. "
+                            "Effective only when `Keep Models on CPU` is ON. Useful for long-lived app sessions; "
+                            "in one-job-per-subprocess usage, benefit is usually smaller."
+                        ),
                     )
                     enable_debug = gr.Checkbox(
                         label="Enable Debug Logging",
@@ -636,13 +655,16 @@ def flashvsr_tab(
             - `24GB+`: `full`, Wan2.x, tiling OFF, chunk size 0.
             - `16GB`: `tiny`, Wan2.1, VAE tiling ON, optional chunking.
             - `12GB`: `tiny`, LightVAE, VAE+DiT tiling ON, chunk size around 32-64.
-            - `8GB`: `tiny-long`, LightVAE/LightTAE, tiling ON, chunk size around 16-32, resize factor 0.5-0.8.
+            - `8GB`: `tiny-long`, LightVAE/LightTAE, tiling ON, chunk size around 16-32.
             - Use **Auto Set by VRAM** to apply these recommendations once, then fine-tune manually.
 
             **Important backend limits**
             - FlashVSR supports only **2x** or **4x** upscale factors.
             - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
             - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
+            - `Local Range` is truly `9` or `11` only. `Sparse Ratio` is `1.5-2.0`. `KV Ratio` is `1.0-3.0`.
+            - `Sparse Ratio`/`Local Range` matter most on sparse attention backends; on `flash_attention_2`/`sdpa` their effect is limited.
+            - `Force Offload After Run` is most useful in long-lived processes; in subprocess-per-job flows it usually has smaller impact.
             """)
     
     # Collect inputs
@@ -1027,11 +1049,11 @@ def flashvsr_tab(
             tiled_vae_val = True
             tiled_dit_val = True
             frame_chunk_val = 20 if scale_i == 4 else 40
-            resize_val = 0.6 if scale_i == 4 else 0.8
             keep_cpu_val = True
             force_offload_val = True
             msg = (
-                "Auto set applied for CPU mode: `tiny-long`, `LightVAE_W2.1`, aggressive memory settings."
+                "Auto set applied for CPU mode: `tiny-long`, `LightVAE_W2.1`, aggressive memory settings. "
+                "Use Max Resolution + Pre-downscale then upscale for extra cap control."
             )
         elif vram_gb is None:
             mode_val = "tiny"
@@ -1040,7 +1062,6 @@ def flashvsr_tab(
             tiled_vae_val = True
             tiled_dit_val = False
             frame_chunk_val = 64 if scale_i == 4 else 0
-            resize_val = 1.0
             keep_cpu_val = True
             force_offload_val = True
             msg = (
@@ -1053,7 +1074,6 @@ def flashvsr_tab(
             tiled_vae_val = False
             tiled_dit_val = False
             frame_chunk_val = 0
-            resize_val = 1.0
             keep_cpu_val = False
             force_offload_val = False
             msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): high-quality `full` profile."
@@ -1064,7 +1084,6 @@ def flashvsr_tab(
             tiled_vae_val = True
             tiled_dit_val = False
             frame_chunk_val = 64 if scale_i == 4 else 0
-            resize_val = 1.0
             keep_cpu_val = True
             force_offload_val = True
             msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): balanced `tiny` profile."
@@ -1075,7 +1094,6 @@ def flashvsr_tab(
             tiled_vae_val = True
             tiled_dit_val = True
             frame_chunk_val = 48 if scale_i == 4 else 80
-            resize_val = 1.0
             keep_cpu_val = True
             force_offload_val = True
             msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): low-VRAM quality profile."
@@ -1086,10 +1104,12 @@ def flashvsr_tab(
             tiled_vae_val = True
             tiled_dit_val = True
             frame_chunk_val = 20 if scale_i == 4 else 40
-            resize_val = 0.6 if scale_i == 4 else 0.8
             keep_cpu_val = True
             force_offload_val = True
-            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): conservative `tiny-long` profile."
+            msg = (
+                f"Auto set applied for {device_label} ({vram_gb:.1f} GB): conservative `tiny-long` profile. "
+                "Use Max Resolution + Pre-downscale then upscale for extra cap control."
+            )
 
         return (
             gr.update(value=mode_val),
@@ -1098,7 +1118,7 @@ def flashvsr_tab(
             gr.update(value=tiled_vae_val),
             gr.update(value=tiled_dit_val),
             gr.update(value=frame_chunk_val),
-            gr.update(value=resize_val),
+            gr.update(value=1.0),
             gr.update(value=keep_cpu_val),
             gr.update(value=force_offload_val),
             False,

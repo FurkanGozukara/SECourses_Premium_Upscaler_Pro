@@ -203,7 +203,7 @@ def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
         "tiled_vae": True,
         "tiled_dit": True,
         "frame_chunk_size": 20,
-        "resize_factor": 0.6,
+        "resize_factor": 1.0,
         "keep_models_on_cpu": True,
     }
 
@@ -256,7 +256,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         mode = model_meta.mode
         scale = int(model_meta.scale)
         frame_chunk_size = int(model_meta.recommended_frame_chunk_size)
-        resize_factor = float(model_meta.recommended_resize_factor)
+        resize_factor = 1.0
         keep_models_on_cpu = bool(model_meta.default_keep_models_on_cpu)
         version = flashvsr_version_to_ui(model_meta.version)
         tiled_vae = False
@@ -436,7 +436,9 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["kv_ratio"] = max(1.0, min(3.0, _to_float(cfg.get("kv_ratio"), 3.0)))
     cfg["local_range"] = 9 if _to_int(cfg.get("local_range"), 11) == 9 else 11
     cfg["frame_chunk_size"] = max(0, _to_int(cfg.get("frame_chunk_size"), 0))
-    cfg["resize_factor"] = max(0.1, min(1.0, _to_float(cfg.get("resize_factor"), 1.0)))
+    # Deprecated manual preprocess control: keep payload key for compatibility,
+    # but always disable it so Resolution tab cap logic is the only pre-scale path.
+    cfg["resize_factor"] = 1.0
 
     cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
     codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()

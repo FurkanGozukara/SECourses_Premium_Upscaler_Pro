@@ -34,3 +34,12 @@ global.json
 temp/
 __pycache__/
 executed_commands
+ComfyUI-FlashVSR/
+ComfyUI-FlashVSR_Ultra_Fast/
+ComfyUI-FlashVSR_Ultra_Fastv2/
+ComfyUI-FlashVSR_Ultra_Long/
+ComfyUI_FlashVSR/
+FlashVSR-Pro/
+FlashVSR/
+FlashVSR_plus_pinokio/
+wan2gp-flashvsr/

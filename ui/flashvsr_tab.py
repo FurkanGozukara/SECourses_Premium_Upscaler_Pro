@@ -222,11 +222,11 @@ def flashvsr_tab(
                         label="Attention Backend",
                         choices=list(FLASHVSR_ATTENTION_OPTIONS),
                         value=(
-                            str(_value("attention_mode", _value("attention", "sparse_sage_attention")))
-                            if str(_value("attention_mode", _value("attention", "sparse_sage_attention"))) in set(FLASHVSR_ATTENTION_OPTIONS)
-                            else "sparse_sage_attention"
+                            str(_value("attention_mode", _value("attention", "flash_attention_2")))
+                            if str(_value("attention_mode", _value("attention", "flash_attention_2"))) in set(FLASHVSR_ATTENTION_OPTIONS)
+                            else "flash_attention_2"
                         ),
-                        info="Recommended: `sparse_sage_attention` for VRAM/speed balance."
+                        info="Default is `flash_attention_2`."
                     )
                     seed = gr.Number(
                         label="Random Seed",

@@ -43,7 +43,7 @@ class FlashVSRModel:
     default_tile_size: int = 256
     default_overlap: int = 24
     default_precision: str = "auto"
-    default_attention_mode: str = "sparse_sage_attention"
+    default_attention_mode: str = "flash_attention_2"
     default_vae_model: str = "Wan2.1"
     default_keep_models_on_cpu: bool = True
     recommended_frame_chunk_size: int = 0

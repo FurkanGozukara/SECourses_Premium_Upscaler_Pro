@@ -251,7 +251,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_precision = "bf16"
         default_tile_size = model_meta.default_tile_size
         default_overlap = model_meta.default_overlap
-        default_attention = model_meta.default_attention_mode
+        default_attention = "flash_attention_2"
         default_vae = "Wan2.2"
         mode = model_meta.mode
         scale = int(model_meta.scale)
@@ -265,7 +265,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_precision = "bf16"
         default_tile_size = 256
         default_overlap = 24
-        default_attention = "sparse_sage_attention"
+        default_attention = "flash_attention_2"
         default_vae = "Wan2.2"
         version = "1.1"
         mode = "tiny"
@@ -394,7 +394,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     precision = str(cfg.get("precision", cfg.get("dtype", defaults.get("precision", "auto")))).strip().lower()
     cfg["precision"] = precision if precision in {"auto", "bf16", "fp16"} else "auto"
 
-    att_raw = str(cfg.get("attention_mode", cfg.get("attention", defaults.get("attention_mode", "sparse_sage_attention")))).strip().lower()
+    att_raw = str(cfg.get("attention_mode", cfg.get("attention", defaults.get("attention_mode", "flash_attention_2")))).strip().lower()
     att_map = {
         "sage": "sparse_sage_attention",
         "sparse_sage": "sparse_sage_attention",
@@ -406,7 +406,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         "flash_attention_2": "flash_attention_2",
         "sdpa": "sdpa",
     }
-    cfg["attention_mode"] = att_map.get(att_raw, "sparse_sage_attention")
+    cfg["attention_mode"] = att_map.get(att_raw, "flash_attention_2")
 
     vae_model = str(cfg.get("vae_model", defaults.get("vae_model", "Wan2.2"))).strip()
     cfg["vae_model"] = vae_model if vae_model in FLASHVSR_VAE_OPTIONS else str(defaults.get("vae_model", "Wan2.2"))
@@ -477,7 +477,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
 
     # Compatibility aliases for older presets/components.
     cfg["dtype"] = cfg.get("precision", "auto")
-    cfg["attention"] = cfg.get("attention_mode", "sparse_sage_attention")
+    cfg["attention"] = cfg.get("attention_mode", "flash_attention_2")
     cfg["quality"] = cfg.get("crf", 18)
 
     return cfg

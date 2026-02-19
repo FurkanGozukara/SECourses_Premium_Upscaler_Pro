@@ -17,7 +17,6 @@ from shared.services.flashvsr_service import (
     FLASHVSR_VAE_OPTIONS,
     FLASHVSR_PRECISION_OPTIONS,
     FLASHVSR_ATTENTION_OPTIONS,
-    FLASHVSR_CODEC_OPTIONS,
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
@@ -315,20 +314,20 @@ def flashvsr_tab(
                 with gr.Row():
                     tiled_vae = gr.Checkbox(
                         label="Enable VAE Tiling",
-                        value=bool(_value("tiled_vae", True)),
-                        info="Splits VAE processing into tiles to reduce VRAM. Usually recommended."
+                        value=bool(_value("tiled_vae", False)),
+                        info="Splits VAE processing into tiles to reduce VRAM. Default OFF."
                     )
                     
                     tiled_dit = gr.Checkbox(
                         label="Enable DiT Tiling",
                         value=bool(_value("tiled_dit", True)),
-                        info="Splits diffusion transformer inference into tiles. Useful for limited VRAM and 4x runs."
+                        info="Splits diffusion transformer inference into tiles. Default ON."
                     )
                     
                     unload_dit = gr.Checkbox(
                         label="Unload DiT Before Decoding",
-                        value=bool(_value("unload_dit", False)),
-                        info="Releases DiT from VRAM before VAE decode. Slower, but helps avoid OOM."
+                        value=bool(_value("unload_dit", True)),
+                        info="Releases DiT from VRAM before VAE decode. Default ON."
                     )
 
                 with gr.Row():
@@ -356,32 +355,6 @@ def flashvsr_tab(
                         value=bool(_value("color_fix", True)),
                         info="Wavelet color transfer. Recommended ON unless you intentionally want different colors."
                     )
-                    
-                    fps_flashvsr = gr.Number(
-                        label="Output FPS Override",
-                        value=float(_value("fps", 0.0) or 0.0),
-                        precision=2,
-                        info="0 = keep source FPS. Set a positive value to force output FPS."
-                    )
-                    
-                    codec = gr.Dropdown(
-                        label="Video Codec",
-                        choices=list(FLASHVSR_CODEC_OPTIONS),
-                        value=(
-                            str(_value("codec", "libx264"))
-                            if str(_value("codec", "libx264")) in set(FLASHVSR_CODEC_OPTIONS)
-                            else "libx264"
-                        ),
-                        info="Encoder backend used by FlashVSR CLI for generated video.",
-                    )
-
-                with gr.Row():
-                    crf = gr.Slider(
-                        label="CRF Quality (Lower = Better)",
-                        minimum=0, maximum=51, step=1,
-                        value=int(_value("crf", _value("quality", 18)) or 18),
-                        info="Typical range: 16-22. Lower values increase quality and file size."
-                    )
                     start_frame = gr.Number(
                         label="Start Frame",
                         value=int(_value("start_frame", 0) or 0),
@@ -394,6 +367,15 @@ def flashvsr_tab(
                         precision=0,
                         info="-1 = process until the end of input."
                     )
+
+                gr.Markdown(
+                    "**Video Codec / CRF / FPS Override:** Controlled from `Output > Video Output` "
+                    "and automatically applied here."
+                )
+                # Keep schema compatibility fields without exposing duplicate controls.
+                fps_flashvsr = gr.State(float(_value("fps", 0.0) or 0.0))
+                codec = gr.State(str(_value("codec", "libx264") or "libx264"))
+                crf = gr.State(int(_value("crf", _value("quality", 18)) or 18))
 
                 models_dir = gr.Textbox(
                     label="FlashVSR Models Directory",

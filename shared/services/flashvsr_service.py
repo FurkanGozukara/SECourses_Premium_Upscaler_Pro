@@ -259,8 +259,8 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         resize_factor = float(model_meta.recommended_resize_factor)
         keep_models_on_cpu = bool(model_meta.default_keep_models_on_cpu)
         version = flashvsr_version_to_ui(model_meta.version)
-        tiled_vae = bool(model_meta.supports_tiled_vae)
-        tiled_dit = bool(model_meta.supports_tiled_dit) if mode == "tiny-long" else False
+        tiled_vae = False
+        tiled_dit = True
     else:
         default_precision = "bf16"
         default_tile_size = 256
@@ -273,8 +273,8 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         frame_chunk_size = 64
         resize_factor = 1.0
         keep_models_on_cpu = True
-        tiled_vae = True
-        tiled_dit = False
+        tiled_vae = False
+        tiled_dit = True
 
     return {
         "input_path": "",
@@ -290,7 +290,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "tiled_dit": tiled_dit,
         "tile_size": default_tile_size,
         "overlap": default_overlap,
-        "unload_dit": False,
+        "unload_dit": True,
         "sparse_ratio": 2.0,
         "kv_ratio": 3.0,
         "local_range": 11,
@@ -647,8 +647,15 @@ def build_flashvsr_callbacks(
                 )
             
             # Apply Output tab cached settings
-            if seed_controls.get("fps_override_val") is not None and seed_controls["fps_override_val"] > 0:
-                settings["fps"] = seed_controls["fps_override_val"]
+            fps_override_val = seed_controls.get("fps_override_val")
+            if fps_override_val is None and isinstance(output_settings, dict):
+                fps_override_val = output_settings.get("fps_override")
+            if fps_override_val is not None:
+                try:
+                    fps_override_num = float(fps_override_val or 0.0)
+                except Exception:
+                    fps_override_num = 0.0
+                settings["fps"] = fps_override_num if fps_override_num > 0 else 0.0
             if seed_controls.get("comparison_mode_val"):
                 settings["_comparison_mode"] = seed_controls["comparison_mode_val"]
             settings["save_metadata"] = bool(
@@ -707,6 +714,32 @@ def build_flashvsr_callbacks(
                     value = output_settings.get(key)
                 if value is not None:
                     settings[key] = value
+
+            # FlashVSR tab uses global Output tab video settings for model-pass encoding.
+            output_codec = settings.get("video_codec")
+            if output_codec is None and isinstance(output_settings, dict):
+                output_codec = output_settings.get("video_codec")
+            codec_map = {
+                "h264": "libx264",
+                "h265": "libx265",
+            }
+            output_codec_key = str(output_codec or "").strip().lower()
+            mapped_codec = codec_map.get(output_codec_key, "libx264")
+            settings["codec"] = mapped_codec
+            if output_codec_key and output_codec_key not in codec_map:
+                settings["_output_codec_note"] = (
+                    f"Output tab codec '{output_codec_key}' is not directly supported by FlashVSR CLI; "
+                    f"using '{mapped_codec}' for model-pass output."
+                )
+
+            output_quality = settings.get("video_quality")
+            if output_quality is None and isinstance(output_settings, dict):
+                output_quality = output_settings.get("video_quality")
+            try:
+                output_quality_i = int(float(output_quality if output_quality is not None else 18))
+            except Exception:
+                output_quality_i = 18
+            settings["crf"] = max(0, min(51, output_quality_i))
 
             face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))
@@ -1598,6 +1631,8 @@ def build_flashvsr_callbacks(
                 log_buffer.append(str(settings.get("_vram_profile_note")))
             if settings.get("_scale_clamp_note"):
                 log_buffer.append(str(settings.get("_scale_clamp_note")))
+            if settings.get("_output_codec_note"):
+                log_buffer.append(str(settings.get("_output_codec_note")))
             
             while thread.is_alive() or not progress_queue.empty():
                 # Check for cancellation

@@ -9,13 +9,14 @@ Notes:
 
 import hashlib
 import html
+import json
 import os
 from pathlib import Path
 import random
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import urllib.parse
 
 
@@ -255,11 +256,22 @@ def _build_video_badge(base_label: str, video_path: str) -> str:
     return base_label
 
 
+def _build_gradio_file_url(file_path: str, side: str = "media") -> str:
+    """
+    Build /gradio_api/file URL with cache-busting token.
+    """
+    encoded = urllib.parse.quote(file_path.replace("\\", "/"), safe=":/")
+    token = _media_version_token(file_path)
+    safe_side = urllib.parse.quote(str(side or "media"), safe="")
+    return f"/gradio_api/file={encoded}?v={token}&side={safe_side}"
+
+
 def create_video_comparison_html(
     original_video: Optional[str],
     upscaled_video: Optional[str],
     height: int = 600,
     slider_position: float = 50.0,
+    selectable_videos: Optional[List[str]] = None,
 ) -> str:
     """
     Create HTML for video comparison slider.
@@ -269,6 +281,7 @@ def create_video_comparison_html(
         upscaled_video: Path to upscaled video file
         height: Height of video player in pixels
         slider_position: Initial slider position (0-100%)
+        selectable_videos: Optional list of videos for in-viewer switching
 
     Returns:
         HTML string with embedded JavaScript for video comparison
@@ -302,24 +315,81 @@ def create_video_comparison_html(
     original_served_path = _ensure_browser_video_playable(original_served_path)
     upscaled_served_path = _ensure_browser_video_playable(upscaled_served_path)
 
-    # Gradio 6.x file route.
-    original_path_encoded = urllib.parse.quote(
-        original_served_path.replace("\\", "/"), safe=":/"
-    )
-    upscaled_path_encoded = urllib.parse.quote(
-        upscaled_served_path.replace("\\", "/"), safe=":/"
-    )
-    original_token = _media_version_token(original_served_path)
-    upscaled_token = _media_version_token(upscaled_served_path)
-    original_url = f"/gradio_api/file={original_path_encoded}?v={original_token}&side=original"
-    upscaled_url = f"/gradio_api/file={upscaled_path_encoded}?v={upscaled_token}&side=upscaled"
+    original_url = _build_gradio_file_url(original_served_path, "original")
+    upscaled_url = _build_gradio_file_url(upscaled_served_path, "upscaled")
 
     original_badge = html.escape(_build_video_badge("Original", original_path))
     upscaled_badge = html.escape(_build_video_badge("Upscaled", upscaled_path))
 
+    selectable_records: List[Dict[str, str]] = []
+    selectable_seen = set()
+
+    def _append_selectable(path_value: str) -> None:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return
+        try:
+            abs_path = str(Path(raw).resolve())
+        except Exception:
+            abs_path = raw
+        if abs_path in selectable_seen:
+            return
+        try:
+            if not Path(abs_path).exists():
+                return
+        except Exception:
+            return
+
+        if abs_path == original_path:
+            served = original_served_path
+        elif abs_path == upscaled_path:
+            served = upscaled_served_path
+        else:
+            served = _ensure_gradio_servable_file(abs_path)
+            served = _ensure_browser_video_playable(served)
+        url = _build_gradio_file_url(served, "select")
+        selectable_records.append(
+            {
+                "path": abs_path,
+                "url": url,
+                "label": _build_video_badge(Path(abs_path).name, abs_path),
+            }
+        )
+        selectable_seen.add(abs_path)
+
+    for p in selectable_videos or []:
+        _append_selectable(str(p))
+    _append_selectable(original_path)
+    _append_selectable(upscaled_path)
+
     safe_height = max(260, int(height or 600))
     initial_slider = max(0.0, min(100.0, float(slider_position or 50.0)))
     unique_id = f"vc_{random.randint(100000, 999999)}"
+
+    has_selectors = len(selectable_records) >= 2
+    selectable_json = json.dumps(selectable_records)
+
+    def _build_select_options(selected_path: str) -> str:
+        rows: List[str] = []
+        for rec in selectable_records:
+            selected_attr = " selected" if rec["path"] == selected_path else ""
+            rows.append(
+                f'<option value="{html.escape(rec["path"], quote=True)}"{selected_attr}>'
+                f'{html.escape(rec["label"])}</option>'
+            )
+        return "".join(rows)
+
+    left_selector_html = ""
+    right_selector_html = ""
+    if has_selectors:
+        left_selector_html = (
+            f'<select id="{unique_id}_leftSelect" class="video-selector-overlay video-selector-left">'
+            f"{_build_select_options(original_path)}</select>"
+        )
+        right_selector_html = (
+            f'<select id="{unique_id}_rightSelect" class="video-selector-overlay video-selector-right">'
+            f"{_build_select_options(upscaled_path)}</select>"
+        )
 
     return f"""
     <div id="{unique_id}_container" class="video-comparison-container" style="position:relative;width:100%;max-width:1200px;margin:0 auto;background:#000;border-radius:8px;overflow:hidden;">
@@ -346,12 +416,14 @@ def create_video_comparison_html(
                 </div>
             </div>
 
-            <div style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
+            <div id="{unique_id}_leftBadge" style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
                 {original_badge}
             </div>
-            <div style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
+            <div id="{unique_id}_rightBadge" style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
                 {upscaled_badge}
             </div>
+            {left_selector_html}
+            {right_selector_html}
         </div>
 
         <div id="{unique_id}_controls" style="padding:15px;background:linear-gradient(to top,rgba(0,0,0,0.9),rgba(0,0,0,0.7));display:flex;gap:15px;align-items:center;flex-wrap:wrap;">
@@ -382,6 +454,14 @@ def create_video_comparison_html(
         const syncBtn = document.getElementById(uid + "_sync");
         const fullscreenBtn = document.getElementById(uid + "_fullscreen");
         const loadingEl = document.getElementById(uid + "_loading");
+        const leftBadge = document.getElementById(uid + "_leftBadge");
+        const rightBadge = document.getElementById(uid + "_rightBadge");
+        const leftSelect = document.getElementById(uid + "_leftSelect");
+        const rightSelect = document.getElementById(uid + "_rightSelect");
+        const selectableItems = {selectable_json};
+        const selectableMap = new Map(
+            (Array.isArray(selectableItems) ? selectableItems : []).map((item) => [item.path, item])
+        );
 
         if (!container || !video1 || !video2 || !videoRight || !slider || !wrapper) {{
             return;
@@ -399,6 +479,8 @@ def create_video_comparison_html(
         let ready2 = false;
         let syncTimer = null;
         let readyWatchdog = null;
+        let currentLeftPath = {json.dumps(original_path)};
+        let currentRightPath = {json.dumps(upscaled_path)};
 
         const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
@@ -428,10 +510,12 @@ def create_video_comparison_html(
         }}
 
         function updateMuteButton() {{
-            // Keep right-side video muted to avoid double-audio/echo.
+            // Enforce left-only audio route at all times.
             video2.muted = true;
+            video2.volume = 0;
+            video1.volume = 1;
             video1.muted = isMuted;
-            if (muteBtn) muteBtn.textContent = isMuted ? "Unmute" : "Mute";
+            if (muteBtn) muteBtn.textContent = isMuted ? "Unmute Left" : "Mute Left";
         }}
 
         function updateSliderPosition(percent) {{
@@ -441,6 +525,64 @@ def create_video_comparison_html(
             videoRight.style.clipPath = `polygon(${{p}}% 0%, 100% 0%, 100% 100%, ${{p}}% 100%)`;
         }}
 
+        function isInteractiveOverlayTarget(target) {{
+            return !!(
+                target &&
+                target.closest &&
+                target.closest(".video-selector-overlay")
+            );
+        }}
+
+        function pickDifferentPath(blockedPath) {{
+            for (const item of selectableItems) {{
+                if (item && item.path && item.path !== blockedPath) return item.path;
+            }}
+            return "";
+        }}
+
+        function updateBadges() {{
+            const leftItem = selectableMap.get(currentLeftPath);
+            const rightItem = selectableMap.get(currentRightPath);
+            if (leftBadge && leftItem && leftItem.label) leftBadge.textContent = "Left: " + leftItem.label;
+            if (rightBadge && rightItem && rightItem.label) rightBadge.textContent = "Right: " + rightItem.label;
+        }}
+
+        function applySideSelection(side, selectedPath) {{
+            const item = selectableMap.get(selectedPath);
+            if (!item || !item.url) return;
+
+            const wasPlaying = isPlaying;
+            const sharedTime = Math.min(video1.currentTime || 0, video2.currentTime || 0);
+            pauseBoth();
+
+            const targetVideo = side === "left" ? video1 : video2;
+            targetVideo.addEventListener(
+                "loadedmetadata",
+                () => {{
+                    const duration = Number(targetVideo.duration || 0);
+                    const t = duration > 0
+                        ? clamp(sharedTime, 0, Math.max(0, duration - 0.02))
+                        : Math.max(0, sharedTime);
+                    try {{
+                        targetVideo.currentTime = t;
+                    }} catch (_) {{}}
+                    if (wasPlaying) {{
+                        playBoth();
+                    }} else {{
+                        syncTo(Math.min(video1.currentTime || 0, video2.currentTime || 0));
+                    }}
+                    renderTime();
+                }},
+                {{ once: true }}
+            );
+            targetVideo.src = item.url;
+            targetVideo.load();
+
+            if (side === "left") currentLeftPath = selectedPath;
+            else currentRightPath = selectedPath;
+            updateBadges();
+        }}
+
         function syncTo(timeValue) {{
             const duration = getEffectiveDuration();
             const t = duration > 0 ? clamp(Number(timeValue || 0), 0, duration) : Math.max(0, Number(timeValue || 0));
@@ -448,7 +590,21 @@ def create_video_comparison_html(
                 if (Math.abs((video1.currentTime || 0) - t) > 0.04) video1.currentTime = t;
                 if (Math.abs((video2.currentTime || 0) - t) > 0.04) video2.currentTime = t;
             }}
+            if (Math.abs((video2.playbackRate || 1) - (video1.playbackRate || 1)) > 0.001) {{
+                video2.playbackRate = video1.playbackRate || 1;
+            }}
+            updateMuteButton();
             renderTime();
+        }}
+
+        function forceSyncNow() {{
+            const ref = Number(video1.currentTime || 0);
+            syncTo(ref);
+            if (isPlaying) {{
+                // Keep right stream running and aligned when user requests sync.
+                safePlay(video2).catch(() => {{}});
+                window.setTimeout(() => syncTo(video1.currentTime || ref), 70);
+            }}
         }}
 
         function stopSyncLoop() {{
@@ -471,12 +627,16 @@ def create_video_comparison_html(
                     pauseBoth();
                     return;
                 }}
-                const delta = Math.abs((video2.currentTime || 0) - (video1.currentTime || 0));
-                if (delta > 0.05) {{
-                    video2.currentTime = video1.currentTime || 0;
+                // Keep right stream alive but avoid aggressive seek thrashing.
+                if (video2.paused && video2.readyState >= 2) {{
+                    safePlay(video2).catch(() => {{}});
                 }}
-                if (video2.paused) {{
-                    video2.play().catch(() => {{}});
+                const masterTime = Number(video1.currentTime || 0);
+                if (video2.readyState >= 2 && !video2.seeking) {{
+                    const delta = Math.abs((video2.currentTime || 0) - masterTime);
+                    if (delta > 0.12) {{
+                        video2.currentTime = masterTime;
+                    }}
                 }}
                 renderTime();
             }}, 80);
@@ -510,12 +670,28 @@ def create_video_comparison_html(
                 return;
             }}
             syncTo(Math.min(video1.currentTime || 0, video2.currentTime || 0));
-            const leftOk = await safePlay(video1);
-            await safePlay(video2);
+            updateMuteButton();
+
+            let leftOk = await safePlay(video1);
+            const rightOk = await safePlay(video2);
+
+            // Fallback: muted warm start, then restore left audio state.
+            if ((!leftOk || video1.paused) && !isMuted) {{
+                video1.muted = true;
+                leftOk = await safePlay(video1);
+                video1.muted = false;
+            }}
+
+            updateMuteButton();
             isPlaying = leftOk && !video1.paused;
             if (playPauseBtn) playPauseBtn.textContent = isPlaying ? "Pause" : "Play";
             if (isPlaying) {{
                 startSyncLoop();
+                if (!rightOk && loadingEl) {{
+                    loadingEl.style.display = "block";
+                    loadingEl.innerHTML = "Right video buffering - sync will continue automatically";
+                    loadingEl.style.color = "#ffb347";
+                }}
             }} else if (loadingEl) {{
                 loadingEl.style.display = "block";
                 loadingEl.innerHTML = "Play blocked by browser or unsupported stream";
@@ -533,6 +709,7 @@ def create_video_comparison_html(
         function markReady(which) {{
             if (which === 1) ready1 = true;
             if (which === 2) ready2 = true;
+            updateMuteButton();
             renderTime();
             if (ready1 && ready2) {{
                 if (readyWatchdog) {{
@@ -554,6 +731,18 @@ def create_video_comparison_html(
         video2.addEventListener("canplay", () => {{ if (!ready2) markReady(2); }}, {{ once: true }});
         video1.addEventListener("loadeddata", () => {{ if (!ready1) markReady(1); }}, {{ once: true }});
         video2.addEventListener("loadeddata", () => {{ if (!ready2) markReady(2); }}, {{ once: true }});
+        video2.addEventListener("canplay", () => {{
+            if (isPlaying) safePlay(video2).catch(() => {{}});
+        }});
+        video2.addEventListener("playing", () => {{
+            if (loadingEl && ready1 && ready2) loadingEl.style.display = "none";
+        }});
+        video2.addEventListener("waiting", () => {{
+            if (!isPlaying || !loadingEl) return;
+            loadingEl.style.display = "block";
+            loadingEl.innerHTML = "Right video buffering - re-syncing...";
+            loadingEl.style.color = "#ffb347";
+        }});
 
         video1.addEventListener("error", () => {{
             if (!loadingEl) return;
@@ -582,6 +771,9 @@ def create_video_comparison_html(
         }}, 5000);
 
         wrapper.addEventListener("pointerdown", (e) => {{
+            if (isInteractiveOverlayTarget(e.target)) {{
+                return;
+            }}
             isDragging = true;
             if (wrapper.setPointerCapture) {{
                 try {{ wrapper.setPointerCapture(e.pointerId); }} catch (_) {{}}
@@ -644,7 +836,7 @@ def create_video_comparison_html(
 
         if (syncBtn) {{
             syncBtn.addEventListener("click", () => {{
-                syncTo(video1.currentTime || 0);
+                forceSyncNow();
             }});
         }}
 
@@ -652,6 +844,50 @@ def create_video_comparison_html(
             muteBtn.addEventListener("click", () => {{
                 isMuted = !isMuted;
                 updateMuteButton();
+            }});
+        }}
+
+        if (leftSelect && rightSelect && Array.isArray(selectableItems) && selectableItems.length >= 2) {{
+            if (!selectableMap.has(currentLeftPath)) {{
+                currentLeftPath = selectableItems[0] && selectableItems[0].path ? selectableItems[0].path : "";
+            }}
+            if (!selectableMap.has(currentRightPath) || currentRightPath === currentLeftPath) {{
+                currentRightPath = pickDifferentPath(currentLeftPath);
+            }}
+            if (currentLeftPath) leftSelect.value = currentLeftPath;
+            if (currentRightPath) rightSelect.value = currentRightPath;
+            updateBadges();
+
+            leftSelect.addEventListener("change", () => {{
+                const nextLeft = String(leftSelect.value || "").trim();
+                if (!nextLeft || !selectableMap.has(nextLeft)) return;
+
+                if (nextLeft === currentRightPath) {{
+                    const replacement = (currentLeftPath && currentLeftPath !== nextLeft)
+                        ? currentLeftPath
+                        : pickDifferentPath(nextLeft);
+                    if (replacement) {{
+                        rightSelect.value = replacement;
+                        applySideSelection("right", replacement);
+                    }}
+                }}
+                applySideSelection("left", nextLeft);
+            }});
+
+            rightSelect.addEventListener("change", () => {{
+                const nextRight = String(rightSelect.value || "").trim();
+                if (!nextRight || !selectableMap.has(nextRight)) return;
+
+                if (nextRight === currentLeftPath) {{
+                    const replacement = (currentRightPath && currentRightPath !== nextRight)
+                        ? currentRightPath
+                        : pickDifferentPath(nextRight);
+                    if (replacement) {{
+                        leftSelect.value = replacement;
+                        applySideSelection("left", replacement);
+                    }}
+                }}
+                applySideSelection("right", nextRight);
             }});
         }}
 
@@ -700,6 +936,39 @@ def create_video_comparison_html(
     .slider-container:hover {{
         width: 6px !important;
     }}
+    .video-selector-overlay {{
+        position: absolute;
+        top: 50px;
+        z-index: 40;
+        min-width: 240px;
+        max-width: 42%;
+        padding: 6px 10px;
+        border: 1px solid rgba(255,255,255,0.42);
+        border-radius: 8px;
+        background: rgba(10,10,10,0.92) !important;
+        color: #f7f7f7 !important;
+        -webkit-text-fill-color: #f7f7f7;
+        font-weight: 500;
+        font-size: 13px;
+        line-height: 1.2;
+        pointer-events: auto;
+        display: none;
+    }}
+    .video-selector-overlay option {{
+        background: #121212 !important;
+        color: #f7f7f7 !important;
+    }}
+    .video-selector-overlay:focus {{
+        outline: 2px solid rgba(125, 211, 252, 0.9);
+        outline-offset: 1px;
+        border-color: rgba(125, 211, 252, 0.9);
+    }}
+    .video-selector-left {{
+        left: 10px;
+    }}
+    .video-selector-right {{
+        right: 10px;
+    }}
     .video-comparison-container:fullscreen {{
         display: flex;
         flex-direction: column;
@@ -708,6 +977,398 @@ def create_video_comparison_html(
     .video-comparison-container:fullscreen .video-container {{
         flex: 1;
         height: auto !important;
+    }}
+    .video-comparison-container:fullscreen .video-selector-overlay {{
+        display: block;
+    }}
+    @media (max-width: 768px) {{
+        .video-selector-overlay {{
+            min-width: 160px;
+            font-size: 12px;
+        }}
+    }}
+    </style>
+    """
+
+
+def create_image_comparison_html(
+    original_image: Optional[str],
+    upscaled_image: Optional[str],
+    height: int = 620,
+    slider_position: float = 50.0,
+    selectable_images: Optional[List[str]] = None,
+) -> str:
+    """
+    Create HTML image comparison slider with fullscreen overlay selectors.
+    """
+    if not original_image or not upscaled_image:
+        return """
+        <div style="text-align:center;padding:40px;background:#f0f0f0;border-radius:8px;">
+            <p style="color:#666;font-size:16px;margin:0;">
+                Upload images to compare.
+            </p>
+        </div>
+        """
+
+    original_path = str(Path(original_image).resolve())
+    upscaled_path = str(Path(upscaled_image).resolve())
+    try:
+        if Path(original_path).resolve() == Path(upscaled_path).resolve():
+            same = html.escape(original_path)
+            return f"""
+            <div style="text-align:center;padding:24px;background:#fff4e5;border:1px solid #ffd59a;border-radius:8px;">
+                <p style="margin:0;color:#8a5300;font-size:14px;">
+                    Comparison skipped: left and right image paths are identical.<br>{same}
+                </p>
+            </div>
+            """
+    except Exception:
+        pass
+
+    left_served_path = _ensure_gradio_servable_file(original_path)
+    right_served_path = _ensure_gradio_servable_file(upscaled_path)
+    left_url = _build_gradio_file_url(left_served_path, "img_left")
+    right_url = _build_gradio_file_url(right_served_path, "img_right")
+
+    left_badge = html.escape(f"Left: {Path(original_path).name}")
+    right_badge = html.escape(f"Right: {Path(upscaled_path).name}")
+
+    selectable_records: List[Dict[str, str]] = []
+    seen = set()
+
+    def _append_image(path_value: str) -> None:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return
+        try:
+            abs_path = str(Path(raw).resolve())
+        except Exception:
+            abs_path = raw
+        if abs_path in seen:
+            return
+        try:
+            if not Path(abs_path).exists():
+                return
+        except Exception:
+            return
+
+        if abs_path == original_path:
+            served = left_served_path
+        elif abs_path == upscaled_path:
+            served = right_served_path
+        else:
+            served = _ensure_gradio_servable_file(abs_path)
+        selectable_records.append(
+            {
+                "path": abs_path,
+                "url": _build_gradio_file_url(served, "img_select"),
+                "label": Path(abs_path).name,
+            }
+        )
+        seen.add(abs_path)
+
+    for p in selectable_images or []:
+        _append_image(str(p))
+    _append_image(original_path)
+    _append_image(upscaled_path)
+
+    safe_height = max(260, int(height or 620))
+    initial_slider = max(0.0, min(100.0, float(slider_position or 50.0)))
+    unique_id = f"ic_{random.randint(100000, 999999)}"
+
+    def _build_select_options(selected_path: str) -> str:
+        rows: List[str] = []
+        for rec in selectable_records:
+            selected_attr = " selected" if rec["path"] == selected_path else ""
+            rows.append(
+                f'<option value="{html.escape(rec["path"], quote=True)}"{selected_attr}>'
+                f'{html.escape(rec["label"])}</option>'
+            )
+        return "".join(rows)
+
+    left_selector_html = ""
+    right_selector_html = ""
+    if len(selectable_records) >= 2:
+        left_selector_html = (
+            f'<select id="{unique_id}_leftSelect" class="image-selector-overlay image-selector-left">'
+            f"{_build_select_options(original_path)}</select>"
+        )
+        right_selector_html = (
+            f'<select id="{unique_id}_rightSelect" class="image-selector-overlay image-selector-right">'
+            f"{_build_select_options(upscaled_path)}</select>"
+        )
+
+    selectable_json = json.dumps(selectable_records)
+    left_json = json.dumps(original_path)
+    right_json = json.dumps(upscaled_path)
+
+    return f"""
+    <div id="{unique_id}_container" class="image-comparison-container" style="position:relative;width:100%;max-width:1200px;margin:0 auto;background:#000;border-radius:8px;overflow:hidden;">
+        <div id="{unique_id}_wrapper" class="image-container" style="position:relative;width:100%;height:{safe_height}px;overflow:hidden;cursor:ew-resize;">
+            <img id="{unique_id}_img1" src="{left_url}" alt="Left image" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;display:block;user-select:none;-webkit-user-drag:none;" />
+            <div id="{unique_id}_imgRight" style="position:absolute;top:0;left:0;width:100%;height:100%;overflow:hidden;z-index:2;clip-path:polygon(50% 0%,100% 0%,100% 100%,50% 100%);">
+                <img id="{unique_id}_img2" src="{right_url}" alt="Right image" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;display:block;user-select:none;-webkit-user-drag:none;" />
+            </div>
+
+            <div id="{unique_id}_slider" class="image-slider-bar" style="position:absolute;top:0;left:50%;width:4px;height:100%;background:#fff;z-index:10;cursor:ew-resize;transform:translateX(-50%);">
+                <div class="slider-handle" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:40px;height:40px;background:#fff;border-radius:50%;box-shadow:0 2px 10px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;cursor:ew-resize;">
+                    <span style="color:#3a76d8;font-weight:bold;font-size:16px;">&#8646;</span>
+                </div>
+            </div>
+
+            <div id="{unique_id}_leftBadge" style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{left_badge}</div>
+            <div id="{unique_id}_rightBadge" style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{right_badge}</div>
+            {left_selector_html}
+            {right_selector_html}
+        </div>
+
+        <div style="padding:12px 14px;background:linear-gradient(to top,rgba(0,0,0,0.9),rgba(0,0,0,0.7));display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <button id="{unique_id}_reset" style="padding:8px 14px;background:linear-gradient(45deg,#4CAF50,#45a049);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;">Reset</button>
+            <div style="flex:1;min-width:180px;">
+                <input id="{unique_id}_range" type="range" min="0" max="100" value="{initial_slider}" style="width:100%;cursor:pointer;accent-color:#4CAF50;">
+            </div>
+            <button id="{unique_id}_fullscreen" style="padding:8px 14px;background:rgba(255,255,255,0.2);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;">Fullscreen</button>
+        </div>
+    </div>
+
+    <script>
+    (function() {{
+        const uid = "{unique_id}";
+        const container = document.getElementById(uid + "_container");
+        const wrapper = document.getElementById(uid + "_wrapper");
+        const rightWrap = document.getElementById(uid + "_imgRight");
+        const img1 = document.getElementById(uid + "_img1");
+        const img2 = document.getElementById(uid + "_img2");
+        const slider = document.getElementById(uid + "_slider");
+        const range = document.getElementById(uid + "_range");
+        const resetBtn = document.getElementById(uid + "_reset");
+        const fullscreenBtn = document.getElementById(uid + "_fullscreen");
+        const leftBadgeEl = document.getElementById(uid + "_leftBadge");
+        const rightBadgeEl = document.getElementById(uid + "_rightBadge");
+        const leftSelect = document.getElementById(uid + "_leftSelect");
+        const rightSelect = document.getElementById(uid + "_rightSelect");
+
+        if (!container || !wrapper || !rightWrap || !img1 || !img2 || !slider || !range) return;
+        if (container.dataset.icInitialized === "1") return;
+        container.dataset.icInitialized = "1";
+
+        const selectableItems = {selectable_json};
+        const selectableMap = new Map(
+            (Array.isArray(selectableItems) ? selectableItems : []).map((item) => [item.path, item])
+        );
+        let currentLeftPath = {left_json};
+        let currentRightPath = {right_json};
+        let isDragging = false;
+
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+        function updateSliderPosition(percent) {{
+            const p = clamp(Number(percent || 50), 0, 100);
+            slider.style.left = p + "%";
+            rightWrap.style.clipPath = `polygon(${{p}}% 0%,100% 0%,100% 100%,${{p}}% 100%)`;
+            if (range) range.value = String(p);
+        }}
+
+        function isInteractiveOverlayTarget(target) {{
+            return !!(
+                target &&
+                target.closest &&
+                target.closest(".image-selector-overlay")
+            );
+        }}
+
+        function pickDifferentPath(blockedPath) {{
+            for (const item of selectableItems) {{
+                if (item && item.path && item.path !== blockedPath) return item.path;
+            }}
+            return "";
+        }}
+
+        function updateBadges() {{
+            const leftItem = selectableMap.get(currentLeftPath);
+            const rightItem = selectableMap.get(currentRightPath);
+            if (leftBadgeEl && leftItem && leftItem.label) leftBadgeEl.textContent = "Left: " + leftItem.label;
+            if (rightBadgeEl && rightItem && rightItem.label) rightBadgeEl.textContent = "Right: " + rightItem.label;
+        }}
+
+        function applySideSelection(side, selectedPath) {{
+            const item = selectableMap.get(selectedPath);
+            if (!item || !item.url) return;
+            if (side === "left") {{
+                img1.src = item.url;
+                currentLeftPath = selectedPath;
+            }} else {{
+                img2.src = item.url;
+                currentRightPath = selectedPath;
+            }}
+            updateBadges();
+        }}
+
+        function handleDragEvent(e) {{
+            const rect = wrapper.getBoundingClientRect();
+            const x = (e.clientX || e.pageX) - rect.left;
+            const pct = (x / Math.max(1, rect.width)) * 100;
+            updateSliderPosition(pct);
+        }}
+
+        wrapper.addEventListener("pointerdown", (e) => {{
+            if (isInteractiveOverlayTarget(e.target)) {{
+                return;
+            }}
+            isDragging = true;
+            if (wrapper.setPointerCapture) {{
+                try {{ wrapper.setPointerCapture(e.pointerId); }} catch (_) {{}}
+            }}
+            handleDragEvent(e);
+            e.preventDefault();
+        }});
+        wrapper.addEventListener("pointermove", (e) => {{
+            if (!isDragging) return;
+            handleDragEvent(e);
+        }});
+        wrapper.addEventListener("pointerup", () => {{ isDragging = false; }});
+        wrapper.addEventListener("pointercancel", () => {{ isDragging = false; }});
+
+        range.addEventListener("input", (e) => {{
+            updateSliderPosition(Number(e.target.value || 50));
+        }});
+
+        if (resetBtn) {{
+            resetBtn.addEventListener("click", () => {{
+                updateSliderPosition(50);
+            }});
+        }}
+
+        if (leftSelect && rightSelect && selectableItems.length >= 2) {{
+            if (!selectableMap.has(currentLeftPath)) {{
+                currentLeftPath = selectableItems[0] && selectableItems[0].path ? selectableItems[0].path : "";
+            }}
+            if (!selectableMap.has(currentRightPath) || currentRightPath === currentLeftPath) {{
+                currentRightPath = pickDifferentPath(currentLeftPath);
+            }}
+            if (currentLeftPath) leftSelect.value = currentLeftPath;
+            if (currentRightPath) rightSelect.value = currentRightPath;
+            updateBadges();
+
+            leftSelect.addEventListener("change", () => {{
+                const nextLeft = String(leftSelect.value || "").trim();
+                if (!nextLeft || !selectableMap.has(nextLeft)) return;
+                if (nextLeft === currentRightPath) {{
+                    const replacement = (currentLeftPath && currentLeftPath !== nextLeft)
+                        ? currentLeftPath
+                        : pickDifferentPath(nextLeft);
+                    if (replacement) {{
+                        rightSelect.value = replacement;
+                        applySideSelection("right", replacement);
+                    }}
+                }}
+                applySideSelection("left", nextLeft);
+            }});
+
+            rightSelect.addEventListener("change", () => {{
+                const nextRight = String(rightSelect.value || "").trim();
+                if (!nextRight || !selectableMap.has(nextRight)) return;
+                if (nextRight === currentLeftPath) {{
+                    const replacement = (currentRightPath && currentRightPath !== nextRight)
+                        ? currentRightPath
+                        : pickDifferentPath(nextRight);
+                    if (replacement) {{
+                        leftSelect.value = replacement;
+                        applySideSelection("left", replacement);
+                    }}
+                }}
+                applySideSelection("right", nextRight);
+            }});
+        }}
+
+        if (fullscreenBtn) {{
+            fullscreenBtn.addEventListener("click", () => {{
+                const fsEl =
+                    document.fullscreenElement ||
+                    document.webkitFullscreenElement ||
+                    document.msFullscreenElement ||
+                    null;
+                if (fsEl) {{
+                    if (document.exitFullscreen) document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                    else if (document.msExitFullscreen) document.msExitFullscreen();
+                    return;
+                }}
+                if (container.requestFullscreen) container.requestFullscreen();
+                else if (container.webkitRequestFullscreen) container.webkitRequestFullscreen();
+                else if (container.msRequestFullscreen) container.msRequestFullscreen();
+            }});
+        }}
+
+        updateSliderPosition({initial_slider});
+    }})();
+    </script>
+
+    <style>
+    .image-comparison-container {{
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    }}
+    .image-comparison-container button:hover {{
+        opacity: 0.92;
+        transform: translateY(-1px);
+        transition: all 0.2s ease;
+    }}
+    .image-comparison-container button:active {{
+        transform: translateY(0);
+    }}
+    .image-slider-bar:hover {{
+        width: 6px !important;
+    }}
+    .image-selector-overlay {{
+        position: absolute;
+        top: 50px;
+        z-index: 40;
+        min-width: 220px;
+        max-width: 42%;
+        padding: 6px 10px;
+        border: 1px solid rgba(255,255,255,0.42);
+        border-radius: 8px;
+        background: rgba(10,10,10,0.92) !important;
+        color: #f7f7f7 !important;
+        -webkit-text-fill-color: #f7f7f7;
+        font-weight: 500;
+        font-size: 13px;
+        line-height: 1.2;
+        pointer-events: auto;
+        display: none;
+    }}
+    .image-selector-overlay option {{
+        background: #121212 !important;
+        color: #f7f7f7 !important;
+    }}
+    .image-selector-overlay:focus {{
+        outline: 2px solid rgba(125, 211, 252, 0.9);
+        outline-offset: 1px;
+        border-color: rgba(125, 211, 252, 0.9);
+    }}
+    .image-selector-left {{
+        left: 10px;
+    }}
+    .image-selector-right {{
+        right: 10px;
+    }}
+    .image-comparison-container:fullscreen {{
+        display: flex;
+        flex-direction: column;
+        background: #000;
+    }}
+    .image-comparison-container:fullscreen .image-container {{
+        flex: 1;
+        height: auto !important;
+    }}
+    .image-comparison-container:fullscreen .image-selector-overlay {{
+        display: block;
+    }}
+    @media (max-width: 768px) {{
+        .image-selector-overlay {{
+            min-width: 150px;
+            font-size: 12px;
+        }}
     }}
     </style>
     """

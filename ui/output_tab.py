@@ -4,8 +4,9 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+import re
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 from shared.services.output_service import (
     build_output_callbacks, OUTPUT_ORDER
@@ -27,6 +28,7 @@ from shared.video_codec_options import (
     AUDIO_CODECS
 )
 from shared.video_comparison_slider import (
+    create_image_comparison_html,
     create_video_comparison_html,
     get_video_comparison_js_on_load,
 )
@@ -452,6 +454,104 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         visible=False,
                     )
 
+        with gr.TabItem("Videos Comparison Slider"):
+            gr.Markdown("#### Multi-Video Comparison Slider")
+            gr.Markdown("Upload multiple videos once, then switch left/right videos instantly.")
+            multi_video_pool_state = gr.State([])
+
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1):
+                    multi_video_upload = gr.File(
+                        label="Upload Videos (Multiple)",
+                        type="filepath",
+                        file_types=["video"],
+                        file_count="multiple",
+                    )
+
+                    with gr.Row():
+                        multi_video_left = gr.Dropdown(
+                            label="Left Video (Reference)",
+                            choices=[],
+                            value=None,
+                        )
+                        multi_video_right = gr.Dropdown(
+                            label="Right Video (Compared)",
+                            choices=[],
+                            value=None,
+                        )
+
+                    with gr.Row():
+                        multi_video_height = gr.Slider(
+                            label="Viewer Height",
+                            minimum=300,
+                            maximum=1000,
+                            step=20,
+                            value=620,
+                        )
+                        multi_video_slider_pos = gr.Slider(
+                            label="Initial Slider Position",
+                            minimum=0,
+                            maximum=100,
+                            step=1,
+                            value=50,
+                        )
+
+                    with gr.Row():
+                        multi_video_swap_btn = gr.Button("Swap", size="lg")
+                        multi_video_render_btn = gr.Button("Render", variant="primary", size="lg")
+                        multi_video_clear_btn = gr.Button("Clear", size="lg")
+
+                    multi_video_status = gr.Markdown("Upload at least 2 videos to compare.")
+
+                with gr.Column(scale=1):
+                    multi_video_html = gr.HTML(
+                        label="Video Pair Comparison",
+                        value="",
+                        js_on_load=get_video_comparison_js_on_load(),
+                        visible=False,
+                    )
+
+        with gr.TabItem("Images Comparison Slider"):
+            gr.Markdown("#### Multi-Image Comparison Slider")
+            gr.Markdown("Upload multiple images once, then switch left/right images instantly.")
+            multi_image_pool_state = gr.State([])
+
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1):
+                    multi_image_upload = gr.File(
+                        label="Upload Images (Multiple)",
+                        type="filepath",
+                        file_types=["image"],
+                        file_count="multiple",
+                    )
+
+                    with gr.Row():
+                        multi_image_left = gr.Dropdown(
+                            label="Left Image (Reference)",
+                            choices=[],
+                            value=None,
+                        )
+                        multi_image_right = gr.Dropdown(
+                            label="Right Image (Compared)",
+                            choices=[],
+                            value=None,
+                        )
+
+                    with gr.Row():
+                        multi_image_swap_btn = gr.Button("Swap", size="lg")
+                        multi_image_render_btn = gr.Button("Render", variant="primary", size="lg")
+                        multi_image_clear_btn = gr.Button("Clear", size="lg")
+
+                    multi_image_status = gr.Markdown("Upload at least 2 images to compare.")
+
+                with gr.Column(scale=1):
+                    multi_image_slider = gr.HTML(
+                        label="Image Pair Comparison",
+                        value="",
+                        js_on_load=get_video_comparison_js_on_load(),
+                        visible=False,
+                    )
+
         with gr.TabItem("Metadata & Logging"):
             gr.Markdown("#### Metadata and Runtime Logging")
 
@@ -668,13 +768,205 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         outputs=inputs_list + [codec_info_display, pixel_format_info, shared_state],
     )
 
-    # Direct comparison events
+    # Direct and multi-comparison helpers/events
     def _upload_to_path(file_val):
         if not file_val:
             return ""
         if isinstance(file_val, dict):
             return str(file_val.get("path") or "")
         return str(file_val)
+
+    def _natural_filename_key(file_path: str) -> Tuple[Tuple[int, object], ...]:
+        name = Path(str(file_path or "")).name.lower()
+        parts = re.split(r"(\d+)", name)
+        key_parts: List[Tuple[int, object]] = []
+        for part in parts:
+            if part.isdigit():
+                key_parts.append((0, int(part)))
+            else:
+                key_parts.append((1, part))
+        return tuple(key_parts)
+
+    def _normalize_uploaded_paths(file_val) -> List[str]:
+        if not file_val:
+            return []
+
+        items = list(file_val) if isinstance(file_val, (list, tuple)) else [file_val]
+        seen = set()
+        normalized: List[str] = []
+
+        for item in items:
+            if not item:
+                continue
+            if isinstance(item, dict):
+                raw_path = str(item.get("path") or item.get("name") or "").strip()
+            else:
+                raw_path = str(item).strip()
+
+            if not raw_path:
+                continue
+
+            candidate = Path(raw_path)
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+
+            if not resolved.exists() or not resolved.is_file():
+                continue
+
+            resolved_str = str(resolved)
+            if resolved_str in seen:
+                continue
+            seen.add(resolved_str)
+            normalized.append(resolved_str)
+
+        normalized.sort(key=_natural_filename_key)
+        return normalized
+
+    def _build_media_dropdown_choices(paths: List[str]) -> List[Tuple[str, str]]:
+        choices: List[Tuple[str, str]] = []
+        for p in paths:
+            p_obj = Path(p)
+            label = p_obj.name
+            try:
+                size_mb = p_obj.stat().st_size / (1024 * 1024)
+                label = f"{p_obj.name} ({size_mb:.1f} MB)"
+            except Exception:
+                pass
+            choices.append((label, p))
+        return choices
+
+    def _resolve_pair(paths: List[str], left_value: str, right_value: str) -> Tuple[str, str]:
+        if not paths:
+            return "", ""
+
+        left = str(left_value or "").strip()
+        right = str(right_value or "").strip()
+
+        if left not in paths:
+            left = paths[0]
+
+        if right not in paths or right == left:
+            right = next((p for p in paths if p != left), "")
+
+        return left, right
+
+    def _render_video_pair(pool_paths: List[str], left_value: str, right_value: str, height: float, slider_pos: float):
+        choices = _build_media_dropdown_choices(pool_paths)
+        left, right = _resolve_pair(pool_paths, left_value, right_value)
+        left_update = gr.update(choices=choices, value=left or None)
+        right_update = gr.update(choices=choices, value=right or None)
+
+        if len(pool_paths) < 2:
+            if len(pool_paths) == 1:
+                msg = f"Only one video loaded ({Path(pool_paths[0]).name}). Upload at least one more."
+            else:
+                msg = "Upload at least 2 videos to compare."
+            return left_update, right_update, gr.update(value=msg), gr.update(value="", visible=False)
+
+        if not left or not right:
+            return (
+                left_update,
+                right_update,
+                gr.update(value="Select two different videos to compare."),
+                gr.update(value="", visible=False),
+            )
+
+        safe_height = max(300, int(float(height or 620)))
+        safe_slider = max(0.0, min(100.0, float(slider_pos or 50.0)))
+        html = create_video_comparison_html(
+            original_video=left,
+            upscaled_video=right,
+            height=safe_height,
+            slider_position=safe_slider,
+            selectable_videos=pool_paths,
+        )
+        status = f"Comparing `{Path(left).name}` vs `{Path(right).name}`"
+        return left_update, right_update, gr.update(value=status), gr.update(value=html, visible=True)
+
+    def _render_image_pair(pool_paths: List[str], left_value: str, right_value: str):
+        choices = _build_media_dropdown_choices(pool_paths)
+        left, right = _resolve_pair(pool_paths, left_value, right_value)
+        left_update = gr.update(choices=choices, value=left or None)
+        right_update = gr.update(choices=choices, value=right or None)
+
+        if len(pool_paths) < 2:
+            if len(pool_paths) == 1:
+                msg = f"Only one image loaded ({Path(pool_paths[0]).name}). Upload at least one more."
+            else:
+                msg = "Upload at least 2 images to compare."
+            return left_update, right_update, gr.update(value=msg), gr.update(value="", visible=False)
+
+        if not left or not right:
+            return (
+                left_update,
+                right_update,
+                gr.update(value="Select two different images to compare."),
+                gr.update(value="", visible=False),
+            )
+
+        html = create_image_comparison_html(
+            original_image=left,
+            upscaled_image=right,
+            height=620,
+            slider_position=50.0,
+            selectable_images=pool_paths,
+        )
+        status = f"Comparing `{Path(left).name}` vs `{Path(right).name}`"
+        return left_update, right_update, gr.update(value=status), gr.update(value=html, visible=True)
+
+    def _sync_multi_video_upload(files, left_value, right_value, height, slider_pos):
+        pool_paths = _normalize_uploaded_paths(files)
+        left_update, right_update, status_update, html_update = _render_video_pair(
+            pool_paths, left_value, right_value, height, slider_pos
+        )
+        return pool_paths, left_update, right_update, status_update, html_update
+
+    def _refresh_multi_video(pool_paths, left_value, right_value, height, slider_pos):
+        normalized = _normalize_uploaded_paths(pool_paths)
+        return _render_video_pair(normalized, left_value, right_value, height, slider_pos)
+
+    def _swap_multi_video(pool_paths, left_value, right_value, height, slider_pos):
+        normalized = _normalize_uploaded_paths(pool_paths)
+        return _render_video_pair(normalized, right_value, left_value, height, slider_pos)
+
+    def _clear_multi_video_compare():
+        empty_dropdown = gr.update(choices=[], value=None)
+        return (
+            gr.update(value=None),
+            [],
+            empty_dropdown,
+            empty_dropdown,
+            gr.update(value=""),
+            gr.update(value="", visible=False),
+        )
+
+    def _sync_multi_image_upload(files, left_value, right_value):
+        pool_paths = _normalize_uploaded_paths(files)
+        left_update, right_update, status_update, slider_update = _render_image_pair(
+            pool_paths, left_value, right_value
+        )
+        return pool_paths, left_update, right_update, status_update, slider_update
+
+    def _refresh_multi_image(pool_paths, left_value, right_value):
+        normalized = _normalize_uploaded_paths(pool_paths)
+        return _render_image_pair(normalized, left_value, right_value)
+
+    def _swap_multi_image(pool_paths, left_value, right_value):
+        normalized = _normalize_uploaded_paths(pool_paths)
+        return _render_image_pair(normalized, right_value, left_value)
+
+    def _clear_multi_image_compare():
+        empty_dropdown = gr.update(choices=[], value=None)
+        return (
+            gr.update(value=None),
+            [],
+            empty_dropdown,
+            empty_dropdown,
+            gr.update(value=""),
+            gr.update(value="", visible=False),
+        )
 
     direct_video_a_upload.change(
         fn=_upload_to_path,
@@ -722,6 +1014,90 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     direct_compare_clear_btn.click(
         fn=_clear_direct_video_compare,
         outputs=[direct_video_a_path, direct_video_b_path, direct_compare_status, direct_comparison_html],
+    )
+
+    multi_video_upload.change(
+        fn=_sync_multi_video_upload,
+        inputs=[multi_video_upload, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_left.change(
+        fn=_refresh_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_right.change(
+        fn=_refresh_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_render_btn.click(
+        fn=_refresh_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_swap_btn.click(
+        fn=_swap_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_height.release(
+        fn=_refresh_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_slider_pos.release(
+        fn=_refresh_multi_video,
+        inputs=[multi_video_pool_state, multi_video_left, multi_video_right, multi_video_height, multi_video_slider_pos],
+        outputs=[multi_video_left, multi_video_right, multi_video_status, multi_video_html],
+    )
+    multi_video_clear_btn.click(
+        fn=_clear_multi_video_compare,
+        outputs=[
+            multi_video_upload,
+            multi_video_pool_state,
+            multi_video_left,
+            multi_video_right,
+            multi_video_status,
+            multi_video_html,
+        ],
+    )
+
+    multi_image_upload.change(
+        fn=_sync_multi_image_upload,
+        inputs=[multi_image_upload, multi_image_left, multi_image_right],
+        outputs=[multi_image_pool_state, multi_image_left, multi_image_right, multi_image_status, multi_image_slider],
+    )
+    multi_image_left.change(
+        fn=_refresh_multi_image,
+        inputs=[multi_image_pool_state, multi_image_left, multi_image_right],
+        outputs=[multi_image_left, multi_image_right, multi_image_status, multi_image_slider],
+    )
+    multi_image_right.change(
+        fn=_refresh_multi_image,
+        inputs=[multi_image_pool_state, multi_image_left, multi_image_right],
+        outputs=[multi_image_left, multi_image_right, multi_image_status, multi_image_slider],
+    )
+    multi_image_render_btn.click(
+        fn=_refresh_multi_image,
+        inputs=[multi_image_pool_state, multi_image_left, multi_image_right],
+        outputs=[multi_image_left, multi_image_right, multi_image_status, multi_image_slider],
+    )
+    multi_image_swap_btn.click(
+        fn=_swap_multi_image,
+        inputs=[multi_image_pool_state, multi_image_left, multi_image_right],
+        outputs=[multi_image_left, multi_image_right, multi_image_status, multi_image_slider],
+    )
+    multi_image_clear_btn.click(
+        fn=_clear_multi_image_compare,
+        outputs=[
+            multi_image_upload,
+            multi_image_pool_state,
+            multi_image_left,
+            multi_image_right,
+            multi_image_status,
+            multi_image_slider,
+        ],
     )
 
     return {

@@ -84,6 +84,18 @@ def flashvsr_tab(
         except Exception:
             pass
         return default
+
+    def _vae_mode_note(mode_value: str) -> str:
+        mode_norm = str(mode_value or "tiny").strip().lower()
+        if mode_norm == "full":
+            return (
+                "**Mode note:** In `full` mode, the selected **VAE Model** directly changes the active decoder "
+                "(quality/VRAM/speed tradeoff is real here)."
+            )
+        return (
+            "**Mode note:** In `tiny` / `tiny-long`, decoding is TCDecoder-based. "
+            "Changing **VAE Model** has limited effect on VRAM/decoder behavior in this backend path."
+        )
     # GPU detection and warnings (parent-process safe: NO torch import)
     cuda_available = False
     cuda_count = 0
@@ -180,6 +192,10 @@ def flashvsr_tab(
                                 "LightVAE/LightTAE = much lower VRAM and faster."
                             ),
                         )
+                        vae_mode_note = gr.Markdown(
+                            _vae_mode_note(str(_value("mode", "tiny"))),
+                            elem_classes=["resolution-info"],
+                        )
 
                     with gr.Column(scale=2):
                         input_image_preview = gr.Image(
@@ -246,7 +262,10 @@ def flashvsr_tab(
                         maximum=10000,
                         step=1,
                         value=int(_value("frame_chunk_size", 0) or 0),
-                        info="0 = process all frames at once. Use 16-100 to reduce VRAM usage on long clips.",
+                        info=(
+                            "0 = process all frames at once. Larger chunks are usually faster and improve temporal quality, "
+                            "but require more VRAM. Smaller chunks use less VRAM on long clips, but may be slower."
+                        ),
                     )
                     local_range = gr.Dropdown(
                         label="Local Range",
@@ -346,7 +365,7 @@ def flashvsr_tab(
                     unload_dit = gr.Checkbox(
                         label="Unload DiT Before Decoding",
                         value=bool(_value("unload_dit", True)),
-                        info="Releases DiT from VRAM before VAE decode. Default ON."
+                        info="Releases DiT from VRAM before decoder step (TCDecoder in tiny modes, VAE in full mode). Default ON."
                     )
 
                 with gr.Row():
@@ -1123,6 +1142,7 @@ def flashvsr_tab(
             gr.update(value=force_offload_val),
             False,
             gr.update(value=msg, visible=True),
+            gr.update(value=_vae_mode_note(mode_val)),
         )
 
     def on_chunk_gallery_select(evt: gr.SelectData, state):
@@ -1427,6 +1447,14 @@ def flashvsr_tab(
         show_progress="hidden",
     )
 
+    mode.change(
+        fn=lambda m: gr.update(value=_vae_mode_note(m)),
+        inputs=[mode],
+        outputs=[vae_mode_note],
+        queue=False,
+        show_progress="hidden",
+    )
+
     auto_set_vram_btn.click(
         fn=_auto_set_by_vram,
         inputs=[shared_state, scale],
@@ -1442,6 +1470,7 @@ def flashvsr_tab(
             force_offload,
             auto_vram_profile,
             auto_set_status,
+            vae_mode_note,
         ],
         queue=False,
         show_progress="hidden",

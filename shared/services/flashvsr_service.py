@@ -213,61 +213,6 @@ def _nearest_supported_scale(value: Any, default: int = 4) -> int:
     return 2 if raw <= 3.0 else 4
 
 
-def _flashvsr_vram_profile(vram_gb: float) -> Dict[str, Any]:
-    if vram_gb >= 24.0:
-        return {
-            "tiled_vae": False,
-            "tiled_dit": False,
-            "frame_chunk_size": 0,
-            "keep_models_on_cpu": False,
-        }
-    if vram_gb >= 16.0:
-        return {
-            "tiled_vae": True,
-            "tiled_dit": False,
-            "frame_chunk_size": 80,
-            "keep_models_on_cpu": True,
-        }
-    if vram_gb >= 12.0:
-        return {
-            "tiled_vae": True,
-            "tiled_dit": True,
-            "frame_chunk_size": 48,
-            "keep_models_on_cpu": True,
-        }
-    return {
-        "tiled_vae": True,
-        "tiled_dit": True,
-        "frame_chunk_size": 20,
-        "keep_models_on_cpu": True,
-    }
-
-
-def _resolve_selected_gpu_vram_gb(device_value: Any) -> Optional[float]:
-    try:
-        from shared.gpu_utils import get_gpu_info
-
-        gpus = get_gpu_info()
-        if not gpus:
-            return None
-        raw = str(device_value or "auto").strip().lower()
-        if raw in {"", "auto", "cuda", "cuda:0"}:
-            return float(gpus[0].total_memory_gb)
-        if raw.startswith("cuda:"):
-            idx = raw.split(":", 1)[1].strip()
-            if idx.isdigit():
-                gpu_idx = int(idx)
-                if 0 <= gpu_idx < len(gpus):
-                    return float(gpus[gpu_idx].total_memory_gb)
-        if raw.isdigit():
-            gpu_idx = int(raw)
-            if 0 <= gpu_idx < len(gpus):
-                return float(gpus[gpu_idx].total_memory_gb)
-        return float(gpus[0].total_memory_gb)
-    except Exception:
-        return None
-
-
 def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Defaults aligned to ComfyUI-FlashVSR_Stable with quality-first tuning.
@@ -1962,8 +1907,6 @@ def build_flashvsr_callbacks(
 
                 return pct, text
 
-            if settings.get("_vram_profile_note"):
-                log_buffer.append(str(settings.get("_vram_profile_note")))
             if settings.get("_scale_clamp_note"):
                 log_buffer.append(str(settings.get("_scale_clamp_note")))
             if settings.get("_max_edge_merge_note"):

@@ -49,6 +49,28 @@ _SINGLE_IMAGE_FAST_TARGET_PIXELS = 4_194_304  # 2048 x 2048
 _SINGLE_IMAGE_REPEAT_FRAMES = 21
 
 
+def _should_suppress_flashvsr_cli_line(line: str) -> bool:
+    """
+    Drop known misleading recommendation/advisory lines emitted by downstream tools.
+    """
+    text = str(line or "").strip().lower()
+    if not text:
+        return False
+    if "found something a bit confusing" in text:
+        return True
+    if "auto set by vram" in text:
+        return True
+    if "vram profile recommendation" in text:
+        return True
+    if "required vram" in text:
+        return True
+    if "estimated vram" in text:
+        return True
+    if "recommended settings" in text and ("wan2" in text or "chunk size" in text):
+        return True
+    return False
+
+
 def _normalize_cuda_token(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text.startswith("cuda:"):
@@ -761,10 +783,13 @@ def run_flashvsr(
                         if proc.poll() is not None:
                             break
                     else:
-                        output_lines.append(item)
-                        log(item)
+                        text = str(item)
+                        if _should_suppress_flashvsr_cli_line(text):
+                            last_activity_ts = time.time()
+                            continue
+                        output_lines.append(text)
+                        log(text)
                         try:
-                            text = str(item)
                             if (
                                 (not preflight_tiling_emitted)
                                 and dit_tiling_lines
@@ -805,8 +830,11 @@ def run_flashvsr(
                 except _queue.Empty:
                     break
                 if item:
-                    output_lines.append(item)
-                    log(item)
+                    text = str(item)
+                    if _should_suppress_flashvsr_cli_line(text):
+                        continue
+                    output_lines.append(text)
+                    log(text)
 
             returncode_local = proc.wait()
             if process_handle is not None:

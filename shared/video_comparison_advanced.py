@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 
+COMPARISON_BRAND_TEXT = "SECourses Upscaler Pro"
+COMPARISON_BRAND_RIGHT_PAD = 20
+
 
 @dataclass
 class ComparisonConfig:
@@ -670,7 +673,9 @@ def create_input_vs_output_comparison_video(
                 f"drawtext=text='{label_input}':x=10:y=10:fontsize=32:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"[1:v]drawtext=text='{label_output}':x=10:y=10:fontsize=32:fontcolor=white:"
-                f"box=1:boxcolor=black@0.6:boxborderw=5[right];"
+                f"box=1:boxcolor=black@0.6:boxborderw=5,"
+                f"drawtext=text='{COMPARISON_BRAND_TEXT}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                f"fontsize=32:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5[right];"
                 f"[left][right]hstack=inputs=2[out]"
             )
         else:
@@ -681,7 +686,9 @@ def create_input_vs_output_comparison_video(
                 f"drawtext=text='{label_input}':x=10:y=10:fontsize=32:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
                 f"[1:v]drawtext=text='{label_output}':x=10:y=10:fontsize=32:fontcolor=white:"
-                f"box=1:boxcolor=black@0.6:boxborderw=5[bottom];"
+                f"box=1:boxcolor=black@0.6:boxborderw=5,"
+                f"drawtext=text='{COMPARISON_BRAND_TEXT}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                f"fontsize=32:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5[bottom];"
                 f"[top][bottom]vstack=inputs=2[out]"
             )
 

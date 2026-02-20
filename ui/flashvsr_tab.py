@@ -33,7 +33,7 @@ from shared.queue_state import (
     snapshot_global_settings,
     merge_payload_state,
 )
-from shared.gpu_utils import get_gpu_info, get_global_gpu_override
+from shared.gpu_utils import get_gpu_info
 
 
 def flashvsr_tab(
@@ -116,11 +116,6 @@ def flashvsr_tab(
         gpu_hint = f" CUDA detection failed: {str(e)}"
         cuda_available = False
 
-    # Layout
-    with gr.Row(equal_height=True):
-        gr.Markdown("### FlashVSR Stable - Diffusion Video Super-Resolution (ComfyUI Backend)")
-        gr.Markdown("*2x/4x upscaling with 5 VAE options, VRAM-aware tuning, and advanced controls*")
-    
     # Show GPU warning if not available
     if not cuda_available:
         gr.Markdown(
@@ -303,12 +298,6 @@ def flashvsr_tab(
                             "(effective levels are roughly `1`, `2`, `3`)."
                         ),
                     )
-                    auto_set_vram_btn = gr.Button(
-                        "Set Low VRAM",
-                        variant="secondary",
-                        elem_classes=["action-btn", "action-btn-auto-vram"],
-                    )
-                auto_set_status = gr.Markdown("", visible=False)
 
                 with gr.Row():
                     keep_models_on_cpu = gr.Checkbox(
@@ -675,13 +664,6 @@ def flashvsr_tab(
             - `LightVAE_W2.1`: lower VRAM + faster; strong default for 8-16GB GPUs.
             - `TAE_W2.2` / `LightTAE_HY1.5`: strong temporal consistency and low VRAM variants.
 
-            **VRAM profile recommendations**
-            - `24GB+`: `full`, Wan2.x, tiling OFF, chunk size 0.
-            - `16GB`: `tiny`, Wan2.1, VAE tiling ON, optional chunking.
-            - `12GB`: `tiny`, LightVAE, VAE+DiT tiling ON, chunk size around 32-64.
-            - `8GB`: `tiny-long`, LightVAE/LightTAE, tiling ON, chunk size around 16-32.
-            - Use **Auto Set by VRAM** to apply these recommendations once, then fine-tune manually.
-
             **Important backend limits**
             - FlashVSR supports only **2x** or **4x** upscale factors.
             - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
@@ -1038,131 +1020,6 @@ def flashvsr_tab(
             gr.update(value=first_video, visible=bool(first_video)),
         )
 
-    def _resolve_vram_for_selected_device(state: Dict[str, Any]) -> tuple[str, float | None]:
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        device_value = str(get_global_gpu_override(seed_controls, global_settings) or "auto").strip().lower()
-        if device_value == "cpu":
-            return "cpu", None
-        try:
-            gpus = get_gpu_info()
-        except Exception:
-            gpus = []
-        if not gpus:
-            return device_value or "auto", None
-        if device_value in {"", "auto", "cuda"}:
-            return "cuda:0", float(gpus[0].total_memory_gb)
-        if device_value.startswith("cuda:"):
-            idx = device_value.split(":", 1)[1].strip()
-            if idx.isdigit():
-                gpu_idx = int(idx)
-                if 0 <= gpu_idx < len(gpus):
-                    return f"cuda:{gpu_idx}", float(gpus[gpu_idx].total_memory_gb)
-        if device_value.isdigit():
-            gpu_idx = int(device_value)
-            if 0 <= gpu_idx < len(gpus):
-                return f"cuda:{gpu_idx}", float(gpus[gpu_idx].total_memory_gb)
-        return "cuda:0", float(gpus[0].total_memory_gb)
-
-    def _auto_set_by_vram(state, scale_val):
-        scale_i = 2 if str(scale_val).strip() == "2" else 4
-        device_label, vram_gb = _resolve_vram_for_selected_device(state)
-
-        if device_label == "cpu":
-            mode_val = "tiny-long"
-            vae_val = "LightVAE_W2.1"
-            precision_val = "auto"
-            tiled_vae_val = True
-            tiled_dit_val = True
-            tile_size_val = 128
-            overlap_val = 16
-            frame_chunk_val = 20 if scale_i == 4 else 40
-            keep_cpu_val = True
-            force_offload_val = True
-            msg = (
-                "Auto set applied for CPU mode: `tiny-long`, `LightVAE_W2.1`, aggressive memory settings. "
-                "Use Max Resolution + Pre-downscale then upscale for extra cap control."
-            )
-        elif vram_gb is None:
-            mode_val = "tiny"
-            vae_val = "Wan2.1"
-            precision_val = "auto"
-            tiled_vae_val = True
-            tiled_dit_val = False
-            tile_size_val = 256
-            overlap_val = 24
-            frame_chunk_val = 64 if scale_i == 4 else 0
-            keep_cpu_val = True
-            force_offload_val = True
-            msg = (
-                "Auto set used safe defaults (VRAM unknown): `tiny`, `Wan2.1`, VAE tiling ON."
-            )
-        elif vram_gb >= 24.0:
-            mode_val = "full"
-            vae_val = "Wan2.2"
-            precision_val = "auto"
-            tiled_vae_val = False
-            tiled_dit_val = False
-            tile_size_val = 384
-            overlap_val = 32
-            frame_chunk_val = 0
-            keep_cpu_val = False
-            force_offload_val = False
-            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): high-quality `full` profile."
-        elif vram_gb >= 16.0:
-            mode_val = "tiny"
-            vae_val = "Wan2.1"
-            precision_val = "auto"
-            tiled_vae_val = True
-            tiled_dit_val = False
-            tile_size_val = 320
-            overlap_val = 24
-            frame_chunk_val = 64 if scale_i == 4 else 0
-            keep_cpu_val = True
-            force_offload_val = True
-            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): balanced `tiny` profile."
-        elif vram_gb >= 12.0:
-            mode_val = "tiny"
-            vae_val = "LightVAE_W2.1"
-            precision_val = "fp16"
-            tiled_vae_val = True
-            tiled_dit_val = True
-            tile_size_val = 256
-            overlap_val = 24
-            frame_chunk_val = 48 if scale_i == 4 else 80
-            keep_cpu_val = True
-            force_offload_val = True
-            msg = f"Auto set applied for {device_label} ({vram_gb:.1f} GB): low-VRAM quality profile."
-        else:
-            mode_val = "tiny-long"
-            vae_val = "LightVAE_W2.1"
-            precision_val = "fp16"
-            tiled_vae_val = True
-            tiled_dit_val = True
-            tile_size_val = 192
-            overlap_val = 24
-            frame_chunk_val = 20 if scale_i == 4 else 40
-            keep_cpu_val = True
-            force_offload_val = True
-            msg = (
-                f"Auto set applied for {device_label} ({vram_gb:.1f} GB): conservative `tiny-long` profile. "
-                "Use Max Resolution + Pre-downscale then upscale for extra cap control."
-            )
-
-        return (
-            gr.update(value=mode_val),
-            gr.update(value=vae_val),
-            gr.update(value=precision_val),
-            gr.update(value=tiled_vae_val),
-            gr.update(value=tiled_dit_val),
-            gr.update(value=tile_size_val),
-            gr.update(value=overlap_val),
-            gr.update(value=frame_chunk_val),
-            gr.update(value=keep_cpu_val),
-            gr.update(value=force_offload_val),
-            gr.update(value=msg, visible=True),
-            gr.update(value=_vae_mode_note(mode_val)),
-        )
-
     def on_chunk_gallery_select(evt: gr.SelectData, state):
         try:
             idx = int(evt.index)
@@ -1469,27 +1326,6 @@ def flashvsr_tab(
         fn=lambda m: gr.update(value=_vae_mode_note(m)),
         inputs=[mode],
         outputs=[vae_mode_note],
-        queue=False,
-        show_progress="hidden",
-    )
-
-    auto_set_vram_btn.click(
-        fn=_auto_set_by_vram,
-        inputs=[shared_state, scale],
-        outputs=[
-            mode,
-            vae_model,
-            precision,
-            tiled_vae,
-            tiled_dit,
-            tile_size,
-            overlap,
-            frame_chunk_size,
-            keep_models_on_cpu,
-            force_offload,
-            auto_set_status,
-            vae_mode_note,
-        ],
         queue=False,
         show_progress="hidden",
     )

@@ -432,6 +432,79 @@ def split_video(
         except Exception:
             return None
 
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            raw = str(value).strip()
+            if not raw or raw.lower() in {"n/a", "nan"}:
+                return None
+            return float(raw)
+        except Exception:
+            return None
+
+    def _probe_av_timing(path: Path) -> Dict[str, Optional[float]]:
+        timing: Dict[str, Optional[float]] = {
+            "video_start": None,
+            "video_duration": None,
+            "audio_start": None,
+            "audio_duration": None,
+        }
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_type,start_time,duration",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode != 0:
+                return timing
+            payload = json.loads(proc.stdout or "{}")
+            streams = payload.get("streams") or []
+            for st in streams:
+                ctype = str(st.get("codec_type") or "").strip().lower()
+                if ctype == "video" and timing["video_duration"] is None:
+                    timing["video_start"] = _to_float(st.get("start_time"))
+                    timing["video_duration"] = _to_float(st.get("duration"))
+                elif ctype == "audio" and timing["audio_duration"] is None:
+                    timing["audio_start"] = _to_float(st.get("start_time"))
+                    timing["audio_duration"] = _to_float(st.get("duration"))
+        except Exception:
+            pass
+        return timing
+
+    def _has_reasonable_av_timing(path: Path) -> bool:
+        """
+        Validate basic A/V alignment for split chunks.
+        Prevent accepting chunks where copied audio drifts far from video.
+        """
+        timing = _probe_av_timing(path)
+        vs = timing.get("video_start")
+        vd = timing.get("video_duration")
+        as_ = timing.get("audio_start")
+        ad = timing.get("audio_duration")
+        if as_ is not None and vs is not None:
+            # AAC priming often causes tiny offsets; allow a small tolerance.
+            if abs(as_ - vs) > 0.25:
+                return False
+        if ad is not None and vd is not None:
+            # Audio can be slightly longer due to codec frame boundaries.
+            if ad > (vd + max(0.25, 0.05 * max(0.0, vd))):
+                return False
+            # Reject severe audio truncation.
+            if ad < max(0.0, vd - 1.0):
+                return False
+        return True
+
     # Filter invalid scenes and optionally frame-align boundaries for precision.
     fps_for_align = float(get_media_fps(video_path) or 30.0) if precise else 0.0
 
@@ -601,6 +674,8 @@ def split_video(
                 "0:a?",
                 "-vf",
                 "setpts=PTS-STARTPTS",
+                "-af",
+                "asetpts=PTS-STARTPTS",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -659,6 +734,16 @@ def split_video(
             if not _is_decodable(out):
                 return False
             if src_has_audio and not has_audio_stream(out):
+                return False
+            if src_has_audio and not _has_reasonable_av_timing(out):
+                try:
+                    if on_progress:
+                        on_progress(
+                            f"WARN: Split chunk {idx} has A/V timing drift; "
+                            "retrying alternate split path.\n"
+                        )
+                except Exception:
+                    pass
                 return False
             return True
 
@@ -2089,13 +2174,22 @@ def chunk_and_process(
         on_progress(f"Detected {len(scenes)} scenes for chunking\n")
 
         precise_split = bool(settings.get("frame_accurate_split", True))
+        audio_codec_pref = str(settings.get("audio_codec") or "copy").strip().lower()
+        include_chunk_audio = audio_codec_pref not in {"none", "no", "off", "disable", "disabled"}
+        try:
+            on_progress(
+                f"Chunk split audio: {'enabled' if include_chunk_audio else 'disabled'} "
+                f"(audio_codec={audio_codec_pref or 'copy'})\n"
+            )
+        except Exception:
+            pass
         chunk_paths = split_video(
             input_path,
             scenes,
             input_chunks_dir,
             precise=precise_split,
             preserve_quality=True,
-            include_audio=False if model_type == "flashvsr" else True,
+            include_audio=include_chunk_audio,
             on_progress=on_progress,
         )
         on_progress(f"Split into {len(chunk_paths)} chunks\n")

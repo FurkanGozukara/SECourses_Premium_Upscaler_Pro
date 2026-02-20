@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +44,37 @@ def _pick_preview_from_dir(chunk_dir: Path) -> Tuple[Optional[str], Optional[str
     return None, None
 
 
+def _safe_video_preview_copy(video_path: str) -> str:
+    """
+    Return a UI-safe copy path for video previews.
+
+    We intentionally avoid hard links because some UI stacks may transcode/normalize
+    preview videos in-place, which could mutate the original output artifact.
+    """
+    src = Path(str(video_path)).resolve()
+    if not src.exists() or not src.is_file():
+        return str(src)
+
+    try:
+        st = src.stat()
+        sig = hashlib.sha256(
+            f"{src.as_posix()}|{st.st_size}|{st.st_mtime_ns}|ui_safe_v1".encode("utf-8")
+        ).hexdigest()[:20]
+        cache_dir = src.parent / ".ui_preview_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dst = cache_dir / f"{src.stem}.__ui_preview_{sig}{src.suffix}"
+
+        if dst.exists() and dst.is_file() and dst.stat().st_size > 1024:
+            return str(dst)
+
+        tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        return str(dst)
+    except Exception:
+        return str(src)
+
+
 def build_chunk_preview_payload(run_dir: str, max_items: int = 24) -> Dict[str, Any]:
     root = Path(str(run_dir))
     if not root.exists():
@@ -59,7 +93,7 @@ def build_chunk_preview_payload(run_dir: str, max_items: int = 24) -> Dict[str, 
 
         if item.is_file():
             if item.suffix.lower() in VIDEO_EXTS:
-                video_path = str(item)
+                video_path = _safe_video_preview_copy(str(item))
                 display_path = str(item)
             elif item.suffix.lower() in IMAGE_EXTS:
                 display_path = str(item)

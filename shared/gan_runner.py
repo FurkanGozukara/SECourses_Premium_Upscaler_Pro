@@ -761,6 +761,12 @@ def _run_gan_video(
                 quality = 18
             preset = str(settings.get("video_preset", "medium") or "medium")
             pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p")
+            h265_tune = str(settings.get("h265_tune", "none") or "none")
+            try:
+                av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+            except Exception:
+                av1_film_grain = 8
+            av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
             audio_codec = str(settings.get("audio_codec") or "copy")
             audio_bitrate = settings.get("audio_bitrate") or None
 
@@ -771,6 +777,9 @@ def _run_gan_video(
                 quality=quality,
                 pixel_format=pixel_format,
                 preset=preset,
+                h265_tune=h265_tune,
+                av1_film_grain=av1_film_grain,
+                av1_film_grain_denoise=av1_film_grain_denoise,
                 audio_codec=audio_codec,
                 audio_bitrate=audio_bitrate,
             )
@@ -840,6 +849,12 @@ def _run_gan_video(
                     quality = int(settings.get("video_quality", 18) or 18)
                     preset = str(settings.get("video_preset", "medium") or "medium")
                     pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p")
+                    h265_tune = str(settings.get("h265_tune", "none") or "none")
+                    try:
+                        av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+                    except Exception:
+                        av1_film_grain = 8
+                    av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
                     two_pass = bool(settings.get("two_pass_encoding", False))
 
                     ok = encode_video(
@@ -850,6 +865,9 @@ def _run_gan_video(
                         crf=quality,
                         preset=preset,
                         pixel_format=pixel_format,
+                        h265_tune=h265_tune,
+                        av1_film_grain=av1_film_grain,
+                        av1_film_grain_denoise=av1_film_grain_denoise,
                         audio_codec="none",
                         two_pass=two_pass,
                         on_progress=on_progress,
@@ -915,6 +933,12 @@ def _run_gan_video(
         quality = int(settings.get("video_quality", 18) or 18)
         preset = str(settings.get("video_preset", "medium") or "medium")
         pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p")
+        h265_tune = str(settings.get("h265_tune", "none") or "none")
+        try:
+            av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+        except Exception:
+            av1_film_grain = 8
+        av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
         two_pass = bool(settings.get("two_pass_encoding", False))
 
         ok = encode_video(
@@ -925,6 +949,9 @@ def _run_gan_video(
             crf=quality,
             preset=preset,
             pixel_format=pixel_format,
+            h265_tune=h265_tune,
+            av1_film_grain=av1_film_grain,
+            av1_film_grain_denoise=av1_film_grain_denoise,
             audio_codec="none",
             two_pass=two_pass,
             on_progress=on_progress,

@@ -159,6 +159,19 @@ ENCODING_PRESETS = [
     "veryslow",   # Best compression, slowest
 ]
 
+H265_TUNE_OPTIONS = [
+    "none",
+    "grain",
+    "psnr",
+    "ssim",
+    "fastdecode",
+    "zerolatency",
+    "animation",
+]
+
+DEFAULT_AV1_FILM_GRAIN = 8
+DEFAULT_AV1_FILM_GRAIN_DENOISE = False
+
 
 AUDIO_CODECS = {
     "copy": "Copy original (no re-encoding)",
@@ -167,6 +180,19 @@ AUDIO_CODECS = {
     "flac": "FLAC (lossless)",
     "none": "No audio (remove audio track)",
 }
+
+
+def _normalize_h265_tune(value: Optional[str]) -> str:
+    tune = str(value or "none").strip().lower()
+    return tune if tune in H265_TUNE_OPTIONS else "none"
+
+
+def _normalize_av1_film_grain(value: Optional[int]) -> int:
+    try:
+        grain = int(float(value if value is not None else DEFAULT_AV1_FILM_GRAIN))
+    except Exception:
+        grain = DEFAULT_AV1_FILM_GRAIN
+    return max(0, min(50, grain))
 
 
 def get_codec_choices() -> List[str]:
@@ -204,7 +230,10 @@ def build_ffmpeg_video_encode_args(
     pixel_format: str = "yuv420p",
     preset: str = "medium",
     audio_codec: str = "copy",
-    audio_bitrate: Optional[str] = None
+    audio_bitrate: Optional[str] = None,
+    h265_tune: str = "none",
+    av1_film_grain: Optional[int] = None,
+    av1_film_grain_denoise: Optional[bool] = None,
 ) -> List[str]:
     """
     Build ffmpeg encoding arguments from settings.
@@ -216,6 +245,9 @@ def build_ffmpeg_video_encode_args(
         preset: Encoding preset (ultrafast to veryslow)
         audio_codec: Audio codec (copy, aac, opus, flac, none)
         audio_bitrate: Audio bitrate (e.g., "192k", None = default)
+        h265_tune: x265 tune value (none, grain, psnr, ssim, ...)
+        av1_film_grain: SVT-AV1 synthetic film grain strength (0-50)
+        av1_film_grain_denoise: SVT-AV1 denoise flag for film grain synthesis
         
     Returns:
         List of ffmpeg arguments to append to command
@@ -245,7 +277,28 @@ def build_ffmpeg_video_encode_args(
     # Encoding preset (if supported)
     if profile.supports_presets and preset in ENCODING_PRESETS:
         args.extend(["-preset", preset])
-    
+
+    # Codec-specific tuning hooks.
+    if codec == "h265":
+        tune = _normalize_h265_tune(h265_tune)
+        if tune != "none":
+            args.extend(["-tune", tune])
+    elif codec == "av1":
+        film_grain_val = _normalize_av1_film_grain(
+            av1_film_grain if av1_film_grain is not None else DEFAULT_AV1_FILM_GRAIN
+        )
+        denoise = (
+            bool(av1_film_grain_denoise)
+            if av1_film_grain_denoise is not None
+            else bool(DEFAULT_AV1_FILM_GRAIN_DENOISE)
+        )
+        args.extend(
+            [
+                "-svtav1-params",
+                f"film-grain={film_grain_val}:film-grain-denoise={1 if denoise else 0}",
+            ]
+        )
+
     # Pixel format (validate compatibility)
     if pixel_format in profile.supports_pixel_formats:
         args.extend(["-pix_fmt", pixel_format])

@@ -33,6 +33,9 @@ from shared.video_codec_options import (
     get_pixel_format_choices,
     ENCODING_PRESETS,
     AUDIO_CODECS,
+    H265_TUNE_OPTIONS,
+    DEFAULT_AV1_FILM_GRAIN,
+    DEFAULT_AV1_FILM_GRAIN_DENOISE,
 )
 
 
@@ -232,6 +235,16 @@ def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
 
     preset = str(cfg.get("video_preset", "medium") or "medium").strip().lower()
     cfg["video_preset"] = preset if preset in ENCODING_PRESETS else "medium"
+    h265_tune = str(cfg.get("h265_tune", "none") or "none").strip().lower()
+    cfg["h265_tune"] = h265_tune if h265_tune in H265_TUNE_OPTIONS else "none"
+    try:
+        av1_film_grain = int(float(cfg.get("av1_film_grain", DEFAULT_AV1_FILM_GRAIN) or DEFAULT_AV1_FILM_GRAIN))
+    except Exception:
+        av1_film_grain = DEFAULT_AV1_FILM_GRAIN
+    cfg["av1_film_grain"] = max(0, min(50, av1_film_grain))
+    cfg["av1_film_grain_denoise"] = bool(
+        cfg.get("av1_film_grain_denoise", DEFAULT_AV1_FILM_GRAIN_DENOISE)
+    )
     cfg["two_pass_encoding"] = bool(cfg.get("two_pass_encoding", False))
 
     pix_fmt_choices = get_pixel_format_choices(codec)
@@ -649,6 +662,11 @@ def update_shared_state_from_preset(
     seed_controls["video_codec_val"] = str(out_settings.get("video_codec", "h264") or "h264")
     seed_controls["video_quality_val"] = int(out_settings.get("video_quality", 18) or 18)
     seed_controls["video_preset_val"] = str(out_settings.get("video_preset", "medium") or "medium")
+    seed_controls["h265_tune_val"] = str(out_settings.get("h265_tune", "none") or "none")
+    seed_controls["av1_film_grain_val"] = int(out_settings.get("av1_film_grain", DEFAULT_AV1_FILM_GRAIN) or DEFAULT_AV1_FILM_GRAIN)
+    seed_controls["av1_film_grain_denoise_val"] = bool(
+        out_settings.get("av1_film_grain_denoise", DEFAULT_AV1_FILM_GRAIN_DENOISE)
+    )
     seed_controls["two_pass_encoding_val"] = bool(out_settings.get("two_pass_encoding", False))
     seed_controls["pixel_format_val"] = str(out_settings.get("pixel_format", "yuv420p") or "yuv420p")
     seed_controls["frame_interpolation_val"] = bool(out_settings.get("frame_interpolation", False))

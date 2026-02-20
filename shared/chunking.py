@@ -8,6 +8,7 @@ import subprocess
 import threading
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -862,44 +863,9 @@ def _sum_chunk_durations(chunk_paths: List[Path]) -> Optional[float]:
     Sum durations for all chunk files.
     Returns None when duration probing is incomplete, so callers can skip plausibility checks.
     """
-    def _video_stream_duration(path: Path) -> Optional[float]:
-        try:
-            proc = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if proc.returncode == 0:
-                raw = (proc.stdout or "").strip()
-                if raw:
-                    val = float(raw)
-                    if val > 0:
-                        return val
-        except Exception:
-            pass
-        try:
-            val2 = get_media_duration_seconds(str(path))
-            if val2 and val2 > 0:
-                return float(val2)
-        except Exception:
-            pass
-        return None
-
     total = 0.0
     for p in chunk_paths:
-        dur = _video_stream_duration(Path(p))
+        dur = _probe_video_stream_duration(Path(p))
         if dur is None or dur <= 0:
             return None
         total += float(dur)
@@ -907,49 +873,97 @@ def _sum_chunk_durations(chunk_paths: List[Path]) -> Optional[float]:
 
 
 def _duration_is_plausible(
-    output_path: Path, expected_duration: Optional[float], min_ratio: float = 0.85
+    output_path: Path,
+    expected_duration: Optional[float],
+    min_ratio: float = 0.85,
+    max_ratio: float = 1.15,
+    slack_sec: float = 0.35,
 ) -> bool:
-    def _video_stream_duration(path: Path) -> Optional[float]:
-        try:
-            proc = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if proc.returncode == 0:
-                raw = (proc.stdout or "").strip()
-                if raw:
-                    v = float(raw)
-                    if v > 0:
-                        return v
-        except Exception:
-            pass
-        try:
-            v2 = get_media_duration_seconds(str(path))
-            if v2 and v2 > 0:
-                return float(v2)
-        except Exception:
-            pass
-        return None
-
     if expected_duration is None or expected_duration <= 0:
         return output_path.exists() and output_path.stat().st_size > 1024
-    actual = _video_stream_duration(Path(output_path))
+    actual = _probe_video_stream_duration(Path(output_path))
     if actual is None or actual <= 0:
         return False
-    return float(actual) >= float(expected_duration) * float(min_ratio)
+    exp = float(expected_duration)
+    min_allowed = exp * float(min_ratio)
+    max_allowed = exp * float(max_ratio) + max(0.0, float(slack_sec))
+    return min_allowed <= float(actual) <= max_allowed
+
+
+def _probe_video_stream_duration(path: Path) -> Optional[float]:
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            raw = (proc.stdout or "").strip()
+            if raw:
+                val = float(raw)
+                if val > 0:
+                    return val
+    except Exception:
+        pass
+    try:
+        val2 = get_media_duration_seconds(str(path))
+        if val2 and val2 > 0:
+            return float(val2)
+    except Exception:
+        pass
+    return None
+
+
+def _remux_video_with_fresh_timestamps(
+    src_path: Path,
+    dst_path: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """
+    Stream-copy remux with regenerated timestamps.
+
+    This is used only when merge output duration drifts too high/low and we want
+    to avoid full re-encoding.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-i",
+        str(src_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-movflags",
+        "+faststart",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(dst_path),
+    ]
+    proc = _run_ffmpeg(cmd)
+    if proc.returncode == 0 and dst_path.exists() and dst_path.stat().st_size > 1024:
+        return True
+    if on_progress:
+        tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        on_progress("WARN: Timestamp remux failed.\n")
+        if tail:
+            on_progress(f"ffmpeg: {tail}\n")
+    return False
 
 
 _CHUNK_INDEX_RE = re.compile(r"chunk_(\d+)", flags=re.IGNORECASE)
@@ -1104,6 +1118,13 @@ def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) 
     except Exception:
         quality = 18
     preset = str(cfg.get("video_preset", "medium") or "medium")
+    h265_tune = str(cfg.get("h265_tune", "none") or "none").strip().lower() or "none"
+    try:
+        av1_film_grain = int(float(cfg.get("av1_film_grain", 8) or 8))
+    except Exception:
+        av1_film_grain = 8
+    av1_film_grain = max(0, min(50, av1_film_grain))
+    av1_film_grain_denoise = bool(cfg.get("av1_film_grain_denoise", False))
     pixel_format = str(cfg.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
     use_10bit = bool(cfg.get("use_10bit", False) or cfg.get("seedvr2_use_10bit", False))
     # SeedVR2's `--10bit` should dominate downstream ffmpeg enforcement/merge settings.
@@ -1115,6 +1136,9 @@ def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) 
         "codec": codec,
         "quality": quality,
         "preset": preset,
+        "h265_tune": h265_tune,
+        "av1_film_grain": av1_film_grain,
+        "av1_film_grain_denoise": av1_film_grain_denoise,
         "pixel_format": pixel_format,
         "use_10bit": use_10bit,
     }
@@ -1315,19 +1339,71 @@ def concat_videos(
     if on_progress:
         on_progress(f"Concatenating {len(stable_chunks)} chunk(s) (video-only merge)...\n")
 
-    def _merge_ok(path: Path, ratio: float = 0.93) -> bool:
-        return (
-            path.exists()
-            and path.stat().st_size > 1024
-            and _duration_is_plausible(path, expected_duration, min_ratio=ratio)
-        )
+    def _validate_or_fix_duration(path: Path, min_ratio: float = 0.90) -> bool:
+        if not (path.exists() and path.stat().st_size > 1024):
+            return False
+        if expected_duration is None or expected_duration <= 0:
+            return True
+
+        actual_now = _probe_video_stream_duration(path)
+        if on_progress and actual_now is not None:
+            on_progress(
+                "Merge duration check: "
+                f"expected~{float(expected_duration):.3f}s, actual={float(actual_now):.3f}s.\n"
+            )
+
+        if _duration_is_plausible(path, expected_duration, min_ratio=min_ratio):
+            return True
+
+        actual_before = _probe_video_stream_duration(path)
+        if on_progress:
+            on_progress(
+                "WARN: Merge duration drift detected "
+                f"(expected~{float(expected_duration):.3f}s, "
+                f"actual={float(actual_before or 0.0):.3f}s). "
+                "Attempting timestamp remux fix.\n"
+            )
+
+        tmp_fixed = path.with_name(f"{path.stem}.__tsfix{path.suffix}")
+        with suppress(Exception):
+            tmp_fixed.unlink(missing_ok=True)
+        if not _remux_video_with_fresh_timestamps(path, tmp_fixed, on_progress=on_progress):
+            with suppress(Exception):
+                tmp_fixed.unlink(missing_ok=True)
+            return False
+
+        fixed_ok = _duration_is_plausible(tmp_fixed, expected_duration, min_ratio=min_ratio)
+        actual_after = _probe_video_stream_duration(tmp_fixed)
+        if fixed_ok:
+            try:
+                os.replace(str(tmp_fixed), str(path))
+                if on_progress:
+                    on_progress(
+                        "Timestamp remux fix applied "
+                        f"(new duration={float(actual_after or 0.0):.3f}s).\n"
+                    )
+                return True
+            except Exception:
+                # If replacement fails, keep original path outcome and fail closed.
+                with suppress(Exception):
+                    tmp_fixed.unlink(missing_ok=True)
+                return False
+
+        if on_progress:
+            on_progress(
+                "WARN: Timestamp remux did not fix duration drift "
+                f"(new duration={float(actual_after or 0.0):.3f}s).\n"
+            )
+        with suppress(Exception):
+            tmp_fixed.unlink(missing_ok=True)
+        return False
 
     # Trivial fast-path: only one chunk.
     if len(stable_chunks) == 1:
         try:
             output_path.unlink(missing_ok=True)
             shutil.copy2(stable_chunks[0], output_path)
-            return output_path.exists() and output_path.stat().st_size > 1024
+            return _validate_or_fix_duration(output_path, min_ratio=0.90)
         except Exception:
             return False
 
@@ -1395,7 +1471,7 @@ def concat_videos(
                     str(output_path),
                 ]
                 proc_ts_concat = _run_ffmpeg(cmd_ts_concat)
-                if proc_ts_concat.returncode == 0 and _merge_ok(output_path, ratio=0.90):
+                if proc_ts_concat.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
                     if on_progress:
                         on_progress(
                             f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
@@ -1428,7 +1504,7 @@ def concat_videos(
         str(output_path),
     ]
     proc_copy = _run_ffmpeg(cmd_copy)
-    if proc_copy.returncode == 0 and _merge_ok(output_path, ratio=0.90):
+    if proc_copy.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
         if on_progress:
             on_progress(
                 f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
@@ -1558,6 +1634,9 @@ def concat_videos_with_blending(
                 quality=enc["quality"],
                 pixel_format=enc["pixel_format"],
                 preset=enc["preset"],
+                h265_tune=enc["h265_tune"],
+                av1_film_grain=enc["av1_film_grain"],
+                av1_film_grain_denoise=enc["av1_film_grain_denoise"],
                 audio_codec="none",
             )
             bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1"} else []

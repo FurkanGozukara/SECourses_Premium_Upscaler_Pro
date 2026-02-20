@@ -41,7 +41,11 @@ from shared.gpu_utils import (
     get_gpu_info,
     resolve_global_gpu_device,
 )
-from shared.video_codec_options import get_pixel_format_choices
+from shared.video_codec_options import (
+    get_pixel_format_choices,
+    DEFAULT_AV1_FILM_GRAIN,
+    DEFAULT_AV1_FILM_GRAIN_DENOISE,
+)
 from ui.seedvr2_tab import seedvr2_tab
 from ui.resolution_tab import resolution_tab
 from ui.output_tab import output_tab
@@ -1288,6 +1292,13 @@ def main(argv=None):
                 "video_codec_val": str(startup_output_settings.get("video_codec", "h264") or "h264"),
                 "video_quality_val": int(startup_output_settings.get("video_quality", 18) or 18),
                 "video_preset_val": str(startup_output_settings.get("video_preset", "medium") or "medium"),
+                "h265_tune_val": str(startup_output_settings.get("h265_tune", "none") or "none"),
+                "av1_film_grain_val": int(
+                    startup_output_settings.get("av1_film_grain", DEFAULT_AV1_FILM_GRAIN) or DEFAULT_AV1_FILM_GRAIN
+                ),
+                "av1_film_grain_denoise_val": bool(
+                    startup_output_settings.get("av1_film_grain_denoise", DEFAULT_AV1_FILM_GRAIN_DENOISE)
+                ),
                 "two_pass_encoding_val": bool(startup_output_settings.get("two_pass_encoding", False)),
                 "pixel_format_val": str(startup_output_settings.get("pixel_format", "yuv420p") or "yuv420p"),
                 "frame_interpolation_val": bool(startup_output_settings.get("frame_interpolation", False)),

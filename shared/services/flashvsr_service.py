@@ -5,6 +5,8 @@ Handles FlashVSR+ processing logic, presets, and callbacks
 
 import queue
 import re
+import hashlib
+import os
 import shutil
 import subprocess
 import threading
@@ -21,6 +23,8 @@ from shared.path_utils import (
     collision_safe_path,
     collision_safe_dir,
     get_media_dimensions,
+    get_media_duration_seconds,
+    get_media_fps,
     detect_input_type,
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -136,6 +140,39 @@ def _apply_image_output_preferences(
         return str(dst)
     except Exception:
         return image_path
+
+
+def _safe_ui_video_preview_path(video_path: Optional[str]) -> Optional[str]:
+    """
+    Return an isolated copy path for UI video widgets.
+
+    Some UI/video preview stacks can normalize media in-place. By serving a copy
+    to the UI, the original processing output remains untouched.
+    """
+    if not video_path:
+        return video_path
+    try:
+        src = Path(str(video_path)).resolve()
+        if not src.exists() or not src.is_file():
+            return str(src)
+
+        st = src.stat()
+        sig = hashlib.sha256(
+            f"{src.as_posix()}|{st.st_size}|{st.st_mtime_ns}|flashvsr_ui_preview_v1".encode("utf-8")
+        ).hexdigest()[:20]
+        cache_dir = src.parent / ".ui_preview_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dst = cache_dir / f"{src.stem}.__ui_preview_{sig}{src.suffix}"
+
+        if dst.exists() and dst.is_file() and dst.stat().st_size > 1024:
+            return str(dst)
+
+        tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        return str(dst)
+    except Exception:
+        return video_path
 
 
 FLASHVSR_VAE_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
@@ -687,6 +724,9 @@ def build_flashvsr_callbacks(
                 "video_codec": seed_controls.get("video_codec_val"),
                 "video_quality": seed_controls.get("video_quality_val"),
                 "video_preset": seed_controls.get("video_preset_val"),
+                "h265_tune": seed_controls.get("h265_tune_val"),
+                "av1_film_grain": seed_controls.get("av1_film_grain_val"),
+                "av1_film_grain_denoise": seed_controls.get("av1_film_grain_denoise_val"),
                 "pixel_format": seed_controls.get("pixel_format_val"),
                 "two_pass_encoding": seed_controls.get("two_pass_encoding_val"),
             }
@@ -694,6 +734,9 @@ def build_flashvsr_callbacks(
                 "video_codec",
                 "video_quality",
                 "video_preset",
+                "h265_tune",
+                "av1_film_grain",
+                "av1_film_grain_denoise",
                 "pixel_format",
                 "two_pass_encoding",
                 "metadata_format",
@@ -712,14 +755,18 @@ def build_flashvsr_callbacks(
             codec_map = {
                 "h264": "libx264",
                 "h265": "libx265",
+                "hevc": "libx265",
+                "x265": "libx265",
+                "av1": "libsvtav1",
+                "libsvtav1": "libsvtav1",
             }
             output_codec_key = str(output_codec or "").strip().lower()
             mapped_codec = codec_map.get(output_codec_key, "libx264")
             settings["codec"] = mapped_codec
             if output_codec_key and output_codec_key not in codec_map:
                 settings["_output_codec_note"] = (
-                    f"Output tab codec '{output_codec_key}' is not directly supported by FlashVSR CLI; "
-                    f"using '{mapped_codec}' for model-pass output."
+                    f"Output tab codec '{output_codec_key}' is not supported by FlashVSR CLI writer; "
+                    f"using '{mapped_codec}' instead."
                 )
 
             output_quality = settings.get("video_quality")
@@ -1134,7 +1181,8 @@ def build_flashvsr_callbacks(
                     if out_path and not Path(out_path).is_dir():
                         suf = Path(out_path).suffix.lower()
                         if suf in video_exts:
-                            return gr.update(value=out_path, visible=True), gr.update(value=None, visible=False)
+                            safe_preview = _safe_ui_video_preview_path(out_path)
+                            return gr.update(value=safe_preview, visible=True), gr.update(value=None, visible=False)
                         if suf in image_exts:
                             return gr.update(value=None, visible=False), gr.update(value=out_path, visible=True)
                 except Exception:
@@ -2186,6 +2234,25 @@ def build_flashvsr_callbacks(
                     log_buffer.append(f"Comparison video created: {Path(comp_vid_path).name}")
                 elif comp_vid_err:
                     log_buffer.append(f"Comparison video failed: {comp_vid_err}")
+
+            # Final media probe for debugging timeline/fps drift.
+            if output_path and Path(output_path).exists() and Path(output_path).suffix.lower() in video_exts:
+                try:
+                    dims = get_media_dimensions(output_path)
+                    fps_val = get_media_fps(output_path)
+                    dur_val = get_media_duration_seconds(output_path)
+                    dim_txt = (
+                        f"{int(dims[0])}x{int(dims[1])}"
+                        if isinstance(dims, tuple) and len(dims) == 2
+                        else "unknown"
+                    )
+                    fps_txt = f"{float(fps_val):.6g}" if fps_val and float(fps_val) > 0 else "unknown"
+                    dur_txt = f"{float(dur_val):.6g}s" if dur_val and float(dur_val) > 0 else "unknown"
+                    log_buffer.append(
+                        f"[final] probe: name={Path(output_path).name}, dims={dim_txt}, fps={fps_txt}, duration={dur_txt}"
+                    )
+                except Exception:
+                    pass
 
             # Create comparison
             html_comp, img_slider = create_unified_comparison(

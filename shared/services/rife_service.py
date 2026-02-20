@@ -197,6 +197,9 @@ def _trim_video(
     no_audio: bool = False,
     video_preset: str = "fast",
     pixel_format: str = "yuv420p",
+    h265_tune: str = "none",
+    av1_film_grain: int = 8,
+    av1_film_grain_denoise: bool = False,
     audio_codec: str = "aac",
     audio_bitrate: Optional[str] = None,
 ) -> Tuple[bool, str]:
@@ -221,6 +224,9 @@ def _trim_video(
                 quality=int(quality),
                 pixel_format=str(pixel_format or "yuv420p"),
                 preset=str(video_preset or "fast"),
+                h265_tune=str(h265_tune or "none"),
+                av1_film_grain=int(av1_film_grain),
+                av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
             )
@@ -244,6 +250,9 @@ def _change_video_speed(
     no_audio: bool = False,
     video_preset: str = "fast",
     pixel_format: str = "yuv420p",
+    h265_tune: str = "none",
+    av1_film_grain: int = 8,
+    av1_film_grain_denoise: bool = False,
     audio_codec: str = "aac",
     audio_bitrate: Optional[str] = None,
 ) -> Tuple[bool, str]:
@@ -277,6 +286,9 @@ def _change_video_speed(
                 quality=int(quality),
                 pixel_format=str(pixel_format or "yuv420p"),
                 preset=str(video_preset or "fast"),
+                h265_tune=str(h265_tune or "none"),
+                av1_film_grain=int(av1_film_grain),
+                av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
             )
@@ -299,6 +311,9 @@ def _concatenate_videos(
     no_audio: bool = False,
     video_preset: str = "fast",
     pixel_format: str = "yuv420p",
+    h265_tune: str = "none",
+    av1_film_grain: int = 8,
+    av1_film_grain_denoise: bool = False,
     audio_codec: str = "copy",
     audio_bitrate: Optional[str] = None,
 ) -> Tuple[bool, str]:
@@ -323,6 +338,9 @@ def _concatenate_videos(
                 quality=int(quality),
                 pixel_format=str(pixel_format or "yuv420p"),
                 preset=str(video_preset or "fast"),
+                h265_tune=str(h265_tune or "none"),
+                av1_film_grain=int(av1_film_grain),
+                av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
             )
@@ -370,6 +388,13 @@ def _apply_video_editing(input_path: str, output_path: str, settings: Dict[str, 
         quality = int(settings.get("video_quality", settings.get("output_quality", 23)))
         video_preset = str(settings.get("video_preset", "fast") or "fast")
         pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p")
+        h265_tune = str(settings.get("h265_tune", "none") or "none")
+        try:
+            av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+        except Exception:
+            av1_film_grain = 8
+        av1_film_grain = max(0, min(50, av1_film_grain))
+        av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
         audio_codec = str(settings.get("audio_codec", "copy") or "copy")
         audio_bitrate = settings.get("audio_bitrate") or None
         no_audio = bool(settings.get("no_audio", False)) or audio_codec.strip().lower() in ("none", "no", "off", "disable", "disabled")
@@ -381,7 +406,16 @@ def _apply_video_editing(input_path: str, output_path: str, settings: Dict[str, 
                 progress_cb("Trimming video...")
             success, log = _trim_video(
                 input_path, str(temp_output), start_time, end_time,
-                video_codec, quality, no_audio, video_preset, pixel_format, audio_codec, audio_bitrate
+                video_codec,
+                quality,
+                no_audio,
+                video_preset,
+                pixel_format,
+                h265_tune,
+                av1_film_grain,
+                av1_film_grain_denoise,
+                audio_codec,
+                audio_bitrate,
             )
             if not success:
                 return False, f"Trimming failed: {log}", ""
@@ -391,7 +425,16 @@ def _apply_video_editing(input_path: str, output_path: str, settings: Dict[str, 
                 progress_cb(f"Changing video speed by factor {speed_factor}...")
             success, log = _change_video_speed(
                 input_path, str(temp_output), speed_factor,
-                video_codec, quality, no_audio, video_preset, pixel_format, audio_codec, audio_bitrate
+                video_codec,
+                quality,
+                no_audio,
+                video_preset,
+                pixel_format,
+                h265_tune,
+                av1_film_grain,
+                av1_film_grain_denoise,
+                audio_codec,
+                audio_bitrate,
             )
             if not success:
                 return False, f"Speed change failed: {log}", ""
@@ -420,6 +463,9 @@ def _apply_video_editing(input_path: str, output_path: str, settings: Dict[str, 
                 no_audio,
                 video_preset,
                 pixel_format,
+                h265_tune,
+                av1_film_grain,
+                av1_film_grain_denoise,
                 audio_codec,
                 audio_bitrate,
             )
@@ -962,6 +1008,9 @@ def build_rife_callbacks(
                 "video_codec": seed_controls.get("video_codec_val"),
                 "video_quality": seed_controls.get("video_quality_val"),
                 "video_preset": seed_controls.get("video_preset_val"),
+                "h265_tune": seed_controls.get("h265_tune_val"),
+                "av1_film_grain": seed_controls.get("av1_film_grain_val"),
+                "av1_film_grain_denoise": seed_controls.get("av1_film_grain_denoise_val"),
                 "pixel_format": seed_controls.get("pixel_format_val"),
                 "two_pass_encoding": seed_controls.get("two_pass_encoding_val"),
             }
@@ -969,6 +1018,9 @@ def build_rife_callbacks(
                 "video_codec",
                 "video_quality",
                 "video_preset",
+                "h265_tune",
+                "av1_film_grain",
+                "av1_film_grain_denoise",
                 "pixel_format",
                 "two_pass_encoding",
                 "metadata_format",

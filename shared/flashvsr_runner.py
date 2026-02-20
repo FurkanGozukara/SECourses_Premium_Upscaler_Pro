@@ -440,6 +440,15 @@ def run_flashvsr(
         end_frame = _parse_int(settings.get("end_frame"), -1)
         codec = str(settings.get("codec", "libx264") or "libx264").strip()
         crf = max(0, min(51, _parse_int(settings.get("crf"), 18)))
+        video_preset = str(settings.get("video_preset", "medium") or "medium").strip().lower() or "medium"
+        pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower() or "yuv420p"
+        h265_tune = str(settings.get("h265_tune", "none") or "none").strip().lower() or "none"
+        try:
+            av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+        except Exception:
+            av1_film_grain = 8
+        av1_film_grain = max(0, min(50, av1_film_grain))
+        av1_film_grain_denoise = _bool(settings.get("av1_film_grain_denoise", False), default=False)
         fps = _parse_float(settings.get("fps"), 0.0)
         single_image_profile_applied = False
         single_image_repeat_frames = 1
@@ -623,6 +632,16 @@ def run_flashvsr(
                 codec,
                 "--crf",
                 str(crf),
+                "--video_preset",
+                video_preset,
+                "--pixel_format",
+                pixel_format,
+                "--h265_tune",
+                h265_tune,
+                "--av1_film_grain",
+                str(av1_film_grain),
+                "--av1_film_grain_denoise",
+                "1" if av1_film_grain_denoise else "0",
                 "--start_frame",
                 str(start_frame),
                 "--end_frame",
@@ -755,7 +774,13 @@ def run_flashvsr(
                                 for math_line in dit_tiling_lines:
                                     output_lines.append(math_line)
                                     log(math_line)
-                            if "%" in text or "Processed:" in text or "Processing:" in text:
+                            if (
+                                "%" in text
+                                or "Processed:" in text
+                                or "Processing:" in text
+                                or "[VideoWriter]" in text
+                                or "[Chunk " in text
+                            ):
                                 last_progress_hint = text
                         except Exception:
                             pass

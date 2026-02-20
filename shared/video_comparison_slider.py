@@ -399,13 +399,13 @@ def create_video_comparison_html(
 
         <div id="{unique_id}_wrapper" class="video-container" style="position:relative;width:100%;height:{safe_height}px;overflow:hidden;cursor:grab;">
             <div class="video-wrapper video-left" style="position:absolute;top:0;left:0;width:100%;height:100%;overflow:hidden;z-index:1;">
-                <video id="{unique_id}_video1" style="width:100%;height:100%;object-fit:contain;display:block;" preload="metadata" playsinline>
+                <video id="{unique_id}_video1" style="width:100%;height:100%;object-fit:contain;display:block;" preload="auto" playsinline>
                     <source src="{original_url}" type="video/mp4">
                 </video>
             </div>
 
             <div id="{unique_id}_videoRight" class="video-wrapper video-right" style="position:absolute;top:0;left:0;width:100%;height:100%;overflow:hidden;z-index:2;clip-path:polygon(50% 0%,100% 0%,100% 100%,50% 100%);">
-                <video id="{unique_id}_video2" style="width:100%;height:100%;object-fit:contain;display:block;" preload="metadata" playsinline>
+                <video id="{unique_id}_video2" style="width:100%;height:100%;object-fit:contain;display:block;" preload="auto" playsinline>
                     <source src="{upscaled_url}" type="video/mp4">
                 </video>
             </div>
@@ -556,9 +556,18 @@ def create_video_comparison_html(
             pauseBoth();
 
             const targetVideo = side === "left" ? video1 : video2;
+            if (side === "left") ready1 = false;
+            if (side === "right") ready2 = false;
+            if (loadingEl) {{
+                loadingEl.style.display = "block";
+                loadingEl.innerHTML = "Loading videos...";
+                loadingEl.style.color = "#fff";
+            }}
             targetVideo.addEventListener(
                 "loadedmetadata",
                 () => {{
+                    if (side === "left") markReady(1);
+                    if (side === "right") markReady(2);
                     const duration = Number(targetVideo.duration || 0);
                     const t = duration > 0
                         ? clamp(sharedTime, 0, Math.max(0, duration - 0.02))
@@ -575,8 +584,26 @@ def create_video_comparison_html(
                 }},
                 {{ once: true }}
             );
+            targetVideo.addEventListener(
+                "loadeddata",
+                () => {{
+                    if (side === "left" && !ready1) markReady(1);
+                    if (side === "right" && !ready2) markReady(2);
+                }},
+                {{ once: true }}
+            );
+            targetVideo.preload = "auto";
             targetVideo.src = item.url;
             targetVideo.load();
+            if (!wasPlaying) {{
+                window.setTimeout(() => {{
+                    warmPausedFrame(targetVideo).then(() => {{
+                        if (side === "left" && !ready1 && targetVideo.readyState >= 1) markReady(1);
+                        if (side === "right" && !ready2 && targetVideo.readyState >= 1) markReady(2);
+                        renderTime();
+                    }}).catch(() => {{}});
+                }}, 220);
+            }}
 
             if (side === "left") currentLeftPath = selectedPath;
             else currentRightPath = selectedPath;
@@ -649,6 +676,27 @@ def create_video_comparison_html(
             }} catch (_) {{
                 return false;
             }}
+        }}
+
+        async function warmPausedFrame(videoEl) {{
+            if (!videoEl || videoEl.readyState >= 2) return true;
+            const prevMuted = !!videoEl.muted;
+            const prevVolume = Number(videoEl.volume || 0);
+            try {{
+                videoEl.muted = true;
+                videoEl.volume = 0;
+                const ok = await safePlay(videoEl);
+                if (ok) {{
+                    window.setTimeout(() => {{
+                        try {{ videoEl.pause(); }} catch (_) {{}}
+                    }}, 60);
+                }}
+            }} catch (_) {{}}
+            try {{
+                videoEl.muted = prevMuted;
+                videoEl.volume = prevVolume;
+            }} catch (_) {{}}
+            return videoEl.readyState >= 1;
         }}
 
         function pauseBoth() {{
@@ -918,6 +966,14 @@ def create_video_comparison_html(
 
         video1.load();
         video2.load();
+        window.setTimeout(() => {{
+            if (ready1 && ready2) return;
+            Promise.all([warmPausedFrame(video1), warmPausedFrame(video2)]).then(() => {{
+                if (!ready1 && video1.readyState >= 1) markReady(1);
+                if (!ready2 && video2.readyState >= 1) markReady(2);
+                renderTime();
+            }}).catch(() => {{}});
+        }}, 280);
     }})();
     </script>
 

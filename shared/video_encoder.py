@@ -28,6 +28,9 @@ def encode_video(
     crf: int = 18,
     preset: str = "medium",
     pixel_format: str = "yuv420p",
+    h265_tune: str = "none",
+    av1_film_grain: Optional[int] = None,
+    av1_film_grain_denoise: bool = False,
     audio_codec: str = "copy",
     audio_bitrate: Optional[str] = None,
     two_pass: bool = False,
@@ -44,6 +47,9 @@ def encode_video(
         codec: Video codec (libx264, libx265, libvpx-vp9)
         crf: Constant Rate Factor (0-51, lower = better quality)
         preset: Encoding preset (ultrafast to veryslow)
+        h265_tune: x265 tune setting (used for H.265 encodes)
+        av1_film_grain: SVT-AV1 film grain strength (0-50)
+        av1_film_grain_denoise: SVT-AV1 film grain denoise flag
         two_pass: Use two-pass encoding for better quality
         metadata: Metadata to embed in video
         on_progress: Progress callback
@@ -77,6 +83,9 @@ def encode_video(
             quality=crf,
             pixel_format=pixel_format,
             preset=preset,
+            h265_tune=h265_tune,
+            av1_film_grain=av1_film_grain,
+            av1_film_grain_denoise=av1_film_grain_denoise,
             audio_codec=audio_codec,
             audio_bitrate=audio_bitrate
         )
@@ -118,6 +127,9 @@ def encode_video(
                         crf=crf,
                         preset=preset,
                         pixel_format=pixel_format,
+                        h265_tune=h265_tune,
+                        av1_film_grain=av1_film_grain,
+                        av1_film_grain_denoise=av1_film_grain_denoise,
                         audio_codec=audio_codec,
                         audio_bitrate=audio_bitrate,
                         two_pass=False,

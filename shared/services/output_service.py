@@ -10,6 +10,9 @@ from shared.video_codec_options import (
     get_pixel_format_choices,
     ENCODING_PRESETS,
     AUDIO_CODECS,
+    H265_TUNE_OPTIONS,
+    DEFAULT_AV1_FILM_GRAIN,
+    DEFAULT_AV1_FILM_GRAIN_DENOISE,
 )
 from shared.models.rife_meta import get_rife_default_model
 
@@ -32,6 +35,9 @@ def output_defaults(models: List[str]) -> Dict[str, Any]:
         "video_codec": "h264",
         "video_quality": 18,
         "video_preset": "medium",
+        "h265_tune": "none",
+        "av1_film_grain": DEFAULT_AV1_FILM_GRAIN,
+        "av1_film_grain_denoise": DEFAULT_AV1_FILM_GRAIN_DENOISE,
         "two_pass_encoding": False,
         "skip_first_frames": 0,
         "pixel_format": "yuv420p",
@@ -72,6 +78,9 @@ OUTPUT_ORDER: List[str] = [
     "video_codec",
     "video_quality",
     "video_preset",
+    "h265_tune",
+    "av1_film_grain",
+    "av1_film_grain_denoise",
     "two_pass_encoding",
     "skip_first_frames",
     "load_cap",
@@ -141,6 +150,16 @@ def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
 
     preset = str(cfg.get("video_preset", "medium") or "medium").strip().lower()
     cfg["video_preset"] = preset if preset in ENCODING_PRESETS else "medium"
+    h265_tune = str(cfg.get("h265_tune", "none") or "none").strip().lower()
+    cfg["h265_tune"] = h265_tune if h265_tune in H265_TUNE_OPTIONS else "none"
+    try:
+        av1_film_grain = int(float(cfg.get("av1_film_grain", DEFAULT_AV1_FILM_GRAIN) or DEFAULT_AV1_FILM_GRAIN))
+    except Exception:
+        av1_film_grain = DEFAULT_AV1_FILM_GRAIN
+    cfg["av1_film_grain"] = max(0, min(50, av1_film_grain))
+    cfg["av1_film_grain_denoise"] = bool(
+        cfg.get("av1_film_grain_denoise", DEFAULT_AV1_FILM_GRAIN_DENOISE)
+    )
     cfg["two_pass_encoding"] = bool(cfg.get("two_pass_encoding", False))
 
     pix_fmt_choices = get_pixel_format_choices(codec)

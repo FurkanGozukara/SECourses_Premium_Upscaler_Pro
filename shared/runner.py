@@ -1846,6 +1846,21 @@ class Runner:
         if preset_raw in allowed_presets:
             cmd.extend(["--video_preset", preset_raw])
 
+        if seed_codec == "libx265":
+            h265_tune_raw = str(settings.get("h265_tune", "none") or "none").strip().lower()
+            if h265_tune_raw and h265_tune_raw != "none":
+                cmd.extend(["--h265_tune", h265_tune_raw])
+
+        if seed_codec == "libsvtav1":
+            try:
+                av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+            except Exception:
+                av1_film_grain = 8
+            av1_film_grain = max(0, min(50, av1_film_grain))
+            av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
+            cmd.extend(["--av1_film_grain", str(av1_film_grain)])
+            cmd.extend(["--av1_film_grain_denoise", "1" if av1_film_grain_denoise else "0"])
+
         # Preview: prefer PNG for quick visualization
         if preview_only and not output_format:
             cmd.extend(["--output_format", "png"])
@@ -2474,6 +2489,21 @@ class Runner:
         if not video_preset:
             video_preset = "slow"
         cmd.extend(["--video-preset", video_preset])
+
+        if video_codec == "libx265":
+            h265_tune_raw = str(settings.get("h265_tune", "none") or "none").strip().lower()
+            if h265_tune_raw and h265_tune_raw != "none":
+                cmd.extend(["--h265-tune", h265_tune_raw])
+
+        if video_codec in {"libsvtav1", "libaom-av1"}:
+            try:
+                av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+            except Exception:
+                av1_film_grain = 8
+            av1_film_grain = max(0, min(50, av1_film_grain))
+            av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
+            cmd.extend(["--av1-film-grain", str(av1_film_grain)])
+            cmd.extend(["--av1-film-grain-denoise", "1" if av1_film_grain_denoise else "0"])
 
         pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
         if not pixel_format:

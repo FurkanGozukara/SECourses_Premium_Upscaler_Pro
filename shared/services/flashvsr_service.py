@@ -387,6 +387,10 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
 
     cfg["tiled_vae"] = _to_bool(cfg.get("tiled_vae"), _to_bool(defaults.get("tiled_vae", True), True))
     cfg["tiled_dit"] = _to_bool(cfg.get("tiled_dit"), _to_bool(defaults.get("tiled_dit", False), False))
+    # Guardrail: full mode + tiled_vae can produce heavily corrupted output on some systems.
+    if cfg.get("mode") == "full" and cfg.get("tiled_vae"):
+        cfg["tiled_vae"] = False
+        cfg["_tiled_vae_note"] = "Disabled tiled_vae in full mode to avoid known corruption artifacts."
     cfg["unload_dit"] = _to_bool(cfg.get("unload_dit"), _to_bool(defaults.get("unload_dit", False), False))
     cfg["stream_decode"] = _to_bool(cfg.get("stream_decode"), _to_bool(defaults.get("stream_decode", False), False))
     cfg["color_fix"] = _to_bool(cfg.get("color_fix"), _to_bool(defaults.get("color_fix", True), True))

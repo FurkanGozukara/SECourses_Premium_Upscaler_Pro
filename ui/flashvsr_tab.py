@@ -148,12 +148,9 @@ def flashvsr_tab(
                         )
 
                     with gr.Column(scale=2):
-                        scale = gr.Dropdown(
-                            label="Backend Upscale Factor (2x/4x)",
-                            choices=["2", "4"],
-                            value="2" if str(_value("scale", "4")).strip() == "2" else "4",
-                            visible=True,
-                            interactive=True,
+                        # Backend-only state (kept for preset/schema compatibility).
+                        scale = gr.State(
+                            value="2" if str(_value("scale", "4")).strip() == "2" else "4"
                         )
                         version = gr.Dropdown(
                             label="Model Version",

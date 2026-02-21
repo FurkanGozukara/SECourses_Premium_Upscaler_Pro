@@ -1165,19 +1165,50 @@ def seedvr2_tab(
         calc_msg, updated_state = result_box.get("value", (gr.update(value="Analysis failed."), state))
         yield ("result", calc_msg, updated_state)
 
+    def _cache_local_resolution_inputs(state, scale_x, max_res_val, pre_down, allow_custom_image_noise):
+        """
+        Persist local SeedVR2 sizing controls into per-model resolution cache.
+        This keeps analysis cards aligned with current UI values (including max edge).
+        """
+        state = state or {}
+        state.setdefault("seed_controls", {})
+        seed_controls = state["seed_controls"]
+
+        try:
+            scale_f = float(scale_x) if scale_x is not None else float(seed_controls.get("upscale_factor_val", 4.0) or 4.0)
+        except Exception:
+            scale_f = 4.0
+        try:
+            max_i = int(max_res_val) if max_res_val is not None else int(defaults.get("max_resolution", 0) or 0)
+        except Exception:
+            max_i = int(defaults.get("max_resolution", 0) or 0)
+        max_i = min(8192, max(0, max_i))
+
+        # Global max-resolution propagation is intentionally disabled.
+        seed_controls["upscale_factor_val"] = scale_f
+        seed_controls.pop("max_resolution_val", None)
+        seed_controls.pop("enable_max_target", None)
+        seed_controls["ratio_downscale"] = bool(pre_down)
+        seed_controls["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
+
+        model_name = seed_controls.get("current_model") or defaults.get("dit_model")
+        if model_name:
+            cache_root = seed_controls.setdefault("resolution_cache", {})
+            model_cache = cache_root.setdefault(model_name, {})
+            model_cache["upscale_factor_val"] = scale_f
+            model_cache["max_resolution_val"] = max_i
+            model_cache["ratio_downscale"] = bool(pre_down)
+            model_cache["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
+            if max_i > 0:
+                model_cache["enable_max_target"] = True
+            else:
+                model_cache.pop("enable_max_target", None)
+
+        return state
+
     def cache_path_value(val, scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         """Cache input path and refresh sizing info panel."""
-        try:
-            state["seed_controls"]["upscale_factor_val"] = float(scale_x) if scale_x is not None else float(
-                state.get("seed_controls", {}).get("upscale_factor_val", 4.0) or 4.0
-            )
-        except Exception:
-            pass
-        # Global max-resolution propagation is removed; keep max cap local to each upscaler tab.
-        state["seed_controls"].pop("max_resolution_val", None)
-        state["seed_controls"].pop("enable_max_target", None)
-        state["seed_controls"]["ratio_downscale"] = bool(pre_down)
-        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
+        state = _cache_local_resolution_inputs(state, scale_x, max_res_val, pre_down, allow_custom_image_noise)
 
         state["seed_controls"]["last_input_path"] = val if val else ""
         if val and str(val).strip():
@@ -1222,17 +1253,7 @@ def seedvr2_tab(
 
     def cache_upload(val, scale_x, max_res_val, pre_down, allow_custom_image_noise, state):
         """Cache uploaded file path and refresh sizing info panel."""
-        try:
-            state["seed_controls"]["upscale_factor_val"] = float(scale_x) if scale_x is not None else float(
-                state.get("seed_controls", {}).get("upscale_factor_val", 4.0) or 4.0
-            )
-        except Exception:
-            pass
-        # Global max-resolution propagation is removed; keep max cap local to each upscaler tab.
-        state["seed_controls"].pop("max_resolution_val", None)
-        state["seed_controls"].pop("enable_max_target", None)
-        state["seed_controls"]["ratio_downscale"] = bool(pre_down)
-        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
+        state = _cache_local_resolution_inputs(state, scale_x, max_res_val, pre_down, allow_custom_image_noise)
 
         state["seed_controls"]["last_input_path"] = val if val else ""
         if val:
@@ -1304,27 +1325,7 @@ def seedvr2_tab(
         if max_i is None or max_i < 0 or max_i > 8192:
             return gr.update(), state
 
-        # Cache shared non-max values. Max cap remains local per upscaler tab.
-        state["seed_controls"]["upscale_factor_val"] = scale_f
-        state["seed_controls"].pop("max_resolution_val", None)
-        state["seed_controls"].pop("enable_max_target", None)
-        state["seed_controls"]["ratio_downscale"] = bool(pre_down)
-        state["seed_controls"]["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
-
-        # Also mirror into per-model cache for consistency when model-specific settings are used.
-        try:
-            model_name = state.get("seed_controls", {}).get("current_model")
-            if model_name:
-                cache_root = state["seed_controls"].setdefault("resolution_cache", {})
-                model_cache = cache_root.setdefault(model_name, {})
-                model_cache["upscale_factor_val"] = scale_f
-                model_cache["max_resolution_val"] = max_i
-                model_cache["ratio_downscale"] = bool(pre_down)
-                model_cache["force_latent_noise_zero_for_images_val"] = bool(allow_custom_image_noise)
-                if max_i and max_i > 0:
-                    model_cache["enable_max_target"] = True
-        except Exception:
-            pass
+        state = _cache_local_resolution_inputs(state, scale_f, max_i, pre_down, allow_custom_image_noise)
 
         input_path_val = state.get("seed_controls", {}).get("last_input_path", "")
         if input_path_val:

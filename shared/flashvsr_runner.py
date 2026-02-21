@@ -460,6 +460,15 @@ def run_flashvsr(
         force_offload = _bool(settings.get("force_offload", True), default=True)
         enable_debug = _bool(settings.get("enable_debug", False), default=False)
 
+        # Runtime guardrail: full mode + tiled_vae can produce severe color/noise corruption.
+        if mode == "full" and tiled_vae:
+            tiled_vae = False
+            settings["tiled_vae"] = False
+            log(
+                "[FlashVSR] Disabled tiled_vae for full mode due to known corruption risk "
+                "(rainbow/noise artifacts on some systems)."
+            )
+
         tile_size = max(32, min(1024, _parse_int(settings.get("tile_size"), 256)))
         overlap = max(8, min(512, _parse_int(settings.get("overlap", settings.get("tile_overlap")), 24)))
         if tiled_dit and tile_size < 128:

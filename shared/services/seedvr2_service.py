@@ -1760,7 +1760,7 @@ def _process_single_file(
                     comparison_output=str(comparison_path),
                     layout=comparison_layout,
                     label_input="Original",
-                    label_output="Upscaled",
+                    label_output="SeedVR2.5",
                     on_progress=progress_cb
                 )
 

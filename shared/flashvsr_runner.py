@@ -62,6 +62,25 @@ def _should_suppress_flashvsr_cli_line(line: str) -> bool:
         return True
     if "vram profile recommendation" in text:
         return True
+    if "current settings require" in text and "gb" in text and "available" in text:
+        return True
+    if "recommended optimal settings" in text:
+        return True
+    if "vram advisory:" in text:
+        return True
+    if "vram critically low" in text:
+        return True
+    if (
+        "recommended:" in text
+        and ("chunk_size" in text or "tiled_vae" in text or "tiled_dit" in text)
+    ):
+        return True
+    if text.startswith("• chunk_size =") or text.startswith("chunk_size ="):
+        return True
+    if text.startswith("• tiled_vae =") or text.startswith("tiled_vae ="):
+        return True
+    if text.startswith("• tiled_dit =") or text.startswith("tiled_dit ="):
+        return True
     if "required vram" in text:
         return True
     if "estimated vram" in text:

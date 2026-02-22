@@ -400,6 +400,75 @@ def main(argv=None):
     .processing-col { display: flex; flex-direction: column; }
     .processing-text { font-weight: 850; animation: secPulse 1.2s ease-in-out infinite; }
     .processing-sub { font-size: 12px; opacity: 0.85; margin-top: 2px; line-height: 1.35; }
+    /* Keep runtime progress/info area height stable so action buttons do not jump. */
+    .runtime-status-box {
+      --runtime-status-height: 34px;
+      height: var(--runtime-status-height);
+      max-height: var(--runtime-status-height);
+      overflow: hidden;
+    }
+    .runtime-status-box .prose,
+    .runtime-status-box .md {
+      height: 100%;
+      margin: 0 !important;
+      display: flex;
+      align-items: center;
+      overflow: hidden;
+    }
+    .runtime-status-box .prose p,
+    .runtime-status-box .md p {
+      margin: 0 !important;
+      line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .runtime-progress-box {
+      --runtime-progress-height: 74px;
+      height: var(--runtime-progress-height);
+      max-height: var(--runtime-progress-height);
+      overflow: hidden;
+    }
+    .runtime-progress-box .prose,
+    .runtime-progress-box .md {
+      height: 100%;
+      max-height: 100%;
+      margin: 0 !important;
+      display: block;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-gutter: stable;
+    }
+    .runtime-progress-box .prose p,
+    .runtime-progress-box .md p {
+      margin: 0 !important;
+      line-height: 1.35;
+    }
+    .runtime-progress-box .processing-banner {
+      margin: 0;
+      height: 100%;
+      max-height: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+    .runtime-progress-box .processing-col {
+      min-width: 0;
+      width: 100%;
+    }
+    .runtime-progress-box .processing-text,
+    .runtime-progress-box .processing-sub {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    @media (max-width: 900px) {
+      .runtime-status-box {
+        --runtime-status-height: 32px;
+      }
+      .runtime-progress-box {
+        --runtime-progress-height: 68px;
+      }
+    }
     @keyframes secSpin {
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }

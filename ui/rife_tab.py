@@ -426,8 +426,8 @@ def rife_tab(
             gr.Markdown("### 🎯 Output / Actions")
             
             # Status and progress
-            status_box = gr.Markdown(value="Ready for processing.")
-            progress_indicator = gr.Markdown(value="", visible=False)
+            status_box = gr.Markdown(value="Ready for processing.", visible=False, elem_classes=["runtime-status-box"])
+            progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
             log_box = gr.Textbox(
                 label="📋 Processing Log",
                 value="",

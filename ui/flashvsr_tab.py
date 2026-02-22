@@ -8,6 +8,7 @@ import gradio as gr
 from pathlib import Path
 from typing import Dict, Any
 import html
+import re
 import threading
 import time
 
@@ -464,8 +465,8 @@ def flashvsr_tab(
         
         # Right Column: Output & Controls
         with gr.Column(scale=2):
-            status_box = gr.Markdown(value="Ready.")
-            progress_indicator = gr.Markdown(value="", visible=True)
+            status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
+            progress_indicator = gr.Markdown(value="", visible=True, elem_classes=["runtime-progress-box"])
 
             gr.Markdown("####  Output & Actions")
 
@@ -1057,6 +1058,17 @@ def flashvsr_tab(
             pass
         return None
 
+    def _compact_single_line(text: Any, max_len: int = 120) -> str:
+        raw = str(text or "")
+        try:
+            raw = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+        except Exception:
+            pass
+        raw = re.sub(r"\s+", " ", raw.replace("\r", " ").replace("\n", " ")).strip()
+        if len(raw) > max_len:
+            raw = raw[: max(0, max_len - 3)].rstrip() + "..."
+        return raw
+
     def _batch_gallery_update_from_state(state):
         outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
         if not isinstance(outputs, list):
@@ -1114,10 +1126,11 @@ def flashvsr_tab(
             subtitle = "Processing..."
             if isinstance(logs, str):
                 for line in reversed(logs.splitlines()):
-                    line = line.strip()
+                    line = _compact_single_line(line)
                     if line:
                         subtitle = line
                         break
+            subtitle = _compact_single_line(subtitle)
             progress_update = _queue_status_indicator(status_text, subtitle, spinning=True)
         else:
             progress_update = gr.update(value="", visible=False)

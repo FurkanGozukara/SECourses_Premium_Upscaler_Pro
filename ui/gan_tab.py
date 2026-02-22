@@ -330,8 +330,8 @@ def gan_tab(
             )
 
         with gr.Column(scale=2):
-            status_box = gr.Markdown(value="Ready for processing.")
-            progress_indicator = gr.Markdown(value="", visible=True)
+            status_box = gr.Markdown(value="Ready for processing.", visible=False, elem_classes=["runtime-status-box"])
+            progress_indicator = gr.Markdown(value="", visible=True, elem_classes=["runtime-progress-box"])
 
             gr.Markdown("### Output / Actions")
 

@@ -141,19 +141,15 @@ def _probe_video_frame_count(video_path: str) -> Tuple[Optional[int], str]:
     return None, "unknown"
 
 
-def _calculate_scene_frame_stats(scenes: List[Tuple[float, float]], fps: Optional[float]) -> Dict[str, Any]:
+def _calculate_scene_frame_stats(
+    scenes: List[Tuple[float, float]],
+    fps: Optional[float],
+    total_frames: Optional[int] = None,
+) -> Dict[str, Any]:
     if not scenes:
         return {}
 
-    try:
-        fps_val = float(fps or 0.0)
-    except Exception:
-        fps_val = 0.0
-
-    if fps_val <= 0:
-        return {"scene_count": len(scenes)}
-
-    frame_counts: List[int] = []
+    normalized_scenes: List[Tuple[float, float]] = []
     for start_sec, end_sec in scenes:
         try:
             start_f = float(start_sec)
@@ -162,7 +158,81 @@ def _calculate_scene_frame_stats(scenes: List[Tuple[float, float]], fps: Optiona
             continue
         if end_f <= start_f:
             continue
+        normalized_scenes.append((start_f, end_f))
 
+    if not normalized_scenes:
+        return {}
+
+    scene_count = len(normalized_scenes)
+    total_frames_val: Optional[int] = None
+    try:
+        if total_frames is not None:
+            tf = int(total_frames)
+            if tf > 0:
+                total_frames_val = tf
+    except Exception:
+        total_frames_val = None
+
+    # Prefer total-frame-aware stats so chunk frame totals stay consistent with Input Stats.
+    if total_frames_val is not None:
+        durations: List[float] = [max(0.0, end_f - start_f) for start_f, end_f in normalized_scenes]
+        total_duration = float(sum(durations))
+        if total_duration > 0.0:
+            baseline = 1 if total_frames_val >= scene_count else 0
+            frame_counts: List[int] = [baseline for _ in range(scene_count)]
+            remaining = max(0, total_frames_val - (baseline * scene_count))
+
+            if remaining > 0:
+                raw = [remaining * (d / total_duration) for d in durations]
+                integer = [int(math.floor(v)) for v in raw]
+                fractions = [v - i for v, i in zip(raw, integer)]
+                frame_counts = [c + i for c, i in zip(frame_counts, integer)]
+
+                leftover = remaining - sum(integer)
+                if leftover > 0:
+                    order = sorted(range(scene_count), key=lambda idx: fractions[idx], reverse=True)
+                    for idx in order[:leftover]:
+                        frame_counts[idx] += 1
+
+            # Final correction for safety: force exact sum match.
+            delta = total_frames_val - sum(frame_counts)
+            if delta > 0:
+                for i in range(delta):
+                    frame_counts[i % scene_count] += 1
+            elif delta < 0:
+                to_remove = -delta
+                order = sorted(range(scene_count), key=lambda idx: frame_counts[idx], reverse=True)
+                floor_val = 1 if total_frames_val >= scene_count else 0
+                for idx in order:
+                    if to_remove <= 0:
+                        break
+                    removable = max(0, frame_counts[idx] - floor_val)
+                    if removable <= 0:
+                        continue
+                    take = min(removable, to_remove)
+                    frame_counts[idx] -= take
+                    to_remove -= take
+
+            avg_frames = float(sum(frame_counts)) / float(len(frame_counts))
+            return {
+                "scene_count": len(frame_counts),
+                "chunk_min_frames": int(min(frame_counts)),
+                "chunk_avg_frames": float(round(avg_frames, 1)),
+                "chunk_max_frames": int(max(frame_counts)),
+                "frame_stats_method": "proportional_total_frames_v1",
+            }
+
+    # Fallback when total-frame information is unavailable.
+    try:
+        fps_val = float(fps or 0.0)
+    except Exception:
+        fps_val = 0.0
+
+    if fps_val <= 0:
+        return {"scene_count": scene_count}
+
+    frame_counts = []
+    for start_f, end_f in normalized_scenes:
         start_frame = int(math.floor(start_f * fps_val + 1e-9))
         end_frame = int(math.ceil(end_f * fps_val - 1e-9))
         if end_frame <= start_frame:
@@ -170,7 +240,7 @@ def _calculate_scene_frame_stats(scenes: List[Tuple[float, float]], fps: Optiona
         frame_counts.append(max(1, end_frame - start_frame))
 
     if not frame_counts:
-        return {"scene_count": len(scenes)}
+        return {"scene_count": scene_count}
 
     avg_frames = float(sum(frame_counts)) / float(len(frame_counts))
     return {
@@ -178,6 +248,7 @@ def _calculate_scene_frame_stats(scenes: List[Tuple[float, float]], fps: Optiona
         "chunk_min_frames": int(min(frame_counts)),
         "chunk_avg_frames": float(round(avg_frames, 1)),
         "chunk_max_frames": int(max(frame_counts)),
+        "frame_stats_method": "fps_timecode_v1",
     }
 
 
@@ -437,6 +508,20 @@ def build_fixed_scale_analysis_update(
                 and abs(float(scan.get("min_scene_len", min_scene_len)) - min_scene_len) < 1e-6
                 and "scene_count" in scan
             )
+            if cached_valid and total_frames is not None:
+                try:
+                    cached_total_frames = int(scan.get("total_frames"))
+                    if cached_total_frames != int(total_frames):
+                        cached_valid = False
+                except Exception:
+                    cached_valid = False
+                if (
+                    cached_valid
+                    and int(scan.get("scene_count", 0) or 0) > 0
+                    and not str(scan.get("frame_stats_method") or "").strip()
+                ):
+                    # Invalidate legacy cached stats that predate total-frame-aware method.
+                    cached_valid = False
 
             scene_count = int(scan.get("scene_count", 0) or 0) if cached_valid else 0
             chunk_min_frames = scan.get("chunk_min_frames") if cached_valid else None
@@ -451,11 +536,12 @@ def build_fixed_scale_analysis_update(
                         threshold=scene_threshold,
                         min_scene_len=min_scene_len,
                     )
-                    scene_stats = _calculate_scene_frame_stats(scenes or [], fps_val)
+                    scene_stats = _calculate_scene_frame_stats(scenes or [], fps_val, total_frames=total_frames)
                     scene_count = int(scene_stats.get("scene_count", len(scenes or [])) or 0)
                     chunk_min_frames = scene_stats.get("chunk_min_frames")
                     chunk_avg_frames = scene_stats.get("chunk_avg_frames")
                     chunk_max_frames = scene_stats.get("chunk_max_frames")
+                    frame_stats_method = str(scene_stats.get("frame_stats_method") or "").strip()
                     scene_scan_error = ""
 
                     scan_payload: Dict[str, Any] = {
@@ -473,6 +559,8 @@ def build_fixed_scale_analysis_update(
                         scan_payload["chunk_max_frames"] = int(chunk_max_frames)
                     if total_frames is not None:
                         scan_payload["total_frames"] = int(total_frames)
+                    if frame_stats_method:
+                        scan_payload["frame_stats_method"] = frame_stats_method
                     seed_controls["last_scene_scan"] = scan_payload
                     state["seed_controls"] = seed_controls
                 except Exception as exc:

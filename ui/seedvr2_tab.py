@@ -597,11 +597,10 @@ def seedvr2_tab(
 
             # Status and progress
             health_display = gr.Markdown(value="", visible=False)
-            status_box = gr.Markdown(value="Ready.")
+            status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
             
             # Progress tracking
-            progress_indicator = gr.Markdown(value="", visible=True)
-            eta_display = gr.Markdown(value="", visible=True)
+            progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
             
             # Upscale factor + action buttons (placed directly above  Run Log)
             with gr.Group():
@@ -741,9 +740,9 @@ def seedvr2_tab(
             )
 
             # Chunk preview (placed directly under the output panel)
-            chunk_info = gr.Markdown("Chunk processing status will appear here.")
+            chunk_info = gr.Markdown(value="")
             resume_status = gr.Markdown("", visible=True)
-            chunk_progress = gr.Markdown("", visible=False)
+            chunk_progress = gr.Markdown("", visible=False, elem_classes=["runtime-progress-box"])
             
             # Chunk thumbnail gallery - Shows completed chunks as they finish
             with gr.Accordion("Completed Chunks Gallery", open=True):

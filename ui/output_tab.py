@@ -5,6 +5,7 @@ UPDATED: Now uses Universal Preset System
 
 import gradio as gr
 import hashlib
+import math
 import re
 import tempfile
 from pathlib import Path
@@ -37,7 +38,12 @@ from shared.video_comparison_slider import (
     create_video_comparison_html,
     get_video_comparison_js_on_load,
 )
+from shared.video_comparison_advanced import (
+    create_input_vs_output_comparison_video,
+    predict_comparison_dimensions,
+)
 from shared.frame_utils import extract_video_thumbnail
+from shared.path_utils import get_default_output_dir, get_media_dimensions
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -160,6 +166,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     default_av1_film_grain_denoise = bool(
         _value("av1_film_grain_denoise", DEFAULT_AV1_FILM_GRAIN_DENOISE)
     )
+    direct_compare_output_root = (
+        get_default_output_dir(base_dir, global_settings_state) / "direct_video_compare"
+    ).resolve()
 
     with gr.Tabs():
         with gr.TabItem("Global RIFE"):
@@ -439,6 +448,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
         with gr.TabItem("Direct Video Compare"):
             gr.Markdown("#### Upload Any Two Videos for Independent Fullscreen Comparison")
+            gr.Markdown("Create a live slider preview and export a labeled comparison video.")
 
             with gr.Row(equal_height=True):
                 with gr.Column(scale=1):
@@ -464,6 +474,28 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                     )
 
                     with gr.Row():
+                        direct_video_a_label = gr.Textbox(
+                            label="Video A Label",
+                            value="Video A",
+                            placeholder="FlashVSR+",
+                        )
+                        direct_video_b_label = gr.Textbox(
+                            label="Video B Label",
+                            value="Video B",
+                            placeholder="Topaz AI",
+                        )
+
+                    with gr.Row():
+                        direct_compare_layout = gr.Dropdown(
+                            label="Comparison Video Layout",
+                            choices=[
+                                ("Auto (Best Fit)", "auto"),
+                                ("Left to Right", "left_to_right"),
+                                ("Top to Bottom", "top_to_bottom"),
+                            ],
+                            value="auto",
+                            info="auto chooses a layout close to 16:9 output aspect ratio.",
+                        )
                         direct_compare_height = gr.Slider(
                             label="Viewer Height",
                             minimum=300,
@@ -471,6 +503,8 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                             step=20,
                             value=620,
                         )
+
+                    with gr.Row():
                         direct_compare_slider = gr.Slider(
                             label="Initial Slider Position",
                             minimum=0,
@@ -480,7 +514,34 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         )
 
                     with gr.Row():
-                        direct_compare_btn = gr.Button("Generate Comparison", variant="primary", size="lg")
+                        direct_compare_width = gr.Number(
+                            label="Final Width (px)",
+                            value=0,
+                            precision=0,
+                            info="Auto-filled from selected videos and layout. Set both width/height to override.",
+                        )
+                        direct_compare_height_px = gr.Number(
+                            label="Final Height (px)",
+                            value=0,
+                            precision=0,
+                            info="Auto-filled from selected videos and layout. Uses even values for compatibility.",
+                        )
+                        direct_compare_font_size = gr.Slider(
+                            label="Label Font Size",
+                            minimum=8,
+                            maximum=120,
+                            step=1,
+                            value=32,
+                            info="Default label size for Video A / Video B text in generated comparison video.",
+                        )
+
+                    direct_compare_geometry = gr.Markdown(
+                        "Set Video A and Video B to auto-calculate final resolution and aspect ratio."
+                    )
+
+                    with gr.Row():
+                        direct_compare_btn = gr.Button("Render Live Slider", size="lg")
+                        direct_compare_video_btn = gr.Button("Generate Comparison Video", variant="primary", size="lg")
                         direct_compare_clear_btn = gr.Button("Clear", size="lg")
 
                     direct_compare_status = gr.Markdown("")
@@ -490,6 +551,17 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         label="Direct Video Comparison",
                         value="",
                         js_on_load=get_video_comparison_js_on_load(),
+                        visible=False,
+                    )
+                    direct_generated_video = gr.Video(
+                        label="Generated Comparison Video",
+                        value=None,
+                        visible=False,
+                    )
+                    direct_generated_video_path = gr.Textbox(
+                        label="Generated Video Path",
+                        value="",
+                        interactive=False,
                         visible=False,
                     )
 
@@ -1306,15 +1378,223 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             slider_state,
         )
 
-    direct_video_a_upload.change(
+    def _coerce_even_dimension(value) -> Optional[int]:
+        try:
+            dim = int(float(value))
+        except Exception:
+            return None
+        if dim <= 0:
+            return None
+        if dim % 2 != 0:
+            dim += 1
+        return max(2, dim)
+
+    def _coerce_font_size(value, default: int = 32) -> int:
+        try:
+            size = int(float(value))
+        except Exception:
+            size = int(default)
+        return max(8, min(200, size))
+
+    def _format_ratio(width: int, height: int) -> str:
+        if width <= 0 or height <= 0:
+            return "unknown"
+        divisor = math.gcd(width, height) or 1
+        return f"{width // divisor}:{height // divisor} ({width / height:.3f})"
+
+    def _layout_label(layout_key: str) -> str:
+        if str(layout_key or "").strip().lower() == "vertical":
+            return "Top to Bottom"
+        return "Left to Right"
+
+    def _resolve_direct_base_dimensions(path_a: str, path_b: str) -> Tuple[int, int, str]:
+        for source_label, candidate in (("Video B", path_b), ("Video A", path_a)):
+            current = str(candidate or "").strip()
+            if not current:
+                continue
+            if not Path(current).exists():
+                continue
+            dims = get_media_dimensions(current)
+            if not dims:
+                continue
+            width, height = int(dims[0] or 0), int(dims[1] or 0)
+            if width > 0 and height > 0:
+                return width, height, source_label
+        return 0, 0, ""
+
+    def _next_direct_compare_run_dir(root: Path) -> Path:
+        base = Path(root)
+        base.mkdir(parents=True, exist_ok=True)
+        max_index = 0
+        for child in base.iterdir():
+            if not child.is_dir():
+                continue
+            name = str(child.name or "").strip()
+            if re.fullmatch(r"\d{4}", name):
+                try:
+                    max_index = max(max_index, int(name))
+                except Exception:
+                    continue
+
+        for idx in range(max_index + 1, max_index + 10000):
+            candidate = base / f"{idx:04d}"
+            try:
+                candidate.mkdir(parents=False, exist_ok=False)
+                return candidate
+            except FileExistsError:
+                continue
+
+        fallback = base / f"{max_index + 10000:04d}"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    def _build_direct_comparison_output_path(path_b: str) -> Path:
+        run_dir = _next_direct_compare_run_dir(direct_compare_output_root)
+        stem = str(Path(str(path_b or "")).stem or "comparison").strip()
+        safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", stem).strip("._") or "comparison"
+        return run_dir / f"{safe_stem}_comparison.mp4"
+
+    def _direct_geometry_details(path_a, path_b, layout_choice, width_value, height_value):
+        pa = str(path_a or "").strip()
+        pb = str(path_b or "").strip()
+
+        if not pa or not pb:
+            return (
+                "Set Video A and Video B to auto-calculate final resolution and aspect ratio.",
+                0,
+                0,
+                0,
+                0,
+                "horizontal",
+            )
+        if not Path(pa).exists() or not Path(pb).exists():
+            return (
+                "One or both video paths do not exist.",
+                0,
+                0,
+                0,
+                0,
+                "horizontal",
+            )
+
+        base_w, base_h, base_source = _resolve_direct_base_dimensions(pa, pb)
+        if base_w <= 0 or base_h <= 0:
+            return (
+                "Could not read video resolution from the selected files.",
+                0,
+                0,
+                0,
+                0,
+                "horizontal",
+            )
+
+        resolved_layout, auto_w, auto_h = predict_comparison_dimensions(
+            base_w,
+            base_h,
+            str(layout_choice or "auto"),
+        )
+
+        custom_w = _coerce_even_dimension(width_value)
+        custom_h = _coerce_even_dimension(height_value)
+        custom_active = bool(custom_w and custom_h)
+
+        final_w = custom_w if custom_active else auto_w
+        final_h = custom_h if custom_active else auto_h
+
+        custom_hint = ""
+        if not custom_active and (custom_w or custom_h):
+            custom_hint = "  \nSet both width and height to apply a custom final size."
+
+        summary = (
+            f"Source resolution (**{base_source}**): **{base_w}x{base_h}** ({_format_ratio(base_w, base_h)})  \n"
+            f"Layout: **{_layout_label(resolved_layout)}**  \n"
+            f"Auto final resolution: **{auto_w}x{auto_h}** ({_format_ratio(auto_w, auto_h)})  \n"
+            f"Final output resolution: **{final_w}x{final_h}** ({_format_ratio(final_w, final_h)}){custom_hint}"
+        )
+        return summary, auto_w, auto_h, final_w, final_h, resolved_layout
+
+    def _sync_direct_geometry_auto(path_a, path_b, layout_choice):
+        summary, auto_w, auto_h, _final_w, _final_h, _resolved_layout = _direct_geometry_details(
+            path_a,
+            path_b,
+            layout_choice,
+            0,
+            0,
+        )
+        return (
+            gr.update(value=auto_w if auto_w > 0 else 0),
+            gr.update(value=auto_h if auto_h > 0 else 0),
+            gr.update(value=summary),
+        )
+
+    def _refresh_direct_geometry(path_a, path_b, layout_choice, width_value, height_value):
+        summary, _auto_w, _auto_h, _final_w, _final_h, _resolved_layout = _direct_geometry_details(
+            path_a,
+            path_b,
+            layout_choice,
+            width_value,
+            height_value,
+        )
+        return gr.update(value=summary)
+
+    direct_a_upload_evt = direct_video_a_upload.change(
         fn=_upload_to_path,
         inputs=[direct_video_a_upload],
         outputs=[direct_video_a_path],
     )
-    direct_video_b_upload.change(
+    direct_b_upload_evt = direct_video_b_upload.change(
         fn=_upload_to_path,
         inputs=[direct_video_b_upload],
         outputs=[direct_video_b_path],
+    )
+
+    direct_a_upload_evt.then(
+        fn=_sync_direct_geometry_auto,
+        inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+    )
+    direct_b_upload_evt.then(
+        fn=_sync_direct_geometry_auto,
+        inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+    )
+
+    direct_video_a_path.change(
+        fn=_sync_direct_geometry_auto,
+        inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+    )
+    direct_video_b_path.change(
+        fn=_sync_direct_geometry_auto,
+        inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+    )
+    direct_compare_layout.change(
+        fn=_sync_direct_geometry_auto,
+        inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+    )
+    direct_compare_width.change(
+        fn=_refresh_direct_geometry,
+        inputs=[
+            direct_video_a_path,
+            direct_video_b_path,
+            direct_compare_layout,
+            direct_compare_width,
+            direct_compare_height_px,
+        ],
+        outputs=[direct_compare_geometry],
+    )
+    direct_compare_height_px.change(
+        fn=_refresh_direct_geometry,
+        inputs=[
+            direct_video_a_path,
+            direct_video_b_path,
+            direct_compare_layout,
+            direct_compare_width,
+            direct_compare_height_px,
+        ],
+        outputs=[direct_compare_geometry],
     )
 
     def _build_direct_video_compare(path_a, path_b, height, slider_pos):
@@ -1332,16 +1612,137 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             slider_position=float(slider_pos or 50.0),
         )
         return (
-            gr.update(value="Direct video comparison ready."),
+            gr.update(value=f"Live slider ready: `{Path(pa).name}` vs `{Path(pb).name}`"),
             gr.update(value=html, visible=True),
+        )
+
+    def _generate_direct_comparison_video(
+        path_a,
+        path_b,
+        label_a,
+        label_b,
+        layout_choice,
+        width_value,
+        height_value,
+        font_size_value,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        progress(0.0, desc="Preparing comparison merge...")
+        pa = str(path_a or "").strip()
+        pb = str(path_b or "").strip()
+        if not pa or not pb:
+            progress(1.0, desc="Comparison merge aborted")
+            return (
+                gr.update(value="Select both videos first."),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
+                gr.update(value="Set Video A and Video B to auto-calculate final resolution and aspect ratio."),
+            )
+        if not Path(pa).exists() or not Path(pb).exists():
+            progress(1.0, desc="Comparison merge aborted")
+            return (
+                gr.update(value="One or both video paths do not exist."),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
+                gr.update(value="One or both video paths do not exist."),
+            )
+
+        summary, _auto_w, _auto_h, final_w, final_h, resolved_layout = _direct_geometry_details(
+            pa,
+            pb,
+            layout_choice,
+            width_value,
+            height_value,
+        )
+        if final_w <= 0 or final_h <= 0:
+            progress(1.0, desc="Comparison merge aborted")
+            return (
+                gr.update(value="Could not determine comparison video resolution."),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
+                gr.update(value=summary),
+            )
+
+        custom_w = _coerce_even_dimension(width_value)
+        custom_h = _coerce_even_dimension(height_value)
+        use_custom_size = bool(custom_w and custom_h)
+        label_font_size = _coerce_font_size(font_size_value, default=32)
+
+        left_label = str(label_a or "").strip() or "Video A"
+        right_label = str(label_b or "").strip() or "Video B"
+        progress(0.02, desc="Starting ffmpeg merge...")
+        comparison_output_path = _build_direct_comparison_output_path(pb)
+
+        progress_pattern = re.compile(r"COMPARISON_PROGRESS\s+([0-9]+(?:\.[0-9]+)?)%")
+
+        def _direct_progress_logger(msg: str):
+            text = str(msg or "").strip()
+            if not text:
+                return
+            print(f"[Direct Compare] {text}", flush=True)
+            match = progress_pattern.search(text)
+            if match:
+                try:
+                    pct = max(0.0, min(100.0, float(match.group(1))))
+                    progress(pct / 100.0, desc=f"Merging comparison video... {pct:.1f}%")
+                except Exception:
+                    pass
+            elif "running ffmpeg" in text.lower():
+                progress(0.03, desc="Running ffmpeg merge...")
+
+        success, comparison_path, error_msg = create_input_vs_output_comparison_video(
+            original_input_video=pa,
+            upscaled_output_video=pb,
+            comparison_output=str(comparison_output_path),
+            layout=str(layout_choice or "auto"),
+            label_input=left_label,
+            label_output=right_label,
+            target_width=custom_w if use_custom_size else None,
+            target_height=custom_h if use_custom_size else None,
+            font_size=label_font_size,
+            include_branding=False,
+            on_progress=_direct_progress_logger,
+        )
+
+        if not success or not comparison_path:
+            err = str(error_msg or "Comparison video generation failed.")
+            progress(1.0, desc="Comparison merge failed")
+            return (
+                gr.update(value=f"Comparison video failed: {err}"),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
+                gr.update(value=summary),
+            )
+
+        layout_text = _layout_label(resolved_layout)
+        run_folder_name = Path(comparison_path).parent.name
+        status = (
+            f"Comparison video ready: `{Path(comparison_path).name}` "
+            f"({layout_text}, {final_w}x{final_h}, folder {run_folder_name})"
+        )
+        progress(1.0, desc="Comparison merge complete")
+        return (
+            gr.update(value=status),
+            gr.update(value=str(comparison_path), visible=True),
+            gr.update(value=str(comparison_path), visible=True),
+            gr.update(value=summary),
         )
 
     def _clear_direct_video_compare():
         return (
             "",
             "",
+            "Video A",
+            "Video B",
+            "auto",
+            0,
+            0,
+            32,
             gr.update(value=""),
             gr.update(value="", visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value="Set Video A and Video B to auto-calculate final resolution and aspect ratio."),
         )
 
     direct_compare_btn.click(
@@ -1349,9 +1750,42 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_height, direct_compare_slider],
         outputs=[direct_compare_status, direct_comparison_html],
     )
+    direct_compare_video_btn.click(
+        fn=_generate_direct_comparison_video,
+        inputs=[
+            direct_video_a_path,
+            direct_video_b_path,
+            direct_video_a_label,
+            direct_video_b_label,
+            direct_compare_layout,
+            direct_compare_width,
+            direct_compare_height_px,
+            direct_compare_font_size,
+        ],
+        outputs=[
+            direct_compare_status,
+            direct_generated_video,
+            direct_generated_video_path,
+            direct_compare_geometry,
+        ],
+    )
     direct_compare_clear_btn.click(
         fn=_clear_direct_video_compare,
-        outputs=[direct_video_a_path, direct_video_b_path, direct_compare_status, direct_comparison_html],
+        outputs=[
+            direct_video_a_path,
+            direct_video_b_path,
+            direct_video_a_label,
+            direct_video_b_label,
+            direct_compare_layout,
+            direct_compare_width,
+            direct_compare_height_px,
+            direct_compare_font_size,
+            direct_compare_status,
+            direct_comparison_html,
+            direct_generated_video,
+            direct_generated_video_path,
+            direct_compare_geometry,
+        ],
     )
 
     multi_video_upload.change(

@@ -10,13 +10,17 @@ Provides multiple comparison layouts:
 """
 
 import json
+import re
 import subprocess
+import time
+from collections import deque
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 
 COMPARISON_BRAND_TEXT = "SECourses Upscaler Pro"
 COMPARISON_BRAND_RIGHT_PAD = 20
+FFMPEG_PROGRESS_TIME_RE = re.compile(r"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
 
 
 @dataclass
@@ -28,6 +32,178 @@ class ComparisonConfig:
     sync_playback: bool = True
     pin_reference: bool = False
     pinned_frame_path: Optional[str] = None
+
+
+def _coerce_even_dimension(value: Any) -> Optional[int]:
+    """Convert a numeric value into a positive even integer dimension."""
+    try:
+        dim = int(float(value))
+    except Exception:
+        return None
+    if dim <= 0:
+        return None
+    if dim % 2 != 0:
+        dim += 1
+    return max(2, dim)
+
+
+def _coerce_font_size(value: Any, default: int = 32) -> int:
+    try:
+        size = int(float(value))
+    except Exception:
+        size = int(default)
+    return max(8, min(200, size))
+
+
+def normalize_comparison_layout(layout: Optional[str], width: int, height: int) -> str:
+    """
+    Normalize user-facing layout values into ffmpeg merge modes.
+
+    Accepted values:
+    - horizontal aliases: horizontal, left_to_right, side_by_side
+    - vertical aliases: vertical, top_to_bottom, stacked
+    - auto: pick layout closest to 16:9 output aspect ratio
+    """
+    key = str(layout or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in {"horizontal", "left_to_right", "side_by_side"}:
+        return "horizontal"
+    if key in {"vertical", "top_to_bottom", "stacked"}:
+        return "vertical"
+    if width > 0 and height > 0:
+        return get_smart_comparison_layout(width, height)
+    return "horizontal"
+
+
+def predict_comparison_dimensions(base_width: int, base_height: int, layout: str = "auto") -> Tuple[str, int, int]:
+    """
+    Predict final merged video dimensions from base output dimensions.
+
+    Returns:
+        (resolved_layout, final_width, final_height)
+    """
+    width = int(base_width or 0)
+    height = int(base_height or 0)
+    if width <= 0 or height <= 0:
+        return "horizontal", 0, 0
+
+    resolved_layout = normalize_comparison_layout(layout, width, height)
+    if resolved_layout == "vertical":
+        merged_w, merged_h = width, height * 2
+    else:
+        merged_w, merged_h = width * 2, height
+
+    safe_w = _coerce_even_dimension(merged_w) or 2
+    safe_h = _coerce_even_dimension(merged_h) or 2
+    return resolved_layout, safe_w, safe_h
+
+
+def _escape_drawtext_text(value: str) -> str:
+    """
+    Escape text for ffmpeg drawtext `text=...` values.
+    """
+    txt = str(value or "").replace("\r", " ").replace("\n", " ")
+    replacements = [
+        ("\\", "\\\\"),
+        (":", r"\:"),
+        ("'", r"\'"),
+        ("%", r"\%"),
+        (",", r"\,"),
+        (";", r"\;"),
+        ("=", r"\="),
+        ("[", r"\["),
+        ("]", r"\]"),
+    ]
+    for src, dst in replacements:
+        txt = txt.replace(src, dst)
+    return txt
+
+
+def _parse_ffmpeg_time_to_seconds(value: str) -> Optional[float]:
+    try:
+        parts = str(value or "").strip().split(":")
+        if len(parts) != 3:
+            return None
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+        return (hours * 3600.0) + (minutes * 60.0) + seconds
+    except Exception:
+        return None
+
+
+def _run_ffmpeg_with_progress(
+    cmd: List[str],
+    timeout_seconds: int,
+    duration_seconds: Optional[float],
+    on_progress: Optional[callable],
+) -> Tuple[int, str]:
+    """
+    Execute ffmpeg and stream best-effort progress callbacks from stderr.
+    """
+    stderr_tail: deque[str] = deque(maxlen=120)
+    duration = float(duration_seconds or 0.0)
+    last_emit_time = 0.0
+    last_pct = -1.0
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+    start = time.time()
+
+    try:
+        if proc.stderr is not None:
+            while True:
+                if time.time() - start > timeout_seconds:
+                    proc.kill()
+                    raise subprocess.TimeoutExpired(cmd, timeout_seconds)
+
+                line = proc.stderr.readline()
+                if line == "" and proc.poll() is not None:
+                    break
+                if not line:
+                    continue
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                stderr_tail.append(stripped)
+
+                match = FFMPEG_PROGRESS_TIME_RE.search(stripped)
+                if not match:
+                    continue
+                elapsed_seconds = _parse_ffmpeg_time_to_seconds(match.group(1))
+                if elapsed_seconds is None:
+                    continue
+
+                now = time.time()
+                if duration > 0.0:
+                    pct = max(0.0, min(100.0, (elapsed_seconds / duration) * 100.0))
+                    if (pct - last_pct) >= 0.3 or (now - last_emit_time) >= 0.6 or pct >= 99.9:
+                        if on_progress:
+                            on_progress(
+                                f"COMPARISON_PROGRESS {pct:.1f}% "
+                                f"({elapsed_seconds:.1f}s/{duration:.1f}s)\n"
+                            )
+                        last_pct = pct
+                        last_emit_time = now
+                elif (now - last_emit_time) >= 1.0:
+                    if on_progress:
+                        on_progress(f"COMPARISON_PROGRESS time={elapsed_seconds:.1f}s\n")
+                    last_emit_time = now
+
+        returncode = proc.wait(timeout=5)
+        return returncode, "\n".join(stderr_tail)
+    finally:
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except Exception:
+            pass
 
 
 def create_side_by_side_video(
@@ -583,7 +759,11 @@ def create_input_vs_output_comparison_video(
     layout: str = "auto",
     label_input: str = "Original",
     label_output: str = "Upscaled",
-    on_progress: Optional[callable] = None
+    on_progress: Optional[callable] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+    font_size: int = 32,
+    include_branding: bool = True,
 ) -> Tuple[bool, str, str]:
     """
     Create a comparison video of original input vs upscaled output.
@@ -599,11 +779,15 @@ def create_input_vs_output_comparison_video(
         label_input: Label for the input/original side
         label_output: Label for the output/upscaled side
         on_progress: Optional progress callback
+        target_width: Optional forced final width (even integer, <=0 ignored)
+        target_height: Optional forced final height (even integer, <=0 ignored)
+        font_size: Label drawtext font size (8-200)
+        include_branding: When True, draws COMPARISON_BRAND_TEXT on right/bottom video
 
     Returns:
         (success, comparison_video_path, error_message)
     """
-    from .path_utils import normalize_path, get_media_dimensions
+    from .path_utils import normalize_path, get_media_dimensions, get_media_duration_seconds
     from .error_handling import check_ffmpeg_available
 
     try:
@@ -625,29 +809,15 @@ def create_input_vs_output_comparison_video(
         if not in_dims or not out_dims:
             return False, "", "Could not determine video dimensions"
 
-        in_w, in_h = in_dims
+        _in_w, _in_h = in_dims
         out_w, out_h = out_dims
 
-        # Determine layout based on aspect ratio if auto
-        # Goal: Choose merge direction that produces aspect ratio closest to 16:9 (1.78)
-        # since most monitors are 16:9
-        if layout == "auto":
-            target_ratio = 16.0 / 9.0  # 1.778
-
-            # Calculate resulting aspect ratios for each merge option
-            # Horizontal (side by side): width doubles
-            horizontal_ratio = (2 * out_w) / out_h if out_h > 0 else 2.0
-            # Vertical (stacked): height doubles
-            vertical_ratio = out_w / (2 * out_h) if out_h > 0 else 0.5
-
-            # Choose whichever is closer to 16:9
-            horizontal_distance = abs(horizontal_ratio - target_ratio)
-            vertical_distance = abs(vertical_ratio - target_ratio)
-
-            if horizontal_distance <= vertical_distance:
-                layout = "horizontal"
-            else:
-                layout = "vertical"
+        layout, auto_w, auto_h = predict_comparison_dimensions(out_w, out_h, layout)
+        custom_w = _coerce_even_dimension(target_width)
+        custom_h = _coerce_even_dimension(target_height)
+        use_custom_size = bool(custom_w and custom_h)
+        final_w = custom_w if use_custom_size else auto_w
+        final_h = custom_h if use_custom_size else auto_h
 
         # Generate output path if not specified
         if comparison_output is None:
@@ -658,39 +828,70 @@ def create_input_vs_output_comparison_video(
         Path(comparison_output).parent.mkdir(parents=True, exist_ok=True)
 
         if on_progress:
-            on_progress(f"Creating comparison video ({layout} layout)...\n")
+            on_progress(
+                f"Creating comparison video ({layout} layout, {final_w}x{final_h})...\n"
+            )
 
         # Build ffmpeg filter complex
         # 1. Scale original input to match output resolution using lanczos for quality
         # 2. Add labels to both videos
         # 3. Merge based on layout
+        safe_label_input = _escape_drawtext_text(label_input)
+        safe_label_output = _escape_drawtext_text(label_output)
+        safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
+        safe_font_size = _coerce_font_size(font_size, default=32)
 
         if layout == "horizontal":
             # Side by side - each video takes half the final width
             # Final video will be 2x the width of output video
-            filter_complex = (
+            right_drawtext = (
+                f"[1:v]drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5"
+            )
+            if include_branding:
+                right_drawtext += (
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+            right_drawtext += "[right];"
+
+            stacked_filter = (
                 f"[0:v]scale={out_w}:{out_h}:flags=lanczos,"
-                f"drawtext=text='{label_input}':x=10:y=10:fontsize=32:fontcolor=white:"
+                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
-                f"[1:v]drawtext=text='{label_output}':x=10:y=10:fontsize=32:fontcolor=white:"
-                f"box=1:boxcolor=black@0.6:boxborderw=5,"
-                f"drawtext=text='{COMPARISON_BRAND_TEXT}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
-                f"fontsize=32:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5[right];"
-                f"[left][right]hstack=inputs=2[out]"
+                f"{right_drawtext}"
+                f"[left][right]hstack=inputs=2[stacked]"
             )
         else:
             # Stacked (vertical) - each video takes half the final height
             # Final video will be 2x the height of output video
-            filter_complex = (
-                f"[0:v]scale={out_w}:{out_h}:flags=lanczos,"
-                f"drawtext=text='{label_input}':x=10:y=10:fontsize=32:fontcolor=white:"
-                f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
-                f"[1:v]drawtext=text='{label_output}':x=10:y=10:fontsize=32:fontcolor=white:"
-                f"box=1:boxcolor=black@0.6:boxborderw=5,"
-                f"drawtext=text='{COMPARISON_BRAND_TEXT}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
-                f"fontsize=32:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5[bottom];"
-                f"[top][bottom]vstack=inputs=2[out]"
+            bottom_drawtext = (
+                f"[1:v]drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
+            if include_branding:
+                bottom_drawtext += (
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+            bottom_drawtext += "[bottom];"
+
+            stacked_filter = (
+                f"[0:v]scale={out_w}:{out_h}:flags=lanczos,"
+                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
+                f"{bottom_drawtext}"
+                f"[top][bottom]vstack=inputs=2[stacked]"
+            )
+
+        if use_custom_size:
+            filter_complex = (
+                f"{stacked_filter};"
+                f"[stacked]scale={final_w}:{final_h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                f"pad={final_w}:{final_h}:(ow-iw)/2:(oh-ih)/2:black[out]"
+            )
+        else:
+            filter_complex = f"{stacked_filter};[stacked]null[out]"
 
         # Build ffmpeg command
         cmd = [
@@ -714,20 +915,25 @@ def create_input_vs_output_comparison_video(
         if on_progress:
             on_progress(f"Running ffmpeg for comparison video...\n")
 
-        # Run ffmpeg
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1200  # 20 minutes timeout for large videos
+        duration_seconds = (
+            get_media_duration_seconds(str(output_path))
+            or get_media_duration_seconds(str(input_path))
+            or 0.0
+        )
+        result_code, stderr_tail = _run_ffmpeg_with_progress(
+            cmd=cmd,
+            timeout_seconds=1200,
+            duration_seconds=duration_seconds,
+            on_progress=on_progress,
         )
 
-        if result.returncode == 0 and Path(comparison_output).exists():
+        if result_code == 0 and Path(comparison_output).exists():
             if on_progress:
+                on_progress("COMPARISON_PROGRESS 100.0%\n")
                 on_progress(f"Comparison video created: {comparison_output}\n")
             return True, comparison_output, ""
         else:
-            error = result.stderr or result.stdout or "Unknown ffmpeg error"
+            error = stderr_tail or "Unknown ffmpeg error"
             return False, "", f"FFmpeg error: {error[:500]}"
 
     except subprocess.TimeoutExpired:

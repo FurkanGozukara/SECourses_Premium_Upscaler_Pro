@@ -2,6 +2,7 @@ import os
 import platform
 import subprocess
 from pathlib import Path
+from typing import Optional, Tuple
 
 import gradio as gr
 
@@ -24,6 +25,64 @@ def _normalize_path(value: str, fallback: str) -> str:
     if raw:
         return raw
     return str(fallback or "").strip()
+
+
+def _normalize_theme_mode(value: str, fallback: str = "dark") -> str:
+    mode = str(value or fallback or "dark").strip().lower()
+    if mode not in {"dark", "light"}:
+        mode = str(fallback or "dark").strip().lower()
+    return mode if mode in {"dark", "light"} else "dark"
+
+
+def _normalize_directory_path(value: str, fallback: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normalize user-provided directory path robustly across Windows/Linux:
+    - accepts '/' and '\\' separators
+    - supports env vars and '~'
+    - requires absolute path (full path)
+    """
+    # Keep backwards compatibility for missing values from older presets,
+    # but require explicit non-empty input when the field is present.
+    if value is None:
+        raw = _normalize_path(value, fallback)
+    else:
+        raw = str(value).strip()
+    if not raw:
+        return None, "Path is empty. Please enter a full absolute path."
+
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if os.name == "nt":
+        # Keep UNC semantics and normalize slash style for Windows.
+        if expanded.startswith("//"):
+            expanded = "\\\\" + expanded.lstrip("/\\")
+        expanded = expanded.replace("/", "\\")
+    else:
+        # Treat Windows-style separators as path separators on Unix too.
+        expanded = expanded.replace("\\", "/")
+
+    path_obj = Path(expanded)
+    if not path_obj.is_absolute():
+        return None, f"Path must be absolute: {raw}"
+
+    try:
+        normalized = str(path_obj.resolve())
+    except Exception:
+        normalized = str(path_obj)
+
+    return normalized, None
+
+
+def _ensure_writable_dir(path_value: str, label: str) -> Optional[str]:
+    try:
+        target = Path(path_value)
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / ".secourses_write_test"
+        with probe.open("w", encoding="utf-8") as f:
+            f.write("ok")
+        probe.unlink(missing_ok=True)
+        return None
+    except Exception as exc:
+        return f"{label} is not writable: {exc}"
 
 
 def _update_runtime_env(global_settings: dict):
@@ -55,6 +114,7 @@ def _build_restart_note(changed_keys: list[str]) -> str:
 def apply_global_settings_live(
     output_dir_val: str,
     temp_dir_val: str,
+    theme_mode_val: str,
     telemetry_enabled: bool,
     face_strength: float,
     queue_enabled: bool,
@@ -87,8 +147,9 @@ def apply_global_settings_live(
     old_hf = str(global_settings.get("hf_home") or "")
     old_trans = str(global_settings.get("transformers_cache") or "")
 
-    output_dir = _normalize_path(output_dir_val, global_settings.get("output_dir"))
-    temp_dir = _normalize_path(temp_dir_val, global_settings.get("temp_dir"))
+    output_dir, output_dir_err = _normalize_directory_path(output_dir_val, global_settings.get("output_dir"))
+    temp_dir, temp_dir_err = _normalize_directory_path(temp_dir_val, global_settings.get("temp_dir"))
+    theme_mode = _normalize_theme_mode(theme_mode_val, str(global_settings.get("theme_mode", "dark")))
     models_dir = _normalize_path(models_dir_val, global_settings.get("models_dir"))
     hf_home = _normalize_path(hf_home_val, global_settings.get("hf_home"))
     transformers_cache = _normalize_path(transformers_cache_val, global_settings.get("transformers_cache"))
@@ -104,10 +165,39 @@ def apply_global_settings_live(
         runner.set_mode("subprocess")
         actual_mode = "subprocess"
 
+    path_errors: list[str] = []
+    if output_dir_err:
+        path_errors.append(f"Output Directory: {output_dir_err}")
+    if temp_dir_err:
+        path_errors.append(f"Temp Directory: {temp_dir_err}")
+    if output_dir:
+        writable_err = _ensure_writable_dir(output_dir, "Output Directory")
+        if writable_err:
+            path_errors.append(writable_err)
+    if temp_dir:
+        writable_err = _ensure_writable_dir(temp_dir, "Temp Directory")
+        if writable_err:
+            path_errors.append(writable_err)
+
+    if path_errors:
+        status = "Settings not applied due to path validation errors:\n- " + "\n- ".join(path_errors)
+        if isinstance(state, dict):
+            state.setdefault("seed_controls", {})
+            seed_controls = state["seed_controls"] if isinstance(state["seed_controls"], dict) else {}
+            state["seed_controls"] = seed_controls
+            current_global = seed_controls.get("global_settings", {})
+            current_global = dict(current_global) if isinstance(current_global, dict) else {}
+            current_global["output_dir"] = str(global_settings.get("output_dir", ""))
+            current_global["temp_dir"] = str(global_settings.get("temp_dir", ""))
+            current_global["theme_mode"] = str(global_settings.get("theme_mode", "dark") or "dark")
+            seed_controls["global_settings"] = current_global
+        return gr.update(value=status), gr.update(value=actual_mode), state
+
     global_settings.update(
         {
             "output_dir": output_dir,
             "temp_dir": temp_dir,
+            "theme_mode": theme_mode,
             "telemetry": bool(telemetry_enabled),
             # Face global on/off remains managed from Face tab, but still persists in unified presets.
             "face_global": face_global_enabled,
@@ -139,12 +229,14 @@ def apply_global_settings_live(
         state["seed_controls"] = seed_controls
         seed_controls["face_strength_val"] = float(face_strength)
         seed_controls["queue_enabled_val"] = bool(queue_enabled)
+        seed_controls["theme_mode_val"] = theme_mode
         seed_controls["global_gpu_device_val"] = global_gpu_device
         seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
         seed_controls["pinned_reference_path"] = pinned_ref
         seed_controls["global_settings"] = {
             "output_dir": output_dir,
             "temp_dir": temp_dir,
+            "theme_mode": theme_mode,
             "telemetry": bool(telemetry_enabled),
             "face_global": face_global_enabled,
             "face_strength": float(face_strength),
@@ -168,6 +260,7 @@ def apply_global_settings_live(
     status = (
         "Applied immediately.\n"
         "Save a Universal Preset to persist across restarts.\n"
+        f"Theme: {theme_mode}\n"
         f"Active mode: {actual_mode}\n"
         f"Global GPU: {describe_gpu_selection(global_gpu_device)}"
         f"{_build_restart_note(changed_restart_keys)}"
@@ -178,6 +271,7 @@ def apply_global_settings_live(
 def save_global_settings(
     output_dir_val: str,
     temp_dir_val: str,
+    theme_mode_val: str,
     telemetry_enabled: bool,
     face_strength: float,
     queue_enabled: bool,
@@ -197,6 +291,7 @@ def save_global_settings(
     return apply_global_settings_live(
         output_dir_val=output_dir_val,
         temp_dir_val=temp_dir_val,
+        theme_mode_val=theme_mode_val,
         telemetry_enabled=telemetry_enabled,
         face_strength=face_strength,
         queue_enabled=queue_enabled,
@@ -228,6 +323,7 @@ def apply_mode_selection(
     status_upd, mode_upd, state = apply_global_settings_live(
         output_dir_val=str(global_settings.get("output_dir", "")),
         temp_dir_val=str(global_settings.get("temp_dir", "")),
+        theme_mode_val=str(global_settings.get("theme_mode", "dark") or "dark"),
         telemetry_enabled=bool(global_settings.get("telemetry", True)),
         face_strength=float(global_settings.get("face_strength", 0.5)),
         queue_enabled=bool(global_settings.get("queue_enabled", True)),

@@ -59,7 +59,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.3 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.4 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -103,6 +103,7 @@ default_global_gpu_device = resolve_global_gpu_device(None)
 GLOBAL_DEFAULTS = {
     "output_dir": launcher_output or str(BASE_DIR / "outputs"),
     "temp_dir": default_temp,
+    "theme_mode": "dark",
     "telemetry": True,
     "face_global": False,
     "face_strength": 0.5,
@@ -842,11 +843,13 @@ def main(argv=None):
     /* Main navigation tabs (Gradio Tabs.svelte): always visible in two rows */
     #secourses-main-tabs {
       --main-tab-col-count: 5;
-      --main-tab-gap: 8px;
+      --main-tab-gap: 6px;
       --main-tab-min-height: 46px;
-      --main-tab-row-slack: 2px;
+      --main-tab-row-slack: 16px;
     }
     #secourses-main-tabs .tab-wrapper {
+      position: relative;
+      display: block;
       height: auto;
       min-height: 0;
       align-items: stretch;
@@ -872,6 +875,7 @@ def main(argv=None):
       opacity: 0.7;
     }
     #secourses-main-tabs .tab-container.visually-hidden {
+      position: absolute !important;
       left: 0 !important;
       top: 0 !important;
       width: 100% !important;
@@ -882,15 +886,17 @@ def main(argv=None):
       white-space: normal !important;
       overflow: visible !important;
       visibility: hidden !important;
+      pointer-events: none !important;
     }
-    #secourses-main-tabs .tab-container button {
+    #secourses-main-tabs .tab-container button,
+    #secourses-main-tabs .overflow-menu .overflow-dropdown button {
       flex: 0 0 calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
       max-width: calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
       min-width: 0;
       min-height: var(--main-tab-min-height);
       height: auto;
       margin: 0;
-      padding: 8px 10px;
+      padding: 6px 8px;
       line-height: 1.24;
       white-space: normal;
       text-align: center;
@@ -902,18 +908,21 @@ def main(argv=None):
       font-weight: 740;
       font-size: 13.5px;
     }
-    #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected) {
+    #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected),
+    #secourses-main-tabs .overflow-menu .overflow-dropdown button:hover:not(:disabled):not(.selected) {
       transform: translateY(-1px);
       border-color: rgba(125, 211, 252, 0.66);
       background: linear-gradient(160deg, rgba(14, 116, 144, 0.44), rgba(15, 23, 42, 0.58));
     }
-    #secourses-main-tabs .tab-container button.selected {
+    #secourses-main-tabs .tab-container button.selected,
+    #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected {
       color: #e0f2fe;
       border-color: rgba(45, 212, 191, 0.92);
       background: linear-gradient(145deg, rgba(30, 64, 175, 0.72), rgba(13, 148, 136, 0.76));
       box-shadow: 0 8px 18px rgba(15, 118, 110, 0.32);
     }
-    #secourses-main-tabs .tab-container button.selected::after {
+    #secourses-main-tabs .tab-container button.selected::after,
+    #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected::after {
       left: 14%;
       width: 72%;
       bottom: 3px;
@@ -921,21 +930,45 @@ def main(argv=None):
       border-radius: 999px;
       background-color: rgba(240, 253, 250, 0.96);
     }
-    #secourses-main-tabs .overflow-menu {
+    #secourses-main-tabs .overflow-menu.hide {
       display: none !important;
+    }
+    #secourses-main-tabs .overflow-menu {
+      display: block !important;
+      width: 100%;
+      margin-top: var(--main-tab-gap);
+    }
+    #secourses-main-tabs .overflow-menu > button {
+      display: none !important;
+    }
+    #secourses-main-tabs .overflow-menu .overflow-dropdown,
+    #secourses-main-tabs .overflow-menu .overflow-dropdown.hide {
+      position: static !important;
+      display: flex !important;
+      flex-wrap: wrap !important;
+      align-items: stretch;
+      gap: var(--main-tab-gap);
+      width: 100%;
+      margin: 0 !important;
+      padding: 0 !important;
+      border: 0 !important;
+      background: transparent !important;
+      box-shadow: none !important;
     }
 
     @media (max-width: 768px) {
       #secourses-main-tabs {
-        --main-tab-gap: 6px;
+        --main-tab-gap: 5px;
         --main-tab-min-height: 42px;
+        --main-tab-row-slack: 12px;
       }
       #secourses-main-tabs .tab-wrapper {
         padding: 8px 8px 10px;
       }
-      #secourses-main-tabs .tab-container button {
-        padding: 7px 8px;
-        font-size: 12.5px;
+      #secourses-main-tabs .tab-container button,
+      #secourses-main-tabs .overflow-menu .overflow-dropdown button {
+        padding: 5px 6px;
+        font-size: 12px;
       }
       .action-btn button,
       button.action-btn {
@@ -1081,6 +1114,7 @@ def main(argv=None):
             return {
                 "output_dir": str(global_settings.get("output_dir", BASE_DIR / "outputs")),
                 "temp_dir": str(global_settings.get("temp_dir", BASE_DIR / "temp")),
+                "theme_mode": str(global_settings.get("theme_mode", "dark") or "dark"),
                 "telemetry": bool(global_settings.get("telemetry", True)),
                 "face_global": bool(global_settings.get("face_global", False)),
                 "face_strength": float(global_settings.get("face_strength", 0.5)),
@@ -1125,6 +1159,8 @@ def main(argv=None):
                     merged[key] = raw.get(key)
         merged["output_dir"] = str(merged.get("output_dir", "") or "")
         merged["temp_dir"] = str(merged.get("temp_dir", "") or "")
+        theme_raw = str(merged.get("theme_mode", "dark") or "dark").strip().lower()
+        merged["theme_mode"] = theme_raw if theme_raw in {"dark", "light"} else "dark"
         merged["telemetry"] = bool(merged.get("telemetry", True))
         merged["face_global"] = bool(merged.get("face_global", False))
         try:
@@ -1144,6 +1180,7 @@ def main(argv=None):
     def apply_global_settings_live(
         od,
         td,
+        theme_mode,
         tel,
         face_str,
         queue_enabled,
@@ -1159,6 +1196,7 @@ def main(argv=None):
         return _apply_global_settings_live(
             output_dir_val=od,
             temp_dir_val=td,
+            theme_mode_val=theme_mode,
             telemetry_enabled=tel,
             face_strength=face_str,
             queue_enabled=queue_enabled,
@@ -1185,6 +1223,7 @@ def main(argv=None):
     _startup_status, _startup_mode, _startup_state = apply_global_settings_live(
         startup_global_settings.get("output_dir", global_settings.get("output_dir")),
         startup_global_settings.get("temp_dir", global_settings.get("temp_dir")),
+        startup_global_settings.get("theme_mode", global_settings.get("theme_mode", "dark")),
         bool(startup_global_settings.get("telemetry", global_settings.get("telemetry", True))),
         float(startup_global_settings.get("face_strength", global_settings.get("face_strength", 0.5))),
         bool(startup_global_settings.get("queue_enabled", global_settings.get("queue_enabled", True))),
@@ -1199,8 +1238,36 @@ def main(argv=None):
     startup_preset["global"] = startup_global_settings
     active_temp_dir = Path(global_settings.get("temp_dir", temp_dir))
     active_output_dir = Path(global_settings.get("output_dir", output_dir))
+    startup_theme_mode = str(startup_global_settings.get("theme_mode", global_settings.get("theme_mode", "dark")) or "dark")
+    if startup_theme_mode not in {"dark", "light"}:
+        startup_theme_mode = "dark"
+
+    theme_bootstrap_head = f"""
+    <script>
+    (() => {{
+      try {{
+        const preferredTheme = {json.dumps(startup_theme_mode)};
+        if (!preferredTheme || (preferredTheme !== "dark" && preferredTheme !== "light")) return;
+        const url = new URL(window.location.href);
+        if (url.searchParams.get("__theme") !== preferredTheme) {{
+          url.searchParams.set("__theme", preferredTheme);
+          window.history.replaceState(null, "", url.toString());
+        }}
+        const applyTheme = () => {{
+          if (preferredTheme === "dark") document.body.classList.add("dark");
+          else document.body.classList.remove("dark");
+        }};
+        if (document.readyState === "loading") {{
+          document.addEventListener("DOMContentLoaded", applyTheme, {{ once: true }});
+        }} else {{
+          applyTheme();
+        }}
+      }} catch (_) {{}}
+    }})();
+    </script>
+    """
     
-    with gr.Blocks(title=APP_TITLE, theme=modern_theme, css=CUSTOM_CSS, head=CUSTOM_HEAD) as demo:
+    with gr.Blocks(title=APP_TITLE, theme=modern_theme, css=CUSTOM_CSS, head=CUSTOM_HEAD + theme_bootstrap_head) as demo:
         # =========================================================================
         # SHARED STATE - Populated from UNIVERSAL PRESET on startup
         # =========================================================================
@@ -1296,6 +1363,7 @@ def main(argv=None):
                 "comparison_video_layout_val": startup_output_settings.get("comparison_video_layout", "auto"),
                 "face_strength_val": float(startup_global_settings.get("face_strength", global_settings.get("face_strength", 0.5))),
                 "queue_enabled_val": bool(startup_global_settings.get("queue_enabled", global_settings.get("queue_enabled", True))),
+                "theme_mode_val": str(startup_global_settings.get("theme_mode", global_settings.get("theme_mode", "dark")) or "dark"),
                 
                 # Resolution tab cached values
                 "auto_chunk": startup_auto_chunk,
@@ -1353,120 +1421,105 @@ def main(argv=None):
         # Global settings tab (rendered LAST for a cleaner workflow)
         def render_global_settings_tab():
             with gr.Tab("⚙️ Global Settings", render_children=True) as tab_global:
-                gr.Markdown("### 📁 Output & Temp Directories")
+                gr.Markdown("### Global Settings")
+                gr.Markdown("Configure absolute output/temp directories and choose light or dark theme.")
                 with gr.Row():
                     output_dir_box = gr.Textbox(
                         label="Default Outputs Folder",
                         value=global_settings["output_dir"],
-                        info="Where processed files will be saved"
+                        placeholder=str(BASE_DIR / "outputs"),
+                        info="Absolute path required. Supports /, //, and \\ separators."
                     )
                     temp_dir_box = gr.Textbox(
-                        label="Temp Folder",
+                        label="Default Temp Folder",
                         value=global_settings["temp_dir"],
-                        info="Temporary files during processing"
+                        placeholder=str(BASE_DIR / "temp"),
+                        info="Absolute path required. Supports /, //, and \\ separators."
                     )
-                
-                gr.Markdown("### Runtime Toggles")
-                with gr.Row():
-                    telemetry_toggle = gr.Checkbox(
-                        label="Save run metadata (local telemetry)",
-                        value=global_settings.get("telemetry", True),
-                        info="Save processing metadata for troubleshooting"
-                    )
-                    queue_enabled_toggle = gr.Checkbox(
-                        label="Enable Queue",
-                        value=bool(global_settings.get("queue_enabled", True)),
-                        info="When enabled, extra generate/upscale clicks are queued. When disabled, new clicks are ignored while processing is active."
-                    )
-                gr.Markdown("Face Restoration global on/off is managed only from the **Face Restoration** tab.")
-                with gr.Row():
-                    face_strength_slider = gr.Slider(
-                        label="Global Face Restoration Strength",
-                        minimum=0.0,
-                        maximum=1.0,
-                        step=0.05,
-                        value=global_settings.get("face_strength", 0.5),
-                        info="Strength of face restoration when globally enabled (0.0 = subtle, 1.0 = maximum)"
-                    )
-                
-                # FIXED: Make model cache paths EDITABLE and persistable (not read-only)
-                gr.Markdown("### 📦 Model Cache Paths")
-                
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("""
-                        **Configure where AI models are downloaded and cached.**
-                        
-                        These paths control where models (SeedVR2, FlashVSR+, Real-ESRGAN, etc.) are stored.
-                        If left empty, defaults from launcher BAT file or system defaults will be used.
-                        """)
-                    with gr.Column():
-                        gr.Markdown("""
-                        ⚠️ **IMPORTANT**: Changing these paths will NOT move existing models. You must:
-                        1. Update paths here (saved immediately)
-                        2. Restart the application
-                        3. Models will re-download to new location (or manually copy from old location)
-                        """)
-                
-                with gr.Row():
-                    models_dir_box = gr.Textbox(
-                        label="Models Directory (MODELS_DIR)",
-                        value=global_settings.get("models_dir", ""),
-                        placeholder=str(BASE_DIR / "models"),
-                        info="Base directory for all model weights. Leave empty to use launcher default or './models'."
-                    )
-                
-                with gr.Row():
-                    hf_home_box = gr.Textbox(
-                        label="HuggingFace Home (HF_HOME)",
-                        value=global_settings.get("hf_home", ""),
-                        placeholder=str(BASE_DIR / "models"),
-                        info="HuggingFace cache directory. Usually same as Models Directory. Leave empty to use MODELS_DIR."
-                    )
-                    transformers_cache_box = gr.Textbox(
-                        label="Transformers Cache (TRANSFORMERS_CACHE)",
-                        value=global_settings.get("transformers_cache", ""),
-                        placeholder=str(BASE_DIR / "models"),
-                        info="Transformers library cache. Usually same as HF_HOME. Leave empty to use MODELS_DIR."
-                    )
-                
-                gr.Markdown("""
-                💡 **Current launcher settings** (from `Windows_Run_SECourses_Upscaler_Pro.bat`):
-                - Models Dir: `{}`
-                - HF Home: `{}`
-                - Transformers: `{}`
-                
-                You can override these in the UI above, or edit the launcher BAT file for permanent changes.
-                """.format(
-                    launcher_models_dir or "Not set (using defaults)",
-                    launcher_hf_home or "Not set (using MODELS_DIR)",
-                    launcher_transformers_cache or "Not set (using MODELS_DIR)"
-                ))
-                
-                # Processing mode selection controls (placed before Execution Mode explanation)
-                mode_radio = gr.Radio(
-                    choices=["subprocess", "in_app"],
-                    value=str(global_settings.get("mode", "subprocess") or "subprocess"),
-                    label="Processing Mode",
-                    info="Applies immediately.",
-                    interactive=True
+
+                theme_mode_default = str(global_settings.get("theme_mode", "dark") or "dark").strip().lower()
+                if theme_mode_default not in {"dark", "light"}:
+                    theme_mode_default = "dark"
+
+                theme_mode_radio = gr.Radio(
+                    choices=["dark", "light"],
+                    value=theme_mode_default,
+                    label="Theme",
+                    info="Select the Gradio UI theme mode."
+                )
+                theme_mode_radio.change(
+                    fn=None,
+                    inputs=[theme_mode_radio],
+                    outputs=None,
+                    queue=False,
+                    show_progress="hidden",
+                    js="""
+                    (mode) => {
+                      try {
+                        const chosen = (mode === "dark" || mode === "light") ? mode : "dark";
+                        const url = new URL(window.location.href);
+                        url.searchParams.set("__theme", chosen);
+                        window.history.replaceState(null, "", url.toString());
+                        if (chosen === "dark") document.body.classList.add("dark");
+                        else document.body.classList.remove("dark");
+                      } catch (_) {}
+                    }
+                    """,
                 )
                 global_status = gr.Markdown("")
-                gr.Markdown(
-                    "**Restart-required settings:** `MODELS_DIR`, `HF_HOME`, `TRANSFORMERS_CACHE`.\n"
-                    "They are saved immediately, but full effect across all libraries is guaranteed after app restart."
-                )
 
+                # Hidden compatibility controls for existing global preset schema.
+                telemetry_toggle = gr.Checkbox(
+                    label="Save run metadata (local telemetry)",
+                    value=global_settings.get("telemetry", True),
+                    visible=False,
+                )
                 face_global_hidden = gr.Checkbox(
                     label="Global Face Restore (synced from Face tab)",
                     value=bool(global_settings.get("face_global", False)),
                     interactive=False,
+                    visible=False,
+                )
+                face_strength_slider = gr.Slider(
+                    label="Global Face Restoration Strength",
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=global_settings.get("face_strength", 0.5),
+                    visible=False,
+                )
+                queue_enabled_toggle = gr.Checkbox(
+                    label="Enable Queue",
+                    value=bool(global_settings.get("queue_enabled", True)),
+                    visible=False,
+                )
+                mode_radio = gr.Radio(
+                    choices=["subprocess", "in_app"],
+                    value=str(global_settings.get("mode", "subprocess") or "subprocess"),
+                    label="Processing Mode",
+                    visible=False,
+                    interactive=True
+                )
+                models_dir_box = gr.Textbox(
+                    label="Models Directory (MODELS_DIR)",
+                    value=global_settings.get("models_dir", ""),
+                    visible=False,
+                )
+                hf_home_box = gr.Textbox(
+                    label="HuggingFace Home (HF_HOME)",
+                    value=global_settings.get("hf_home", ""),
+                    visible=False,
+                )
+                transformers_cache_box = gr.Textbox(
+                    label="Transformers Cache (TRANSFORMERS_CACHE)",
+                    value=global_settings.get("transformers_cache", ""),
+                    visible=False,
                 )
                 pinned_reference_path_hidden = gr.Textbox(
                     label="Pinned Reference Path",
                     value=str(global_settings.get("pinned_reference_path", "") or ""),
-                    info="Current pinned comparison reference. Managed from Output & Comparison actions.",
                     interactive=False,
+                    visible=False,
                 )
 
                 (
@@ -1488,9 +1541,11 @@ def main(argv=None):
                     open_accordion=True,
                 )
 
+                # Must match GLOBAL_ORDER in shared/universal_preset.py
                 global_preset_inputs = [
                     output_dir_box,
                     temp_dir_box,
+                    theme_mode_radio,
                     telemetry_toggle,
                     face_global_hidden,
                     face_strength_slider,
@@ -1515,100 +1570,6 @@ def main(argv=None):
                     shared_state=shared_state,
                     tab_name="global",
                 )
-
-                # Execution mode controls
-                gr.Markdown("### ⚙️ Execution Mode")
-                
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("""
-                        ## 🟢 Subprocess Mode
-                        **(Default & STRONGLY RECOMMENDED)**
-                        
-                        **What it does:**
-                        - Completely isolated subprocess per run
-                        - Models load fresh, process, exit with guaranteed cleanup
-                        - Works perfectly for ALL models
-                        
-                        **Benefits:**
-                        - ✅ **100% VRAM/RAM cleanup** after each run
-                        - ✅ **Full cancellation support** - kill anytime
-                        - ✅ **Automatic vcvars wrapper** (Windows torch.compile)
-                        - ✅ **Process isolation** - prevents memory leaks
-                        - ✅ **Proven stability** - production-ready
-                        - ✅ **Cross-platform** - Windows and Linux
-                        
-                        **Performance:**
-                        - ~5-10s loading overhead per run
-                        - Negligible for long videos (<1% total time)
-                        - Amortized across batch processing
-                        """)
-                    
-                    with gr.Column():
-                        gr.Markdown("""
-                        ## 🔴 In-App Mode
-                        **(EXPERIMENTAL - DO NOT USE)**
-                        
-                        **⚠️ CRITICAL: NON-FUNCTIONAL PLACEHOLDER**
-                        
-                        **Status**: Partially implemented with **ZERO BENEFITS** and **CRITICAL LIMITATIONS**
-                        
-                        **Why It Doesn't Work:**
-                        
-                        **1. ❌ NO MODEL PERSISTENCE**
-                        - Models reload EVERY RUN (identical to subprocess)
-                        - Expected: Models stay in VRAM for speed
-                        - Result: **ZERO SPEED BENEFIT**
-                        
-                        **2. ❌ NO CANCELLATION**
-                        - Cannot stop once started
-                        - Must wait or force-quit entire app
-                        
-                        **3. ❌ NO VCVARS WRAPPER**
-                        - torch.compile fails on Windows
-                        - Must activate vcvars before launch
-                        """)
-                    
-                    with gr.Column():
-                        gr.Markdown("""
-                        ## 🔴 More Issues
-                        
-                        **4. ⚠️ MEMORY LEAKS**
-                        - VRAM may not fully clear
-                        - Usage creeps up, eventual OOM crashes
-                        
-                        **5. ℹ️ MODE SWITCH**
-                        - Mode changes apply immediately from the selector above
-                        - No restart needed for mode-only changes
-                        
-                        **Required for Functional Mode:**
-                        - Refactor CLIs for persistent loading
-                        - Implement VRAM caching
-                        - Add threading cancellation
-                        - Pre-activate vcvars on startup
-                        - CUDA memory profiling
-                        
-                        **Effort**: 40-60 hours + testing  
-                        **Risk**: High (CUDA complexity)  
-                        **Benefit**: Marginal (5-10% for short videos)
-                        
-                        ---
-                        
-                        **Recommendation:**
-                        
-                        ✅ **USE SUBPROCESS MODE**
-                        - Production-ready and battle-tested
-                        - Reliable cleanup and cancellation
-                        
-                        🚫 **AVOID IN-APP MODE**
-                        - Non-functional (models reload anyway)
-                        - Dangerous (memory leaks, failures)
-                        """)
-                
-                gr.Markdown("💡 **Note**: In-app mode exists ONLY as a code framework for potential future optimization. Consider it **disabled** for all practical purposes.")
-
-                # Runtime apply is handled centrally by shared_state.change
-                # via apply_global_settings_from_state().
 
                 return {
                     "tab": tab_global,
@@ -1938,6 +1899,7 @@ def main(argv=None):
             status_upd, mode_upd, next_state = apply_global_settings_live(
                 merged_global.get("output_dir", global_settings.get("output_dir")),
                 merged_global.get("temp_dir", global_settings.get("temp_dir")),
+                merged_global.get("theme_mode", global_settings.get("theme_mode", "dark")),
                 bool(merged_global.get("telemetry", global_settings.get("telemetry", True))),
                 float(merged_global.get("face_strength", global_settings.get("face_strength", 0.5))),
                 bool(merged_global.get("queue_enabled", global_settings.get("queue_enabled", True))),

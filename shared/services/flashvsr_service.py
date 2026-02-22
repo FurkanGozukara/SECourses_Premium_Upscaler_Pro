@@ -247,7 +247,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_attention = "flash_attention_2"
         default_vae = "Wan2.2"
         version = "1.1"
-        mode = "tiny"
+        mode = "full"
         scale = 4
         frame_chunk_size = 64
         keep_models_on_cpu = True
@@ -359,8 +359,8 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     )
 
     cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
-    mode = str(cfg.get("mode", defaults.get("mode", "tiny")) or "tiny").strip().lower()
-    cfg["mode"] = mode if mode in {"tiny", "tiny-long", "full"} else "tiny"
+    mode = str(cfg.get("mode", defaults.get("mode", "full")) or "full").strip().lower()
+    cfg["mode"] = mode if mode in {"tiny", "tiny-long", "full"} else "full"
     scale = _nearest_supported_scale(cfg.get("scale", defaults.get("scale", 4)), 4)
     cfg["scale"] = str(scale)
     cfg["upscale_factor"] = float(scale)
@@ -441,7 +441,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
 
     # Apply metadata defaults for selected version/mode/scale.
     internal_version = flashvsr_version_to_internal(cfg.get("version", "1.1"))
-    model_id = f"v{internal_version}_{cfg.get('mode', 'tiny')}_{cfg.get('scale', '4')}x"
+    model_id = f"v{internal_version}_{cfg.get('mode', 'full')}_{cfg.get('scale', '4')}x"
     model_meta = get_flashvsr_metadata(model_id)
     if model_meta:
         if cfg.get("tile_size", 0) <= 0:

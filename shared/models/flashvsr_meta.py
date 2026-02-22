@@ -162,7 +162,7 @@ def get_flashvsr_model_names() -> List[str]:
 
 
 def get_flashvsr_default_model() -> str:
-    return "v11_tiny_4x"
+    return "v11_full_4x"
 
 
 def get_flashvsr_metadata(model_name: str) -> Optional[FlashVSRModel]:

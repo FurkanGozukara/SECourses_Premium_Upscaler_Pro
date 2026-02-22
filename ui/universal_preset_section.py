@@ -515,6 +515,7 @@ def sync_tab_to_shared_state(
     if tab_name == "global":
         seed_controls["face_strength_val"] = float(tab_dict.get("face_strength", 0.5) or 0.5)
         seed_controls["queue_enabled_val"] = bool(tab_dict.get("queue_enabled", True))
+        seed_controls["theme_mode_val"] = str(tab_dict.get("theme_mode", "dark") or "dark")
         seed_controls["pinned_reference_path"] = tab_dict.get("pinned_reference_path")
         global_gpu_device = resolve_global_gpu_device(tab_dict.get("global_gpu_device"))
         tab_dict["global_gpu_device"] = global_gpu_device

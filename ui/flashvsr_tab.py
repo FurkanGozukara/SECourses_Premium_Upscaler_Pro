@@ -86,7 +86,7 @@ def flashvsr_tab(
         return default
 
     def _vae_mode_note(mode_value: str) -> str:
-        mode_norm = str(mode_value or "tiny").strip().lower()
+        mode_norm = str(mode_value or "full").strip().lower()
         if mode_norm == "full":
             return (
                 "**Mode note:** In `full` mode, the selected **VAE Model** directly changes the active decoder "
@@ -162,13 +162,13 @@ def flashvsr_tab(
                             label="Pipeline Mode",
                             choices=["tiny", "tiny-long", "full"],
                             value=(
-                                str(_value("mode", "tiny"))
-                                if str(_value("mode", "tiny")) in {"tiny", "tiny-long", "full"}
-                                else "tiny"
+                                str(_value("mode", "full"))
+                                if str(_value("mode", "full")) in {"tiny", "tiny-long", "full"}
+                                else "full"
                             ),
                             info=(
-                                "`tiny` = best default balance. `tiny-long` = lowest VRAM for long clips. "
-                                "`full` = maximum quality but highest VRAM usage."
+                                "`tiny` = best speed/quality balance. `tiny-long` = lowest VRAM for long clips. "
+                                "`full` = maximum quality (default), but highest VRAM usage."
                             )
                         )
                         vae_model = gr.Dropdown(
@@ -185,7 +185,7 @@ def flashvsr_tab(
                             ),
                         )
                         vae_mode_note = gr.Markdown(
-                            _vae_mode_note(str(_value("mode", "tiny"))),
+                            _vae_mode_note(str(_value("mode", "full"))),
                             elem_classes=["resolution-info"],
                         )
 

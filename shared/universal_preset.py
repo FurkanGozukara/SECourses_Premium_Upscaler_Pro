@@ -42,6 +42,7 @@ from shared.video_codec_options import (
 GLOBAL_ORDER = [
     "output_dir",
     "temp_dir",
+    "theme_mode",
     "telemetry",
     "face_global",
     "face_strength",
@@ -62,6 +63,7 @@ def global_defaults(base_dir: Path = None) -> Dict[str, Any]:
     return {
         "output_dir": str(base / "outputs"),
         "temp_dir": str(base / "temp"),
+        "theme_mode": "dark",
         "telemetry": True,
         "face_global": False,
         "face_strength": 0.5,
@@ -291,6 +293,8 @@ def _normalize_global_settings(data: Dict[str, Any], defaults: Dict[str, Any]) -
 
     cfg["output_dir"] = str(cfg.get("output_dir", defaults.get("output_dir", "")) or "").strip()
     cfg["temp_dir"] = str(cfg.get("temp_dir", defaults.get("temp_dir", "")) or "").strip()
+    theme_raw = str(cfg.get("theme_mode", defaults.get("theme_mode", "dark")) or "dark").strip().lower()
+    cfg["theme_mode"] = theme_raw if theme_raw in {"dark", "light"} else "dark"
     cfg["telemetry"] = bool(cfg.get("telemetry", defaults.get("telemetry", True)))
     cfg["face_global"] = bool(cfg.get("face_global", defaults.get("face_global", False)))
     try:
@@ -691,6 +695,7 @@ def update_shared_state_from_preset(
     seed_controls["comparison_video_layout_val"] = str(out_settings.get("comparison_video_layout", "auto") or "auto")
     seed_controls["face_strength_val"] = float(global_settings.get("face_strength", 0.5))
     seed_controls["queue_enabled_val"] = bool(global_settings.get("queue_enabled", True))
+    seed_controls["theme_mode_val"] = str(global_settings.get("theme_mode", "dark") or "dark")
     seed_controls["pinned_reference_path"] = global_settings.get("pinned_reference_path")
 
     state["seed_controls"] = seed_controls

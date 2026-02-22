@@ -55,6 +55,32 @@ def _coerce_font_size(value: Any, default: int = 32) -> int:
     return max(8, min(200, size))
 
 
+def _resolve_pair_base_dimensions(
+    dims_a: Tuple[int, int],
+    dims_b: Tuple[int, int],
+) -> Tuple[int, int]:
+    """
+    Pick the larger source resolution as the common merge base.
+    """
+    a_w, a_h = int(dims_a[0] or 0), int(dims_a[1] or 0)
+    b_w, b_h = int(dims_b[0] or 0), int(dims_b[1] or 0)
+    if a_w <= 0 or a_h <= 0:
+        return max(2, b_w), max(2, b_h)
+    if b_w <= 0 or b_h <= 0:
+        return max(2, a_w), max(2, a_h)
+
+    a_area = a_w * a_h
+    b_area = b_w * b_h
+    if a_area > b_area:
+        return a_w, a_h
+    if b_area > a_area:
+        return b_w, b_h
+
+    if (a_w, a_h) >= (b_w, b_h):
+        return a_w, a_h
+    return b_w, b_h
+
+
 def normalize_comparison_layout(layout: Optional[str], width: int, height: int) -> str:
     """
     Normalize user-facing layout values into ffmpeg merge modes.
@@ -787,7 +813,11 @@ def create_input_vs_output_comparison_video(
     Returns:
         (success, comparison_video_path, error_message)
     """
-    from .path_utils import normalize_path, get_media_dimensions, get_media_duration_seconds
+    from .path_utils import (
+        normalize_path,
+        get_media_dimensions,
+        get_media_duration_seconds,
+    )
     from .error_handling import check_ffmpeg_available
 
     try:
@@ -809,10 +839,11 @@ def create_input_vs_output_comparison_video(
         if not in_dims or not out_dims:
             return False, "", "Could not determine video dimensions"
 
-        _in_w, _in_h = in_dims
+        in_w, in_h = in_dims
         out_w, out_h = out_dims
+        base_w, base_h = _resolve_pair_base_dimensions((in_w, in_h), (out_w, out_h))
 
-        layout, auto_w, auto_h = predict_comparison_dimensions(out_w, out_h, layout)
+        layout, auto_w, auto_h = predict_comparison_dimensions(base_w, base_h, layout)
         custom_w = _coerce_even_dimension(target_width)
         custom_h = _coerce_even_dimension(target_height)
         use_custom_size = bool(custom_w and custom_h)
@@ -845,7 +876,8 @@ def create_input_vs_output_comparison_video(
             # Side by side - each video takes half the final width
             # Final video will be 2x the width of output video
             right_drawtext = (
-                f"[1:v]drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
+                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -856,7 +888,7 @@ def create_input_vs_output_comparison_video(
             right_drawtext += "[right];"
 
             stacked_filter = (
-                f"[0:v]scale={out_w}:{out_h}:flags=lanczos,"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
@@ -866,7 +898,8 @@ def create_input_vs_output_comparison_video(
             # Stacked (vertical) - each video takes half the final height
             # Final video will be 2x the height of output video
             bottom_drawtext = (
-                f"[1:v]drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
+                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -877,7 +910,7 @@ def create_input_vs_output_comparison_video(
             bottom_drawtext += "[bottom];"
 
             stacked_filter = (
-                f"[0:v]scale={out_w}:{out_h}:flags=lanczos,"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
                 f"{bottom_drawtext}"
@@ -940,6 +973,495 @@ def create_input_vs_output_comparison_video(
         return False, "", "Comparison video generation timed out (>20 minutes)"
     except Exception as e:
         return False, "", f"Error creating comparison video: {str(e)}"
+
+
+def create_input_vs_output_slider_comparison_video(
+    original_input_video: str,
+    upscaled_output_video: str,
+    comparison_output: Optional[str] = None,
+    layout: str = "auto",
+    label_input: str = "Original",
+    label_output: str = "Upscaled",
+    on_progress: Optional[callable] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+    font_size: int = 32,
+    include_branding: bool = True,
+    slider_pass_duration_seconds: Optional[float] = None,
+) -> Tuple[bool, str, str]:
+    """
+    Create an animated slider comparison video (left->right then right->left).
+
+    The output contains two passes:
+    1) Reveal from left to right (or top to bottom for vertical layout)
+    2) Reverse back to the start
+    """
+    from .path_utils import (
+        normalize_path,
+        get_media_dimensions,
+        get_media_duration_seconds,
+        get_media_fps,
+    )
+    from .error_handling import check_ffmpeg_available
+
+    try:
+        if not check_ffmpeg_available():
+            return False, "", "FFmpeg not found in PATH"
+
+        input_path = Path(normalize_path(original_input_video))
+        output_path = Path(normalize_path(upscaled_output_video))
+
+        if not input_path.exists():
+            return False, "", f"Original input not found: {input_path}"
+        if not output_path.exists():
+            return False, "", f"Upscaled output not found: {output_path}"
+
+        in_dims = get_media_dimensions(str(input_path))
+        out_dims = get_media_dimensions(str(output_path))
+        if not in_dims or not out_dims:
+            return False, "", "Could not determine video dimensions"
+        in_w, in_h = in_dims
+        out_w, out_h = out_dims
+        base_w, base_h = _resolve_pair_base_dimensions((in_w, in_h), (out_w, out_h))
+
+        layout = normalize_comparison_layout(layout, base_w, base_h)
+        custom_w = _coerce_even_dimension(target_width)
+        custom_h = _coerce_even_dimension(target_height)
+        use_custom_size = bool(custom_w and custom_h)
+        final_w = custom_w if use_custom_size else base_w
+        final_h = custom_h if use_custom_size else base_h
+
+        if comparison_output is None:
+            comparison_output = str(output_path.parent / f"{output_path.stem}_comparison_slider.mp4")
+        else:
+            comparison_output = normalize_path(comparison_output)
+        Path(comparison_output).parent.mkdir(parents=True, exist_ok=True)
+
+        dur_out = get_media_duration_seconds(str(output_path)) or 0.0
+        dur_in = get_media_duration_seconds(str(input_path)) or 0.0
+        source_duration = max(float(dur_out), float(dur_in), 0.0)
+        try:
+            pass_duration = float(slider_pass_duration_seconds or 0.0)
+        except Exception:
+            pass_duration = 0.0
+        if pass_duration <= 0.0:
+            pass_duration = float(source_duration or 0.0)
+        pass_duration = max(0.5, pass_duration)
+        source_fps = (
+            get_media_fps(str(output_path))
+            or get_media_fps(str(input_path))
+            or 30.0
+        )
+        source_fps = max(1.0, float(source_fps))
+        pass_frames = max(1, int(round(pass_duration * source_fps)))
+        total_frames = pass_frames * 2
+        pass_duration = pass_frames / source_fps
+        total_duration = total_frames / source_fps
+
+        if on_progress:
+            on_progress(
+                f"Creating slider comparison video ({layout} layout, {final_w}x{final_h}, "
+                f"pass={pass_duration:.2f}s)...\n"
+            )
+
+        safe_label_input = _escape_drawtext_text(label_input)
+        safe_label_output = _escape_drawtext_text(label_output)
+        safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
+        safe_font_size = _coerce_font_size(font_size, default=32)
+
+        if layout == "vertical":
+            frame_idx_expr = "max(N-1,0)"
+            boundary_expr = (
+                f"if(lt({frame_idx_expr},{pass_frames}),"
+                f"{base_h}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                f"if(lt({frame_idx_expr},{total_frames}),"
+                f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+            )
+            edge_min = 8
+            edge_max = max(edge_min, int(base_h) - edge_min)
+            split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
+            right_drawtext = (
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5"
+            )
+            if include_branding:
+                right_drawtext += (
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+            right_drawtext += "[right];"
+
+            blend_expr = (
+                f"if(between({boundary_expr},{edge_min},{edge_max}),"
+                f"if(lte(abs(Y-({boundary_expr})),2),255,"
+                f"if(lte(abs(Y-({boundary_expr})),6),20,{split_expr})),"
+                f"{split_expr})"
+            )
+            base_filter = (
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
+                f"{right_drawtext}"
+                f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+            )
+        else:
+            frame_idx_expr = "max(N-1,0)"
+            boundary_expr = (
+                f"if(lt({frame_idx_expr},{pass_frames}),"
+                f"{base_w}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                f"if(lt({frame_idx_expr},{total_frames}),"
+                f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+            )
+            edge_min = 8
+            edge_max = max(edge_min, int(base_w) - edge_min)
+            split_expr = f"if(lt(X,{boundary_expr}),A,B)"
+            right_drawtext = (
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5"
+            )
+            if include_branding:
+                right_drawtext += (
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+            right_drawtext += "[right];"
+
+            blend_expr = (
+                f"if(between({boundary_expr},{edge_min},{edge_max}),"
+                f"if(lte(abs(X-({boundary_expr})),2),255,"
+                f"if(lte(abs(X-({boundary_expr})),6),20,{split_expr})),"
+                f"{split_expr})"
+            )
+            base_filter = (
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
+                f"{right_drawtext}"
+                f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+            )
+
+        if use_custom_size:
+            filter_complex = (
+                f"{base_filter};"
+                f"[slider]scale={final_w}:{final_h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                f"pad={final_w}:{final_h}:(ow-iw)/2:(oh-ih)/2:black[out]"
+            )
+        else:
+            filter_complex = f"{base_filter};[slider]null[out]"
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(input_path),
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(output_path),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-map",
+            "1:a?",
+            "-t",
+            f"{total_duration:.6f}",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            f"{source_fps:.6f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(comparison_output),
+        ]
+
+        if on_progress:
+            on_progress(f"Running ffmpeg for slider comparison video...\n")
+
+        result_code, stderr_tail = _run_ffmpeg_with_progress(
+            cmd=cmd,
+            timeout_seconds=1200,
+            duration_seconds=total_duration,
+            on_progress=on_progress,
+        )
+
+        if result_code == 0 and Path(comparison_output).exists():
+            if on_progress:
+                on_progress("COMPARISON_PROGRESS 100.0%\n")
+                on_progress(f"Slider comparison video created: {comparison_output}\n")
+            return True, comparison_output, ""
+
+        error = stderr_tail or "Unknown ffmpeg error"
+        return False, "", f"FFmpeg error: {error[:500]}"
+
+    except subprocess.TimeoutExpired:
+        return False, "", "Slider comparison video generation timed out (>20 minutes)"
+    except Exception as e:
+        return False, "", f"Error creating slider comparison video: {str(e)}"
+
+
+def create_input_vs_output_comparison_preview_image(
+    original_input_video: str,
+    upscaled_output_video: str,
+    preview_output: Optional[str] = None,
+    layout: str = "auto",
+    label_input: str = "Original",
+    label_output: str = "Upscaled",
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+    font_size: int = 32,
+    include_branding: bool = True,
+    slider_mode: bool = False,
+    slider_pass_duration_seconds: Optional[float] = None,
+    on_progress: Optional[callable] = None,
+) -> Tuple[bool, str, str]:
+    """
+    Render a fast first-frame preview image for comparison settings.
+    """
+    from .path_utils import (
+        normalize_path,
+        get_media_dimensions,
+        get_media_duration_seconds,
+        get_media_fps,
+    )
+    from .error_handling import check_ffmpeg_available
+
+    try:
+        if not check_ffmpeg_available():
+            return False, "", "FFmpeg not found in PATH"
+
+        input_path = Path(normalize_path(original_input_video))
+        output_path = Path(normalize_path(upscaled_output_video))
+
+        if not input_path.exists():
+            return False, "", f"Original input not found: {input_path}"
+        if not output_path.exists():
+            return False, "", f"Upscaled output not found: {output_path}"
+
+        in_dims = get_media_dimensions(str(input_path))
+        out_dims = get_media_dimensions(str(output_path))
+        if not in_dims or not out_dims:
+            return False, "", "Could not determine video dimensions"
+        in_w, in_h = in_dims
+        out_w, out_h = out_dims
+        base_w, base_h = _resolve_pair_base_dimensions((in_w, in_h), (out_w, out_h))
+
+        layout = normalize_comparison_layout(layout, base_w, base_h)
+        custom_w = _coerce_even_dimension(target_width)
+        custom_h = _coerce_even_dimension(target_height)
+        use_custom_size = bool(custom_w and custom_h)
+        if slider_mode:
+            final_w = custom_w if use_custom_size else base_w
+            final_h = custom_h if use_custom_size else base_h
+        else:
+            _resolved_layout, auto_w, auto_h = predict_comparison_dimensions(base_w, base_h, layout)
+            final_w = custom_w if use_custom_size else auto_w
+            final_h = custom_h if use_custom_size else auto_h
+
+        if preview_output is None:
+            preview_output = str(output_path.parent / f"{output_path.stem}_comparison_preview.png")
+        else:
+            preview_output = normalize_path(preview_output)
+        Path(preview_output).parent.mkdir(parents=True, exist_ok=True)
+
+        safe_label_input = _escape_drawtext_text(label_input)
+        safe_label_output = _escape_drawtext_text(label_output)
+        safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
+        safe_font_size = _coerce_font_size(font_size, default=32)
+
+        if slider_mode:
+            dur_out = get_media_duration_seconds(str(output_path)) or 0.0
+            dur_in = get_media_duration_seconds(str(input_path)) or 0.0
+            source_duration = max(float(dur_out), float(dur_in), 0.0)
+            try:
+                pass_duration = float(slider_pass_duration_seconds or 0.0)
+            except Exception:
+                pass_duration = 0.0
+            if pass_duration <= 0.0:
+                pass_duration = float(source_duration or 0.0)
+            pass_duration = max(0.5, pass_duration)
+            source_fps = (
+                get_media_fps(str(output_path))
+                or get_media_fps(str(input_path))
+                or 30.0
+            )
+            source_fps = max(1.0, float(source_fps))
+            pass_frames = max(1, int(round(pass_duration * source_fps)))
+            total_frames = pass_frames * 2
+            pass_duration = pass_frames / source_fps
+            total_duration = total_frames / source_fps
+
+            if layout == "vertical":
+                frame_idx_expr = "max(N-1,0)"
+                boundary_expr = (
+                    f"if(lt({frame_idx_expr},{pass_frames}),"
+                    f"{base_h}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                    f"if(lt({frame_idx_expr},{total_frames}),"
+                    f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+                )
+                edge_min = 8
+                edge_max = max(edge_min, int(base_h) - edge_min)
+                split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
+                right_drawtext = (
+                    f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+                if include_branding:
+                    right_drawtext += (
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                    )
+                right_drawtext += "[right];"
+                blend_expr = (
+                    f"if(between({boundary_expr},{edge_min},{edge_max}),"
+                    f"if(lte(abs(Y-({boundary_expr})),2),255,"
+                    f"if(lte(abs(Y-({boundary_expr})),6),20,{split_expr})),"
+                    f"{split_expr})"
+                )
+                base_filter = (
+                    f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
+                    f"{right_drawtext}"
+                    f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+                )
+            else:
+                frame_idx_expr = "max(N-1,0)"
+                boundary_expr = (
+                    f"if(lt({frame_idx_expr},{pass_frames}),"
+                    f"{base_w}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                    f"if(lt({frame_idx_expr},{total_frames}),"
+                    f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+                )
+                edge_min = 8
+                edge_max = max(edge_min, int(base_w) - edge_min)
+                split_expr = f"if(lt(X,{boundary_expr}),A,B)"
+                right_drawtext = (
+                    f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+                if include_branding:
+                    right_drawtext += (
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                    )
+                right_drawtext += "[right];"
+                blend_expr = (
+                    f"if(between({boundary_expr},{edge_min},{edge_max}),"
+                    f"if(lte(abs(X-({boundary_expr})),2),255,"
+                    f"if(lte(abs(X-({boundary_expr})),6),20,{split_expr})),"
+                    f"{split_expr})"
+                )
+                base_filter = (
+                    f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
+                    f"{right_drawtext}"
+                    f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+                )
+            if use_custom_size:
+                filter_complex = (
+                    f"{base_filter};"
+                    f"[slider]scale={final_w}:{final_h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                    f"pad={final_w}:{final_h}:(ow-iw)/2:(oh-ih)/2:black[out]"
+                )
+            else:
+                filter_complex = f"{base_filter};[slider]null[out]"
+        else:
+            if layout == "horizontal":
+                right_drawtext = (
+                    f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
+                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+                if include_branding:
+                    right_drawtext += (
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                    )
+                right_drawtext += "[right];"
+                stacked_filter = (
+                    f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
+                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
+                    f"{right_drawtext}"
+                    f"[left][right]hstack=inputs=2[stacked]"
+                )
+            else:
+                bottom_drawtext = (
+                    f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
+                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5"
+                )
+                if include_branding:
+                    bottom_drawtext += (
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
+                    )
+                bottom_drawtext += "[bottom];"
+                stacked_filter = (
+                    f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
+                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
+                    f"{bottom_drawtext}"
+                    f"[top][bottom]vstack=inputs=2[stacked]"
+                )
+            if use_custom_size:
+                filter_complex = (
+                    f"{stacked_filter};"
+                    f"[stacked]scale={final_w}:{final_h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                    f"pad={final_w}:{final_h}:(ow-iw)/2:(oh-ih)/2:black[out]"
+                )
+            else:
+                filter_complex = f"{stacked_filter};[stacked]null[out]"
+
+        if on_progress:
+            mode_txt = "slider" if slider_mode else "merged"
+            on_progress(f"Rendering {mode_txt} preview frame...\n")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-i",
+            str(output_path),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-frames:v",
+            "1",
+            str(preview_output),
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode == 0 and Path(preview_output).exists() and Path(preview_output).stat().st_size > 0:
+            return True, str(preview_output), ""
+        err = result.stderr or result.stdout or "Unknown ffmpeg error"
+        return False, "", f"FFmpeg preview error: {err[:500]}"
+    except Exception as e:
+        return False, "", f"Error creating comparison preview image: {str(e)}"
 
 
 def get_smart_comparison_layout(width: int, height: int) -> str:

@@ -40,10 +40,17 @@ from shared.video_comparison_slider import (
 )
 from shared.video_comparison_advanced import (
     create_input_vs_output_comparison_video,
+    create_input_vs_output_comparison_preview_image,
+    create_input_vs_output_slider_comparison_video,
     predict_comparison_dimensions,
 )
 from shared.frame_utils import extract_video_thumbnail
-from shared.path_utils import get_default_output_dir, get_media_dimensions
+from shared.path_utils import (
+    get_default_output_dir,
+    get_media_dimensions,
+    get_media_duration_seconds,
+)
+from shared.services.global_service import open_outputs_folder
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -494,7 +501,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                                 ("Top to Bottom", "top_to_bottom"),
                             ],
                             value="auto",
-                            info="auto chooses a layout close to 16:9 output aspect ratio.",
+                            info="Auto uses existing normal comparison layout logic.",
                         )
                         direct_compare_height = gr.Slider(
                             label="Viewer Height",
@@ -540,9 +547,25 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                     )
 
                     with gr.Row():
+                        direct_generate_slider_video = gr.Checkbox(
+                            label="Generate Animated Slider Comparison Video",
+                            value=False,
+                            info="When enabled, also generates an animated slider video (left->right then right->left).",
+                        )
+                        direct_slider_pass_duration = gr.Number(
+                            label="Slider Pass Duration (seconds)",
+                            value=0.0,
+                            precision=3,
+                            info="Default is auto from the longer uploaded video duration. One full slider cycle is 2x this value.",
+                        )
+
+                    with gr.Row():
                         direct_compare_btn = gr.Button("Render Live Slider", size="lg")
                         direct_compare_video_btn = gr.Button("Generate Comparison Video", variant="primary", size="lg")
+                        direct_compare_preview_btn = gr.Button("Preview Frame", size="lg")
                         direct_compare_clear_btn = gr.Button("Clear", size="lg")
+                    with gr.Row():
+                        direct_open_outputs_btn = gr.Button("Open Outputs Folder", size="lg")
 
                     direct_compare_status = gr.Markdown("")
 
@@ -563,6 +586,29 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         value="",
                         interactive=False,
                         visible=False,
+                    )
+                    direct_generated_slider_video = gr.Video(
+                        label="Generated Slider Comparison Video",
+                        value=None,
+                        visible=False,
+                    )
+                    direct_generated_slider_video_path = gr.Textbox(
+                        label="Generated Slider Video Path",
+                        value="",
+                        interactive=False,
+                        visible=False,
+                    )
+                    direct_preview_main_image = gr.Image(
+                        label="Preview Frame (Main Comparison)",
+                        value=None,
+                        visible=False,
+                        interactive=False,
+                    )
+                    direct_preview_slider_image = gr.Image(
+                        label="Preview Frame (Slider Comparison)",
+                        value=None,
+                        visible=False,
+                        interactive=False,
                     )
 
         with gr.TabItem("Videos Comparison Slider"):
@@ -1407,19 +1453,34 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             return "Top to Bottom"
         return "Left to Right"
 
+    def _normalize_direct_layout_choice(layout_choice: str) -> str:
+        key = str(layout_choice or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if key in {"", "auto"}:
+            return "auto"
+        if key in {"left_to_right", "horizontal", "side_by_side"}:
+            return "left_to_right"
+        if key in {"top_to_bottom", "vertical", "stacked"}:
+            return "top_to_bottom"
+        return "auto"
+
     def _resolve_direct_base_dimensions(path_a: str, path_b: str) -> Tuple[int, int, str]:
-        for source_label, candidate in (("Video B", path_b), ("Video A", path_a)):
+        candidates = []
+        for source_label, candidate in (("Video A", path_a), ("Video B", path_b)):
             current = str(candidate or "").strip()
-            if not current:
-                continue
-            if not Path(current).exists():
+            if not current or not Path(current).exists():
                 continue
             dims = get_media_dimensions(current)
             if not dims:
                 continue
             width, height = int(dims[0] or 0), int(dims[1] or 0)
             if width > 0 and height > 0:
-                return width, height, source_label
+                candidates.append((source_label, width, height))
+        if candidates:
+            best_label, best_w, best_h = max(
+                candidates,
+                key=lambda item: ((item[1] * item[2]), item[1], item[2]),
+            )
+            return best_w, best_h, best_label
         return 0, 0, ""
 
     def _next_direct_compare_run_dir(root: Path) -> Path:
@@ -1448,11 +1509,55 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
 
-    def _build_direct_comparison_output_path(path_b: str) -> Path:
-        run_dir = _next_direct_compare_run_dir(direct_compare_output_root)
+    def _direct_compare_safe_stem(path_b: str) -> str:
         stem = str(Path(str(path_b or "")).stem or "comparison").strip()
-        safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", stem).strip("._") or "comparison"
-        return run_dir / f"{safe_stem}_comparison.mp4"
+        return re.sub(r"[^a-zA-Z0-9_.-]+", "_", stem).strip("._") or "comparison"
+
+    def _build_direct_comparison_output_paths(path_b: str) -> Tuple[Path, Path, Path]:
+        run_dir = _next_direct_compare_run_dir(direct_compare_output_root)
+        safe_stem = _direct_compare_safe_stem(path_b)
+        merged_path = run_dir / f"{safe_stem}_comparison.mp4"
+        slider_path = run_dir / f"{safe_stem}_comparison_slider.mp4"
+        return run_dir, merged_path, slider_path
+
+    def _resolve_direct_duration_seconds(path_a: str, path_b: str) -> float:
+        durations = []
+        for candidate in (path_a, path_b):
+            current = str(candidate or "").strip()
+            if not current or not Path(current).exists():
+                continue
+            duration = get_media_duration_seconds(current)
+            if duration and float(duration) > 0:
+                durations.append(float(duration))
+        return max(durations) if durations else 0.0
+
+    def _build_direct_preview_image_path(
+        path_a: str,
+        path_b: str,
+        layout_choice: str,
+        width_value,
+        height_value,
+        font_size_value,
+        slider_pass_duration,
+        kind: str,
+    ) -> Path:
+        preview_dir = (Path(tempfile.gettempdir()) / "secourses_direct_compare_preview").resolve()
+        preview_dir.mkdir(parents=True, exist_ok=True)
+
+        def _sig_for(path_value: str) -> str:
+            p = Path(str(path_value or "").strip())
+            try:
+                st = p.stat()
+                return f"{p.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+            except Exception:
+                return str(p)
+
+        signature = (
+            f"{_sig_for(path_a)}|{_sig_for(path_b)}|{layout_choice}|{width_value}|{height_value}|"
+            f"{font_size_value}|{slider_pass_duration}|{kind}"
+        )
+        token = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:24]
+        return preview_dir / f"{token}_{kind}.png"
 
     def _direct_geometry_details(path_a, path_b, layout_choice, width_value, height_value):
         pa = str(path_a or "").strip()
@@ -1488,10 +1593,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 "horizontal",
             )
 
+        layout_value = _normalize_direct_layout_choice(layout_choice)
         resolved_layout, auto_w, auto_h = predict_comparison_dimensions(
             base_w,
             base_h,
-            str(layout_choice or "auto"),
+            layout_value,
         )
 
         custom_w = _coerce_even_dimension(width_value)
@@ -1521,10 +1627,15 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             0,
             0,
         )
+        duration_seconds = _resolve_direct_duration_seconds(
+            str(path_a or "").strip(),
+            str(path_b or "").strip(),
+        )
         return (
             gr.update(value=auto_w if auto_w > 0 else 0),
             gr.update(value=auto_h if auto_h > 0 else 0),
             gr.update(value=summary),
+            gr.update(value=round(duration_seconds, 3) if duration_seconds > 0 else 0.0),
         )
 
     def _refresh_direct_geometry(path_a, path_b, layout_choice, width_value, height_value):
@@ -1551,28 +1662,28 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
     direct_a_upload_evt.then(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
-        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
     direct_b_upload_evt.then(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
-        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
 
     direct_video_a_path.change(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
-        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
     direct_video_b_path.change(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
-        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
     direct_compare_layout.change(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
-        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry],
+        outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
     direct_compare_width.change(
         fn=_refresh_direct_geometry,
@@ -1625,6 +1736,8 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         width_value,
         height_value,
         font_size_value,
+        generate_slider_video,
+        slider_pass_duration_value,
         progress=gr.Progress(track_tqdm=False),
     ):
         progress(0.0, desc="Preparing comparison merge...")
@@ -1637,6 +1750,8 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 gr.update(value=None, visible=False),
                 gr.update(value="", visible=False),
                 gr.update(value="Set Video A and Video B to auto-calculate final resolution and aspect ratio."),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
             )
         if not Path(pa).exists() or not Path(pb).exists():
             progress(1.0, desc="Comparison merge aborted")
@@ -1645,9 +1760,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 gr.update(value=None, visible=False),
                 gr.update(value="", visible=False),
                 gr.update(value="One or both video paths do not exist."),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
             )
 
-        summary, _auto_w, _auto_h, final_w, final_h, resolved_layout = _direct_geometry_details(
+        summary, auto_w, auto_h, final_w, final_h, resolved_layout = _direct_geometry_details(
             pa,
             pb,
             layout_choice,
@@ -1661,19 +1778,45 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 gr.update(value=None, visible=False),
                 gr.update(value="", visible=False),
                 gr.update(value=summary),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
             )
 
+        main_layout_value = _normalize_direct_layout_choice(layout_choice)
+        slider_layout_value = "left_to_right"
+        base_w, base_h, _ = _resolve_direct_base_dimensions(pa, pb)
         custom_w = _coerce_even_dimension(width_value)
         custom_h = _coerce_even_dimension(height_value)
         use_custom_size = bool(custom_w and custom_h)
+        manual_size_override = bool(
+            use_custom_size and (
+                custom_w != int(auto_w or 0) or custom_h != int(auto_h or 0)
+            )
+        )
+        slider_final_w = custom_w if manual_size_override else int(base_w or 0)
+        slider_final_h = custom_h if manual_size_override else int(base_h or 0)
         label_font_size = _coerce_font_size(font_size_value, default=32)
+        slider_enabled = bool(generate_slider_video)
+        try:
+            slider_pass_duration = float(slider_pass_duration_value or 0.0)
+        except Exception:
+            slider_pass_duration = 0.0
+        if slider_pass_duration <= 0.0:
+            slider_pass_duration = _resolve_direct_duration_seconds(pa, pb)
+        if slider_enabled:
+            slider_pass_duration = max(0.5, float(slider_pass_duration or 0.0))
 
         left_label = str(label_a or "").strip() or "Video A"
         right_label = str(label_b or "").strip() or "Video B"
         progress(0.02, desc="Starting ffmpeg merge...")
-        comparison_output_path = _build_direct_comparison_output_path(pb)
+        _run_dir, comparison_output_path, slider_output_path = _build_direct_comparison_output_paths(pb)
 
         progress_pattern = re.compile(r"COMPARISON_PROGRESS\s+([0-9]+(?:\.[0-9]+)?)%")
+        progress_stage = {
+            "name": "main",
+            "offset": 0.0,
+            "span": 0.5 if slider_enabled else 1.0,
+        }
 
         def _direct_progress_logger(msg: str):
             text = str(msg or "").strip()
@@ -1684,21 +1827,26 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             if match:
                 try:
                     pct = max(0.0, min(100.0, float(match.group(1))))
-                    progress(pct / 100.0, desc=f"Merging comparison video... {pct:.1f}%")
+                    scaled = progress_stage["offset"] + (progress_stage["span"] * (pct / 100.0))
+                    if progress_stage["name"] == "slider":
+                        progress(scaled, desc=f"Merging slider comparison video... {pct:.1f}%")
+                    else:
+                        progress(scaled, desc=f"Merging comparison video... {pct:.1f}%")
                 except Exception:
                     pass
             elif "running ffmpeg" in text.lower():
-                progress(0.03, desc="Running ffmpeg merge...")
+                desc = "Running ffmpeg slider merge..." if progress_stage["name"] == "slider" else "Running ffmpeg merge..."
+                progress(progress_stage["offset"] + 0.03 * progress_stage["span"], desc=desc)
 
         success, comparison_path, error_msg = create_input_vs_output_comparison_video(
             original_input_video=pa,
             upscaled_output_video=pb,
             comparison_output=str(comparison_output_path),
-            layout=str(layout_choice or "auto"),
+            layout=main_layout_value,
             label_input=left_label,
             label_output=right_label,
-            target_width=custom_w if use_custom_size else None,
-            target_height=custom_h if use_custom_size else None,
+            target_width=custom_w if manual_size_override else None,
+            target_height=custom_h if manual_size_override else None,
             font_size=label_font_size,
             include_branding=False,
             on_progress=_direct_progress_logger,
@@ -1712,13 +1860,66 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 gr.update(value=None, visible=False),
                 gr.update(value="", visible=False),
                 gr.update(value=summary),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
             )
+
+        slider_path = ""
+        if slider_enabled:
+            progress_stage["name"] = "slider"
+            progress_stage["offset"] = 0.5
+            progress_stage["span"] = 0.5
+            progress(0.52, desc="Starting animated slider merge...")
+            slider_ok, slider_path, slider_err = create_input_vs_output_slider_comparison_video(
+                original_input_video=pa,
+                upscaled_output_video=pb,
+                comparison_output=str(slider_output_path),
+                layout=slider_layout_value,
+                label_input=left_label,
+                label_output=right_label,
+                target_width=custom_w if manual_size_override else None,
+                target_height=custom_h if manual_size_override else None,
+                font_size=label_font_size,
+                include_branding=False,
+                slider_pass_duration_seconds=slider_pass_duration,
+                on_progress=_direct_progress_logger,
+            )
+            if not slider_ok or not slider_path:
+                err = str(slider_err or "Slider comparison video generation failed.")
+                progress(1.0, desc="Slider merge failed")
+                return (
+                    gr.update(value=f"Main comparison ready, but slider comparison failed: {err}"),
+                    gr.update(value=str(comparison_path), visible=True),
+                    gr.update(value=str(comparison_path), visible=True),
+                    gr.update(value=summary),
+                    gr.update(value=None, visible=False),
+                    gr.update(value="", visible=False),
+                )
 
         layout_text = _layout_label(resolved_layout)
         run_folder_name = Path(comparison_path).parent.name
-        status = (
-            f"Comparison video ready: `{Path(comparison_path).name}` "
-            f"({layout_text}, {final_w}x{final_h}, folder {run_folder_name})"
+        if slider_enabled and slider_path:
+            status = (
+                f"Comparison videos ready in folder `{run_folder_name}`: "
+                f"`{Path(comparison_path).name}` + `{Path(slider_path).name}` "
+                f"(main {layout_text} {final_w}x{final_h}, "
+                f"slider Left to Right {slider_final_w}x{slider_final_h}, "
+                f"slider pass {slider_pass_duration:.3f}s)"
+            )
+        else:
+            status = (
+                f"Comparison video ready: `{Path(comparison_path).name}` "
+                f"({layout_text}, {final_w}x{final_h}, folder {run_folder_name})"
+            )
+        slider_video_update = (
+            gr.update(value=str(slider_path), visible=True)
+            if slider_path
+            else gr.update(value=None, visible=False)
+        )
+        slider_path_update = (
+            gr.update(value=str(slider_path), visible=True)
+            if slider_path
+            else gr.update(value="", visible=False)
         )
         progress(1.0, desc="Comparison merge complete")
         return (
@@ -1726,6 +1927,158 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             gr.update(value=str(comparison_path), visible=True),
             gr.update(value=str(comparison_path), visible=True),
             gr.update(value=summary),
+            slider_video_update,
+            slider_path_update,
+        )
+
+    def _preview_direct_comparison_frames(
+        path_a,
+        path_b,
+        label_a,
+        label_b,
+        layout_choice,
+        width_value,
+        height_value,
+        font_size_value,
+        generate_slider_video,
+        slider_pass_duration_value,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        progress(0.0, desc="Preparing preview frame...")
+        pa = str(path_a or "").strip()
+        pb = str(path_b or "").strip()
+        if not pa or not pb:
+            progress(1.0, desc="Preview aborted")
+            return (
+                gr.update(value="Select both videos first."),
+                gr.update(value="Set Video A and Video B to auto-calculate final resolution and aspect ratio."),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+        if not Path(pa).exists() or not Path(pb).exists():
+            progress(1.0, desc="Preview aborted")
+            return (
+                gr.update(value="One or both video paths do not exist."),
+                gr.update(value="One or both video paths do not exist."),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+
+        summary, auto_w, auto_h, final_w, final_h, resolved_layout = _direct_geometry_details(
+            pa,
+            pb,
+            layout_choice,
+            width_value,
+            height_value,
+        )
+        if final_w <= 0 or final_h <= 0:
+            progress(1.0, desc="Preview aborted")
+            return (
+                gr.update(value="Could not determine preview resolution."),
+                gr.update(value=summary),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+
+        custom_w = _coerce_even_dimension(width_value)
+        custom_h = _coerce_even_dimension(height_value)
+        use_custom_size = bool(custom_w and custom_h)
+        manual_size_override = bool(
+            use_custom_size and (
+                custom_w != int(auto_w or 0) or custom_h != int(auto_h or 0)
+            )
+        )
+        label_font_size = _coerce_font_size(font_size_value, default=32)
+        slider_enabled = bool(generate_slider_video)
+        try:
+            slider_pass_duration = float(slider_pass_duration_value or 0.0)
+        except Exception:
+            slider_pass_duration = 0.0
+        if slider_pass_duration <= 0.0:
+            slider_pass_duration = _resolve_direct_duration_seconds(pa, pb)
+        slider_pass_duration = max(0.5, float(slider_pass_duration or 0.5))
+
+        left_label = str(label_a or "").strip() or "Video A"
+        right_label = str(label_b or "").strip() or "Video B"
+        main_layout_value = _normalize_direct_layout_choice(layout_choice)
+        slider_layout_value = "left_to_right"
+
+        main_preview_path = _build_direct_preview_image_path(
+            path_a=pa,
+            path_b=pb,
+            layout_choice=main_layout_value,
+            width_value=width_value,
+            height_value=height_value,
+            font_size_value=label_font_size,
+            slider_pass_duration=slider_pass_duration,
+            kind="main",
+        )
+        progress(0.2, desc="Rendering main preview frame...")
+        main_ok, main_path, main_err = create_input_vs_output_comparison_preview_image(
+            original_input_video=pa,
+            upscaled_output_video=pb,
+            preview_output=str(main_preview_path),
+            layout=main_layout_value,
+            label_input=left_label,
+            label_output=right_label,
+            target_width=custom_w if manual_size_override else None,
+            target_height=custom_h if manual_size_override else None,
+            font_size=label_font_size,
+            include_branding=False,
+            slider_mode=False,
+        )
+        if not main_ok or not main_path:
+            progress(1.0, desc="Preview failed")
+            err = str(main_err or "Main preview generation failed.")
+            return (
+                gr.update(value=f"Preview failed: {err}"),
+                gr.update(value=summary),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+
+        slider_preview_update = gr.update(value=None, visible=False)
+        status_text = "Preview frame ready."
+        if slider_enabled:
+            slider_preview_path = _build_direct_preview_image_path(
+                path_a=pa,
+                path_b=pb,
+                layout_choice=slider_layout_value,
+                width_value=width_value,
+                height_value=height_value,
+                font_size_value=label_font_size,
+                slider_pass_duration=slider_pass_duration,
+                kind="slider",
+            )
+            progress(0.7, desc="Rendering slider preview frame...")
+            slider_ok, slider_path, slider_err = create_input_vs_output_comparison_preview_image(
+                original_input_video=pa,
+                upscaled_output_video=pb,
+                preview_output=str(slider_preview_path),
+                layout=slider_layout_value,
+                label_input=left_label,
+                label_output=right_label,
+                target_width=custom_w if manual_size_override else None,
+                target_height=custom_h if manual_size_override else None,
+                font_size=label_font_size,
+                include_branding=False,
+                slider_mode=True,
+                slider_pass_duration_seconds=slider_pass_duration,
+            )
+            if slider_ok and slider_path:
+                slider_preview_update = gr.update(value=str(slider_path), visible=True)
+                status_text = "Preview frames ready (main + slider)."
+            else:
+                status_text = f"Main preview ready, slider preview failed: {str(slider_err or 'unknown error')}"
+
+        layout_text = _layout_label(resolved_layout)
+        status_text = f"{status_text} ({layout_text}, {final_w}x{final_h})"
+        progress(1.0, desc="Preview complete")
+        return (
+            gr.update(value=status_text),
+            gr.update(value=summary),
+            gr.update(value=str(main_path), visible=True),
+            slider_preview_update,
         )
 
     def _clear_direct_video_compare():
@@ -1738,12 +2091,25 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             0,
             0,
             32,
+            False,
+            0.0,
             gr.update(value=""),
             gr.update(value="", visible=False),
             gr.update(value=None, visible=False),
             gr.update(value="", visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
             gr.update(value="Set Video A and Video B to auto-calculate final resolution and aspect ratio."),
         )
+
+    def _open_direct_compare_outputs(main_video_path, slider_video_path):
+        candidates = [str(slider_video_path or "").strip(), str(main_video_path or "").strip()]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return open_outputs_folder(str(Path(candidate).parent))
+        return open_outputs_folder(str(direct_compare_output_root))
 
     direct_compare_btn.click(
         fn=_build_direct_video_compare,
@@ -1761,12 +2127,37 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_width,
             direct_compare_height_px,
             direct_compare_font_size,
+            direct_generate_slider_video,
+            direct_slider_pass_duration,
         ],
         outputs=[
             direct_compare_status,
             direct_generated_video,
             direct_generated_video_path,
             direct_compare_geometry,
+            direct_generated_slider_video,
+            direct_generated_slider_video_path,
+        ],
+    )
+    direct_compare_preview_btn.click(
+        fn=_preview_direct_comparison_frames,
+        inputs=[
+            direct_video_a_path,
+            direct_video_b_path,
+            direct_video_a_label,
+            direct_video_b_label,
+            direct_compare_layout,
+            direct_compare_width,
+            direct_compare_height_px,
+            direct_compare_font_size,
+            direct_generate_slider_video,
+            direct_slider_pass_duration,
+        ],
+        outputs=[
+            direct_compare_status,
+            direct_compare_geometry,
+            direct_preview_main_image,
+            direct_preview_slider_image,
         ],
     )
     direct_compare_clear_btn.click(
@@ -1780,12 +2171,23 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_width,
             direct_compare_height_px,
             direct_compare_font_size,
+            direct_generate_slider_video,
+            direct_slider_pass_duration,
             direct_compare_status,
             direct_comparison_html,
             direct_generated_video,
             direct_generated_video_path,
+            direct_generated_slider_video,
+            direct_generated_slider_video_path,
+            direct_preview_main_image,
+            direct_preview_slider_image,
             direct_compare_geometry,
         ],
+    )
+    direct_open_outputs_btn.click(
+        fn=_open_direct_compare_outputs,
+        inputs=[direct_generated_video_path, direct_generated_slider_video_path],
+        outputs=[direct_compare_status],
     )
 
     multi_video_upload.change(

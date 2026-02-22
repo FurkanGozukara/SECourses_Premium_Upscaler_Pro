@@ -330,10 +330,9 @@ def gan_tab(
             )
 
         with gr.Column(scale=2):
-            status_box = gr.Markdown(value="Ready for processing.", visible=False, elem_classes=["runtime-status-box"])
-            progress_indicator = gr.Markdown(value="", visible=True, elem_classes=["runtime-progress-box"])
-
             gr.Markdown("### Output / Actions")
+            status_box = gr.Markdown(value="Ready for processing.", visible=False, elem_classes=["runtime-status-box"])
+            progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
 
             with gr.Group():
                 _upscale_factor_default = _value("upscale_factor", 4.0)
@@ -742,6 +741,58 @@ def gan_tab(
         )
         return gr.update(value=indicator_html, visible=True)
 
+    def _extract_update_value(update_obj):
+        try:
+            if isinstance(update_obj, dict):
+                return update_obj.get("value")
+        except Exception:
+            pass
+        return None
+
+    def _compact_single_line(text: Any, max_len: int = 120) -> str:
+        raw = str(text or "")
+        raw = " ".join(raw.replace("\r", " ").replace("\n", " ").split())
+        if len(raw) > max_len:
+            raw = raw[: max(0, max_len - 3)].rstrip() + "..."
+        return raw
+
+    def _log_tail_line(logs: Any) -> str:
+        if not isinstance(logs, str):
+            return ""
+        for line in reversed(logs.splitlines()):
+            compact = _compact_single_line(line)
+            if compact:
+                return compact
+        return ""
+
+    def _fallback_progress_update(status, logs):
+        status_text = _extract_update_value(status) if isinstance(status, dict) else status
+        status_text = str(status_text or "").strip()
+        log_tail = _log_tail_line(logs)
+        status_lc = status_text.lower()
+        log_lc = log_tail.lower()
+        terminal_tokens = (
+            "complete",
+            "completed",
+            "failed",
+            "error",
+            "critical",
+            "cancel",
+            "out of vram",
+            "oom",
+            "timed out",
+            "timeout",
+            "aborted",
+        )
+        is_terminal = any(tok in status_lc for tok in terminal_tokens) or any(
+            tok in log_lc for tok in ("critical error", "processing failed", "cancelled", "out of vram")
+        )
+        if (status_text or log_tail) and not is_terminal:
+            title = _compact_single_line(status_text or "RUNNING: GAN upscaling in progress", max_len=96)
+            subtitle = log_tail or "Processing..."
+            return _queue_status_indicator(title, subtitle, spinning=True)
+        return gr.update(value="", visible=False)
+
     def _expand_service_payload(payload, live_state):
         merged = merge_payload_state(payload, live_state)
         safe_state = live_state if isinstance(live_state, dict) else {}
@@ -768,7 +819,7 @@ def gan_tab(
         return (
             status,
             logs,
-            prog_upd if prog_upd is not None else gr.update(value="", visible=False),
+            prog_upd if prog_upd is not None else _fallback_progress_update(status, logs),
             img_upd if img_upd is not None else gr.update(value=None, visible=False),
             vid_upd if vid_upd is not None else gr.update(value=None, visible=False),
             last_txt,
@@ -779,6 +830,27 @@ def gan_tab(
             chunk_gallery_upd,
             chunk_preview_upd,
             state_out,
+        )
+
+    def _starting_runtime_output(state, action_label: str):
+        safe_state = state or {}
+        title = f"{action_label} started"
+        subtitle = "Initializing runtime and preparing input..."
+        chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)
+        return (
+            gr.update(value=title),
+            gr.update(value=f"{action_label} requested. Preparing backend..."),
+            _queue_status_indicator(title, subtitle, spinning=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Initializing...",
+            gr.update(value=None),
+            gr.update(value="", visible=False),
+            gr.update(value=[], visible=False),
+            chunk_status_upd,
+            chunk_gallery_upd,
+            chunk_preview_upd,
+            safe_state,
         )
 
     def _queued_waiting_output(state, ticket_id: str, position: int):
@@ -857,6 +929,8 @@ def gan_tab(
         acquired_slot = queue_manager.is_active(ticket.job_id)
 
         try:
+            yield _starting_runtime_output(live_state, "Upscale")
+
             if not queue_enabled:
                 if not acquired_slot:
                     queue_manager.cancel_waiting([ticket.job_id])
@@ -911,6 +985,7 @@ def gan_tab(
         live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
         queued_state = snapshot_queue_state(live_state)
         queued_global_settings = snapshot_global_settings(global_settings)
+        yield _starting_runtime_output(live_state, "Preview")
         for payload in service["run_action"](
             upload,
             *args[:-1],

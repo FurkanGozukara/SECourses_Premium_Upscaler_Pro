@@ -465,10 +465,9 @@ def flashvsr_tab(
         
         # Right Column: Output & Controls
         with gr.Column(scale=2):
-            status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
-            progress_indicator = gr.Markdown(value="", visible=True, elem_classes=["runtime-progress-box"])
-
             gr.Markdown("####  Output & Actions")
+            status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
+            progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
 
             with gr.Group():
                 _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
@@ -1069,6 +1068,15 @@ def flashvsr_tab(
             raw = raw[: max(0, max_len - 3)].rstrip() + "..."
         return raw
 
+    def _log_tail_line(logs: Any) -> str:
+        if not isinstance(logs, str):
+            return ""
+        for line in reversed(logs.splitlines()):
+            compact = _compact_single_line(line)
+            if compact:
+                return compact
+        return ""
+
     def _batch_gallery_update_from_state(state):
         outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
         if not isinstance(outputs, list):
@@ -1107,10 +1115,13 @@ def flashvsr_tab(
         status, logs, vid_upd, img_upd, slider_upd, html_upd, state_out = merged
         status_text = _extract_update_value(status) if isinstance(status, dict) else status
         status_text = str(status_text or "").strip()
+        log_tail = _log_tail_line(logs)
         status_lc = status_text.lower()
+        log_lc = log_tail.lower()
 
         terminal_tokens = (
             "complete",
+            "completed",
             "failed",
             "error",
             "critical",
@@ -1118,20 +1129,27 @@ def flashvsr_tab(
             "no result",
             "out of vram",
             "oom",
-            "missing",
-            "insufficient",
+            "timed out",
+            "timeout",
+            "aborted",
+            "input path missing",
+            "input missing",
+            "batch input folder missing",
+            "resume folder not found",
+            "resume input not found",
+            "resume unavailable",
+            "ffmpeg not found",
+            "max resolution preprocess failed",
+            "insufficient disk space",
         )
-        is_terminal = any(tok in status_lc for tok in terminal_tokens)
-        if status_text and not is_terminal:
-            subtitle = "Processing..."
-            if isinstance(logs, str):
-                for line in reversed(logs.splitlines()):
-                    line = _compact_single_line(line)
-                    if line:
-                        subtitle = line
-                        break
-            subtitle = _compact_single_line(subtitle)
-            progress_update = _queue_status_indicator(status_text, subtitle, spinning=True)
+        is_terminal = any(tok in status_lc for tok in terminal_tokens) or any(
+            tok in log_lc for tok in ("critical error", "processing failed", "cancelled", "out of vram")
+        )
+
+        if (status_text or log_tail) and not is_terminal:
+            title = _compact_single_line(status_text or "FlashVSR+ processing...", max_len=96)
+            subtitle = log_tail or "Processing..."
+            progress_update = _queue_status_indicator(title, subtitle, spinning=True)
         else:
             progress_update = gr.update(value="", visible=False)
 
@@ -1146,6 +1164,23 @@ def flashvsr_tab(
             html_upd if html_upd is not None else gr.update(value="", visible=False),
             _batch_gallery_update_from_state(state_out),
             state_out,
+        )
+
+    def _starting_runtime_output(state, action_label: str):
+        safe_state = state or {}
+        title = f"{action_label} started"
+        subtitle = "Initializing runtime and preparing input..."
+        return (
+            gr.update(value=title),
+            gr.update(value=f"{action_label} requested. Preparing backend..."),
+            _queue_status_indicator(title, subtitle, spinning=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Initializing...",
+            gr.update(value=None),
+            gr.update(value="", visible=False),
+            _batch_gallery_update_from_state(safe_state),
+            safe_state,
         )
 
     def _queued_waiting_output(state, ticket_id: str, position: int):
@@ -1212,6 +1247,8 @@ def flashvsr_tab(
         acquired_slot = queue_manager.is_active(ticket.job_id)
 
         try:
+            yield _starting_runtime_output(live_state, "Upscale")
+
             if not queue_enabled:
                 if not acquired_slot:
                     queue_manager.cancel_waiting([ticket.job_id])
@@ -1266,6 +1303,7 @@ def flashvsr_tab(
         live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
         queued_state = snapshot_queue_state(live_state)
         queued_global_settings = snapshot_global_settings(global_settings)
+        yield _starting_runtime_output(live_state, "Preview")
         for payload in service["run_action"](
             args[0],
             *args[1:-1],

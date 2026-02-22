@@ -55,6 +55,16 @@ def _coerce_font_size(value: Any, default: int = 32) -> int:
     return max(8, min(200, size))
 
 
+def _coerce_slowmo_factor(value: Any, default: float = 1.0) -> float:
+    try:
+        factor = float(value)
+    except Exception:
+        factor = float(default)
+    if factor != factor or factor <= 0.0:
+        factor = float(default)
+    return max(0.1, min(16.0, factor))
+
+
 def _resolve_pair_base_dimensions(
     dims_a: Tuple[int, int],
     dims_b: Tuple[int, int],
@@ -988,6 +998,7 @@ def create_input_vs_output_slider_comparison_video(
     font_size: int = 32,
     include_branding: bool = True,
     slider_pass_duration_seconds: Optional[float] = None,
+    slow_motion_factor: Optional[float] = 1.0,
 ) -> Tuple[bool, str, str]:
     """
     Create an animated slider comparison video (left->right then right->left).
@@ -995,6 +1006,9 @@ def create_input_vs_output_slider_comparison_video(
     The output contains two passes:
     1) Reveal from left to right (or top to bottom for vertical layout)
     2) Reverse back to the start
+
+    `slider_pass_duration_seconds` is treated as the base full-cycle duration at 1x.
+    `slow_motion_factor` scales that duration and lowers output fps proportionally.
     """
     from .path_utils import (
         normalize_path,
@@ -1041,27 +1055,31 @@ def create_input_vs_output_slider_comparison_video(
         dur_in = get_media_duration_seconds(str(input_path)) or 0.0
         source_duration = max(float(dur_out), float(dur_in), 0.0)
         try:
-            pass_duration = float(slider_pass_duration_seconds or 0.0)
+            base_cycle_duration = float(slider_pass_duration_seconds or 0.0)
         except Exception:
-            pass_duration = 0.0
-        if pass_duration <= 0.0:
-            pass_duration = float(source_duration or 0.0)
-        pass_duration = max(0.5, pass_duration)
+            base_cycle_duration = 0.0
+        if base_cycle_duration <= 0.0:
+            base_cycle_duration = float(source_duration or 0.0)
+        base_cycle_duration = max(0.5, base_cycle_duration)
         source_fps = (
             get_media_fps(str(output_path))
             or get_media_fps(str(input_path))
             or 30.0
         )
         source_fps = max(1.0, float(source_fps))
-        pass_frames = max(1, int(round(pass_duration * source_fps)))
-        total_frames = pass_frames * 2
-        pass_duration = pass_frames / source_fps
-        total_duration = total_frames / source_fps
+        slowmo_factor = _coerce_slowmo_factor(slow_motion_factor, default=1.0)
+        timeline_fps = max(1.0, source_fps / slowmo_factor)
+        total_duration = max(0.5, base_cycle_duration * slowmo_factor)
+        total_frames = max(2, int(round(total_duration * timeline_fps)))
+        forward_frames = max(1, total_frames // 2)
+        backward_frames = max(1, total_frames - forward_frames)
+        effective_pass_duration = total_duration / 2.0
+        total_duration = total_frames / timeline_fps
 
         if on_progress:
             on_progress(
                 f"Creating slider comparison video ({layout} layout, {final_w}x{final_h}, "
-                f"pass={pass_duration:.2f}s)...\n"
+                f"pass={effective_pass_duration:.2f}s, slowmo={slowmo_factor:.3f}x, fps={timeline_fps:.3f})...\n"
             )
 
         safe_label_input = _escape_drawtext_text(label_input)
@@ -1072,22 +1090,23 @@ def create_input_vs_output_slider_comparison_video(
         if layout == "vertical":
             frame_idx_expr = "max(N-1,0)"
             boundary_expr = (
-                f"if(lt({frame_idx_expr},{pass_frames}),"
-                f"{base_h}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                f"if(lt({frame_idx_expr},{forward_frames}),"
+                f"{base_h}*({frame_idx_expr}/{float(forward_frames):.6f}),"
                 f"if(lt({frame_idx_expr},{total_frames}),"
-                f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+                f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
             edge_min = 8
             edge_max = max(edge_min, int(base_h) - edge_min)
             split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
             right_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
                 right_drawtext += (
-                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:"
+                    f"y={safe_font_size + 22}:"
                     f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
                 )
             right_drawtext += "[right];"
@@ -1099,7 +1118,7 @@ def create_input_vs_output_slider_comparison_video(
                 f"{split_expr})"
             )
             base_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
@@ -1108,22 +1127,23 @@ def create_input_vs_output_slider_comparison_video(
         else:
             frame_idx_expr = "max(N-1,0)"
             boundary_expr = (
-                f"if(lt({frame_idx_expr},{pass_frames}),"
-                f"{base_w}*({frame_idx_expr}/{float(pass_frames):.6f}),"
+                f"if(lt({frame_idx_expr},{forward_frames}),"
+                f"{base_w}*({frame_idx_expr}/{float(forward_frames):.6f}),"
                 f"if(lt({frame_idx_expr},{total_frames}),"
-                f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(pass_frames):.6f}),0))"
+                f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
             edge_min = 8
             edge_max = max(edge_min, int(base_w) - edge_min)
             split_expr = f"if(lt(X,{boundary_expr}),A,B)"
             right_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
                 right_drawtext += (
-                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                    f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:"
+                    f"y={safe_font_size + 22}:"
                     f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
                 )
             right_drawtext += "[right];"
@@ -1135,7 +1155,7 @@ def create_input_vs_output_slider_comparison_video(
                 f"{split_expr})"
             )
             base_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
@@ -1179,7 +1199,7 @@ def create_input_vs_output_slider_comparison_video(
             "-pix_fmt",
             "yuv420p",
             "-r",
-            f"{source_fps:.6f}",
+            f"{timeline_fps:.6f}",
             "-c:a",
             "aac",
             "-b:a",
@@ -1318,12 +1338,13 @@ def create_input_vs_output_comparison_preview_image(
                 split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
                 right_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
                     right_drawtext += (
-                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:"
+                        f"y={safe_font_size + 22}:"
                         f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
                     )
                 right_drawtext += "[right];"
@@ -1353,12 +1374,13 @@ def create_input_vs_output_comparison_preview_image(
                 split_expr = f"if(lt(X,{boundary_expr}),A,B)"
                 right_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
                     right_drawtext += (
-                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:y=10:"
+                        f",drawtext=text='{safe_brand_text}':x=w-tw-{COMPARISON_BRAND_RIGHT_PAD}:"
+                        f"y={safe_font_size + 22}:"
                         f"fontsize={safe_font_size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=5"
                     )
                 right_drawtext += "[right];"

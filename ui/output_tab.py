@@ -553,10 +553,16 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                             info="When enabled, also generates an animated slider video (left->right then right->left).",
                         )
                         direct_slider_pass_duration = gr.Number(
-                            label="Slider Pass Duration (seconds)",
+                            label="Slider Duration (seconds)",
                             value=0.0,
                             precision=3,
-                            info="Default is auto from the longer uploaded video duration. One full slider cycle is 2x this value.",
+                            info="Default is auto from the longer uploaded video duration. This is the full left->right->left cycle at 1.0x speed; Slow Motion scales it.",
+                        )
+                        direct_slider_slowmo = gr.Number(
+                            label="Slider Slow Motion (x)",
+                            value=1.0,
+                            precision=3,
+                            info="1.0 = normal speed. Higher values reduce FPS and extend slider duration proportionally.",
                         )
 
                     with gr.Row():
@@ -1442,6 +1448,15 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             size = int(default)
         return max(8, min(200, size))
 
+    def _coerce_slowmo_factor(value, default: float = 1.0) -> float:
+        try:
+            factor = float(value)
+        except Exception:
+            factor = float(default)
+        if factor != factor or factor <= 0.0:
+            factor = float(default)
+        return max(0.1, min(16.0, factor))
+
     def _format_ratio(width: int, height: int) -> str:
         if width <= 0 or height <= 0:
             return "unknown"
@@ -1539,6 +1554,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         height_value,
         font_size_value,
         slider_pass_duration,
+        slider_slowmo_factor,
         kind: str,
     ) -> Path:
         preview_dir = (Path(tempfile.gettempdir()) / "secourses_direct_compare_preview").resolve()
@@ -1554,7 +1570,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
         signature = (
             f"{_sig_for(path_a)}|{_sig_for(path_b)}|{layout_choice}|{width_value}|{height_value}|"
-            f"{font_size_value}|{slider_pass_duration}|{kind}"
+            f"{font_size_value}|{slider_pass_duration}|{slider_slowmo_factor}|{kind}"
         )
         token = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:24]
         return preview_dir / f"{token}_{kind}.png"
@@ -1738,6 +1754,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         font_size_value,
         generate_slider_video,
         slider_pass_duration_value,
+        slider_slowmo_factor_value,
         progress=gr.Progress(track_tqdm=False),
     ):
         progress(0.0, desc="Preparing comparison merge...")
@@ -1805,6 +1822,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             slider_pass_duration = _resolve_direct_duration_seconds(pa, pb)
         if slider_enabled:
             slider_pass_duration = max(0.5, float(slider_pass_duration or 0.0))
+        slider_slowmo_factor = _coerce_slowmo_factor(slider_slowmo_factor_value, default=1.0)
+        effective_slider_cycle_duration = slider_pass_duration * slider_slowmo_factor
+        effective_slider_pass_duration = effective_slider_cycle_duration / 2.0
 
         left_label = str(label_a or "").strip() or "Video A"
         right_label = str(label_b or "").strip() or "Video B"
@@ -1882,6 +1902,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 font_size=label_font_size,
                 include_branding=False,
                 slider_pass_duration_seconds=slider_pass_duration,
+                slow_motion_factor=slider_slowmo_factor,
                 on_progress=_direct_progress_logger,
             )
             if not slider_ok or not slider_path:
@@ -1904,7 +1925,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 f"`{Path(comparison_path).name}` + `{Path(slider_path).name}` "
                 f"(main {layout_text} {final_w}x{final_h}, "
                 f"slider Left to Right {slider_final_w}x{slider_final_h}, "
-                f"slider pass {slider_pass_duration:.3f}s)"
+                f"slider pass {effective_slider_pass_duration:.3f}s, "
+                f"slider cycle {effective_slider_cycle_duration:.3f}s, "
+                f"slowmo {slider_slowmo_factor:.3f}x)"
             )
         else:
             status = (
@@ -1942,6 +1965,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         font_size_value,
         generate_slider_video,
         slider_pass_duration_value,
+        slider_slowmo_factor_value,
         progress=gr.Progress(track_tqdm=False),
     ):
         progress(0.0, desc="Preparing preview frame...")
@@ -1997,6 +2021,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         if slider_pass_duration <= 0.0:
             slider_pass_duration = _resolve_direct_duration_seconds(pa, pb)
         slider_pass_duration = max(0.5, float(slider_pass_duration or 0.5))
+        slider_slowmo_factor = _coerce_slowmo_factor(slider_slowmo_factor_value, default=1.0)
 
         left_label = str(label_a or "").strip() or "Video A"
         right_label = str(label_b or "").strip() or "Video B"
@@ -2011,6 +2036,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             height_value=height_value,
             font_size_value=label_font_size,
             slider_pass_duration=slider_pass_duration,
+            slider_slowmo_factor=slider_slowmo_factor,
             kind="main",
         )
         progress(0.2, desc="Rendering main preview frame...")
@@ -2048,6 +2074,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 height_value=height_value,
                 font_size_value=label_font_size,
                 slider_pass_duration=slider_pass_duration,
+                slider_slowmo_factor=slider_slowmo_factor,
                 kind="slider",
             )
             progress(0.7, desc="Rendering slider preview frame...")
@@ -2093,6 +2120,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             32,
             False,
             0.0,
+            1.0,
             gr.update(value=""),
             gr.update(value="", visible=False),
             gr.update(value=None, visible=False),
@@ -2129,6 +2157,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_font_size,
             direct_generate_slider_video,
             direct_slider_pass_duration,
+            direct_slider_slowmo,
         ],
         outputs=[
             direct_compare_status,
@@ -2152,6 +2181,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_font_size,
             direct_generate_slider_video,
             direct_slider_pass_duration,
+            direct_slider_slowmo,
         ],
         outputs=[
             direct_compare_status,
@@ -2173,6 +2203,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_font_size,
             direct_generate_slider_video,
             direct_slider_pass_duration,
+            direct_slider_slowmo,
             direct_compare_status,
             direct_comparison_html,
             direct_generated_video,

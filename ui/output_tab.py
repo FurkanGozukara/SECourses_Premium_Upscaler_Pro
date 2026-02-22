@@ -936,20 +936,6 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
         return left, right
 
-    def _merge_media_pools(existing_pool, new_files) -> List[str]:
-        existing_paths = _normalize_uploaded_paths(existing_pool)
-        new_paths = _normalize_uploaded_paths(new_files)
-        merged = existing_paths + new_paths
-        seen = set()
-        unique_paths: List[str] = []
-        for p in merged:
-            if p in seen:
-                continue
-            seen.add(p)
-            unique_paths.append(p)
-        unique_paths.sort(key=_natural_filename_key)
-        return unique_paths
-
     def _preview_update(preview_path: Optional[str]):
         preview = str(preview_path or "").strip()
         if preview and Path(preview).exists():
@@ -1139,8 +1125,8 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             gr.update(value=html, visible=True),
         )
 
-    def _sync_multi_video_upload(files, pool_paths, left_value, right_value, height, slider_pos, thumb_cache):
-        merged_pool = _merge_media_pools(pool_paths, files)
+    def _sync_multi_video_upload(files, left_value, right_value, height, slider_pos, thumb_cache):
+        normalized_pool = _normalize_uploaded_paths(files)
         (
             left_update,
             right_update,
@@ -1152,10 +1138,10 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             html_update,
             thumb_cache_update,
         ) = _render_video_pair(
-            merged_pool, left_value, right_value, height, slider_pos, thumb_cache
+            normalized_pool, left_value, right_value, height, slider_pos, thumb_cache
         )
         return (
-            merged_pool,
+            normalized_pool,
             left_update,
             right_update,
             left_gallery_update,
@@ -1205,8 +1191,35 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             {},
         )
 
-    def _sync_multi_image_upload(files, pool_paths, left_value, right_value):
-        merged_pool = _merge_media_pools(pool_paths, files)
+    def _clear_multi_video_state_only():
+        (
+            _upload_update,
+            pool_state,
+            left_state,
+            right_state,
+            left_gallery_state,
+            right_gallery_state,
+            left_preview_state,
+            right_preview_state,
+            status_state,
+            html_state,
+            thumb_cache_state,
+        ) = _clear_multi_video_compare()
+        return (
+            pool_state,
+            left_state,
+            right_state,
+            left_gallery_state,
+            right_gallery_state,
+            left_preview_state,
+            right_preview_state,
+            status_state,
+            html_state,
+            thumb_cache_state,
+        )
+
+    def _sync_multi_image_upload(files, left_value, right_value):
+        normalized_pool = _normalize_uploaded_paths(files)
         (
             left_update,
             right_update,
@@ -1217,10 +1230,10 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             status_update,
             slider_update,
         ) = _render_image_pair(
-            merged_pool, left_value, right_value
+            normalized_pool, left_value, right_value
         )
         return (
-            merged_pool,
+            normalized_pool,
             left_update,
             right_update,
             left_gallery_update,
@@ -1266,6 +1279,31 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             hidden_preview,
             gr.update(value="Upload at least 2 images to compare."),
             gr.update(value="", visible=False),
+        )
+
+    def _clear_multi_image_state_only():
+        (
+            _upload_update,
+            pool_state,
+            left_state,
+            right_state,
+            left_gallery_state,
+            right_gallery_state,
+            left_preview_state,
+            right_preview_state,
+            status_state,
+            slider_state,
+        ) = _clear_multi_image_compare()
+        return (
+            pool_state,
+            left_state,
+            right_state,
+            left_gallery_state,
+            right_gallery_state,
+            left_preview_state,
+            right_preview_state,
+            status_state,
+            slider_state,
         )
 
     direct_video_a_upload.change(
@@ -1320,13 +1358,50 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         fn=_sync_multi_video_upload,
         inputs=[
             multi_video_upload,
-            multi_video_pool_state,
             multi_video_left_state,
             multi_video_right_state,
             multi_video_height,
             multi_video_slider_pos,
             multi_video_thumb_cache_state,
         ],
+        outputs=[
+            multi_video_pool_state,
+            multi_video_left_state,
+            multi_video_right_state,
+            multi_video_left_gallery,
+            multi_video_right_gallery,
+            multi_video_left_preview,
+            multi_video_right_preview,
+            multi_video_status,
+            multi_video_html,
+            multi_video_thumb_cache_state,
+        ],
+    )
+    multi_video_upload.delete(
+        fn=_sync_multi_video_upload,
+        inputs=[
+            multi_video_upload,
+            multi_video_left_state,
+            multi_video_right_state,
+            multi_video_height,
+            multi_video_slider_pos,
+            multi_video_thumb_cache_state,
+        ],
+        outputs=[
+            multi_video_pool_state,
+            multi_video_left_state,
+            multi_video_right_state,
+            multi_video_left_gallery,
+            multi_video_right_gallery,
+            multi_video_left_preview,
+            multi_video_right_preview,
+            multi_video_status,
+            multi_video_html,
+            multi_video_thumb_cache_state,
+        ],
+    )
+    multi_video_upload.clear(
+        fn=_clear_multi_video_state_only,
         outputs=[
             multi_video_pool_state,
             multi_video_left_state,
@@ -1491,7 +1566,36 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
     multi_image_upload.change(
         fn=_sync_multi_image_upload,
-        inputs=[multi_image_upload, multi_image_pool_state, multi_image_left_state, multi_image_right_state],
+        inputs=[multi_image_upload, multi_image_left_state, multi_image_right_state],
+        outputs=[
+            multi_image_pool_state,
+            multi_image_left_state,
+            multi_image_right_state,
+            multi_image_left_gallery,
+            multi_image_right_gallery,
+            multi_image_left_preview,
+            multi_image_right_preview,
+            multi_image_status,
+            multi_image_slider,
+        ],
+    )
+    multi_image_upload.delete(
+        fn=_sync_multi_image_upload,
+        inputs=[multi_image_upload, multi_image_left_state, multi_image_right_state],
+        outputs=[
+            multi_image_pool_state,
+            multi_image_left_state,
+            multi_image_right_state,
+            multi_image_left_gallery,
+            multi_image_right_gallery,
+            multi_image_left_preview,
+            multi_image_right_preview,
+            multi_image_status,
+            multi_image_slider,
+        ],
+    )
+    multi_image_upload.clear(
+        fn=_clear_multi_image_state_only,
         outputs=[
             multi_image_pool_state,
             multi_image_left_state,

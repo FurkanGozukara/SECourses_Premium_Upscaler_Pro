@@ -364,6 +364,8 @@ def build_fixed_scale_analysis_update(
     sizing_rows.append(_stat_row("Input", f"{plan.input_width}x{plan.input_height} (short side: {input_short}px)"))
 
     target_line = f"upscale {scale_x:g}x"
+    if use_global and seed_controls.get("upscale_factor_val") is not None:
+        target_line += " (shared scale)"
     if max_edge and max_edge > 0:
         target_line += f", max edge {max_edge}px"
         if plan.cap_ratio < 0.999999:

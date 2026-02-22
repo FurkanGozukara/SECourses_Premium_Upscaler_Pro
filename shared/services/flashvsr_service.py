@@ -213,6 +213,24 @@ def _nearest_supported_scale(value: Any, default: int = 4) -> int:
     return 2 if raw <= 3.0 else 4
 
 
+def canonical_flashvsr_scale(
+    *,
+    scale_value: Any = None,
+    upscale_factor_value: Any = None,
+    default: Any = 4,
+) -> int:
+    """
+    Resolve FlashVSR scale to backend-supported values (2x or 4x).
+
+    `upscale_factor_value` takes precedence over `scale_value` so UI slider
+    updates cannot be overridden by stale hidden/state fields.
+    """
+    default_scale = _nearest_supported_scale(default, 4)
+    if upscale_factor_value is not None:
+        return _nearest_supported_scale(upscale_factor_value, default_scale)
+    return _nearest_supported_scale(scale_value, default_scale)
+
+
 def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Defaults aligned to ComfyUI-FlashVSR_Stable with quality-first tuning.
@@ -361,7 +379,11 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["version"] = flashvsr_version_to_ui(cfg.get("version", defaults.get("version", "1.1")))
     mode = str(cfg.get("mode", defaults.get("mode", "full")) or "full").strip().lower()
     cfg["mode"] = mode if mode in {"tiny", "tiny-long", "full"} else "full"
-    scale = _nearest_supported_scale(cfg.get("scale", defaults.get("scale", 4)), 4)
+    scale = canonical_flashvsr_scale(
+        scale_value=cfg.get("scale", defaults.get("scale", 4)),
+        upscale_factor_value=cfg.get("upscale_factor"),
+        default=defaults.get("upscale_factor", defaults.get("scale", 4)),
+    )
     cfg["scale"] = str(scale)
     cfg["upscale_factor"] = float(scale)
 
@@ -596,7 +618,11 @@ def build_flashvsr_callbacks(
                 if seed_controls.get("upscale_factor_val") is not None:
                     try:
                         global_scale = float(seed_controls["upscale_factor_val"])
-                        fixed_scale = _nearest_supported_scale(global_scale, _to_int(settings.get("scale", 4), 4))
+                        fixed_scale = canonical_flashvsr_scale(
+                            scale_value=settings.get("scale", 4),
+                            upscale_factor_value=global_scale,
+                            default=settings.get("upscale_factor", settings.get("scale", 4)),
+                        )
                         settings["scale"] = str(fixed_scale)
                         settings["upscale_factor"] = float(fixed_scale)
                         if abs(global_scale - float(fixed_scale)) > 0.01:

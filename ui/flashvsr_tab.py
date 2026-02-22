@@ -18,6 +18,7 @@ from shared.services.flashvsr_service import (
     FLASHVSR_VAE_OPTIONS,
     FLASHVSR_PRECISION_OPTIONS,
     FLASHVSR_ATTENTION_OPTIONS,
+    canonical_flashvsr_scale,
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
@@ -35,6 +36,44 @@ from shared.queue_state import (
     merge_payload_state,
 )
 from shared.gpu_utils import get_gpu_info
+
+
+def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> float | None:
+    """
+    Resolve shared/global upscale value from app state.
+    """
+    if not isinstance(state, dict):
+        return None
+    try:
+        seed_controls = state.get("seed_controls", {}) or {}
+        raw = seed_controls.get("upscale_factor_val")
+        if raw is None:
+            return None
+        val = float(raw)
+        if val <= 0:
+            return None
+        return val
+    except Exception:
+        return None
+
+
+def resolve_flashvsr_effective_scale(
+    *,
+    scale_state_val,
+    use_global: bool,
+    local_upscale_factor,
+    state: Dict[str, Any] | None,
+) -> int:
+    """
+    Resolve FlashVSR effective scale (2x/4x) from UI + shared-state inputs.
+    """
+    default_scale = canonical_flashvsr_scale(scale_value=scale_state_val, default=4)
+    global_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+    return canonical_flashvsr_scale(
+        scale_value=scale_state_val,
+        upscale_factor_value=(global_scale if global_scale is not None else local_upscale_factor),
+        default=default_scale,
+    )
 
 
 def flashvsr_tab(
@@ -150,8 +189,13 @@ def flashvsr_tab(
 
                     with gr.Column(scale=2):
                         # Backend-only state (kept for preset/schema compatibility).
+                        _initial_scale_state = canonical_flashvsr_scale(
+                            scale_value=_value("scale", "4"),
+                            upscale_factor_value=_value("upscale_factor", None),
+                            default=4,
+                        )
                         scale = gr.State(
-                            value="2" if str(_value("scale", "4")).strip() == "2" else "4"
+                            value=str(int(_initial_scale_state))
                         )
                         version = gr.Dropdown(
                             label="Model Version",
@@ -477,6 +521,19 @@ def flashvsr_tab(
                     _upscale_factor_default = 4.0
                 _upscale_factor_default = 2.0 if _upscale_factor_default <= 3.0 else 4.0
 
+                _initial_use_global_scale = bool(_value("use_resolution_tab", True))
+                _initial_shared_scale = resolve_shared_upscale_factor(
+                    shared_state.value if _initial_use_global_scale else None
+                )
+                if _initial_use_global_scale and _initial_shared_scale is not None:
+                    _upscale_factor_default = float(
+                        canonical_flashvsr_scale(
+                            scale_value=None,
+                            upscale_factor_value=_initial_shared_scale,
+                            default=_upscale_factor_default,
+                        )
+                    )
+
                 _max_resolution_default = _value("max_target_resolution", 1920)
                 try:
                     _max_resolution_default = int(_max_resolution_default)
@@ -492,6 +549,7 @@ def flashvsr_tab(
                         step=2.0,
                         value=_upscale_factor_default,
                         info="FlashVSR backend supports only 2x or 4x.",
+                        interactive=True,
                         scale=2,
                     )
                     max_target_resolution = gr.Slider(
@@ -513,7 +571,10 @@ def flashvsr_tab(
                 use_resolution_tab = gr.Checkbox(
                     label="Use Resolution & Scene Split Tab Settings",
                     value=bool(_value("use_resolution_tab", True)),
-                    info="Apply Resolution tab sizing controls. Non-2x/4x global ratios are auto-clamped to 2x or 4x.",
+                    info=(
+                        "When enabled, Upscale x follows shared app scale cache (e.g., SeedVR2/Resolution workflow). "
+                        "Moving this local slider will switch this toggle OFF and use local sizing."
+                    ),
                 )
 
                 with gr.Row():
@@ -746,12 +807,20 @@ def flashvsr_tab(
             return gr.update(value=f"ERROR: **Detection Error**\n\n{str(e)}", visible=True)
 
     def _build_sizing_info(path_val, model_scale_val, use_global, local_scale_x, local_max_edge, local_pre_down, state):
-        ms = int(model_scale_val or 4)
+        resolved_scale = resolve_flashvsr_effective_scale(
+            scale_state_val=model_scale_val,
+            use_global=bool(use_global),
+            local_upscale_factor=local_scale_x,
+            state=state if isinstance(state, dict) else None,
+        )
+        ms = int(resolved_scale or 4)
         return build_fixed_scale_analysis_update(
             input_path_val=path_val,
             model_scale=ms,
-            use_global=bool(use_global),
-            local_scale_x=float(local_scale_x or 4.0),
+            # Scale is resolved locally (with Resolution-tab fallback + 2x/4x clamp)
+            # so the preview cannot desync from hidden backend state.
+            use_global=False,
+            local_scale_x=float(ms),
             local_max_edge=int(local_max_edge or 0),
             local_pre_down=bool(local_pre_down),
             state=state,
@@ -982,18 +1051,79 @@ def flashvsr_tab(
             trigger_mode="always_last",
         )
 
-    def _sync_scale_from_upscale(local_x):
-        try:
-            return gr.update(value=("2" if float(local_x) <= 3.0 else "4"))
-        except Exception:
-            return gr.update(value="4")
+    def _sync_upscale_ui(use_global, local_x, state):
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        if bool(use_global) and shared_scale is not None:
+            effective = canonical_flashvsr_scale(
+                scale_value=None,
+                upscale_factor_value=shared_scale,
+                default=local_x if local_x is not None else 4,
+            )
+            return (
+                gr.update(value=float(effective), interactive=True),
+                gr.update(value=str(int(effective))),
+            )
+
+        effective_local = canonical_flashvsr_scale(
+            scale_value=None,
+            upscale_factor_value=local_x,
+            default=4,
+        )
+        return (
+            gr.update(value=float(effective_local), interactive=True),
+            gr.update(value=str(int(effective_local))),
+        )
+
+    def _sync_upscale_ui_and_sizing(use_global, local_x, path_val, max_edge, pre_down, state):
+        slider_upd, scale_upd = _sync_upscale_ui(use_global, local_x, state)
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        effective_scale = shared_scale if (bool(use_global) and shared_scale is not None) else local_x
+        resolved = canonical_flashvsr_scale(
+            scale_value=None,
+            upscale_factor_value=effective_scale,
+            default=4,
+        )
+        info = _build_sizing_info(
+            path_val or "",
+            int(resolved),
+            bool(use_global),
+            float(resolved),
+            max_edge,
+            pre_down,
+            state,
+        )
+        return slider_upd, scale_upd, info
+
+    def _on_local_upscale_changed(local_x, use_global, state):
+        resolved = canonical_flashvsr_scale(
+            scale_value=None,
+            upscale_factor_value=local_x,
+            default=4,
+        )
+        # If a shared/global scale is currently active, local slider interaction
+        # switches to local mode instead of staying locked behind global mode.
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        next_use_global = bool(use_global)
+        if bool(use_global) and shared_scale is not None:
+            next_use_global = False
+        return gr.update(value=next_use_global), gr.update(value=str(int(resolved)))
 
     upscale_factor.change(
-        fn=_sync_scale_from_upscale,
-        inputs=[upscale_factor],
-        outputs=[scale],
+        fn=_on_local_upscale_changed,
+        inputs=[upscale_factor, use_resolution_tab, shared_state],
+        outputs=[use_resolution_tab, scale],
         queue=False,
         show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    use_resolution_tab.change(
+        fn=_sync_upscale_ui_and_sizing,
+        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[upscale_factor, scale, sizing_info],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     def refresh_chunk_preview_ui(state):
@@ -1360,6 +1490,15 @@ def flashvsr_tab(
         fn=refresh_chunk_preview_ui,
         inputs=[shared_state],
         outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+    )
+
+    shared_state.change(
+        fn=_sync_upscale_ui_and_sizing,
+        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[upscale_factor, scale, sizing_info],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     shared_state.change(

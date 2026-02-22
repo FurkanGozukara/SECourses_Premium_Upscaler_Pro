@@ -28,6 +28,25 @@ from shared.queue_state import (
 )
 
 
+def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> float | None:
+    """
+    Resolve shared/global upscale value from app state.
+    """
+    if not isinstance(state, dict):
+        return None
+    try:
+        seed_controls = state.get("seed_controls", {}) or {}
+        raw = seed_controls.get("upscale_factor_val")
+        if raw is None:
+            return None
+        val = float(raw)
+        if val <= 0:
+            return None
+        return val
+    except Exception:
+        return None
+
+
 def gan_tab(
     preset_manager,
     runner,
@@ -342,6 +361,13 @@ def gan_tab(
                     _upscale_factor_default = 4.0
                 _upscale_factor_default = min(9.9, max(1.0, _upscale_factor_default))
 
+                _initial_use_global_scale = bool(_value("use_resolution_tab", True))
+                _initial_shared_scale = resolve_shared_upscale_factor(
+                    shared_state.value if _initial_use_global_scale else None
+                )
+                if _initial_use_global_scale and _initial_shared_scale is not None:
+                    _upscale_factor_default = min(9.9, max(1.0, float(_initial_shared_scale)))
+
                 _max_resolution_default = _value("max_resolution", 1920)
                 try:
                     _max_resolution_default = int(_max_resolution_default)
@@ -357,6 +383,7 @@ def gan_tab(
                         step=0.1,
                         value=_upscale_factor_default,
                         info="e.g., 4.0 = 4x. Target size is computed from input, then capped by Max Resolution (max edge).",
+                        interactive=True,
                         scale=2,
                     )
                     max_resolution = gr.Slider(
@@ -378,7 +405,10 @@ def gan_tab(
                 use_resolution_tab = gr.Checkbox(
                     label="Use Resolution & Scene Split Tab Settings",
                     value=bool(_value("use_resolution_tab", True)),
-                    info="Apply Upscale-x, Max Resolution, and Pre-downscale settings from the Resolution tab. Recommended ON.",
+                    info=(
+                        "When enabled, Upscale x follows shared app scale cache (e.g., SeedVR2/Resolution workflow). "
+                        "Moving this local slider will switch this toggle OFF and use local sizing."
+                    ),
                 )
                 with gr.Row():
                     upscale_btn = gr.Button(
@@ -686,6 +716,64 @@ def gan_tab(
             outputs=[sizing_info, shared_state],
             trigger_mode="always_last",
         )
+
+    def _sync_upscale_ui(use_global, local_x, state):
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        if bool(use_global) and shared_scale is not None:
+            clamped = min(9.9, max(1.0, float(shared_scale)))
+            return gr.update(value=clamped, interactive=True)
+        try:
+            local_val = float(local_x)
+        except Exception:
+            local_val = 4.0
+        local_val = min(9.9, max(1.0, local_val))
+        return gr.update(value=local_val, interactive=True)
+
+    def _sync_upscale_and_sizing(use_global, local_x, max_edge, pre_down, model_val, path_val, state):
+        slider_update = _sync_upscale_ui(use_global, local_x, state)
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        effective_scale = shared_scale if (bool(use_global) and shared_scale is not None) else local_x
+        try:
+            effective_scale_f = float(effective_scale)
+        except Exception:
+            effective_scale_f = 4.0
+        info = _build_sizing_info(
+            path_val or "",
+            model_val,
+            bool(use_global),
+            effective_scale_f,
+            max_edge,
+            pre_down,
+            state,
+        )
+        return slider_update, info
+
+    use_resolution_tab.change(
+        fn=_sync_upscale_ui,
+        inputs=[use_resolution_tab, upscale_factor, shared_state],
+        outputs=[upscale_factor],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    def _on_local_upscale_changed(local_x, use_global, state):
+        # If a shared/global scale is currently active, local slider interaction
+        # switches to local mode instead of staying locked behind global mode.
+        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
+        next_use_global = bool(use_global)
+        if bool(use_global) and shared_scale is not None:
+            next_use_global = False
+        return gr.update(value=next_use_global)
+
+    upscale_factor.change(
+        fn=_on_local_upscale_changed,
+        inputs=[upscale_factor, use_resolution_tab, shared_state],
+        outputs=[use_resolution_tab],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
 
     def refresh_chunk_preview_ui(state):
         preview = (state or {}).get("seed_controls", {}).get("gan_chunk_preview", {})
@@ -1018,6 +1106,15 @@ def gan_tab(
             last_processed, image_slider, video_comparison_html, batch_gallery,
             chunk_status, chunk_gallery, chunk_preview_video, shared_state
         ]
+    )
+
+    shared_state.change(
+        fn=_sync_upscale_and_sizing,
+        inputs=[use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, gan_model, input_path, shared_state],
+        outputs=[upscale_factor, sizing_info],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
     
     # vNext sizing is driven by Upscale-x + max-edge cap + optional pre-downscale.

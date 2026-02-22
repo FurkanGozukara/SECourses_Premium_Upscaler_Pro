@@ -21,7 +21,11 @@ from typing import Any, Dict, List, Optional
 from shared.services.seedvr2_service import SEEDVR2_ORDER, seedvr2_defaults
 from shared.services.gan_service import GAN_ORDER, gan_defaults
 from shared.services.rife_service import RIFE_ORDER, rife_defaults
-from shared.services.flashvsr_service import FLASHVSR_ORDER, flashvsr_defaults
+from shared.services.flashvsr_service import (
+    FLASHVSR_ORDER,
+    flashvsr_defaults,
+    canonical_flashvsr_scale,
+)
 from shared.services.face_service import FACE_ORDER, face_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
@@ -132,9 +136,13 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     cfg["output_format"] = "mp4"
-    scale_raw = str(cfg.get("scale", "4")).strip()
-    cfg["scale"] = "2" if scale_raw == "2" else "4"
-    cfg["upscale_factor"] = 2.0 if cfg["scale"] == "2" else 4.0
+    resolved_scale = canonical_flashvsr_scale(
+        scale_value=cfg.get("scale", "4"),
+        upscale_factor_value=cfg.get("upscale_factor"),
+        default=4,
+    )
+    cfg["scale"] = str(int(resolved_scale))
+    cfg["upscale_factor"] = float(resolved_scale)
     cfg["version"] = flashvsr_version_to_ui(cfg.get("version", "1.0"))
     mode_raw = str(cfg.get("mode", "tiny") or "tiny").strip().lower()
     cfg["mode"] = mode_raw if mode_raw in {"tiny", "tiny-long", "full"} else "tiny"

@@ -612,7 +612,7 @@ def rife_tab(
         state["seed_controls"]["last_input_path"] = val if val else ""
         return val or "", gr.update(value="✅ Input cached for processing.", visible=True), state
 
-    input_file.upload(
+    input_upload_evt = input_file.upload(
         fn=lambda val, state: cache_input(val, state),
         inputs=[input_file, shared_state],
         outputs=[input_path, input_cache_msg, shared_state]
@@ -643,16 +643,26 @@ def rife_tab(
         outputs=[input_path, input_cache_msg, shared_state],
     )
 
-    input_path.change(
+    input_path_submit_evt = input_path.submit(
         fn=lambda val, state: (gr.update(value="✅ Input path updated.", visible=True), state),
         inputs=[input_path, shared_state],
         outputs=[input_cache_msg, shared_state]
     )
 
-    input_path.change(
+    input_path_submit_evt.then(
         fn=lambda p: preview_updates(p),
         inputs=[input_path],
         outputs=[input_image_preview, input_video_preview],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    input_upload_evt.then(
+        fn=lambda p: preview_updates(p),
+        inputs=[input_path],
+        outputs=[input_image_preview, input_video_preview],
+        queue=False,
+        show_progress="hidden",
     )
 
     def _queue_status_indicator(title: str, subtitle: str, spinning: bool = True):

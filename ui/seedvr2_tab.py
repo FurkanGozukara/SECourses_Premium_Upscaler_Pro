@@ -1299,13 +1299,16 @@ def seedvr2_tab(
         return
 
     # Wire up input events with resolution auto-calculation
-    input_file.upload(
+    input_upload_evt = input_file.upload(
         fn=cache_upload,
         inputs=[input_file, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[input_path, input_cache_msg, shared_state, auto_res_msg]
     )
 
-    input_path.change(
+    # Keep heavy media/path analysis user-triggered only.
+    # `.change()` also fires on function updates (e.g. tab sync), which can fan out
+    # into expensive cascades on large UIs.
+    input_path_submit_evt = input_path.submit(
         fn=cache_path_value,
         inputs=[input_path, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[input_cache_msg, shared_state, auto_res_msg]
@@ -1339,10 +1342,11 @@ def seedvr2_tab(
                 return gr.update(visible=False), state
         return gr.update(visible=False), state
 
-    upscale_factor.change(
+    upscale_factor.release(
         fn=recalculate_sizing_info,
         inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
+        preprocess=False,
         trigger_mode="always_last",
     )
 
@@ -1358,14 +1362,6 @@ def seedvr2_tab(
         inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[auto_res_msg, shared_state],
         preprocess=False,
-        trigger_mode="always_last",
-    )
-
-    # Also respond to typed value changes (release may not fire when user edits the number field directly)
-    max_resolution.change(
-        fn=recalculate_sizing_info,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
-        outputs=[auto_res_msg, shared_state],
         trigger_mode="always_last",
     )
 
@@ -1852,6 +1848,9 @@ def seedvr2_tab(
         inputs=shared_state,
         outputs=health_display
     )
+
+    # Signature cache to avoid re-running chunk estimation when path/settings are unchanged.
+    chunk_estimate_sync_signature = gr.State(value="")
     
     # Input preview (image + video) for Gradio 6.2.0
     def update_input_previews(path_val):
@@ -1867,7 +1866,17 @@ def seedvr2_tab(
     def clear_input_panels_on_upload_clear(file_path, state):
         # Only act when cleared.
         if file_path:
-            return gr.update(), gr.update(), gr.update(), gr.update(), state
+            return (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                state,
+            )
         try:
             state = state or {}
             state.setdefault("seed_controls", {})
@@ -1879,20 +1888,27 @@ def seedvr2_tab(
             gr.update(value="", visible=False),  # input_cache_msg
             gr.update(value="", visible=False),  # auto_res_msg
             gr.update(value="", visible=False),  # input_detection_result
+            gr.update(visible=False),  # alpha_warn
+            gr.update(visible=False),  # fps_warn
+            gr.update(value="", visible=False),  # chunk_estimate_display
+            gr.update(value=""),  # chunk_estimate_sync_signature
             state,
         )
 
     input_file.change(
         fn=clear_input_panels_on_upload_clear,
         inputs=[input_file, shared_state],
-        outputs=[input_path, input_cache_msg, auto_res_msg, input_detection_result, shared_state],
-    )
-
-    # Also preview when user types/pastes a path (not only uploads)
-    input_path.change(
-        fn=update_input_previews,
-        inputs=[input_path],
-        outputs=[input_image_preview, input_video_preview],
+        outputs=[
+            input_path,
+            input_cache_msg,
+            auto_res_msg,
+            input_detection_result,
+            alpha_warn,
+            fps_warn,
+            chunk_estimate_display,
+            chunk_estimate_sync_signature,
+            shared_state,
+        ],
     )
 
     # Output format change handler for alpha warnings
@@ -1916,13 +1932,6 @@ def seedvr2_tab(
         outputs=alpha_warn
     )
 
-    # Input path change should also trigger alpha warning update
-    input_path.change(
-        fn=lambda path, fmt: update_alpha_warning(fmt, path),
-        inputs=[input_path, output_format],
-        outputs=alpha_warn
-    )
-
     # FPS metadata checking
     def check_fps_metadata(input_path_val):
         if not input_path_val or not input_path_val.strip():
@@ -1939,12 +1948,6 @@ def seedvr2_tab(
             return gr.update(visible=True)
 
         return gr.update(visible=False)
-
-    input_path.change(
-        fn=check_fps_metadata,
-        inputs=[input_path],
-        outputs=fps_warn
-    )
 
     # Tile validation helpers
     def validate_tile_encode(tile_size, overlap):
@@ -2037,34 +2040,6 @@ def seedvr2_tab(
                 visible=True
             )
     
-    # Auto-detect on input path change with debouncing using Timer
-    # No manual button needed - detection happens automatically
-    # Create a timer that triggers detection after 1 second of no changes
-    detection_timer = gr.Timer(value=1.0, active=False)
-    
-    def start_detection_timer(path, state):
-        """Restart timer on path change to debounce detection"""
-        return gr.Timer(value=1.0, active=True), state
-    
-    def trigger_detection(path):
-        """Called by timer - does actual detection and stops timer"""
-        result = detect_input_type(path)
-        return result, gr.Timer(value=1.0, active=False)
-    
-    # Start timer on path change
-    input_path.change(
-        fn=start_detection_timer,
-        inputs=[input_path, shared_state],
-        outputs=[detection_timer, shared_state]
-    )
-    
-    # Timer triggers detection and stops itself
-    detection_timer.tick(
-        fn=trigger_detection,
-        inputs=input_path,
-        outputs=[input_detection_result, detection_timer]
-    )
-
     # Add batch size validation
     def validate_batch_size_ui(val):
         is_valid, message, corrected = validate_batch_size_seedvr2(val)
@@ -2088,7 +2063,7 @@ def seedvr2_tab(
     def auto_estimate_chunks(input_path_val, state):
         """Automatically estimate chunks based on Resolution tab settings and current input"""
         if not input_path_val or not input_path_val.strip():
-            return gr.update(value="", visible=False), state
+            return gr.update(value="", visible=False)
         
         # Get chunk settings from Resolution tab (via shared state)
         seed_controls = state.get("seed_controls", {})
@@ -2100,7 +2075,7 @@ def seedvr2_tab(
         
         if (not auto_chunk) and chunk_size_sec <= 0:
             # Chunking disabled
-            return gr.update(value="", visible=False), state
+            return gr.update(value="", visible=False)
         
         # Calculate chunk estimate
         try:
@@ -2108,11 +2083,11 @@ def seedvr2_tab(
             
             input_type = detect_input_type(input_path_val)
             if input_type != "video":
-                return gr.update(value="", visible=False), state
+                return gr.update(value="", visible=False)
             
             duration = get_media_duration_seconds(input_path_val)
             if not duration or duration <= 0:
-                return gr.update(value=" Could not detect video duration for chunk estimation", visible=True), state
+                return gr.update(value=" Could not detect video duration for chunk estimation", visible=True)
             
             if auto_chunk:
                 info_lines = [
@@ -2125,7 +2100,7 @@ def seedvr2_tab(
                 ]
             else:
                 if chunk_size_sec > 0 and chunk_overlap_sec >= chunk_size_sec:
-                    return gr.update(value=" Static chunk overlap must be smaller than chunk size.", visible=True), state
+                    return gr.update(value=" Static chunk overlap must be smaller than chunk size.", visible=True)
 
                 # Estimate number of chunks
                 import math
@@ -2140,23 +2115,90 @@ def seedvr2_tab(
                     f"**Processing:** Each chunk processed independently, then merged (optional blending if overlap > 0)",
                 ]
             
-            return gr.update(value="\n".join(info_lines), visible=True), state
+            return gr.update(value="\n".join(info_lines), visible=True)
             
         except Exception as e:
-            return gr.update(value=f" Estimation error: {str(e)[:100]}", visible=True), state
+            return gr.update(value=f" Estimation error: {str(e)[:100]}", visible=True)
+
+    def _chunk_estimate_signature(path_val, state):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        return (
+            str(path_val or "").strip(),
+            bool(seed_controls.get("auto_chunk", True)),
+            float(seed_controls.get("chunk_size_sec", 0) or 0),
+            float(seed_controls.get("chunk_overlap_sec", 0.0) or 0.0),
+            float(seed_controls.get("scene_threshold", 27.0) or 27.0),
+            float(seed_controls.get("min_scene_len", 1.0) or 1.0),
+        )
+
+    def auto_estimate_chunks_if_needed(input_path_val, state, previous_signature=""):
+        signature = str(_chunk_estimate_signature(input_path_val, state))
+        if signature == str(previous_signature or ""):
+            return gr.skip(), previous_signature
+        return auto_estimate_chunks(input_path_val, state), signature
     
-    # Wire up automatic chunk estimation
-    input_path.change(
-        fn=auto_estimate_chunks,
-        inputs=[input_path, shared_state],
-        outputs=[chunk_estimate_display, shared_state]
-    )
-    
-    # Also update when shared state changes (Resolution tab updates chunk settings)
+    # Update chunk estimation when shared chunk settings change (Resolution tab).
     shared_state.change(
-        fn=auto_estimate_chunks,
-        inputs=[input_path, shared_state],
-        outputs=[chunk_estimate_display, shared_state]
+        fn=auto_estimate_chunks_if_needed,
+        inputs=[input_path, shared_state, chunk_estimate_sync_signature],
+        outputs=[chunk_estimate_display, chunk_estimate_sync_signature]
+    )
+
+    def refresh_path_metadata_panels(path_val, format_choice, state, previous_chunk_signature=""):
+        """
+        Refresh path-derived lightweight UI panels in one batched callback.
+        This avoids multiple parallel input_path.change fan-outs while preserving UX.
+        """
+        preview_img, preview_vid = update_input_previews(path_val)
+        alpha_update = update_alpha_warning(format_choice, path_val)
+        fps_update = check_fps_metadata(path_val)
+        detection_update = detect_input_type(path_val)
+        chunk_update, next_chunk_signature = auto_estimate_chunks_if_needed(
+            path_val, state, previous_chunk_signature
+        )
+        return (
+            preview_img,
+            preview_vid,
+            alpha_update,
+            fps_update,
+            detection_update,
+            chunk_update,
+            next_chunk_signature,
+        )
+
+    # Refresh side panels only when user explicitly commits a path (submit/upload),
+    # not on every programmatic textbox update.
+    input_path_submit_evt.then(
+        fn=refresh_path_metadata_panels,
+        inputs=[input_path, output_format, shared_state, chunk_estimate_sync_signature],
+        outputs=[
+            input_image_preview,
+            input_video_preview,
+            alpha_warn,
+            fps_warn,
+            input_detection_result,
+            chunk_estimate_display,
+            chunk_estimate_sync_signature,
+        ],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    input_upload_evt.then(
+        fn=refresh_path_metadata_panels,
+        inputs=[input_path, output_format, shared_state, chunk_estimate_sync_signature],
+        outputs=[
+            input_image_preview,
+            input_video_preview,
+            alpha_warn,
+            fps_warn,
+            input_detection_result,
+            chunk_estimate_display,
+            chunk_estimate_sync_signature,
+        ],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     # Note: In Gradio 6.2.0, component.update() is removed

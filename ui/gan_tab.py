@@ -4,6 +4,8 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -698,7 +700,10 @@ def gan_tab(
             state,
         )
 
-    input_path.change(
+    # Keep heavy media/path analysis user-triggered only.
+    # `.change()` also fires on function updates (e.g. tab sync), which can fan out
+    # into expensive cascades on large UIs.
+    input_path.submit(
         fn=update_from_path,
         inputs=[input_path, gan_model, use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
@@ -707,13 +712,21 @@ def gan_tab(
     # Refresh sizing info when settings change
     def refresh_sizing(scale_x, max_edge, pre_down, use_global, model_val, path_val, state):
         info = _build_sizing_info(path_val or "", model_val, bool(use_global), scale_x, max_edge, pre_down, state)
-        return info, state
+        return info
 
-    for comp in [upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, gan_model]:
+    for comp in [pre_downscale_then_upscale, use_resolution_tab, gan_model]:
         comp.change(
             fn=refresh_sizing,
             inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, gan_model, input_path, shared_state],
-            outputs=[sizing_info, shared_state],
+            outputs=[sizing_info],
+            trigger_mode="always_last",
+        )
+    for comp in [upscale_factor, max_resolution]:
+        comp.release(
+            fn=refresh_sizing,
+            inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, gan_model, input_path, shared_state],
+            outputs=[sizing_info],
+            preprocess=False,
             trigger_mode="always_last",
         )
 
@@ -766,10 +779,11 @@ def gan_tab(
             next_use_global = False
         return gr.update(value=next_use_global)
 
-    upscale_factor.change(
+    upscale_factor.release(
         fn=_on_local_upscale_changed,
         inputs=[upscale_factor, use_resolution_tab, shared_state],
         outputs=[use_resolution_tab],
+        preprocess=False,
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",
@@ -1108,10 +1122,49 @@ def gan_tab(
         ]
     )
 
+    gan_upscale_sync_signature = gr.State(value="")
+
+    def _sync_signature(payload: Dict[str, Any]) -> str:
+        try:
+            blob = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str, separators=(",", ":"))
+        except Exception:
+            blob = str(payload)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+    def _sync_upscale_and_sizing_if_needed(
+        use_global,
+        local_x,
+        max_edge,
+        pre_down,
+        model_val,
+        path_val,
+        state,
+        previous_signature: str = "",
+    ):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        signature = _sync_signature(
+            {
+                "use_global": bool(use_global),
+                "local_x": local_x,
+                "max_edge": max_edge,
+                "pre_down": bool(pre_down),
+                "model_val": model_val,
+                "path_val": path_val,
+                "shared_scale": resolve_shared_upscale_factor(state if bool(use_global) else None),
+                "resolution_settings": seed_controls.get("resolution_settings", {}),
+            }
+        )
+        if signature == str(previous_signature or ""):
+            return gr.skip(), gr.skip(), previous_signature
+        slider_upd, info_upd = _sync_upscale_and_sizing(
+            use_global, local_x, max_edge, pre_down, model_val, path_val, state
+        )
+        return slider_upd, info_upd, signature
+
     shared_state.change(
-        fn=_sync_upscale_and_sizing,
-        inputs=[use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, gan_model, input_path, shared_state],
-        outputs=[upscale_factor, sizing_info],
+        fn=_sync_upscale_and_sizing_if_needed,
+        inputs=[use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, gan_model, input_path, shared_state, gan_upscale_sync_signature],
+        outputs=[upscale_factor, sizing_info, gan_upscale_sync_signature],
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",

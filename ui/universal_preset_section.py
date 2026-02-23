@@ -7,6 +7,7 @@ This component provides a unified preset management interface that:
 - Syncs via shared_state when any tab saves/loads
 """
 
+import copy
 import gradio as gr
 from typing import Any, Dict, List, Optional, Tuple, Callable
 from pathlib import Path
@@ -75,61 +76,75 @@ def create_universal_preset_callbacks(
     
     def save_preset(
         preset_name: str,
+        selected_preset_name: str | None,
         current_tab_values: List[Any],
         state: Dict[str, Any],
     ) -> Tuple:
         """
         Save a universal preset from current shared_state.
-        
+
         The current tab's values are updated in state first,
         then the full state is saved as a universal preset.
-        
+
         Returns:
             (updated_dropdown, status_message, updated_state)
         """
-        if not preset_name or not preset_name.strip():
+        typed_name = str(preset_name or "").strip()
+        selected_name = str(selected_preset_name or "").strip()
+        state_current_name = ""
+        if isinstance(state, dict):
+            seed_controls = state.get("seed_controls", {})
+            if isinstance(seed_controls, dict):
+                state_current_name = str(seed_controls.get("current_preset_name") or "").strip()
+
+        target_name = typed_name or selected_name or state_current_name
+        if not target_name:
             return (
                 gr.update(),
-                "⚠️ Enter a preset name before saving",
+                "⚠️ Enter a preset name or select a preset to overwrite",
                 state,
             )
-        
+
+        fallback_overwrite = not typed_name
+
         try:
             # Update current tab's settings in state
             seed_controls = state.get("seed_controls", {})
             tab_settings_key = f"{tab_name}_settings"
-            
+
             # Convert current tab values to dict
             tab_dict = values_to_dict(tab_name, current_tab_values)
             seed_controls[tab_settings_key] = tab_dict
             state["seed_controls"] = seed_controls
-            
+
             # Collect full preset from state
             preset_data = collect_preset_from_shared_state(state)
-            
+
             # Save universal preset
-            saved_name = preset_manager.save_universal_preset(preset_name.strip(), preset_data)
-            
+            saved_name = preset_manager.save_universal_preset(target_name, preset_data)
+
             # Update state with new preset name
             state["seed_controls"]["current_preset_name"] = saved_name
             state["seed_controls"]["preset_dirty"] = False
-            
+
             # Refresh dropdown
             presets = get_presets_list()
-            
+            action = "Overwrote" if fallback_overwrite else "Saved"
+
             return (
                 gr.update(choices=presets, value=saved_name),
-                f"✅ Saved universal preset '{saved_name}' (all tabs)",
+                f"✅ {action} universal preset '{saved_name}' (all tabs)",
                 state,
             )
-        
+
         except Exception as e:
             return (
                 gr.update(),
                 f"❌ Error saving preset: {str(e)}",
                 state,
             )
-    
+
+
     def load_preset(
         preset_name: str,
         state: Dict[str, Any],
@@ -363,17 +378,17 @@ def wire_universal_preset_events(
     """
     
     # Save preset - wrap to collect unpacked inputs_list back into a list
-    def save_preset_wrapper(preset_name, *args):
+    def save_preset_wrapper(preset_name, selected_preset_name, *args):
         """Wrapper to collect unpacked inputs_list values"""
         # args = (value1, value2, ..., valueN, shared_state)
         # Split into tab_values and state
         tab_values = list(args[:-1])  # All except last
         state = args[-1]  # Last argument is shared_state
-        return callbacks["save_preset"](preset_name, tab_values, state)
+        return callbacks["save_preset"](preset_name, selected_preset_name, tab_values, state)
     
     save_event = save_btn.click(
         fn=save_preset_wrapper,
-        inputs=[preset_name_input] + inputs_list + [shared_state],
+        inputs=[preset_name_input, preset_dropdown] + inputs_list + [shared_state],
         outputs=[preset_dropdown, preset_status, shared_state],
     )
     
@@ -430,18 +445,26 @@ def wire_universal_preset_events(
             # args = (value1, value2, ..., valueN, shared_state)
             tab_values = list(args[:-1])
             state = args[-1]
-            return sync_tab_to_shared_state(tab_name, tab_values, state)
+            next_state, changed = sync_tab_to_shared_state(
+                tab_name,
+                tab_values,
+                state,
+                return_changed=True,
+            )
+            if not changed:
+                return gr.skip()
+            return next_state
 
         triggers = []
         for comp in inputs_list:
-            # Most components support .change; sliders also support .release.
-            if hasattr(comp, "change"):
-                triggers.append(comp.change)
+            # Use a single best trigger per component to reduce fan-out:
+            # release (sliders) -> input (text-like) -> change (fallback).
             if hasattr(comp, "release"):
                 triggers.append(comp.release)
-            # Textbox/Number edits should sync before blur/save-tab-switch.
-            if hasattr(comp, "input"):
+            elif hasattr(comp, "input"):
                 triggers.append(comp.input)
+            elif hasattr(comp, "change"):
+                triggers.append(comp.change)
 
         # Prefer gr.on() for a single endpoint; fall back to per-component wiring if needed.
         if hasattr(gr, "on") and triggers:
@@ -457,15 +480,6 @@ def wire_universal_preset_events(
         else:
             # Fallback: register one event per component (heavier, but compatible).
             for comp in inputs_list:
-                if hasattr(comp, "change"):
-                    comp.change(
-                        fn=_sync_wrapper,
-                        inputs=inputs_list + [shared_state],
-                        outputs=[shared_state],
-                        queue=False,
-                        show_progress="hidden",
-                        trigger_mode="always_last",
-                    )
                 if hasattr(comp, "release"):
                     comp.release(
                         fn=_sync_wrapper,
@@ -475,8 +489,17 @@ def wire_universal_preset_events(
                         show_progress="hidden",
                         trigger_mode="always_last",
                     )
-                if hasattr(comp, "input"):
+                elif hasattr(comp, "input"):
                     comp.input(
+                        fn=_sync_wrapper,
+                        inputs=inputs_list + [shared_state],
+                        outputs=[shared_state],
+                        queue=False,
+                        show_progress="hidden",
+                        trigger_mode="always_last",
+                    )
+                elif hasattr(comp, "change"):
+                    comp.change(
                         fn=_sync_wrapper,
                         inputs=inputs_list + [shared_state],
                         outputs=[shared_state],
@@ -499,16 +522,41 @@ def sync_tab_to_shared_state(
     tab_name: str,
     values: List[Any],
     state: Dict[str, Any],
-) -> Dict[str, Any]:
+    return_changed: bool = False,
+) -> Dict[str, Any] | Tuple[Dict[str, Any], bool]:
     """
     Sync current tab values to shared_state.
     
     Call this when any value in the tab changes to keep state updated.
     """
+    state = state if isinstance(state, dict) else {}
     seed_controls = state.get("seed_controls", {})
+    if not isinstance(seed_controls, dict):
+        seed_controls = {}
+    try:
+        before_seed_controls = copy.deepcopy(seed_controls)
+    except Exception:
+        before_seed_controls = seed_controls.copy()
+
+    tab_settings_key = f"{tab_name}_settings"
     tab_dict = values_to_dict(tab_name, values)
-    seed_controls[f"{tab_name}_settings"] = tab_dict
-    seed_controls["preset_dirty"] = True  # Mark as modified
+    existing_tab_settings = seed_controls.get(tab_settings_key, {})
+    if not isinstance(existing_tab_settings, dict):
+        existing_tab_settings = {}
+    try:
+        existing_normalized = values_to_dict(
+            tab_name,
+            dict_to_values(tab_name, existing_tab_settings),
+        )
+    except Exception:
+        existing_normalized = existing_tab_settings
+
+    tab_settings_changed = tab_dict != existing_normalized
+    if tab_settings_changed:
+        seed_controls[tab_settings_key] = tab_dict
+    elif tab_settings_key not in seed_controls:
+        seed_controls[tab_settings_key] = tab_dict
+        tab_settings_changed = True
 
     # Keep derived cross-tab caches in sync so other pipelines immediately
     # see updated Resolution/Output settings without requiring "Apply" buttons.
@@ -592,7 +640,14 @@ def sync_tab_to_shared_state(
         seed_controls["generate_comparison_video_val"] = bool(tab_dict.get("generate_comparison_video", True))
         seed_controls["comparison_video_layout_val"] = str(tab_dict.get("comparison_video_layout", "auto") or "auto")
 
+    # Mark dirty only when user-facing tab settings actually changed.
+    if tab_settings_changed:
+        seed_controls["preset_dirty"] = True
+
     state["seed_controls"] = seed_controls
+    changed = before_seed_controls != seed_controls
+    if return_changed:
+        return state, changed
     return state
 
 
@@ -616,3 +671,4 @@ def get_tab_values_from_state(
         tab_settings = defaults.get(tab_name, {})
     
     return dict_to_values(tab_name, tab_settings)
+

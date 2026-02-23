@@ -1686,12 +1686,12 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
 
-    direct_video_a_path.change(
+    direct_video_a_path.submit(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
         outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],
     )
-    direct_video_b_path.change(
+    direct_video_b_path.submit(
         fn=_sync_direct_geometry_auto,
         inputs=[direct_video_a_path, direct_video_b_path, direct_compare_layout],
         outputs=[direct_compare_width, direct_compare_height_px, direct_compare_geometry, direct_slider_pass_duration],

@@ -253,7 +253,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                 outputs=[input_image_preview, input_video_preview],
             )
 
-            standalone_input_path.change(
+            standalone_input_path.submit(
                 fn=lambda p: preview_updates(p),
                 inputs=[standalone_input_path],
                 outputs=[input_image_preview, input_video_preview],

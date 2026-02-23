@@ -5,6 +5,8 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -1037,19 +1039,37 @@ def flashvsr_tab(
                 state,
             )
 
-    input_path.change(
+    # Keep heavy media/path analysis user-triggered only.
+    # `.change()` also fires on function updates (e.g. tab sync), which can fan out
+    # into expensive cascades on large UIs.
+    input_path.submit(
         fn=cache_input_path,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
-    for comp in [scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale]:
-        comp.change(
-            fn=lambda p, s, ug, sx, me, pd, st: (_build_sizing_info(p, int(s), bool(ug), sx, me, pd, st), st),
-            inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-            outputs=[sizing_info, shared_state],
-            trigger_mode="always_last",
-        )
+    def refresh_sizing(path_val, scale_val, use_global, local_scale_x, max_edge, pre_down, state):
+        return _build_sizing_info(path_val, int(scale_val), bool(use_global), local_scale_x, max_edge, pre_down, state)
+
+    scale.change(
+        fn=refresh_sizing,
+        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[sizing_info],
+        trigger_mode="always_last",
+    )
+    pre_downscale_then_upscale.change(
+        fn=refresh_sizing,
+        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[sizing_info],
+        trigger_mode="always_last",
+    )
+    max_target_resolution.release(
+        fn=refresh_sizing,
+        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[sizing_info],
+        preprocess=False,
+        trigger_mode="always_last",
+    )
 
     def _sync_upscale_ui(use_global, local_x, state):
         shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
@@ -1108,10 +1128,19 @@ def flashvsr_tab(
             next_use_global = False
         return gr.update(value=next_use_global), gr.update(value=str(int(resolved)))
 
-    upscale_factor.change(
+    local_scale_evt = upscale_factor.release(
         fn=_on_local_upscale_changed,
         inputs=[upscale_factor, use_resolution_tab, shared_state],
         outputs=[use_resolution_tab, scale],
+        preprocess=False,
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    local_scale_evt.then(
+        fn=refresh_sizing,
+        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[sizing_info],
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",
@@ -1444,6 +1473,52 @@ def flashvsr_tab(
         ):
             yield _expand_service_payload(payload, live_state)
 
+    flashvsr_upscale_sync_signature = gr.State(value="")
+    flashvsr_chunk_sync_signature = gr.State(value="")
+
+    def _sync_signature(payload: Dict[str, Any]) -> str:
+        try:
+            blob = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str, separators=(",", ":"))
+        except Exception:
+            blob = str(payload)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+    def _sync_upscale_ui_and_sizing_if_needed(
+        use_global,
+        local_x,
+        path_val,
+        max_edge,
+        pre_down,
+        state,
+        previous_signature: str = "",
+    ):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        signature = _sync_signature(
+            {
+                "use_global": bool(use_global),
+                "local_x": local_x,
+                "path_val": path_val,
+                "max_edge": max_edge,
+                "pre_down": bool(pre_down),
+                "shared_scale": resolve_shared_upscale_factor(state if bool(use_global) else None),
+                "resolution_settings": seed_controls.get("resolution_settings", {}),
+            }
+        )
+        if signature == str(previous_signature or ""):
+            return gr.skip(), gr.skip(), gr.skip(), previous_signature
+        slider_upd, scale_upd, sizing_upd = _sync_upscale_ui_and_sizing(
+            use_global, local_x, path_val, max_edge, pre_down, state
+        )
+        return slider_upd, scale_upd, sizing_upd, signature
+
+    def _refresh_chunk_preview_ui_if_needed(state, previous_signature: str = ""):
+        preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})
+        signature = _sync_signature(preview if isinstance(preview, dict) else {"preview": None})
+        if signature == str(previous_signature or ""):
+            return gr.skip(), gr.skip(), gr.skip(), previous_signature
+        chunk_status_upd, chunk_gallery_upd, chunk_video_upd = refresh_chunk_preview_ui(state)
+        return chunk_status_upd, chunk_gallery_upd, chunk_video_upd, signature
+
     # Main processing
     run_evt = upscale_btn.click(
         fn=run_upscale_with_queue,
@@ -1465,9 +1540,9 @@ def flashvsr_tab(
         trigger_mode="multiple",
     )
     run_evt.then(
-        fn=refresh_chunk_preview_ui,
-        inputs=[shared_state],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+        fn=_refresh_chunk_preview_ui_if_needed,
+        inputs=[shared_state, flashvsr_chunk_sync_signature],
+        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
     )
 
     preview_evt = preview_btn.click(
@@ -1487,24 +1562,24 @@ def flashvsr_tab(
         ],
     )
     preview_evt.then(
-        fn=refresh_chunk_preview_ui,
-        inputs=[shared_state],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+        fn=_refresh_chunk_preview_ui_if_needed,
+        inputs=[shared_state, flashvsr_chunk_sync_signature],
+        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
     )
 
     shared_state.change(
-        fn=_sync_upscale_ui_and_sizing,
-        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[upscale_factor, scale, sizing_info],
+        fn=_sync_upscale_ui_and_sizing_if_needed,
+        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, flashvsr_upscale_sync_signature],
+        outputs=[upscale_factor, scale, sizing_info, flashvsr_upscale_sync_signature],
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",
     )
 
     shared_state.change(
-        fn=refresh_chunk_preview_ui,
-        inputs=[shared_state],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video],
+        fn=_refresh_chunk_preview_ui_if_needed,
+        inputs=[shared_state, flashvsr_chunk_sync_signature],
+        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
         queue=False,
         show_progress="hidden",
     )

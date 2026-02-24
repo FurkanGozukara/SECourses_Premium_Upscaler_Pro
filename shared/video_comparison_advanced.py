@@ -1106,8 +1106,9 @@ def create_input_vs_output_slider_comparison_video(
                 f"if(lt({frame_idx_expr},{total_frames}),"
                 f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
-            split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
-            line_mask_expr = f"lte(abs(Y-({boundary_expr})),2)"
+            plane_boundary_expr = f"(({boundary_expr})*SH)"
+            split_expr = f"if(lt(Y,{plane_boundary_expr}),A,B)"
+            line_mask_expr = f"lte(abs(Y-({plane_boundary_expr})),2)"
             luma_expr = f"if({line_mask_expr},235,{split_expr})"
             chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (
@@ -1138,8 +1139,9 @@ def create_input_vs_output_slider_comparison_video(
                 f"if(lt({frame_idx_expr},{total_frames}),"
                 f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
-            split_expr = f"if(lt(X,{boundary_expr}),A,B)"
-            line_mask_expr = f"lte(abs(X-({boundary_expr})),2)"
+            plane_boundary_expr = f"(({boundary_expr})*SW)"
+            split_expr = f"if(lt(X,{plane_boundary_expr}),A,B)"
+            line_mask_expr = f"lte(abs(X-({plane_boundary_expr})),2)"
             luma_expr = f"if({line_mask_expr},235,{split_expr})"
             chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (

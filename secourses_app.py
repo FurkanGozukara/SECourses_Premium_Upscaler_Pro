@@ -4,6 +4,7 @@ import hashlib
 import json
 import string
 import argparse
+import warnings
 from pathlib import Path
 from typing import Any, Dict
 
@@ -11,6 +12,14 @@ from typing import Any, Dict
 # - hf_transfer can improve download speed but can also cause issues on some Windows setups.
 # - Default to disabled unless the launcher/user explicitly enables it.
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
+# Upstream dependency warning (not emitted by this repo's direct code):
+# suppress only this known PyTorch deprecation message to keep startup logs clean.
+warnings.filterwarnings(
+    "ignore",
+    message=r"torch\.meshgrid: in an upcoming release, it will be required to pass the indexing argument\.",
+    category=UserWarning,
+)
 
 # Fix Unicode encoding on Windows console to support emojis and special characters
 if sys.platform == 'win32':
@@ -59,7 +68,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.7 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.8 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -1336,7 +1345,7 @@ def main(argv=None):
     </script>
     """
     
-    with gr.Blocks(title=APP_TITLE, theme=modern_theme, css=CUSTOM_CSS, head=CUSTOM_HEAD + theme_bootstrap_head) as demo:
+    with gr.Blocks(title=APP_TITLE) as demo:
         # =========================================================================
         # SHARED STATE - Populated from UNIVERSAL PRESET on startup
         # =========================================================================
@@ -2052,6 +2061,9 @@ def main(argv=None):
         "inbrowser": True,
         "allowed_paths": launch_allowed_paths,
         "share": share_enabled,
+        "theme": modern_theme,
+        "css": CUSTOM_CSS,
+        "head": CUSTOM_HEAD + theme_bootstrap_head,
     }
     if launch_cli_args.server_name:
         launch_kwargs["server_name"] = launch_cli_args.server_name

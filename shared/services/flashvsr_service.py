@@ -1912,12 +1912,109 @@ def build_flashvsr_callbacks(
             log_buffer = []
             live_progress_pct: Optional[float] = None
             live_progress_desc = ""
+            live_log_idx: Optional[int] = None
+            progress_tile_idx: Optional[int] = None
+            progress_tile_total: Optional[int] = None
+            progress_iter_idx: Optional[int] = None
+            progress_iter_ts: Optional[float] = None
+            progress_iter_ema_s: Optional[float] = None
 
             def _strip_ansi(text: str) -> str:
                 try:
                     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
                 except Exception:
                     return text
+
+            def _upsert_log_entry(text: str, transient: bool) -> None:
+                nonlocal live_log_idx
+                if not text:
+                    return
+                if transient:
+                    if live_log_idx is None or live_log_idx >= len(log_buffer):
+                        log_buffer.append(text)
+                        live_log_idx = len(log_buffer) - 1
+                    else:
+                        log_buffer[live_log_idx] = text
+                    return
+                live_log_idx = None
+                log_buffer.append(text)
+
+            def _normalize_live_progress_line(msg_text: str) -> Tuple[str, bool]:
+                nonlocal progress_tile_idx, progress_tile_total
+                nonlocal progress_iter_idx, progress_iter_ts, progress_iter_ema_s
+
+                text = _strip_ansi(str(msg_text or "")).strip()
+                if not text:
+                    return "", False
+
+                iter_match = re.search(
+                    r"(?:^|\|)\s*(?:Processing|Processed):\s*(\d+)\s*/\s*(\d+)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if iter_match:
+                    tile_match = re.search(
+                        r"Processing\s+Tiles:\s*(\d+)\s*/\s*(\d+)",
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+                    if tile_match:
+                        tile_idx = int(tile_match.group(1))
+                        tile_total = max(1, int(tile_match.group(2)))
+                        if progress_tile_idx != tile_idx:
+                            progress_tile_idx = tile_idx
+                            progress_tile_total = tile_total
+                            progress_iter_idx = None
+                            progress_iter_ts = None
+                            progress_iter_ema_s = None
+
+                    now_ts = time.time()
+                    iter_idx = int(iter_match.group(1))
+                    iter_total = max(1, int(iter_match.group(2)))
+
+                    if progress_iter_idx is None or iter_idx <= progress_iter_idx:
+                        progress_iter_ema_s = None
+                    elif progress_iter_ts is not None:
+                        delta_s = max(0.0, now_ts - progress_iter_ts)
+                        if progress_iter_ema_s is None:
+                            progress_iter_ema_s = delta_s
+                        else:
+                            progress_iter_ema_s = (progress_iter_ema_s * 0.7) + (delta_s * 0.3)
+
+                    progress_iter_idx = iter_idx
+                    progress_iter_ts = now_ts
+
+                    iter_pct = (float(iter_idx) / float(iter_total)) * 100.0
+                    parts: List[str] = []
+                    if progress_tile_idx is not None and progress_tile_total:
+                        parts.append(f"Processing Tiles: {int(progress_tile_idx)}/{int(progress_tile_total)}")
+                    parts.append(f"Processing: {iter_idx}/{iter_total} ({iter_pct:.1f}%)")
+                    if progress_iter_ema_s is not None and progress_iter_ema_s > 0:
+                        parts.append(f"{progress_iter_ema_s:.2f}s/iter")
+                    return " | ".join(parts), True
+
+                tile_match = re.search(
+                    r"^\s*Processing\s+Tiles:\s*(\d+)\s*/\s*(\d+)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if tile_match:
+                    tile_idx = int(tile_match.group(1))
+                    tile_total = max(1, int(tile_match.group(2)))
+                    if progress_tile_idx != tile_idx:
+                        progress_tile_idx = tile_idx
+                        progress_tile_total = tile_total
+                        progress_iter_idx = None
+                        progress_iter_ts = None
+                        progress_iter_ema_s = None
+                    tile_pct = (float(tile_idx) / float(tile_total)) * 100.0
+                    return f"Processing Tiles: {tile_idx}/{tile_total} ({tile_pct:.1f}%)", True
+
+                text_lc = text.lower()
+                if text_lc.startswith("[flashvsr] processing..."):
+                    return text, True
+
+                return text, False
 
             def _extract_progress(msg_text: str) -> Tuple[Optional[float], str]:
                 text = _strip_ansi(str(msg_text or "")).strip()
@@ -2026,8 +2123,9 @@ def build_flashvsr_callbacks(
                 
                 try:
                     msg = progress_queue.get(timeout=0.1)
-                    log_buffer.append(msg)
-                    pct_val, msg_clean = _extract_progress(msg)
+                    msg_clean, is_live_line = _normalize_live_progress_line(msg)
+                    _upsert_log_entry(msg_clean, transient=is_live_line)
+                    pct_val, _ = _extract_progress(msg_clean)
 
                     if msg_clean:
                         msg_lc = msg_clean.lower()
@@ -2035,8 +2133,10 @@ def build_flashvsr_callbacks(
                             pct_val is not None
                             or "processed:" in msg_lc
                             or msg_lc.startswith("processing:")
+                            or msg_lc.startswith("processing tiles:")
                             or "eta:" in msg_lc
                             or "speed:" in msg_lc
+                            or "s/iter" in msg_lc
                         )
                         if has_real_hint:
                             live_progress_desc = msg_clean

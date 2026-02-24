@@ -3,6 +3,7 @@ FlashVSR runner backed by ComfyUI-FlashVSR_Stable CLI.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -415,12 +416,106 @@ def run_flashvsr(
     log_lines: List[str] = []
     cmd: List[str] = []
     temp_input_dir: Optional[Path] = None
+    console_progress_active = False
+    console_progress_width = 0
+    progress_state: Dict[str, Any] = {
+        "tile_idx": None,
+        "tile_total": None,
+        "iter_idx": None,
+        "iter_total": None,
+        "iter_ts": None,
+        "iter_ema": None,
+    }
+    progress_tiles_re = re.compile(r"^\s*processing\s+tiles:\s*(\d+)\s*/\s*(\d+)", flags=re.IGNORECASE)
+    progress_iter_re = re.compile(r"^\s*(?:processing|processed):\s*(\d+)\s*/\s*(\d+)", flags=re.IGNORECASE)
 
-    def log(msg: str):
-        text = str(msg)
-        log_lines.append(text)
+    def _flush_console_progress() -> None:
+        nonlocal console_progress_active, console_progress_width
+        if not console_progress_active:
+            return
         try:
-            print(text, flush=True)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        console_progress_active = False
+        console_progress_width = 0
+
+    def _format_live_progress(text: str) -> Tuple[str, bool]:
+        raw = str(text or "").strip()
+        if not raw:
+            return "", False
+
+        now_ts = time.time()
+        m_tiles = progress_tiles_re.search(raw)
+        if m_tiles:
+            tile_idx = int(m_tiles.group(1))
+            tile_total = max(1, int(m_tiles.group(2)))
+            if progress_state.get("tile_idx") != tile_idx:
+                progress_state["tile_idx"] = tile_idx
+                progress_state["tile_total"] = tile_total
+                progress_state["iter_idx"] = None
+                progress_state["iter_total"] = None
+                progress_state["iter_ts"] = None
+                progress_state["iter_ema"] = None
+            tile_pct = (float(tile_idx) / float(tile_total)) * 100.0
+            return f"Processing Tiles: {tile_idx}/{tile_total} ({tile_pct:.1f}%)", True
+
+        m_iter = progress_iter_re.search(raw)
+        if m_iter:
+            iter_idx = int(m_iter.group(1))
+            iter_total = max(1, int(m_iter.group(2)))
+            prev_idx = progress_state.get("iter_idx")
+            prev_ts = progress_state.get("iter_ts")
+
+            if prev_idx is None or iter_idx <= int(prev_idx):
+                progress_state["iter_ema"] = None
+            elif prev_ts is not None:
+                delta_s = max(0.0, now_ts - float(prev_ts))
+                prev_ema = progress_state.get("iter_ema")
+                if prev_ema is None:
+                    progress_state["iter_ema"] = delta_s
+                else:
+                    progress_state["iter_ema"] = (float(prev_ema) * 0.7) + (delta_s * 0.3)
+
+            progress_state["iter_idx"] = iter_idx
+            progress_state["iter_total"] = iter_total
+            progress_state["iter_ts"] = now_ts
+
+            iter_pct = (float(iter_idx) / float(iter_total)) * 100.0
+            speed_s = progress_state.get("iter_ema")
+            parts: List[str] = []
+
+            tile_idx = progress_state.get("tile_idx")
+            tile_total = progress_state.get("tile_total")
+            if tile_idx is not None and tile_total:
+                parts.append(f"Processing Tiles: {int(tile_idx)}/{int(tile_total)}")
+            parts.append(f"Processing: {iter_idx}/{iter_total} ({iter_pct:.1f}%)")
+            if speed_s is not None and float(speed_s) > 0:
+                parts.append(f"{float(speed_s):.2f}s/iter")
+            return " | ".join(parts), True
+
+        return raw, False
+
+    def log(msg: str, transient: bool = False):
+        nonlocal console_progress_active, console_progress_width
+        text = str(msg).rstrip("\r\n")
+        if not text:
+            return
+        if not transient:
+            log_lines.append(text)
+        try:
+            if transient:
+                padding = ""
+                if console_progress_width > len(text):
+                    padding = " " * (console_progress_width - len(text))
+                sys.stdout.write("\r" + text + padding)
+                sys.stdout.flush()
+                console_progress_active = True
+                console_progress_width = max(console_progress_width, len(text))
+            else:
+                _flush_console_progress()
+                print(text, flush=True)
         except Exception:
             pass
         if on_progress:
@@ -823,12 +918,14 @@ def run_flashvsr(
                         if proc.poll() is not None:
                             break
                     else:
-                        text = str(item)
-                        if _should_suppress_flashvsr_cli_line(text):
+                        raw_text = str(item)
+                        if _should_suppress_flashvsr_cli_line(raw_text):
                             last_activity_ts = time.time()
                             continue
-                        output_lines.append(text)
-                        log(text)
+                        text, is_live_progress = _format_live_progress(raw_text)
+                        if not is_live_progress:
+                            output_lines.append(text)
+                        log(text, transient=is_live_progress)
                         try:
                             if (
                                 (not preflight_tiling_emitted)
@@ -840,11 +937,12 @@ def run_flashvsr(
                                     output_lines.append(math_line)
                                     log(math_line)
                             if (
-                                "%" in text
-                                or "Processed:" in text
-                                or "Processing:" in text
-                                or "[VideoWriter]" in text
-                                or "[Chunk " in text
+                                is_live_progress
+                                or "%" in raw_text
+                                or "Processed:" in raw_text
+                                or "Processing:" in raw_text
+                                or "[VideoWriter]" in raw_text
+                                or "[Chunk " in raw_text
                             ):
                                 last_progress_hint = text
                         except Exception:
@@ -870,15 +968,18 @@ def run_flashvsr(
                 except _queue.Empty:
                     break
                 if item:
-                    text = str(item)
-                    if _should_suppress_flashvsr_cli_line(text):
+                    raw_text = str(item)
+                    if _should_suppress_flashvsr_cli_line(raw_text):
                         continue
-                    output_lines.append(text)
-                    log(text)
+                    text, is_live_progress = _format_live_progress(raw_text)
+                    if not is_live_progress:
+                        output_lines.append(text)
+                    log(text, transient=is_live_progress)
 
             returncode_local = proc.wait()
             if process_handle is not None:
                 process_handle["proc"] = None
+            _flush_console_progress()
             return returncode_local, "\n".join(output_lines), False
 
         attempts: List[str] = [precision]

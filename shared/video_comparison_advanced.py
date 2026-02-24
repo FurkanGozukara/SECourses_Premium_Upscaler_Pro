@@ -1054,12 +1054,14 @@ def create_input_vs_output_slider_comparison_video(
         dur_out = get_media_duration_seconds(str(output_path)) or 0.0
         dur_in = get_media_duration_seconds(str(input_path)) or 0.0
         source_duration = max(float(dur_out), float(dur_in), 0.0)
+        duration_was_auto = False
         try:
             base_cycle_duration = float(slider_pass_duration_seconds or 0.0)
         except Exception:
             base_cycle_duration = 0.0
         if base_cycle_duration <= 0.0:
             base_cycle_duration = float(source_duration or 0.0)
+            duration_was_auto = True
         base_cycle_duration = max(0.5, base_cycle_duration)
         source_fps = (
             get_media_fps(str(output_path))
@@ -1068,7 +1070,14 @@ def create_input_vs_output_slider_comparison_video(
         )
         source_fps = max(1.0, float(source_fps))
         slowmo_factor = _coerce_slowmo_factor(slow_motion_factor, default=1.0)
-        timeline_fps = max(1.0, source_fps / slowmo_factor)
+        min_slider_fps = 48.0 if max(base_w, base_h) >= 1280 else 36.0
+        timeline_fps = max(1.0, min_slider_fps, source_fps / slowmo_factor)
+        if duration_was_auto:
+            axis_pixels = float(base_h if layout == "vertical" else base_w)
+            min_pass_frames = max(60.0, axis_pixels / 14.0)
+            min_cycle_duration = (2.0 * min_pass_frames) / timeline_fps
+            base_cycle_duration = max(base_cycle_duration, min_cycle_duration)
+
         total_duration = max(0.5, base_cycle_duration * slowmo_factor)
         total_frames = max(2, int(round(total_duration * timeline_fps)))
         forward_frames = max(1, total_frames // 2)
@@ -1087,6 +1096,8 @@ def create_input_vs_output_slider_comparison_video(
         safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
         safe_font_size = _coerce_font_size(font_size, default=32)
 
+        slider_scale_flags = "bicubic"
+
         if layout == "vertical":
             frame_idx_expr = "max(N-1,0)"
             boundary_expr = (
@@ -1095,11 +1106,12 @@ def create_input_vs_output_slider_comparison_video(
                 f"if(lt({frame_idx_expr},{total_frames}),"
                 f"{base_h}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
-            edge_min = 8
-            edge_max = max(edge_min, int(base_h) - edge_min)
             split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
+            line_mask_expr = f"lte(abs(Y-({boundary_expr})),2)"
+            luma_expr = f"if({line_mask_expr},235,{split_expr})"
+            chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"[1:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
                 f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
@@ -1111,18 +1123,12 @@ def create_input_vs_output_slider_comparison_video(
                 )
             right_drawtext += "[right];"
 
-            blend_expr = (
-                f"if(between({boundary_expr},{edge_min},{edge_max}),"
-                f"if(lte(abs(Y-({boundary_expr})),2),255,"
-                f"if(lte(abs(Y-({boundary_expr})),6),20,{split_expr})),"
-                f"{split_expr})"
-            )
             base_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"[0:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
-                f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+                f"[left][right]blend=c0_expr='{luma_expr}':c1_expr='{chroma_expr}':c2_expr='{chroma_expr}'[slider]"
             )
         else:
             frame_idx_expr = "max(N-1,0)"
@@ -1132,11 +1138,12 @@ def create_input_vs_output_slider_comparison_video(
                 f"if(lt({frame_idx_expr},{total_frames}),"
                 f"{base_w}*(({float(total_frames):.6f}-{frame_idx_expr})/{float(backward_frames):.6f}),0))"
             )
-            edge_min = 8
-            edge_max = max(edge_min, int(base_w) - edge_min)
             split_expr = f"if(lt(X,{boundary_expr}),A,B)"
+            line_mask_expr = f"lte(abs(X-({boundary_expr})),2)"
+            luma_expr = f"if({line_mask_expr},235,{split_expr})"
+            chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"[1:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
                 f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
@@ -1148,24 +1155,18 @@ def create_input_vs_output_slider_comparison_video(
                 )
             right_drawtext += "[right];"
 
-            blend_expr = (
-                f"if(between({boundary_expr},{edge_min},{edge_max}),"
-                f"if(lte(abs(X-({boundary_expr})),2),255,"
-                f"if(lte(abs(X-({boundary_expr})),6),20,{split_expr})),"
-                f"{split_expr})"
-            )
             base_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={timeline_fps:.6f},format=gbrp,"
+                f"[0:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
                 f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
-                f"[left][right]blend=all_expr='{blend_expr}'[slider]"
+                f"[left][right]blend=c0_expr='{luma_expr}':c1_expr='{chroma_expr}':c2_expr='{chroma_expr}'[slider]"
             )
 
         if use_custom_size:
             filter_complex = (
                 f"{base_filter};"
-                f"[slider]scale={final_w}:{final_h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                f"[slider]scale={final_w}:{final_h}:flags={slider_scale_flags}:force_original_aspect_ratio=decrease,"
                 f"pad={final_w}:{final_h}:(ow-iw)/2:(oh-ih)/2:black[out]"
             )
         else:
@@ -1195,7 +1196,7 @@ def create_input_vs_output_slider_comparison_video(
             "-crf",
             "18",
             "-preset",
-            "medium",
+            "veryfast",
             "-pix_fmt",
             "yuv420p",
             "-r",

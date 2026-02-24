@@ -2,6 +2,10 @@
 
 ## Download Link : https://www.patreon.com/posts/150202809
 
+## 4K NEWER TUTORIAL : https://youtu.be/_WT4C78j5-c
+
+[![Watch the video](https://img.youtube.com/vi/_WT4C78j5-c/maxresdefault.jpg)](https://youtu.be/_WT4C78j5-c)
+
 ## 4K HD Tutorial : https://www.youtube.com/watch?v=bPWsg8DREiM
 
 ### SECourses Ultimate Video and Image Upscaler Pro - SeedVR2 - FlashVSR+ - Face Restoration - Gan Upscalers - Queue System - Fully Automated Movie Restoration and Upscale Studio

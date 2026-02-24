@@ -7,6 +7,7 @@ UPDATED: Now uses Universal Preset System
 import gradio as gr
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -24,6 +25,8 @@ from shared.services.flashvsr_service import (
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
+from shared.path_utils import get_media_dimensions, normalize_path
+from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -138,6 +141,130 @@ def flashvsr_tab(
             "**Mode note:** In `tiny` / `tiny-long`, decoding is TCDecoder-based. "
             "Changing **VAE Model** has limited effect on VRAM/decoder behavior in this backend path."
         )
+
+    def _compute_dit_tile_count_text(
+        path_val,
+        tile_size_val,
+        overlap_val,
+        scale_state_val,
+        use_global,
+        local_upscale_factor,
+        max_edge_val,
+        pre_downscale_val,
+        state,
+        tiled_dit_val,
+        mode_val,
+        stream_decode_val,
+    ) -> tuple[str, bool]:
+        if not bool(tiled_dit_val):
+            return "DiT tile count: disabled (`Enable DiT Tiling` is OFF).", True
+
+        mode_norm = str(mode_val or "full").strip().lower()
+        if bool(stream_decode_val) and mode_norm in {"tiny", "tiny-long"}:
+            return "DiT tile count: disabled at runtime (`Stream Decode` is ON in tiny modes).", True
+
+        try:
+            tile_size = int(float(tile_size_val))
+        except Exception:
+            tile_size = 256
+        tile_size = max(32, min(1024, tile_size))
+
+        try:
+            overlap = int(float(overlap_val))
+        except Exception:
+            overlap = 24
+        overlap = max(8, min(512, overlap))
+
+        notes = []
+        if tile_size < 128:
+            tile_size = 128
+            notes.append("tile_size auto-raised to 128")
+        if overlap >= tile_size:
+            overlap = max(8, tile_size - 8)
+            notes.append("overlap auto-corrected")
+        stride = max(1, int(tile_size - overlap))
+
+        normalized_path = normalize_path(path_val) if path_val else None
+        if not normalized_path:
+            return "**DiT tiles:** set an input path to estimate tile count.", True
+
+        dims = get_media_dimensions(normalized_path)
+        if not dims:
+            return "**DiT tiles:** unable to read input dimensions yet.", True
+
+        src_w, src_h = int(dims[0]), int(dims[1])
+        tiling_w, tiling_h = src_w, src_h
+
+        try:
+            resolved_scale = resolve_flashvsr_effective_scale(
+                scale_state_val=scale_state_val,
+                use_global=bool(use_global),
+                local_upscale_factor=local_upscale_factor,
+                state=state if isinstance(state, dict) else None,
+            )
+            model_scale = int(resolved_scale or 4)
+            max_edge = int(max_edge_val or 0)
+
+            plan = estimate_fixed_scale_upscale_plan_from_dims(
+                src_w,
+                src_h,
+                requested_scale=float(model_scale),
+                model_scale=int(model_scale),
+                max_edge=max_edge,
+                force_pre_downscale=bool(pre_downscale_val),
+            )
+            tiling_w = int(plan.preprocess_width or src_w)
+            tiling_h = int(plan.preprocess_height or src_h)
+        except Exception:
+            tiling_w, tiling_h = src_w, src_h
+
+        rows = max(1, int(math.ceil((tiling_h - overlap) / float(stride))))
+        cols = max(1, int(math.ceil((tiling_w - overlap) / float(stride))))
+        total = int(rows * cols)
+
+        preprocess_note = ""
+        if tiling_w != src_w or tiling_h != src_h:
+            preprocess_note = f"; preprocessed from `{src_w}x{src_h}`"
+
+        guardrail_note = ""
+        if notes:
+            guardrail_note = f" ({'; '.join(notes)})"
+
+        text = (
+            f"**DiT tiles:** `{total}` (`{cols} x {rows}`)  \n"
+            f"Input for tiling: `{tiling_w}x{tiling_h}`; stride: `{stride}`{preprocess_note}{guardrail_note}."
+        )
+        return text, True
+
+    def _tile_count_info_update(
+        path_val,
+        tile_size_val,
+        overlap_val,
+        scale_state_val,
+        use_global,
+        local_upscale_factor,
+        max_edge_val,
+        pre_downscale_val,
+        state,
+        tiled_dit_val,
+        mode_val,
+        stream_decode_val,
+    ):
+        text, visible = _compute_dit_tile_count_text(
+            path_val,
+            tile_size_val,
+            overlap_val,
+            scale_state_val,
+            use_global,
+            local_upscale_factor,
+            max_edge_val,
+            pre_downscale_val,
+            state,
+            tiled_dit_val,
+            mode_val,
+            stream_decode_val,
+        )
+        return gr.update(value=text, visible=visible)
     # GPU detection and warnings (parent-process safe: NO torch import)
     cuda_available = False
     cuda_count = 0
@@ -406,20 +533,42 @@ def flashvsr_tab(
                         ),
                     )
 
+                _initial_tile_count_text, _initial_tile_count_visible = _compute_dit_tile_count_text(
+                    _value("input_path", ""),
+                    _value("tile_size", 256),
+                    _value("overlap", 24),
+                    _value("scale", "4"),
+                    _value("use_resolution_tab", True),
+                    _value("upscale_factor", _value("scale", 4)),
+                    _value("max_target_resolution", 1920),
+                    _value("pre_downscale_then_upscale", True),
+                    shared_state.value if isinstance(shared_state.value, dict) else {},
+                    _value("tiled_dit", True),
+                    _value("mode", "full"),
+                    _value("stream_decode", False),
+                )
+
                 with gr.Row():
-                    tile_size = gr.Slider(
-                        label="Tile Size",
-                        minimum=32, maximum=1024, step=32,
-                        value=int(_value("tile_size", 256) or 256),
-                        info="Larger tiles are faster but use more VRAM. 256 is a balanced default."
-                    )
-                    
-                    overlap = gr.Slider(
-                        label="Tile Overlap",
-                        minimum=8, maximum=512, step=8,
-                        value=int(_value("overlap", 24) or 24),
-                        info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
-                    )
+                    with gr.Column():
+                        tile_size = gr.Slider(
+                            label="Tile Size",
+                            minimum=32, maximum=1024, step=32,
+                            value=int(_value("tile_size", 256) or 256),
+                            info="Larger tiles are faster but use more VRAM. 256 is a balanced default."
+                        )
+                        dit_tile_count = gr.Markdown(
+                            value=_initial_tile_count_text,
+                            visible=bool(_initial_tile_count_visible),
+                            elem_classes=["resolution-info"],
+                        )
+
+                    with gr.Column():
+                        overlap = gr.Slider(
+                            label="Tile Overlap",
+                            minimum=8, maximum=512, step=8,
+                            value=int(_value("overlap", 24) or 24),
+                            info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
+                        )
 
             gr.Markdown("#### Diffusion Controls (Experimental)")
             with gr.Group():
@@ -968,10 +1117,49 @@ def flashvsr_tab(
                 state,
             )
 
-    input_file.upload(
+    def refresh_tile_count(path_val, tile_size_val, overlap_val, scale_val, use_global, local_scale_x, max_edge, pre_down, state, tiled_dit_val, mode_val, stream_decode_val):
+        return _tile_count_info_update(
+            path_val,
+            tile_size_val,
+            overlap_val,
+            scale_val,
+            use_global,
+            local_scale_x,
+            max_edge,
+            pre_down,
+            state,
+            tiled_dit_val,
+            mode_val,
+            stream_decode_val,
+        )
+
+    tile_count_inputs = [
+        input_path,
+        tile_size,
+        overlap,
+        scale,
+        use_resolution_tab,
+        upscale_factor,
+        max_target_resolution,
+        pre_downscale_then_upscale,
+        shared_state,
+        tiled_dit,
+        mode,
+        stream_decode,
+    ]
+
+    upload_evt = input_file.upload(
         fn=cache_input_upload,
         inputs=[input_file, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
+    )
+    upload_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     # When upload is cleared, also clear the textbox path and hide dependent panels.
@@ -995,10 +1183,18 @@ def flashvsr_tab(
             state,
         )
 
-    input_file.change(
+    upload_clear_evt = input_file.change(
         fn=clear_input_path_on_upload_clear,
         inputs=[input_file, shared_state],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
+    )
+    upload_clear_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     def cache_input_path(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
@@ -1070,32 +1266,75 @@ def flashvsr_tab(
     # Keep heavy media/path analysis user-triggered only.
     # `.change()` also fires on function updates (e.g. tab sync), which can fan out
     # into expensive cascades on large UIs.
-    input_path.submit(
+    input_submit_evt = input_path.submit(
         fn=cache_input_path,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
+    )
+    input_submit_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    input_path.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     def refresh_sizing(path_val, scale_val, use_global, local_scale_x, max_edge, pre_down, state):
         return _build_sizing_info(path_val, int(scale_val), bool(use_global), local_scale_x, max_edge, pre_down, state)
 
-    scale.change(
+    scale_evt = scale.change(
         fn=refresh_sizing,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[sizing_info],
         trigger_mode="always_last",
     )
-    pre_downscale_then_upscale.change(
+    scale_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    pre_down_evt = pre_downscale_then_upscale.change(
         fn=refresh_sizing,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[sizing_info],
         trigger_mode="always_last",
     )
-    max_target_resolution.release(
+    pre_down_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    max_res_evt = max_target_resolution.release(
         fn=refresh_sizing,
         inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[sizing_info],
         preprocess=False,
+        trigger_mode="always_last",
+    )
+    max_res_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
         trigger_mode="always_last",
     )
 
@@ -1173,11 +1412,27 @@ def flashvsr_tab(
         show_progress="hidden",
         trigger_mode="always_last",
     )
+    local_scale_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
 
-    use_resolution_tab.change(
+    use_resolution_evt = use_resolution_tab.change(
         fn=_sync_upscale_ui_and_sizing,
         inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[upscale_factor, scale, sizing_info],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    use_resolution_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",
@@ -1595,10 +1850,18 @@ def flashvsr_tab(
         outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
     )
 
-    shared_state.change(
+    shared_scale_sync_evt = shared_state.change(
         fn=_sync_upscale_ui_and_sizing_if_needed,
         inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, flashvsr_upscale_sync_signature],
         outputs=[upscale_factor, scale, sizing_info, flashvsr_upscale_sync_signature],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    shared_scale_sync_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
         queue=False,
         show_progress="hidden",
         trigger_mode="always_last",
@@ -1618,6 +1881,51 @@ def flashvsr_tab(
         outputs=[vae_mode_note],
         queue=False,
         show_progress="hidden",
+    )
+
+    mode.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    tile_size.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    overlap.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    tiled_dit.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    stream_decode.change(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     def _cancel_with_confirmation_reset(ok):

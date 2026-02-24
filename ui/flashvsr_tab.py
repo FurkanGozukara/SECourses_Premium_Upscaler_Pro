@@ -420,6 +420,32 @@ def flashvsr_tab(
                         value=int(_value("overlap", 24) or 24),
                         info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
                     )
+
+            gr.Markdown("#### Diffusion Controls (Experimental)")
+            with gr.Group():
+                with gr.Row():
+                    cfg_scale = gr.Slider(
+                        label="CFG Scale",
+                        minimum=0.5,
+                        maximum=2.0,
+                        step=0.05,
+                        value=float(_value("cfg_scale", 1.0) or 1.0),
+                        info=(
+                            "Experimental latent update gain. `1.0` = default behavior. "
+                            "Higher values push stronger hallucination/detail; lower values are more conservative."
+                        ),
+                    )
+                    denoise_amount = gr.Slider(
+                        label="Denoise Amount",
+                        minimum=0.5,
+                        maximum=2.0,
+                        step=0.05,
+                        value=float(_value("denoise_amount", 1.0) or 1.0),
+                        info=(
+                            "Experimental one-step denoise strength. `1.0` = default. "
+                            "Higher can increase diffusion impact but may introduce artifacts/flicker."
+                        ),
+                    )
             
             # Quality / I/O Settings
             gr.Markdown("#### Output / I/O Settings")
@@ -730,6 +756,7 @@ def flashvsr_tab(
             - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
             - `Local Range` is truly `9` or `11` only. `Sparse Ratio` is `1.5-2.0`. `KV Ratio` is `1.0-3.0`.
             - `Sparse Ratio`/`Local Range` matter most on sparse attention backends; on `flash_attention_2`/`sdpa` their effect is limited.
+            - `CFG Scale` and `Denoise Amount` are experimental one-step multipliers; keep both near `1.0` for baseline behavior.
             - `Force Offload After Run` is most useful in long-lived processes; in subprocess-per-job flows it usually has smaller impact.
             - `Enable Stream Decode` works only in tiny modes and automatically disables DiT tiling for that run.
             """)
@@ -739,6 +766,7 @@ def flashvsr_tab(
         input_path, output_override, output_format, scale, version, mode,
         vae_model, precision, attention_mode,
         tiled_vae, tiled_dit, tile_size, overlap, unload_dit, stream_decode,
+        cfg_scale, denoise_amount,
         sparse_ratio, kv_ratio, local_range, frame_chunk_size,
         keep_models_on_cpu, force_offload, enable_debug,
         color_fix, seed, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir,

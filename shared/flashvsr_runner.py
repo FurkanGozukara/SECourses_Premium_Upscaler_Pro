@@ -483,6 +483,14 @@ def run_flashvsr(
         sparse_ratio = max(1.5, min(2.0, _parse_float(settings.get("sparse_ratio"), 2.0)))
         kv_ratio = max(1.0, min(3.0, _parse_float(settings.get("kv_ratio"), 3.0)))
         local_range = 9 if _parse_int(settings.get("local_range"), 11) == 9 else 11
+        cfg_scale = max(0.5, min(2.0, _parse_float(settings.get("cfg_scale"), 1.0)))
+        denoise_amount = max(
+            0.5,
+            min(
+                2.0,
+                _parse_float(settings.get("denoise_amount", settings.get("denoising_strength")), 1.0),
+            ),
+        )
         frame_chunk_size = max(0, _parse_int(settings.get("frame_chunk_size"), 0))
         resize_factor = max(0.1, min(1.0, _parse_float(settings.get("resize_factor"), 1.0)))
         seed = max(0, _parse_int(settings.get("seed"), 0))
@@ -672,6 +680,10 @@ def run_flashvsr(
                 str(kv_ratio),
                 "--local_range",
                 str(local_range),
+                "--cfg_scale",
+                str(cfg_scale),
+                "--denoise_amount",
+                str(denoise_amount),
                 "--seed",
                 str(seed),
                 "--frame_chunk_size",
@@ -960,6 +972,8 @@ def run_flashvsr(
                         "version": version_ui if "version_ui" in locals() else settings.get("version", "unknown"),
                         "mode": mode if "mode" in locals() else settings.get("mode", "unknown"),
                         "vae_model": vae_model if "vae_model" in locals() else settings.get("vae_model", "unknown"),
+                        "cfg_scale": float(cfg_scale) if "cfg_scale" in locals() else _parse_float(settings.get("cfg_scale"), 1.0),
+                        "denoise_amount": float(denoise_amount) if "denoise_amount" in locals() else _parse_float(settings.get("denoise_amount"), 1.0),
                         "stream_decode": bool(stream_decode) if "stream_decode" in locals() else bool(settings.get("stream_decode", False)),
                         "single_image_profile": bool(single_image_profile_applied) if "single_image_profile_applied" in locals() else False,
                         "single_image_repeat_frames": int(single_image_repeat_frames) if "single_image_repeat_frames" in locals() else 1,

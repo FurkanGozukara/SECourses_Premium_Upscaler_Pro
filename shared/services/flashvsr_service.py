@@ -288,6 +288,8 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "overlap": default_overlap,
         "unload_dit": True,
         "stream_decode": False,
+        "cfg_scale": 1.0,
+        "denoise_amount": 1.0,
         "sparse_ratio": 2.0,
         "kv_ratio": 3.0,
         "local_range": 11,
@@ -333,6 +335,8 @@ FLASHVSR_ORDER: List[str] = [
     "overlap",
     "unload_dit",
     "stream_decode",
+    "cfg_scale",
+    "denoise_amount",
     "sparse_ratio",
     "kv_ratio",
     "local_range",
@@ -415,6 +419,17 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         cfg["_tiled_vae_note"] = "Disabled tiled_vae in full mode to avoid known corruption artifacts."
     cfg["unload_dit"] = _to_bool(cfg.get("unload_dit"), _to_bool(defaults.get("unload_dit", False), False))
     cfg["stream_decode"] = _to_bool(cfg.get("stream_decode"), _to_bool(defaults.get("stream_decode", False), False))
+    cfg["cfg_scale"] = max(0.5, min(2.0, _to_float(cfg.get("cfg_scale"), _to_float(defaults.get("cfg_scale"), 1.0))))
+    cfg["denoise_amount"] = max(
+        0.5,
+        min(
+            2.0,
+            _to_float(
+                cfg.get("denoise_amount", cfg.get("denoising_strength")),
+                _to_float(defaults.get("denoise_amount", defaults.get("denoising_strength", 1.0)), 1.0),
+            ),
+        ),
+    )
     cfg["color_fix"] = _to_bool(cfg.get("color_fix"), _to_bool(defaults.get("color_fix", True), True))
     cfg["keep_models_on_cpu"] = _to_bool(
         cfg.get("keep_models_on_cpu"),

@@ -660,6 +660,32 @@ def main(argv=None):
       box-shadow: 0 12px 28px rgba(14, 116, 144, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
     }
 
+    /* Optimize parameters */
+    .action-btn-optimize button,
+    button.action-btn-optimize {
+      background: linear-gradient(132deg, #0b1222 0%, #0f766e 43%, #0ea5e9 100%) !important;
+      border-color: rgba(153, 246, 228, 1) !important;
+      box-shadow: 0 13px 30px rgba(8, 145, 178, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+      letter-spacing: 0.25px;
+      font-weight: 800;
+    }
+    .action-btn-optimize button::after,
+    button.action-btn-optimize::after {
+      content: "";
+      position: absolute;
+      inset: -36% auto -36% -26%;
+      width: 28%;
+      transform: rotate(16deg);
+      background: linear-gradient(90deg, rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.0));
+      animation: actionSweep 2.0s linear infinite;
+      pointer-events: none;
+    }
+    .action-btn-optimize button:hover,
+    button.action-btn-optimize:hover {
+      box-shadow: 0 17px 34px rgba(8, 145, 178, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.27) !important;
+      border-color: rgba(204, 251, 241, 1) !important;
+    }
+
     /* Cancel */
     .action-btn-cancel button,
     button.action-btn-cancel {

@@ -1272,6 +1272,7 @@ def build_flashvsr_callbacks(
                 last_input_path: Optional[str] = None
                 last_output_path: Optional[str] = None
                 last_chunk_run_dir: Optional[Path] = None
+                total_items = max(1, len(items))
                 batch_root = resolve_batch_output_dir(
                     batch_input_path=str(in_dir),
                     batch_output_path=settings.get("batch_output_path"),
@@ -1284,28 +1285,51 @@ def build_flashvsr_callbacks(
                 except Exception:
                     pass
 
+                def _batch_live_payload(status_text: str, preview_out: Optional[str] = None):
+                    seed_controls["flashvsr_batch_outputs"] = list(outputs)
+                    state["seed_controls"] = seed_controls
+                    preview_candidate = str(preview_out or "").strip() if preview_out else ""
+                    if (not preview_candidate) and last_output_path:
+                        preview_candidate = str(last_output_path)
+                    vid_upd, img_upd = _media_updates(preview_candidate if preview_candidate else None)
+                    return (
+                        status_text,
+                        "\n".join(logs[-200:]),
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+
                 if progress:
                     progress(0, desc=f"Batch: {len(items)} item(s) queued")
+                logs.append(f"Batch queued: {len(items)} item(s). Output: {batch_root}")
+                yield _batch_live_payload(f"Starting FlashVSR+ batch ({len(items)} item(s))")
 
                 for idx, item in enumerate(items, 1):
                     if _flashvsr_cancel_event.is_set():
-                        vid_upd, img_upd = _media_updates(None)
+                        logs.append("Batch cancelled by user.")
+                        payload = _batch_live_payload("Batch cancelled by user")
                         yield (
-                            "⏹️ Batch cancelled",
-                            "\n".join(logs[-200:]) + "\n\n[Cancelled by user]",
-                            vid_upd,
-                            img_upd,
-                            gr.update(visible=False),
-                            gr.update(value="", visible=False),
-                            state,
+                            payload[0],
+                            (payload[1] + "\n\n[Cancelled by user]").strip(),
+                            payload[2],
+                            payload[3],
+                            payload[4],
+                            payload[5],
+                            payload[6],
                         )
                         return
 
                     item_path = str(item)
                     last_input_path = item_path
+                    item_name = Path(item_path).name
+                    logs.append(f"[{idx}/{len(items)}] Processing {item_name}")
+                    yield _batch_live_payload(f"Batch {idx}/{len(items)}: processing {item_name}")
 
                     if progress:
-                        progress((idx - 1) / max(1, len(items)), desc=f"Batch {idx}/{len(items)}: {Path(item_path).name}")
+                        progress((idx - 1) / max(1, len(items)), desc=f"Batch {idx}/{len(items)}: {item_name}")
 
                     item_settings = settings.copy()
                     item_settings["batch_enable"] = False
@@ -1336,10 +1360,12 @@ def build_flashvsr_callbacks(
                             )
                             if predicted_output_file.exists():
                                 outputs.append(str(predicted_output_file))
+                            yield _batch_live_payload(f"Batch {idx}/{len(items)}: skipped {item_name}")
                             continue
                         logs.append(
                             f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed (could not create output folder)"
                         )
+                        yield _batch_live_payload(f"Batch {idx}/{len(items)}: could not prepare output for {item_name}")
                         continue
 
                     item_settings["global_output_dir"] = str(run_paths.run_dir)
@@ -1355,6 +1381,7 @@ def build_flashvsr_callbacks(
                             f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed: "
                             f"{item_settings.get('_preprocess_error_note') or 'required pre-downscale failed'}"
                         )
+                        yield _batch_live_payload(f"Batch {idx}/{len(items)}: preprocessing issue for {item_name}")
                         continue
 
                     effective_for_chunk = normalize_path(item_settings.get("_effective_input_path") or item_path)
@@ -1542,6 +1569,13 @@ def build_flashvsr_callbacks(
                             )
                         except Exception:
                             pass
+
+                    succeeded = len(outputs)
+                    with_issues = max(0, idx - succeeded)
+                    yield _batch_live_payload(
+                        f"Batch progress {idx}/{total_items}: {succeeded} succeeded, {with_issues} with issues",
+                        preview_out=last_output_path,
+                    )
 
                 if progress:
                     progress(1.0, desc=f"Batch complete ({len(outputs)}/{len(items)} succeeded)")

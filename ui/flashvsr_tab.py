@@ -40,7 +40,11 @@ from shared.queue_state import (
     snapshot_global_settings,
     merge_payload_state,
 )
-from shared.gpu_utils import get_gpu_info
+from shared.gpu_utils import get_gpu_info, get_global_gpu_override
+from shared.flashvsr_optimizer import (
+    optimize_flashvsr_settings,
+    format_flashvsr_optimization_summary,
+)
 
 
 def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> float | None:
@@ -420,6 +424,12 @@ def flashvsr_tab(
                         precision=0,
                         info="Seed for reproducibility."
                     )
+                    optimize_params_btn = gr.Button(
+                        "Optimize Parameters",
+                        size="md",
+                        elem_classes=["action-btn", "action-btn-optimize"],
+                    )
+                optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
 
                 with gr.Row():
                     frame_chunk_size = gr.Slider(
@@ -1438,6 +1448,94 @@ def flashvsr_tab(
         trigger_mode="always_last",
     )
 
+    def optimize_parameters_for_vram(
+        path_val,
+        mode_val,
+        precision_val,
+        vae_model_val,
+        keep_models_on_cpu_val,
+        stream_decode_val,
+        scale_state_val,
+        use_global_val,
+        local_upscale_val,
+        max_edge_val,
+        pre_downscale_val,
+        state,
+    ):
+        resolved_scale = resolve_flashvsr_effective_scale(
+            scale_state_val=scale_state_val,
+            use_global=bool(use_global_val),
+            local_upscale_factor=local_upscale_val,
+            state=state if isinstance(state, dict) else None,
+        )
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        selected_gpu = get_global_gpu_override(seed_controls, global_settings)
+        records_csv_path = str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_records.csv")
+
+        result = optimize_flashvsr_settings(
+            input_path=path_val or "",
+            requested_scale=int(resolved_scale or 4),
+            mode=str(mode_val or "full"),
+            precision=str(precision_val or "bf16"),
+            vae_model=str(vae_model_val or "Wan2.2"),
+            keep_models_on_cpu=bool(keep_models_on_cpu_val),
+            stream_decode=bool(stream_decode_val),
+            selected_gpu_value=selected_gpu,
+            max_target_resolution=int(max_edge_val or 0),
+            pre_downscale_then_upscale=bool(pre_downscale_val),
+            reserve_vram_gb=2.0,
+            records_csv_path=records_csv_path,
+        )
+        summary = format_flashvsr_optimization_summary(result)
+
+        if result.stage_label in {"invalid_input", "missing_dimensions", "cpu_mode"}:
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.update(value=summary, visible=True),
+                gr.update(value="Optimization skipped. Check input path and CUDA GPU availability.", visible=True),
+            )
+
+        next_use_global = bool(use_global_val)
+        if next_use_global and int(result.scale) != int(resolved_scale or 4):
+            next_use_global = False
+            summary = (
+                f"{summary}\n"
+                "- Note: Disabled `Use Resolution & Scene Split Tab Settings` so optimized scale can be applied."
+            )
+
+        status_line = (
+            "Optimization applied. "
+            f"Estimated VRAM {result.estimated_peak_vram_gb:.2f} GB "
+            f"(guarded {result.estimated_guarded_vram_gb:.2f} GB) / target {result.budget.target_vram_gb:.2f} GB."
+        )
+        if not result.success:
+            status_line = (
+                "Optimization applied with minimum-safe constraints, but estimate is still above target. "
+                f"Guarded estimate {result.estimated_guarded_vram_gb:.2f} GB / target {result.budget.target_vram_gb:.2f} GB."
+            )
+
+        return (
+            gr.update(value=int(result.tile_size)),
+            gr.update(value=int(result.overlap)),
+            gr.update(value=int(result.frame_chunk_size)),
+            gr.update(value=bool(result.tiled_dit)),
+            gr.update(value=bool(result.tiled_vae)),
+            gr.update(value=float(result.scale)),
+            gr.update(value=str(int(result.scale))),
+            gr.update(value=int(result.max_target_resolution)),
+            gr.update(value=bool(next_use_global)),
+            gr.update(value=summary, visible=True),
+            gr.update(value=status_line, visible=True),
+        )
+
     def refresh_chunk_preview_ui(state):
         preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})
         if not isinstance(preview, dict):
@@ -1458,6 +1556,53 @@ def flashvsr_tab(
             gr.update(value=gallery, visible=bool(gallery)),
             gr.update(value=first_video, visible=bool(first_video)),
         )
+
+    optimize_evt = optimize_params_btn.click(
+        fn=optimize_parameters_for_vram,
+        inputs=[
+            input_path,
+            mode,
+            precision,
+            vae_model,
+            keep_models_on_cpu,
+            stream_decode,
+            scale,
+            use_resolution_tab,
+            upscale_factor,
+            max_target_resolution,
+            pre_downscale_then_upscale,
+            shared_state,
+        ],
+        outputs=[
+            tile_size,
+            overlap,
+            frame_chunk_size,
+            tiled_dit,
+            tiled_vae,
+            upscale_factor,
+            scale,
+            max_target_resolution,
+            use_resolution_tab,
+            optimize_summary,
+            status_box,
+        ],
+    )
+    optimize_evt.then(
+        fn=refresh_sizing,
+        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[sizing_info],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    optimize_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
 
     def on_chunk_gallery_select(evt: gr.SelectData, state):
         try:

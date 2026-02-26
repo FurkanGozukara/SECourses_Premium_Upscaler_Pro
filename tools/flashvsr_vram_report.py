@@ -40,7 +40,14 @@ class SweepRow:
     gpu_total_gb: float
     peak_vram_gb: float
     success: bool
+    effective_success: bool
+    raw_success: bool
+    profile_partial: bool
+    shared_vram_suspect: bool
+    oom_recovery_override: bool
     oom: bool
+    failure_reason: str
+    processing_fps: float
 
     @property
     def preprocess_pixels(self) -> int:
@@ -128,7 +135,22 @@ def _load_rows(csv_path: Path) -> List[SweepRow]:
                         gpu_total_gb=_to_float(row.get("gpu_total_gb"), 0.0),
                         peak_vram_gb=max(0.0, _to_float(row.get("peak_vram_gb"), 0.0)),
                         success=_to_bool(row.get("success")),
+                        effective_success=(
+                            _to_bool(row.get("effective_success"))
+                            if str(row.get("effective_success", "")).strip()
+                            else _to_bool(row.get("success"))
+                        ),
+                        raw_success=(
+                            _to_bool(row.get("raw_success"))
+                            if str(row.get("raw_success", "")).strip()
+                            else _to_bool(row.get("success"))
+                        ),
+                        profile_partial=_to_bool(row.get("profile_partial")),
+                        shared_vram_suspect=_to_bool(row.get("shared_vram_suspect")),
+                        oom_recovery_override=_to_bool(row.get("oom_recovery_override")),
                         oom=_to_bool(row.get("oom")),
+                        failure_reason=str(row.get("failure_reason") or ""),
+                        processing_fps=max(0.0, _to_float(row.get("processing_fps"), 0.0)),
                     )
                 )
             except Exception:
@@ -137,7 +159,11 @@ def _load_rows(csv_path: Path) -> List[SweepRow]:
 
 
 def _build_sensitivity(rows: List[SweepRow]) -> Dict[str, Dict[str, float]]:
-    ok_rows = [r for r in rows if r.success and r.peak_vram_gb > 0.0]
+    ok_rows = [
+        r
+        for r in rows
+        if r.effective_success and (not r.shared_vram_suspect) and (not r.oom_recovery_override) and r.peak_vram_gb > 0.0
+    ]
 
     tile_slopes: List[float] = []
     chunk_slopes: List[float] = []
@@ -231,7 +257,7 @@ def _build_sensitivity(rows: List[SweepRow]) -> Dict[str, Dict[str, float]]:
 def _best_tile_map(rows: List[SweepRow]) -> List[Dict[str, object]]:
     best: Dict[Tuple[object, ...], SweepRow] = {}
     for r in rows:
-        if not r.success:
+        if (not r.effective_success) or r.shared_vram_suspect or r.oom_recovery_override:
             continue
         key = (
             r.gpu_id,
@@ -294,8 +320,26 @@ def _build_markdown(
     best_tiles: List[Dict[str, object]],
 ) -> str:
     total = len(rows)
-    success = sum(1 for r in rows if r.success)
+    raw_success = sum(1 for r in rows if r.raw_success)
+    effective_success = sum(1 for r in rows if r.effective_success and not r.shared_vram_suspect)
+    profile_partial = sum(1 for r in rows if r.profile_partial and r.effective_success and not r.shared_vram_suspect)
+    shared_suspects = sum(1 for r in rows if r.shared_vram_suspect)
+    oom_recovery_overrides = sum(1 for r in rows if r.oom_recovery_override)
     oom = sum(1 for r in rows if r.oom)
+    effective_rows = [
+        r
+        for r in rows
+        if r.effective_success and not r.shared_vram_suspect and not r.oom_recovery_override and r.processing_fps > 0.0
+    ]
+    if effective_rows:
+        fps_vals = [r.processing_fps for r in effective_rows]
+        fps_median = statistics.median(fps_vals)
+        fps_p10 = _quantile(fps_vals, 0.10)
+        fps_p90 = _quantile(fps_vals, 0.90)
+    else:
+        fps_median = 0.0
+        fps_p10 = 0.0
+        fps_p90 = 0.0
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
     lines: List[str] = []
@@ -304,8 +348,19 @@ def _build_markdown(
     lines.append(f"- Generated: `{now}`")
     lines.append(f"- Source CSV: `{csv_path}`")
     lines.append(f"- Total cases: `{total}`")
-    lines.append(f"- Successful cases: `{success}`")
+    lines.append(f"- Raw successful cases: `{raw_success}`")
+    lines.append(f"- Effective successful cases (shared-VRAM filtered): `{effective_success}`")
+    lines.append(f"- Effective partial profile cases (timeout accepted): `{profile_partial}`")
+    lines.append(f"- Shared-VRAM suspect cases: `{shared_suspects}`")
+    lines.append(f"- OOM recovery override cases (invalid for strict tiling): `{oom_recovery_overrides}`")
     lines.append(f"- OOM cases: `{oom}`")
+    lines.append("")
+    lines.append("## Throughput Snapshot")
+    lines.append("")
+    lines.append(
+        "- Effective processing FPS (`processing_fps` from logs): "
+        f"median `{fps_median:.3f}`, P10 `{fps_p10:.3f}`, P90 `{fps_p90:.3f}`."
+    )
     lines.append("")
     lines.append("## Sensitivity Estimates")
     lines.append("")
@@ -395,7 +450,13 @@ def main() -> int:
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "records_csv": str(csv_path),
         "total_cases": len(rows),
-        "successful_cases": sum(1 for r in rows if r.success),
+        "raw_successful_cases": sum(1 for r in rows if r.raw_success),
+        "effective_successful_cases": sum(1 for r in rows if r.effective_success and not r.shared_vram_suspect),
+        "effective_profile_partial_cases": sum(
+            1 for r in rows if r.profile_partial and r.effective_success and not r.shared_vram_suspect
+        ),
+        "shared_vram_suspect_cases": sum(1 for r in rows if r.shared_vram_suspect),
+        "oom_recovery_override_cases": sum(1 for r in rows if r.oom_recovery_override),
         "oom_cases": sum(1 for r in rows if r.oom),
         "sensitivity": sensitivity,
         "best_successful_tiles": best_tiles,
@@ -413,4 +474,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

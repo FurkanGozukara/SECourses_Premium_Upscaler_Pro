@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -381,6 +382,12 @@ def _load_vram_calibration_samples(records_csv_path: Optional[str]) -> List[Dict
         return []
 
     rows: List[Dict[str, Any]] = []
+    allow_legacy = str(os.environ.get("FLASHVSR_ALLOW_LEGACY_SWEEP_ROWS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
         with path.open("r", encoding="utf-8", newline="") as fp:
             reader = csv.DictReader(fp)
@@ -388,9 +395,17 @@ def _load_vram_calibration_samples(records_csv_path: Optional[str]) -> List[Dict
                 if not isinstance(row, dict):
                     continue
                 try:
-                    success = _to_bool(row.get("success"), False)
+                    oom_recovery_override = _to_bool(row.get("oom_recovery_override"), False) or (
+                        "oom_recovery_override" in str(row.get("failure_reason") or "").strip().lower()
+                    )
+                    shared_vram_suspect = _to_bool(row.get("shared_vram_suspect"), False)
+                    has_effective = str(row.get("effective_success", "")).strip() != ""
+                    if has_effective:
+                        success = _to_bool(row.get("effective_success"), False)
+                    else:
+                        success = _to_bool(row.get("success"), False) if allow_legacy else False
                     peak = float(row.get("peak_vram_gb") or 0.0)
-                    if not success or peak <= 0:
+                    if (not success) or shared_vram_suspect or oom_recovery_override or peak <= 0:
                         continue
                     rows.append(row)
                 except Exception:
@@ -604,6 +619,167 @@ def _calibration_multiplier(
     return float(mul), int(n)
 
 
+def _collect_empirical_tile_points(
+    *,
+    mode: str,
+    scale: int,
+    precision: str,
+    vae_model: str,
+    preprocess_width: int,
+    preprocess_height: int,
+    overlap: int,
+    frame_chunk_size: int,
+    keep_models_on_cpu: bool,
+    tiled_dit: bool,
+    tiled_vae: bool,
+    stream_decode: bool,
+    records_csv_path: Optional[str],
+    calibration_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[int, List[float]]:
+    samples = list(calibration_rows) if calibration_rows is not None else _load_vram_calibration_samples(records_csv_path)
+    if not samples:
+        return {}
+
+    target_mode = str(mode or "full").strip().lower()
+    target_scale = _normalized_scale(scale)
+    target_precision = str(precision or "bf16").strip().lower()
+    target_vae = str(vae_model or "Wan2.2").strip().lower()
+    target_w = max(1, int(preprocess_width))
+    target_h = max(1, int(preprocess_height))
+    target_overlap = _clamp_int(overlap, 8, 512, TARGET_OVERLAP)
+    target_chunk = _clamp_int(frame_chunk_size, MIN_FRAME_CHUNK, 10000, TARGET_FRAME_CHUNK)
+
+    by_tile: Dict[int, List[float]] = {}
+    for row in samples:
+        try:
+            row_mode = str(row.get("mode") or "").strip().lower()
+            row_scale = _normalized_scale(row.get("scale"))
+            row_precision = str(row.get("precision") or target_precision).strip().lower()
+            row_vae = str(row.get("vae_model") or target_vae).strip().lower()
+            row_w = max(1, int(float(row.get("preprocess_width") or 0)))
+            row_h = max(1, int(float(row.get("preprocess_height") or 0)))
+            row_overlap = _clamp_int(row.get("overlap"), 8, 512, target_overlap)
+            row_chunk = _clamp_int(row.get("frame_chunk_size"), MIN_FRAME_CHUNK, 10000, target_chunk)
+            row_keep_cpu = _to_bool(row.get("keep_models_on_cpu"), keep_models_on_cpu)
+            row_tiled_dit = _to_bool(row.get("tiled_dit"), tiled_dit)
+            row_tiled_vae = _to_bool(row.get("tiled_vae"), tiled_vae)
+            row_stream_decode = _to_bool(row.get("stream_decode"), stream_decode)
+            if row_mode != target_mode or row_scale != target_scale:
+                continue
+            if row_precision != target_precision or row_vae != target_vae:
+                continue
+            if row_w != target_w or row_h != target_h:
+                continue
+            if row_overlap != target_overlap or row_chunk != target_chunk:
+                continue
+            if row_keep_cpu != bool(keep_models_on_cpu):
+                continue
+            if row_tiled_dit != bool(tiled_dit) or row_tiled_vae != bool(tiled_vae):
+                continue
+            if row_stream_decode != bool(stream_decode):
+                continue
+
+            tile = _clamp_int(row.get("tile_size"), MIN_TILE_SIZE, MAX_TILE_SIZE, MIN_TILE_SIZE)
+            peak = float(row.get("peak_vram_gb") or 0.0)
+            if peak <= 0.0:
+                continue
+            by_tile.setdefault(int(tile), []).append(float(peak))
+        except Exception:
+            continue
+    return by_tile
+
+
+def _empirical_tile_estimate_with_margin(
+    *,
+    mode: str,
+    scale: int,
+    precision: str,
+    vae_model: str,
+    preprocess_width: int,
+    preprocess_height: int,
+    tile_size: int,
+    overlap: int,
+    frame_chunk_size: int,
+    keep_models_on_cpu: bool,
+    tiled_dit: bool,
+    tiled_vae: bool,
+    stream_decode: bool,
+    records_csv_path: Optional[str],
+    calibration_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Tuple[float, float, int]]:
+    by_tile = _collect_empirical_tile_points(
+        mode=mode,
+        scale=scale,
+        precision=precision,
+        vae_model=vae_model,
+        preprocess_width=preprocess_width,
+        preprocess_height=preprocess_height,
+        overlap=overlap,
+        frame_chunk_size=frame_chunk_size,
+        keep_models_on_cpu=keep_models_on_cpu,
+        tiled_dit=tiled_dit,
+        tiled_vae=tiled_vae,
+        stream_decode=stream_decode,
+        records_csv_path=records_csv_path,
+        calibration_rows=calibration_rows,
+    )
+    if not by_tile:
+        return None
+
+    tile_i = _clamp_int(tile_size, MIN_TILE_SIZE, MAX_TILE_SIZE, MIN_TILE_SIZE)
+    exact_vals = by_tile.get(tile_i)
+    if exact_vals:
+        med = float(median(exact_vals))
+        abs_err = [abs(float(v) - med) for v in exact_vals]
+        spread = _quantile(abs_err, 0.90, default=0.0)
+        margin = _clamp_float(
+            max(0.28, float(spread) + 0.12),
+            MIN_ESTIMATION_MARGIN_GB,
+            MAX_ESTIMATION_MARGIN_GB,
+            DEFAULT_ESTIMATION_MARGIN_GB,
+        )
+        return float(med), float(margin), int(len(exact_vals))
+
+    points: List[Tuple[int, float, int]] = []
+    for tile, vals in by_tile.items():
+        if not vals:
+            continue
+        points.append((int(tile), float(median(vals)), int(len(vals))))
+    points.sort(key=lambda item: item[0])
+    if len(points) < 2:
+        return None
+
+    if tile_i <= points[0][0]:
+        p1, p2 = points[0], points[1]
+    elif tile_i >= points[-1][0]:
+        p1, p2 = points[-2], points[-1]
+    else:
+        p1, p2 = points[0], points[1]
+        for idx in range(len(points) - 1):
+            a = points[idx]
+            b = points[idx + 1]
+            if int(a[0]) <= tile_i <= int(b[0]):
+                p1, p2 = a, b
+                break
+
+    t1, v1, n1 = p1
+    t2, v2, n2 = p2
+    if t1 == t2:
+        est = float(v1)
+    else:
+        alpha = float(tile_i - t1) / float(t2 - t1)
+        est = float(v1 + alpha * (v2 - v1))
+
+    slope_gb_per_px = abs(float(v2) - float(v1)) / max(1.0, abs(float(t2) - float(t1)))
+    margin = _clamp_float(
+        max(0.45, slope_gb_per_px * 16.0 + 0.20),
+        MIN_ESTIMATION_MARGIN_GB,
+        MAX_ESTIMATION_MARGIN_GB,
+        DEFAULT_ESTIMATION_MARGIN_GB,
+    )
+    return float(est), float(margin), int(n1 + n2)
+
+
 def _estimate_flashvsr_peak_vram_with_margin_gb(
     *,
     preprocess_width: int,
@@ -622,6 +798,34 @@ def _estimate_flashvsr_peak_vram_with_margin_gb(
     records_csv_path: Optional[str] = None,
     calibration_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[float, float, float, int, float]:
+    empirical = _empirical_tile_estimate_with_margin(
+        mode=mode,
+        scale=scale,
+        precision=precision,
+        vae_model=vae_model,
+        preprocess_width=preprocess_width,
+        preprocess_height=preprocess_height,
+        tile_size=tile_size,
+        overlap=overlap,
+        frame_chunk_size=frame_chunk_size,
+        keep_models_on_cpu=keep_models_on_cpu,
+        tiled_dit=tiled_dit,
+        tiled_vae=tiled_vae,
+        stream_decode=stream_decode,
+        records_csv_path=records_csv_path,
+        calibration_rows=calibration_rows,
+    )
+    if empirical is not None:
+        empirical_est, empirical_margin, empirical_samples = empirical
+        empirical_guarded = float(empirical_est + empirical_margin)
+        return (
+            float(empirical_est),
+            float(empirical_guarded),
+            1.0,
+            int(empirical_samples),
+            float(empirical_margin),
+        )
+
     raw = _raw_estimate_peak_vram_gb(
         preprocess_width=preprocess_width,
         preprocess_height=preprocess_height,

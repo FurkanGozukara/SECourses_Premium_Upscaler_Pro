@@ -41,16 +41,19 @@ def _safe_print(text: str) -> None:
 def _default_scenarios(base_dir: Path, scenario_set: str) -> List[Scenario]:
     in960 = base_dir / "450frame960.mp4"
     in1280 = base_dir / "450frame1280.mp4"
+    in832 = base_dir / "450frame832.mp4"
     common = [
         Scenario("960_s4_max0", in960, 4, 0),
         Scenario("960_s2_max0", in960, 2, 0),
         Scenario("1280_s4_max3840", in1280, 4, 3840),
         Scenario("1280_s2_max1920", in1280, 2, 1920),
+        Scenario("832_s4_max0", in832, 4, 0),
+        Scenario("832_s2_max0", in832, 2, 0),
     ]
     if scenario_set == "common":
         return common
 
-    # Wider resolution coverage while still aligned to common output targets.
+    # Wider resolution coverage for sensitivity analysis and capping behavior.
     wide = list(common)
     wide.extend(
         [
@@ -60,6 +63,10 @@ def _default_scenarios(base_dir: Path, scenario_set: str) -> List[Scenario]:
             Scenario("960_s2_max1080", in960, 2, 1080),
             Scenario("1280_s4_max2160", in1280, 4, 2160),
             Scenario("1280_s2_max1080", in1280, 2, 1080),
+            Scenario("832_s4_max3840", in832, 4, 3840),
+            Scenario("832_s4_max2160", in832, 4, 2160),
+            Scenario("832_s2_max1920", in832, 2, 1920),
+            Scenario("832_s2_max1080", in832, 2, 1080),
         ]
     )
     return wide
@@ -109,7 +116,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-list", type=str, default="450,384,320,256,224,192,160,128,96,64,48,32")
     parser.add_argument("--keep-models-on-cpu", action="store_true", default=True)
     parser.add_argument("--no-keep-models-on-cpu", action="store_false", dest="keep_models_on_cpu")
-    parser.add_argument("--timeout-minutes", type=float, default=35.0)
+    parser.add_argument("--timeout-minutes", type=float, default=5.0)
+    parser.add_argument("--stall-seconds", type=float, default=240.0)
+    parser.add_argument("--min-effective-fps", type=float, default=0.20)
+    parser.add_argument("--shared-low-util-pct", type=float, default=12.0)
+    parser.add_argument("--shared-near-full-margin-mb", type=float, default=768.0)
+    parser.add_argument("--shared-pressure-seconds", type=float, default=120.0)
+    parser.add_argument("--min-shared-check-runtime-sec", type=float, default=90.0)
+    parser.add_argument("--accept-timeout-profile", action="store_true", default=True)
+    parser.add_argument("--no-accept-timeout-profile", action="store_false", dest="accept_timeout_profile")
+    parser.add_argument("--profile-min-elapsed-sec", type=float, default=75.0)
     parser.add_argument("--max-cases-per-scenario", type=int, default=0)
     parser.add_argument("--scenario-set", type=str, choices=["common", "wide"], default="common")
     parser.add_argument(
@@ -197,6 +213,17 @@ def main() -> int:
     manifest["scenario_set"] = str(args.scenario_set)
     manifest["gpu_id"] = int(args.gpu_id)
     manifest["records_csv"] = str(records_csv)
+    manifest["guardrails"] = {
+        "timeout_minutes": float(args.timeout_minutes),
+        "stall_seconds": float(args.stall_seconds),
+        "min_effective_fps": float(args.min_effective_fps),
+        "accept_timeout_profile": bool(args.accept_timeout_profile),
+        "profile_min_elapsed_sec": float(args.profile_min_elapsed_sec),
+        "shared_low_util_pct": float(args.shared_low_util_pct),
+        "shared_near_full_margin_mb": float(args.shared_near_full_margin_mb),
+        "shared_pressure_seconds": float(args.shared_pressure_seconds),
+        "min_shared_check_runtime_sec": float(args.min_shared_check_runtime_sec),
+    }
     manifest.setdefault("runs", [])
     _save_manifest(manifest_path, manifest)
 
@@ -212,6 +239,17 @@ def main() -> int:
     _safe_print(f"GPU: cuda:{int(args.gpu_id)}")
     _safe_print(f"Records CSV: {records_csv}")
     _safe_print(f"Manifest: {manifest_path}")
+    _safe_print(
+        "Guards: "
+        f"timeout={float(args.timeout_minutes):.1f}m, "
+        f"stall={float(args.stall_seconds):.0f}s, "
+        f"min_fps={float(args.min_effective_fps):.3f}, "
+        f"timeout_profile={bool(args.accept_timeout_profile)} "
+        f"(min_elapsed={float(args.profile_min_elapsed_sec):.0f}s), "
+        f"shared(low_util<={float(args.shared_low_util_pct):.1f}%, "
+        f"margin={float(args.shared_near_full_margin_mb):.0f}MB, "
+        f"duration>={float(args.shared_pressure_seconds):.0f}s)"
+    )
     _safe_print("-" * 72)
 
     for scenario in scenarios:
@@ -262,7 +300,25 @@ def main() -> int:
             str(run_dir),
             "--timeout-minutes",
             str(float(args.timeout_minutes)),
+            "--stall-seconds",
+            str(float(args.stall_seconds)),
+            "--min-effective-fps",
+            str(float(args.min_effective_fps)),
+            "--profile-min-elapsed-sec",
+            str(float(args.profile_min_elapsed_sec)),
+            "--shared-low-util-pct",
+            str(float(args.shared_low_util_pct)),
+            "--shared-near-full-margin-mb",
+            str(float(args.shared_near_full_margin_mb)),
+            "--shared-pressure-seconds",
+            str(float(args.shared_pressure_seconds)),
+            "--min-shared-check-runtime-sec",
+            str(float(args.min_shared_check_runtime_sec)),
         ]
+        if bool(args.accept_timeout_profile):
+            cmd.append("--accept-timeout-profile")
+        else:
+            cmd.append("--no-accept-timeout-profile")
         if bool(args.resume):
             cmd.append("--resume")
         else:

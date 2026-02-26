@@ -68,7 +68,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.91 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.95 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #

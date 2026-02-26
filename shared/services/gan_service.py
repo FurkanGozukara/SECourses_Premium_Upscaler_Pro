@@ -210,6 +210,7 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "face_restore_after_upscale": False,
         "create_subfolders": False,
         "resume_run_dir": "",
+        "auto_transfer_output_to_input": False,
     }
 
 
@@ -249,6 +250,8 @@ GAN_ORDER: List[str] = [
     "pre_downscale_then_upscale",
     # Resume from an existing chunk run folder.
     "resume_run_dir",
+    # Auto-copy latest output into input after upscale completes.
+    "auto_transfer_output_to_input",
 ]
 
 
@@ -789,10 +792,26 @@ def build_gan_callbacks(
                 if progress_q:
                     progress_q.put(f"WARNING: Failed to write batch metadata: {e}\n")
             
+            try:
+                seed_controls["gan_batch_outputs"] = list(outputs)
+                if outputs:
+                    latest_batch_out = Path(outputs[-1])
+                    seed_controls["gan_last_output_path"] = str(latest_batch_out)
+                    seed_controls["last_output_dir"] = str(
+                        latest_batch_out.parent if latest_batch_out.is_file() else latest_batch_out
+                    )
+                    seed_controls["last_output_path"] = (
+                        str(latest_batch_out) if latest_batch_out.is_file() else None
+                    )
+                else:
+                    seed_controls["gan_last_output_path"] = ""
+            except Exception:
+                pass
+
             result_holder["payload"] = (
                 f"SUCCESS: Batch complete: {len(outputs)}/{len(batch_items)} processed ({batch_result.failed_files} failed)",
                 "\n\n".join(logs),
-                outputs[0] if outputs else None,
+                outputs[-1] if outputs else None,
                 last_cmp,
                 last_slider,
             )
@@ -812,6 +831,8 @@ def build_gan_callbacks(
                 "videos": [],
                 "count": 0,
             }
+            seed_controls["gan_batch_outputs"] = []
+            seed_controls["gan_last_output_path"] = ""
             state["seed_controls"] = seed_controls
             # Clear any previous VRAM OOM banner at the start of a new run.
             clear_vram_oom_alert(state)
@@ -1388,6 +1409,8 @@ def build_gan_callbacks(
                                 out_path = Path(outp)
                                 seed_controls["last_output_dir"] = str(out_path.parent if out_path.is_file() else out_path)
                                 seed_controls["last_output_path"] = str(out_path) if out_path.is_file() else None
+                                seed_controls["gan_last_output_path"] = str(out_path)
+                                seed_controls["gan_batch_outputs"] = []
                             except Exception:
                                 pass
 
@@ -1579,6 +1602,8 @@ def build_gan_callbacks(
                         outp = Path(final_out_path)
                         seed_controls["last_output_dir"] = str(outp.parent if outp.is_file() else outp)
                         seed_controls["last_output_path"] = str(outp) if outp.is_file() else None
+                        seed_controls["gan_last_output_path"] = str(outp)
+                        seed_controls["gan_batch_outputs"] = []
                     except Exception:
                         pass
                 if bool(runtime_settings.get("save_metadata", True)):

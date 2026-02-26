@@ -68,7 +68,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.9 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V2.91 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -740,6 +740,24 @@ def main(argv=None):
     .action-btn-source-seed button:hover,
     button.action-btn-source-seed:hover {
       box-shadow: 0 14px 30px rgba(3, 105, 161, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+    }
+    /* FlashVSR input source column: keep controls stacked at the top. */
+    .flashvsr-input-source-col {
+      justify-content: flex-start !important;
+      align-content: flex-start !important;
+      gap: 0 !important;
+    }
+    .flashvsr-input-source-col .flashvsr-copy-output-compact {
+      margin-top: 0 !important;
+    }
+    /* FlashVSR inline copy button: keep text readable, trim vertical height. */
+    .flashvsr-copy-output-compact button,
+    button.flashvsr-copy-output-compact {
+      min-height: 34px !important;
+      padding-top: 0.24rem !important;
+      padding-bottom: 0.24rem !important;
+      font-size: 0.98rem !important;
+      line-height: 1.15 !important;
     }
     .action-btn-source-gan button,
     button.action-btn-source-gan {

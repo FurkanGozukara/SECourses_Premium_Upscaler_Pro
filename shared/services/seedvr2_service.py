@@ -367,6 +367,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "batch_size": default_batch_size,  # Apply model-specific default
         "uniform_batch_size": False,
         "seed": 42,
+        "auto_transfer_output_to_input": False,
         "skip_first_frames": 0,
         "load_cap": 0,
         "prepend_frames": 0,
@@ -635,6 +636,8 @@ SEEDVR2_ORDER: List[str] = [
     "resume_run_dir",
     # Optional image latent-noise policy (see default key notes above).
     "force_latent_noise_zero_for_images",
+    # Auto-copy latest output back into Input Path after successful upscale.
+    "auto_transfer_output_to_input",
 ]
 
 
@@ -715,6 +718,10 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
     cfg["force_latent_noise_zero_for_images"] = _coerce_bool(
         cfg.get("force_latent_noise_zero_for_images", defaults.get("force_latent_noise_zero_for_images", False)),
         default=bool(defaults.get("force_latent_noise_zero_for_images", False)),
+    )
+    cfg["auto_transfer_output_to_input"] = _coerce_bool(
+        cfg.get("auto_transfer_output_to_input", defaults.get("auto_transfer_output_to_input", False)),
+        default=bool(defaults.get("auto_transfer_output_to_input", False)),
     )
     
     # Apply model-specific metadata constraints
@@ -1615,6 +1622,8 @@ def _process_single_file(
                 outp = Path(result.output_path)
                 seed_controls["last_output_dir"] = str(outp.parent if outp.is_file() else outp)
                 seed_controls["last_output_path"] = str(outp) if outp.is_file() else None
+                seed_controls["seedvr2_last_output_path"] = str(outp) if outp.exists() else ""
+                seed_controls["seedvr2_batch_outputs"] = []
             except Exception:
                 pass
 
@@ -1827,6 +1836,18 @@ def _process_single_file(
                 preprocessed_input_path=str(pre_in) if pre_in else None,
                 input_kind=input_kind_for_ctx,
             )
+    except Exception:
+        pass
+
+    # Keep final output tracking in sync after optional post-processing (face restore, mux, RIFE, conversion).
+    try:
+        final_out = output_video or output_image
+        if final_out and Path(final_out).exists():
+            outp = Path(final_out)
+            seed_controls["last_output_dir"] = str(outp.parent if outp.is_file() else outp)
+            seed_controls["last_output_path"] = str(outp) if outp.is_file() else None
+            seed_controls["seedvr2_last_output_path"] = str(outp)
+            seed_controls["seedvr2_batch_outputs"] = []
     except Exception:
         pass
 
@@ -2887,6 +2908,7 @@ def build_seedvr2_callbacks(
             global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
             seed_controls["global_gpu_device_val"] = global_gpu_device
             seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
+            seed_controls["seedvr2_batch_outputs"] = []
             state["seed_controls"] = seed_controls
 
             # Keep legacy cached keys synced with Output tab source-of-truth values.
@@ -3702,6 +3724,25 @@ def build_seedvr2_callbacks(
                 for job in jobs:
                     if job.status == "completed" and job.output_path and Path(job.output_path).exists():
                         batch_outputs.append(str(job.output_path))
+
+                # Persist last SeedVR2 outputs for copy/auto-transfer convenience.
+                try:
+                    seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+                    if not isinstance(seed_controls, dict):
+                        seed_controls = {}
+                    seed_controls["seedvr2_batch_outputs"] = list(batch_outputs)
+                    if batch_outputs:
+                        last_batch_out = Path(batch_outputs[-1])
+                        seed_controls["seedvr2_last_output_path"] = str(last_batch_out)
+                        seed_controls["last_output_dir"] = str(
+                            last_batch_out.parent if last_batch_out.is_file() else last_batch_out
+                        )
+                        seed_controls["last_output_path"] = str(last_batch_out) if last_batch_out.is_file() else None
+                    else:
+                        seed_controls["seedvr2_last_output_path"] = ""
+                    state["seed_controls"] = seed_controls
+                except Exception:
+                    pass
 
                 summary_msg = f"Batch complete: {completed}/{len(jobs)} succeeded"
                 if skipped > 0:

@@ -28,6 +28,7 @@ from ui.universal_preset_section import (
 )
 from shared.universal_preset import dict_to_values
 from ui.media_preview import preview_updates
+from shared.path_utils import normalize_path
 from shared.processing_queue import get_processing_queue_manager
 from shared.queue_state import (
     snapshot_queue_state,
@@ -224,16 +225,9 @@ def seedvr2_tab(
             # -----------------------------------------------------------------
             #  New sizing controls (Upscale-x)
             # -----------------------------------------------------------------
-            # Keep the legacy short-side resolution value for backward compatibility
-            # with old presets, but hide it from the UI. The runtime `resolution`
-            # passed to SeedVR2 CLI is computed from `upscale_factor` + input size.
-            resolution = gr.Number(
-                label="Legacy Target Resolution (short side)",
-                value=values[9],  # Kept for old presets; NOT used for sizing anymore
-                precision=0,
-                info="Legacy preset field retained for backward compatibility. Active sizing is driven by Upscale-x controls.",
-                interactive=False,
-            )
+            # Legacy short-side resolution is no longer shown in UI.
+            # Keep it as hidden state for preset/backward compatibility.
+            resolution = gr.State(value=values[9])
 
             # NOTE: Upscale-x sizing controls (Upscale x / Max Resolution / Pre-downscale)
             # are defined in the right column directly above  Run Log for quick access.
@@ -253,6 +247,17 @@ def seedvr2_tab(
                     label="Uniform Batch Size",
                     value=values[12],  # Was 15, now 12
                     info="Force all batches to same size by padding. Improves compilation efficiency but may use more memory. Recommended ON with torch.compile.",
+                    scale=1,
+                )
+                copy_output_into_input_btn = gr.Button(
+                    "Copy Output Into Input",
+                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    scale=1,
+                )
+                auto_transfer_output_to_input = gr.Checkbox(
+                    label="Auto Transfer Output to Input",
+                    value=bool(merged_defaults.get("auto_transfer_output_to_input", False)),
+                    info="After upscale completes, automatically copy the latest SeedVR2 output path into Input Path.",
                     scale=1,
                 )
             batch_size_warning = gr.Markdown("", visible=False)
@@ -981,7 +986,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 52, len(inputs_list) must also = 52
+    # Current count: len(SEEDVR2_ORDER) = 53, len(inputs_list) must also = 53
     # ============================================================================
     
     inputs_list = [
@@ -1006,6 +1011,8 @@ def seedvr2_tab(
         resume_run_dir,
         # Optional image safeguard
         allow_custom_image_latent_noise,
+        # Auto-copy output into input after run
+        auto_transfer_output_to_input,
     ]
     
     # Validate synchronization at tab initialization (development-time check)
@@ -1298,6 +1305,186 @@ def seedvr2_tab(
         yield val or "", gr.update(value="", visible=False), state, gr.update(value="", visible=False)
         return
 
+    def _output_path_signature(path_val):
+        normalized = normalize_path(path_val) if path_val else ""
+        if not normalized:
+            return ""
+        try:
+            cand = Path(normalized)
+            if not cand.exists():
+                return ""
+            stat = cand.stat()
+            if cand.is_file():
+                return f"file|{normalized}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+            return f"dir|{normalized}|{int(stat.st_mtime_ns)}"
+        except Exception:
+            return ""
+
+    def _resolve_latest_seedvr2_output_path(state):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        candidates = []
+
+        preferred = seed_controls.get("seedvr2_last_output_path")
+        if preferred:
+            normalized = normalize_path(preferred)
+            if normalized:
+                candidates.append(normalized)
+
+        batch_outputs = seed_controls.get("seedvr2_batch_outputs", [])
+        if isinstance(batch_outputs, list):
+            for item in reversed(batch_outputs):
+                normalized = normalize_path(item) if item else ""
+                if normalized:
+                    candidates.append(normalized)
+
+        fallback = seed_controls.get("last_output_path")
+        if fallback:
+            normalized = normalize_path(fallback)
+            if normalized:
+                candidates.append(normalized)
+
+        seen = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                if Path(cand).exists():
+                    return cand
+            except Exception:
+                continue
+        return ""
+
+    def _transfer_output_to_input_with_analysis(
+        output_path_val,
+        scale_x,
+        max_res_val,
+        pre_down,
+        allow_custom_image_noise,
+        state,
+        success_msg: str,
+    ):
+        state = _cache_local_resolution_inputs(state, scale_x, max_res_val, pre_down, allow_custom_image_noise)
+        state.setdefault("seed_controls", {})
+        state["seed_controls"]["last_input_path"] = output_path_val if output_path_val else ""
+
+        if not output_path_val or not Path(output_path_val).exists():
+            yield (
+                gr.update(),
+                gr.update(value="⚠️ Output path no longer exists. Generate again and retry.", visible=True),
+                state,
+                gr.skip(),
+            )
+            return
+
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
+        yield (
+            output_path_val,
+            gr.update(value="", visible=False),
+            state,
+            gr.update(value=_processing_banner_html(state, 0, _analysis_progress_note(scene_mode, 0)), visible=True),
+        )
+
+        try:
+            for event_type, payload_a, payload_b in _iter_auto_res_progress(output_path_val, state):
+                if event_type == "progress":
+                    pct = int(payload_a)
+                    note = str(payload_b or "")
+                    yield (
+                        output_path_val,
+                        gr.update(value="", visible=False),
+                        state,
+                        gr.update(value=_processing_banner_html(state, pct, note), visible=True),
+                    )
+                    continue
+
+                calc_msg = payload_a
+                updated_state = payload_b
+                if isinstance(calc_msg, dict):
+                    calc_msg["visible"] = True
+                else:
+                    calc_msg = gr.update(value=str(calc_msg), visible=True)
+                yield (
+                    output_path_val,
+                    gr.update(value=f"✅ {success_msg}", visible=True),
+                    updated_state,
+                    calc_msg,
+                )
+                return
+        except Exception as e:
+            yield (
+                output_path_val,
+                gr.update(value=f"✅ {success_msg} (analysis warning: {str(e)[:120]})", visible=True),
+                state,
+                gr.update(value="", visible=False),
+            )
+
+    def copy_latest_output_to_input(
+        _current_input_path,
+        scale_x,
+        max_res_val,
+        pre_down,
+        allow_custom_image_noise,
+        state,
+    ):
+        state = state if isinstance(state, dict) else {}
+        output_path_val = _resolve_latest_seedvr2_output_path(state)
+        if not output_path_val:
+            yield (
+                gr.update(),
+                gr.update(value="⚠️ No generated SeedVR2 output found to transfer.", visible=True),
+                state,
+                gr.skip(),
+            )
+            return
+        yield from _transfer_output_to_input_with_analysis(
+            output_path_val,
+            scale_x,
+            max_res_val,
+            pre_down,
+            allow_custom_image_noise,
+            state,
+            success_msg="Output path copied into input.",
+        )
+
+    def capture_latest_output_signature(state):
+        return _output_path_signature(_resolve_latest_seedvr2_output_path(state))
+
+    def auto_transfer_latest_output_to_input(
+        scale_x,
+        max_res_val,
+        pre_down,
+        allow_custom_image_noise,
+        auto_enabled,
+        previous_signature,
+        state,
+    ):
+        state = state if isinstance(state, dict) else {}
+        if not bool(auto_enabled):
+            yield gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            return
+
+        output_path_val = _resolve_latest_seedvr2_output_path(state)
+        if not output_path_val:
+            yield gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            return
+
+        latest_signature = _output_path_signature(output_path_val)
+        if previous_signature and latest_signature and str(previous_signature) == str(latest_signature):
+            yield gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            return
+
+        yield from _transfer_output_to_input_with_analysis(
+            output_path_val,
+            scale_x,
+            max_res_val,
+            pre_down,
+            allow_custom_image_noise,
+            state,
+            success_msg="Auto-transferred latest output into input.",
+        )
+
     # Wire up input events with resolution auto-calculation
     input_upload_evt = input_file.upload(
         fn=cache_upload,
@@ -1312,6 +1499,12 @@ def seedvr2_tab(
         fn=cache_path_value,
         inputs=[input_path, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
         outputs=[input_cache_msg, shared_state, auto_res_msg]
+    )
+
+    copy_output_evt = copy_output_into_input_btn.click(
+        fn=copy_latest_output_to_input,
+        inputs=[input_path, upscale_factor, max_resolution, pre_downscale_then_upscale, allow_custom_image_latent_noise, shared_state],
+        outputs=[input_path, input_cache_msg, shared_state, auto_res_msg],
     )
     
     # Recalculate sizing info when any sizing control changes
@@ -1734,8 +1927,20 @@ def seedvr2_tab(
             else:
                 queue_manager.cancel_waiting([ticket.job_id])
     
-    # Main action buttons with gr.Progress
+    seedvr2_pre_run_output_signature = gr.State(value="")
+
+    # Capture current output signature before run starts so auto-transfer
+    # only triggers on newly generated outputs.
     upscale_btn.click(
+        fn=capture_latest_output_signature,
+        inputs=[shared_state],
+        outputs=[seedvr2_pre_run_output_signature],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    # Main action buttons with gr.Progress
+    upscale_evt = upscale_btn.click(
         fn=run_upscale_wrapper,
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
@@ -2185,6 +2390,52 @@ def seedvr2_tab(
         trigger_mode="always_last",
     )
     input_upload_evt.then(
+        fn=refresh_path_metadata_panels,
+        inputs=[input_path, output_format, shared_state, chunk_estimate_sync_signature],
+        outputs=[
+            input_image_preview,
+            input_video_preview,
+            alpha_warn,
+            fps_warn,
+            input_detection_result,
+            chunk_estimate_display,
+            chunk_estimate_sync_signature,
+        ],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+    copy_output_evt.then(
+        fn=refresh_path_metadata_panels,
+        inputs=[input_path, output_format, shared_state, chunk_estimate_sync_signature],
+        outputs=[
+            input_image_preview,
+            input_video_preview,
+            alpha_warn,
+            fps_warn,
+            input_detection_result,
+            chunk_estimate_display,
+            chunk_estimate_sync_signature,
+        ],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    auto_transfer_evt = upscale_evt.then(
+        fn=auto_transfer_latest_output_to_input,
+        inputs=[
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            allow_custom_image_latent_noise,
+            auto_transfer_output_to_input,
+            seedvr2_pre_run_output_signature,
+            shared_state,
+        ],
+        outputs=[input_path, input_cache_msg, shared_state, auto_res_msg],
+    )
+    auto_transfer_evt.then(
         fn=refresh_path_metadata_panels,
         inputs=[input_path, output_format, shared_state, chunk_estimate_sync_signature],
         outputs=[

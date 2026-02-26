@@ -21,6 +21,7 @@ from ui.universal_preset_section import (
 )
 from shared.universal_preset import dict_to_values
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
+from shared.path_utils import normalize_path
 from ui.media_preview import preview_updates
 from shared.processing_queue import get_processing_queue_manager
 from shared.queue_state import (
@@ -255,6 +256,19 @@ def gan_tab(
                         value=_value("batch_output_path", ""),
                         placeholder="Output directory for batch results"
                     )
+
+            with gr.Row():
+                copy_output_into_input_btn = gr.Button(
+                    "Copy Output Into Input",
+                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    scale=1,
+                )
+                auto_transfer_output_to_input = gr.Checkbox(
+                    label="Auto Transfer Output to Input",
+                    value=bool(_value("auto_transfer_output_to_input", False)),
+                    info="After upscale completes, automatically copy the latest GAN output path into Input Path.",
+                    scale=1,
+                )
 
             gr.Markdown("#### Processing Settings")
             with gr.Group():
@@ -561,7 +575,7 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 24 components (model-specific controls + vNext sizing + resume path)
+    # Current count: 22 components (model-specific controls + vNext sizing + resume path)
     # ============================================================================
     
     inputs_list = [
@@ -573,6 +587,8 @@ def gan_tab(
         upscale_factor, max_resolution, pre_downscale_then_upscale,
         # Resume path (chunk/scene mode)
         resume_run_dir,
+        # Auto-copy output into input after run
+        auto_transfer_output_to_input,
     ]
     
     # Development validation
@@ -688,6 +704,12 @@ def gan_tab(
     )
 
     def update_from_path(val, model_val, use_global, scale_x, max_edge, pre_down, state):
+        try:
+            state = state or {}
+            state.setdefault("seed_controls", {})
+            state["seed_controls"]["last_input_path"] = val if val else ""
+        except Exception:
+            pass
         det = _build_input_detection_md(val or "")
         info = _build_sizing_info(val or "", model_val, bool(use_global), scale_x, max_edge, pre_down, state)
         img_prev, vid_prev = preview_updates(val)
@@ -700,6 +722,175 @@ def gan_tab(
             state,
         )
 
+    def _output_path_signature(path_val: str) -> str:
+        normalized = normalize_path(path_val) if path_val else ""
+        if not normalized:
+            return ""
+        try:
+            cand = Path(normalized)
+            if not cand.exists():
+                return ""
+            stat = cand.stat()
+            if cand.is_file():
+                return f"file|{normalized}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+            return f"dir|{normalized}|{int(stat.st_mtime_ns)}"
+        except Exception:
+            return ""
+
+    def _resolve_latest_gan_output_path(state) -> str:
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        candidates = []
+
+        preferred = seed_controls.get("gan_last_output_path")
+        if preferred:
+            normalized = normalize_path(preferred)
+            if normalized:
+                candidates.append(normalized)
+
+        batch_outputs = seed_controls.get("gan_batch_outputs", [])
+        if isinstance(batch_outputs, list):
+            for item in reversed(batch_outputs):
+                normalized = normalize_path(item) if item else ""
+                if normalized:
+                    candidates.append(normalized)
+
+        fallback = seed_controls.get("last_output_path")
+        if fallback:
+            normalized = normalize_path(fallback)
+            if normalized:
+                candidates.append(normalized)
+
+        seen = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                if Path(cand).exists():
+                    return cand
+            except Exception:
+                continue
+        return ""
+
+    def _apply_output_path_to_input(
+        output_path_val,
+        model_val,
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        state,
+        message: str,
+    ):
+        state = state if isinstance(state, dict) else {}
+        state.setdefault("seed_controls", {})
+        state["seed_controls"]["last_input_path"] = output_path_val if output_path_val else ""
+
+        det = _build_input_detection_md(output_path_val or "")
+        info = _build_sizing_info(
+            output_path_val or "",
+            model_val,
+            bool(use_global),
+            scale_x,
+            max_edge,
+            pre_down,
+            state,
+        )
+        img_prev, vid_prev = preview_updates(output_path_val)
+        return (
+            output_path_val or "",
+            gr.update(value=message, visible=True),
+            img_prev,
+            vid_prev,
+            det,
+            info,
+            state,
+        )
+
+    def copy_latest_output_to_input(model_val, use_global, scale_x, max_edge, pre_down, state):
+        state = state if isinstance(state, dict) else {}
+        output_path_val = _resolve_latest_gan_output_path(state)
+        if not output_path_val:
+            return (
+                gr.skip(),
+                gr.update(value="⚠️ No generated GAN output found to transfer.", visible=True),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+        return _apply_output_path_to_input(
+            output_path_val,
+            model_val,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            state,
+            message="✅ Output path copied into input.",
+        )
+
+    def capture_latest_output_signature(state):
+        return _output_path_signature(_resolve_latest_gan_output_path(state))
+
+    def auto_transfer_latest_output_to_input(
+        model_val,
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        auto_enabled,
+        previous_signature,
+        state,
+    ):
+        state = state if isinstance(state, dict) else {}
+        if not bool(auto_enabled):
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        output_path_val = _resolve_latest_gan_output_path(state)
+        if not output_path_val:
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        latest_signature = _output_path_signature(output_path_val)
+        if previous_signature and latest_signature and str(previous_signature) == str(latest_signature):
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        return _apply_output_path_to_input(
+            output_path_val,
+            model_val,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            state,
+            message="✅ Auto-transferred latest output into input.",
+        )
+
     # Keep heavy media/path analysis user-triggered only.
     # `.change()` also fires on function updates (e.g. tab sync), which can fan out
     # into expensive cascades on large UIs.
@@ -707,6 +898,12 @@ def gan_tab(
         fn=update_from_path,
         inputs=[input_path, gan_model, use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
+    )
+
+    copy_output_evt = copy_output_into_input_btn.click(
+        fn=copy_latest_output_to_input,
+        inputs=[gan_model, use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
     # Refresh sizing info when settings change
@@ -1098,6 +1295,16 @@ def gan_tab(
         ):
             yield _expand_service_payload(payload, live_state)
 
+    gan_pre_run_output_signature = gr.State(value="")
+
+    upscale_btn.click(
+        fn=capture_latest_output_signature,
+        inputs=[shared_state],
+        outputs=[gan_pre_run_output_signature],
+        queue=False,
+        show_progress="hidden",
+    )
+
     # Main processing with gr.Progress - include input_file upload
     run_evt = upscale_btn.click(
         fn=run_upscale_with_queue,
@@ -1120,6 +1327,21 @@ def gan_tab(
             last_processed, image_slider, video_comparison_html, batch_gallery,
             chunk_status, chunk_gallery, chunk_preview_video, shared_state
         ]
+    )
+
+    run_evt.then(
+        fn=auto_transfer_latest_output_to_input,
+        inputs=[
+            gan_model,
+            use_resolution_tab,
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            auto_transfer_output_to_input,
+            gan_pre_run_output_signature,
+            shared_state,
+        ],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
     gan_upscale_sync_signature = gr.State(value="")

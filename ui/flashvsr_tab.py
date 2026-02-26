@@ -306,8 +306,8 @@ def flashvsr_tab(
             gr.Markdown("####  Input")
 
             with gr.Group():
-                with gr.Row(equal_height=True):
-                    with gr.Column(scale=2):
+                with gr.Row():
+                    with gr.Column(scale=2, elem_classes=["flashvsr-input-source-col"]):
                         input_file = gr.File(
                             label="Upload video or image (optional)",
                             type="filepath",
@@ -318,6 +318,11 @@ def flashvsr_tab(
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
                             info="Video file or image sequence folder"
+                        )
+                        copy_output_into_input_btn = gr.Button(
+                            "Copy Output Into Input",
+                            elem_classes=["action-btn", "action-btn-source-seed", "flashvsr-copy-output-compact"],
+                            size="md",
                         )
 
                     with gr.Column(scale=2):
@@ -418,12 +423,18 @@ def flashvsr_tab(
                             "(`sparse_sage_attention`, `block_sparse_attention`)."
                         )
                     )
-                    seed = gr.Number(
-                        label="Random Seed",
-                        value=_value("seed", 0),
-                        precision=0,
-                        info="Seed for reproducibility."
-                    )
+                    with gr.Column(scale=1):
+                        seed = gr.Number(
+                            label="Random Seed",
+                            value=_value("seed", 0),
+                            precision=0,
+                            info="Seed for reproducibility."
+                        )
+                        auto_transfer_output_to_input = gr.Checkbox(
+                            label="Auto Transfer Output to Input",
+                            value=bool(_value("auto_transfer_output_to_input", False)),
+                            info="After upscale completes, automatically copy the latest output path into Input Path.",
+                        )
                     optimize_params_btn = gr.Button(
                         "Optimize Parameters",
                         size="md",
@@ -928,7 +939,7 @@ def flashvsr_tab(
         cfg_scale, denoise_amount,
         sparse_ratio, kv_ratio, local_range, frame_chunk_size,
         keep_models_on_cpu, force_offload, enable_debug,
-        color_fix, seed, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir,
+        color_fix, seed, auto_transfer_output_to_input, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir,
         save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
@@ -1273,6 +1284,178 @@ def flashvsr_tab(
                 state,
             )
 
+    def _output_path_signature(path_val):
+        normalized = normalize_path(path_val) if path_val else ""
+        if not normalized:
+            return ""
+        try:
+            cand = Path(normalized)
+            if not cand.exists() or not cand.is_file():
+                return ""
+            stat = cand.stat()
+            return f"{normalized}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+        except Exception:
+            return ""
+
+    def _resolve_latest_output_path(state):
+        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+        candidates = []
+
+        last_output = normalize_path(seed_controls.get("last_output_path")) if seed_controls.get("last_output_path") else ""
+        if last_output:
+            candidates.append(last_output)
+
+        batch_outputs = seed_controls.get("flashvsr_batch_outputs", [])
+        if isinstance(batch_outputs, list):
+            for item in reversed(batch_outputs):
+                normalized = normalize_path(item) if item else ""
+                if normalized:
+                    candidates.append(normalized)
+
+        seen = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                if Path(cand).exists():
+                    return cand
+            except Exception:
+                continue
+        return ""
+
+    def _apply_output_path_to_input(
+        output_path_val,
+        scale_val,
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        state,
+        source_label="Output transferred to input.",
+    ):
+        state = state or {}
+        state.setdefault("seed_controls", {})
+        state["seed_controls"]["last_input_path"] = output_path_val or ""
+
+        try:
+            img_prev, vid_prev, det, info, state_out = _run_analysis_payload(
+                output_path_val or "",
+                scale_val,
+                use_global,
+                scale_x,
+                max_edge,
+                pre_down,
+                state,
+            )
+            return (
+                output_path_val or "",
+                gr.update(value=f"OK: {source_label}", visible=True),
+                img_prev,
+                vid_prev,
+                det,
+                info,
+                state_out,
+            )
+        except Exception as exc:
+            img_prev, vid_prev = preview_updates(output_path_val)
+            return (
+                output_path_val or "",
+                gr.update(
+                    value=f"OK: {source_label} Analysis warning: {str(exc)[:120]}",
+                    visible=True,
+                ),
+                img_prev,
+                vid_prev,
+                _build_input_detection_md(output_path_val or ""),
+                gr.update(value="", visible=False),
+                state,
+            )
+
+    def copy_latest_output_to_input(scale_val, use_global, scale_x, max_edge, pre_down, state):
+        state = state if isinstance(state, dict) else {}
+        output_path_val = _resolve_latest_output_path(state)
+        if not output_path_val:
+            return (
+                gr.skip(),
+                gr.update(value="⚠️ No generated output found to transfer.", visible=True),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+        return _apply_output_path_to_input(
+            output_path_val,
+            scale_val,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            state,
+            source_label="Output path copied into input.",
+        )
+
+    def capture_latest_output_signature(state):
+        return _output_path_signature(_resolve_latest_output_path(state))
+
+    def auto_transfer_latest_output_to_input(
+        scale_val,
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        auto_enabled,
+        previous_signature,
+        state,
+    ):
+        state = state if isinstance(state, dict) else {}
+        if not bool(auto_enabled):
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        output_path_val = _resolve_latest_output_path(state)
+        if not output_path_val:
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        latest_signature = _output_path_signature(output_path_val)
+        if previous_signature and latest_signature and str(previous_signature) == str(latest_signature):
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                state,
+            )
+
+        return _apply_output_path_to_input(
+            output_path_val,
+            scale_val,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            state,
+            source_label="Auto-transferred latest output into input.",
+        )
+
     # Keep heavy media/path analysis user-triggered only.
     # `.change()` also fires on function updates (e.g. tab sync), which can fan out
     # into expensive cascades on large UIs.
@@ -1282,6 +1465,20 @@ def flashvsr_tab(
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
     input_submit_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    copy_output_evt = copy_output_into_input_btn.click(
+        fn=copy_latest_output_to_input,
+        inputs=[scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
+    )
+    copy_output_evt.then(
         fn=refresh_tile_count,
         inputs=tile_count_inputs,
         outputs=[dit_tile_count],
@@ -1903,6 +2100,7 @@ def flashvsr_tab(
 
     flashvsr_upscale_sync_signature = gr.State(value="")
     flashvsr_chunk_sync_signature = gr.State(value="")
+    flashvsr_pre_run_output_signature = gr.State(value="")
 
     def _sync_signature(payload: Dict[str, Any]) -> str:
         try:
@@ -1948,6 +2146,14 @@ def flashvsr_tab(
         return chunk_status_upd, chunk_gallery_upd, chunk_video_upd, signature
 
     # Main processing
+    upscale_btn.click(
+        fn=capture_latest_output_signature,
+        inputs=[shared_state],
+        outputs=[flashvsr_pre_run_output_signature],
+        queue=False,
+        show_progress="hidden",
+    )
+
     run_evt = upscale_btn.click(
         fn=run_upscale_with_queue,
         inputs=[input_file] + inputs_list + [shared_state],
@@ -1971,6 +2177,28 @@ def flashvsr_tab(
         fn=_refresh_chunk_preview_ui_if_needed,
         inputs=[shared_state, flashvsr_chunk_sync_signature],
         outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
+    )
+    auto_transfer_evt = run_evt.then(
+        fn=auto_transfer_latest_output_to_input,
+        inputs=[
+            scale,
+            use_resolution_tab,
+            upscale_factor,
+            max_target_resolution,
+            pre_downscale_then_upscale,
+            auto_transfer_output_to_input,
+            flashvsr_pre_run_output_signature,
+            shared_state,
+        ],
+        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
+    )
+    auto_transfer_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
 
     preview_evt = preview_btn.click(

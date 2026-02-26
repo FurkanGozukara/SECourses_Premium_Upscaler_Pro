@@ -299,6 +299,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "enable_debug": False,
         "color_fix": True,
         "seed": 0,
+        "auto_transfer_output_to_input": False,
         "device": cuda_default,
         "fps": 0.0,
         "codec": "libx264",
@@ -346,6 +347,7 @@ FLASHVSR_ORDER: List[str] = [
     "enable_debug",
     "color_fix",
     "seed",
+    "auto_transfer_output_to_input",
     "device",
     "fps",
     "codec",
@@ -431,6 +433,10 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         ),
     )
     cfg["color_fix"] = _to_bool(cfg.get("color_fix"), _to_bool(defaults.get("color_fix", True), True))
+    cfg["auto_transfer_output_to_input"] = _to_bool(
+        cfg.get("auto_transfer_output_to_input"),
+        _to_bool(defaults.get("auto_transfer_output_to_input", False), False),
+    )
     cfg["keep_models_on_cpu"] = _to_bool(
         cfg.get("keep_models_on_cpu"),
         _to_bool(defaults.get("keep_models_on_cpu", True), True),

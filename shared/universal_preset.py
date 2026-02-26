@@ -171,6 +171,7 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["quality"] = cfg["crf"]
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
+    cfg["auto_transfer_output_to_input"] = bool(cfg.get("auto_transfer_output_to_input", False))
     return cfg
 
 
@@ -399,6 +400,7 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
             "upscale_factor": 4.0,
             "max_resolution": 0,
             "pre_downscale_then_upscale": True,
+            "auto_transfer_output_to_input": False,
         })
     
     # RIFE

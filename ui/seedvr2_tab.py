@@ -162,7 +162,7 @@ def seedvr2_tab(
 
             # Ensure we always have at least one model choice (fallback to placeholder)
             if not available_models:
-                available_models = ["seedvr2_ema_7b_fp16.safetensors"]
+                available_models = ["seedvr2_ema_7b_sharp_fp16.safetensors"]
                 dit_model_value = available_models[0]
             else:
                 dit_model_value = values[4] if len(values) > 4 else available_models[0]

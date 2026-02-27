@@ -227,8 +227,8 @@ def get_seedvr2_model_names() -> List[str]:
     """
     # Preferred models to display (in order of preference)
     preferred_models = [
-        "seedvr2_ema_7b_fp16.safetensors",  # Default
-        "seedvr2_ema_7b_sharp_fp16.safetensors",
+        "seedvr2_ema_7b_sharp_fp16.safetensors",  # Default
+        "seedvr2_ema_7b_fp16.safetensors",
         "seedvr2_ema_3b_fp16.safetensors",
         "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
         "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",

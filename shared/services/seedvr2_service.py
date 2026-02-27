@@ -322,9 +322,17 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
     
     # Get model metadata if specific model is provided
     model_meta = None
-    # Default to 7B fp16 model (best quality/speed balance)
+    # Default to 7B sharp fp16 model (best quality with edge enhancement)
     available_models = get_seedvr2_model_names()
-    default_model = "seedvr2_ema_7b_fp16.safetensors" if "seedvr2_ema_7b_fp16.safetensors" in available_models else (available_models[0] if available_models else "seedvr2_ema_3b_fp16.safetensors")
+    default_model = (
+        "seedvr2_ema_7b_sharp_fp16.safetensors"
+        if "seedvr2_ema_7b_sharp_fp16.safetensors" in available_models
+        else (
+            "seedvr2_ema_7b_fp16.safetensors"
+            if "seedvr2_ema_7b_fp16.safetensors" in available_models
+            else (available_models[0] if available_models else "seedvr2_ema_3b_fp16.safetensors")
+        )
+    )
     target_model = model_name or default_model
     
     if target_model:

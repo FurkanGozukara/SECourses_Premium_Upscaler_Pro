@@ -1344,10 +1344,8 @@ def build_flashvsr_callbacks(
                     item_settings["_original_filename"] = Path(item_path).name
                     item_out_dir = batch_item_dir(batch_root, Path(item_path).name)
 
-                    mode_val = str(item_settings.get("mode", "tiny") or "tiny")
-                    seed_val = int(item_settings.get("seed", 0) or 0)
                     base_no_ext = Path(item_path).stem
-                    predicted_output_file = item_out_dir / f"FlashVSR_{mode_val}_{base_no_ext}_{seed_val}.mp4"
+                    predicted_output_file = item_out_dir / f"{base_no_ext}.mp4"
 
                     from shared.output_run_manager import prepare_batch_video_run_dir
 
@@ -1406,13 +1404,11 @@ def build_flashvsr_callbacks(
                         chunk_settings["input_path"] = effective_for_chunk
                         chunk_settings["frame_accurate_split"] = frame_accurate_split
 
-                        # For batch output, prefer an explicit file name to match FlashVSR naming.
+                        # For batch output, prefer deterministic input-stem naming.
                         try:
                             out_base = Path(item_out_dir)
                             base_stem = Path(chunk_settings.get("_original_filename") or item_path).stem
-                            seed_val = int(chunk_settings.get("seed", 0) or 0)
-                            mode_val = str(chunk_settings.get("mode", "tiny") or "tiny")
-                            chunk_settings["output_override"] = str(out_base / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4")
+                            chunk_settings["output_override"] = str(out_base / f"{base_stem}.mp4")
                         except Exception:
                             pass
 
@@ -1748,9 +1744,7 @@ def build_flashvsr_callbacks(
                     settings["_user_output_override_raw"] = settings.get("output_override") or ""
 
                     base_stem = Path(settings.get("_original_filename") or input_path).stem
-                    seed_val = int(settings.get("seed", 0) or 0)
-                    mode_val = str(settings.get("mode", "tiny") or "tiny")
-                    default_final = run_dir / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4"
+                    default_final = run_dir / f"{base_stem}.mp4"
                     # Resume mode ignores new output override paths and keeps output in the selected run folder.
                     settings["output_override"] = str(default_final)
                     if input_kind_single != "video":
@@ -1773,9 +1767,7 @@ def build_flashvsr_callbacks(
                         settings["_user_output_override_raw"] = settings.get("output_override") or ""
 
                         base_stem = Path(settings.get("_original_filename") or input_path).stem
-                        seed_val = int(settings.get("seed", 0) or 0)
-                        mode_val = str(settings.get("mode", "tiny") or "tiny")
-                        default_final = run_dir / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4"
+                        default_final = run_dir / f"{base_stem}.mp4"
                         settings["output_override"] = str(explicit_final) if explicit_final else str(default_final)
                     except Exception:
                         pass
@@ -1866,14 +1858,12 @@ def build_flashvsr_callbacks(
                         chunk_settings = settings.copy()
                         chunk_settings["input_path"] = effective_for_chunk
 
-                        # Default output path: match FlashVSR naming unless user overrides.
+                        # Default output path: deterministic input-stem naming unless user overrides.
                         if not (chunk_settings.get("output_override") or "").strip():
                             try:
                                 out_base = Path(global_settings.get("output_dir", output_dir))
                                 base_stem = Path(chunk_settings.get("_original_filename") or input_path).stem
-                                seed_val = int(chunk_settings.get("seed", 0) or 0)
-                                mode_val = str(chunk_settings.get("mode", "tiny") or "tiny")
-                                chunk_settings["output_override"] = str(out_base / f"FlashVSR_{mode_val}_{base_stem}_{seed_val}.mp4")
+                                chunk_settings["output_override"] = str(out_base / f"{base_stem}.mp4")
                             except Exception:
                                 pass
                         if resume_requested:

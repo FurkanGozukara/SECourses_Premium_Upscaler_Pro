@@ -18,7 +18,14 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from shared.path_utils import get_media_dimensions
+from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,56 @@ def _default_scenarios(base_dir: Path, scenario_set: str) -> List[Scenario]:
         ]
     )
     return wide
+
+
+def _scenario_effective_signature(scenario: Scenario) -> Tuple[int, int, int, int, int]:
+    dims = get_media_dimensions(str(scenario.input_path))
+    if not dims:
+        raise RuntimeError(f"could not read dimensions for {scenario.input_path}")
+    input_w, input_h = int(dims[0]), int(dims[1])
+    plan = estimate_fixed_scale_upscale_plan_from_dims(
+        input_w,
+        input_h,
+        requested_scale=float(scenario.scale),
+        model_scale=int(scenario.scale),
+        max_edge=int(scenario.max_target_resolution),
+        force_pre_downscale=True,
+    )
+    return (
+        int(scenario.scale),
+        int(plan.preprocess_width),
+        int(plan.preprocess_height),
+        int(plan.resize_width),
+        int(plan.resize_height),
+    )
+
+
+def _dedupe_effective_scenarios(
+    scenarios: List[Scenario],
+) -> Tuple[List[Scenario], List[Dict[str, object]]]:
+    kept: List[Scenario] = []
+    skipped: List[Dict[str, object]] = []
+    seen: Dict[Tuple[int, int, int, int, int], Scenario] = {}
+
+    for scenario in scenarios:
+        signature = _scenario_effective_signature(scenario)
+        existing = seen.get(signature)
+        if existing is None:
+            seen[signature] = scenario
+            kept.append(scenario)
+            continue
+        skipped.append(
+            {
+                "skipped": scenario.name,
+                "kept": existing.name,
+                "signature": {
+                    "scale": int(signature[0]),
+                    "preprocess_resolution": f"{int(signature[1])}x{int(signature[2])}",
+                    "output_resolution": f"{int(signature[3])}x{int(signature[4])}",
+                },
+            }
+        )
+    return kept, skipped
 
 
 def _load_manifest(path: Path) -> Dict[str, object]:
@@ -163,6 +220,8 @@ def _parse_args() -> argparse.Namespace:
         default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report.json"),
     )
     parser.add_argument("--skip-report", action="store_true", default=False)
+    parser.add_argument("--dedupe-effective-scenarios", action="store_true", default=True)
+    parser.add_argument("--no-dedupe-effective-scenarios", action="store_false", dest="dedupe_effective_scenarios")
     return parser.parse_args()
 
 
@@ -198,6 +257,20 @@ def main() -> int:
             _safe_print(f"ERROR: missing input video: {p}")
         return 2
 
+    deduped_scenarios: List[Dict[str, object]] = []
+    if bool(args.dedupe_effective_scenarios):
+        scenarios, deduped_scenarios = _dedupe_effective_scenarios(scenarios)
+        if deduped_scenarios:
+            _safe_print("[INFO] skipping spatially redundant scenarios with matching effective preprocess/output sizes:")
+            for item in deduped_scenarios:
+                sig = item["signature"]
+                _safe_print(
+                    "  "
+                    f"{item['skipped']} -> {item['kept']} "
+                    f"(scale={sig['scale']}, preprocess={sig['preprocess_resolution']}, output={sig['output_resolution']})"
+                )
+            _safe_print("-" * 72)
+
     if args.manifest:
         manifest_path = Path(args.manifest).resolve()
     else:
@@ -224,6 +297,8 @@ def main() -> int:
         "shared_pressure_seconds": float(args.shared_pressure_seconds),
         "min_shared_check_runtime_sec": float(args.min_shared_check_runtime_sec),
     }
+    manifest["dedupe_effective_scenarios"] = bool(args.dedupe_effective_scenarios)
+    manifest["deduped_scenarios"] = deduped_scenarios
     manifest.setdefault("runs", [])
     _save_manifest(manifest_path, manifest)
 

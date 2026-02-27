@@ -34,7 +34,7 @@ MIN_FRAME_CHUNK = 32
 DEFAULT_VRAM_RESERVE_GB = 2.0
 DEFAULT_ESTIMATION_MARGIN_GB = 1.25
 MIN_ESTIMATION_MARGIN_GB = 0.35
-MAX_ESTIMATION_MARGIN_GB = 3.5
+MAX_ESTIMATION_MARGIN_GB = 5.0
 
 FRAME_CHUNK_FALLBACKS: Tuple[int, ...] = (450, 384, 320, 256, 224, 192, 160, 128, 96, 64, 48, 32)
 MAX_EDGE_REDUCTION_CANDIDATES: Tuple[int, ...] = (
@@ -585,6 +585,126 @@ def _calibration_stats(
     return float(mul), len(candidates), float(margin)
 
 
+def _interpolation_uncertainty_margin_gb(
+    *,
+    mode: str,
+    scale: int,
+    precision: str,
+    vae_model: str,
+    preprocess_width: int,
+    preprocess_height: int,
+    tile_size: int,
+    overlap: int,
+    frame_chunk_size: int,
+    keep_models_on_cpu: bool,
+    tiled_dit: bool,
+    tiled_vae: bool,
+    stream_decode: bool,
+    rows: List[Dict[str, Any]],
+) -> float:
+    if not rows:
+        return float(DEFAULT_ESTIMATION_MARGIN_GB)
+
+    target_mode = str(mode or "full").strip().lower()
+    target_scale = _normalized_scale(scale)
+    target_precision = str(precision or "bf16").strip().lower()
+    target_vae = str(vae_model or "Wan2.2").strip().lower()
+    target_w = max(1, int(preprocess_width))
+    target_h = max(1, int(preprocess_height))
+    target_chunk = _clamp_int(frame_chunk_size, MIN_FRAME_CHUNK, 10000, TARGET_FRAME_CHUNK)
+    target_overlap = _clamp_int(overlap, 8, 512, TARGET_OVERLAP)
+    target_tile = _clamp_int(tile_size, MIN_TILE_SIZE, MAX_TILE_SIZE, MIN_TILE_SIZE)
+    target_pixels = float(target_w * target_h)
+    target_aspect = float(max(target_w, target_h)) / float(max(1, min(target_w, target_h)))
+    target_tile_effective = float(target_tile) + max(0.0, float(target_overlap) - 24.0) * 0.60
+
+    distances: List[float] = []
+    seen_pixels: List[float] = []
+    seen_aspects: List[float] = []
+    exact_signature_found = False
+
+    for row in rows:
+        try:
+            row_mode = str(row.get("mode") or "").strip().lower()
+            row_scale = _normalized_scale(row.get("scale"))
+            row_precision = str(row.get("precision") or target_precision).strip().lower()
+            row_vae = str(row.get("vae_model") or target_vae).strip().lower()
+            row_keep_cpu = _to_bool(row.get("keep_models_on_cpu"), keep_models_on_cpu)
+            row_tiled_dit = _to_bool(row.get("tiled_dit"), tiled_dit)
+            row_tiled_vae = _to_bool(row.get("tiled_vae"), tiled_vae)
+            row_stream_decode = _to_bool(row.get("stream_decode"), stream_decode)
+            if row_mode != target_mode or row_scale != target_scale:
+                continue
+            if row_precision != target_precision or row_vae != target_vae:
+                continue
+            if row_keep_cpu != bool(keep_models_on_cpu):
+                continue
+            if row_tiled_dit != bool(tiled_dit) or row_tiled_vae != bool(tiled_vae):
+                continue
+            if row_stream_decode != bool(stream_decode):
+                continue
+
+            row_w = max(1, int(float(row.get("preprocess_width") or 0)))
+            row_h = max(1, int(float(row.get("preprocess_height") or 0)))
+            row_chunk = _clamp_int(row.get("frame_chunk_size"), MIN_FRAME_CHUNK, 10000, target_chunk)
+            row_overlap = _clamp_int(row.get("overlap"), 8, 512, target_overlap)
+            row_tile = _clamp_int(row.get("tile_size"), MIN_TILE_SIZE, MAX_TILE_SIZE, target_tile)
+
+            if (
+                row_w == target_w
+                and row_h == target_h
+                and row_chunk == target_chunk
+                and row_overlap == target_overlap
+                and row_tile == target_tile
+            ):
+                exact_signature_found = True
+                break
+
+            row_pixels = float(row_w * row_h)
+            row_aspect = float(max(row_w, row_h)) / float(max(1, min(row_w, row_h)))
+            row_tile_effective = float(row_tile) + max(0.0, float(row_overlap) - 24.0) * 0.60
+            seen_pixels.append(float(row_pixels))
+            seen_aspects.append(float(row_aspect))
+
+            dist = 0.0
+            dist += 1.35 * _safe_ratio_distance(row_pixels, target_pixels)
+            dist += 1.05 * _safe_ratio_distance(row_aspect, target_aspect)
+            dist += 0.85 * _safe_ratio_distance(row_tile_effective, target_tile_effective)
+            dist += 0.65 * _safe_ratio_distance(float(max(row_w, row_h)), float(max(target_w, target_h)))
+            dist += 0.65 * _safe_ratio_distance(float(min(row_w, row_h)), float(min(target_w, target_h)))
+            dist += abs(float(row_chunk) - float(target_chunk)) / 120.0
+            distances.append(float(dist))
+        except Exception:
+            continue
+
+    if exact_signature_found:
+        return 0.0
+    if not distances:
+        return float(DEFAULT_ESTIMATION_MARGIN_GB)
+
+    nearest = min(float(v) for v in distances)
+    extra = max(0.0, (nearest - 0.12) * 2.4)
+    if seen_pixels:
+        min_pixels = min(seen_pixels)
+        max_pixels = max(seen_pixels)
+        if target_pixels > max_pixels:
+            extra += min(3.0, _safe_ratio_distance(target_pixels, max_pixels) * 6.4 + 0.55)
+        elif target_pixels < min_pixels:
+            extra += min(1.8, _safe_ratio_distance(target_pixels, min_pixels) * 2.8 + 0.20)
+    if seen_aspects:
+        min_aspect = min(seen_aspects)
+        max_aspect = max(seen_aspects)
+        if target_aspect > max_aspect:
+            extra += min(1.8, _safe_ratio_distance(target_aspect, max_aspect) * 4.2 + 0.20)
+        elif target_aspect < min_aspect:
+            extra += min(1.8, _safe_ratio_distance(target_aspect, min_aspect) * 4.2 + 0.20)
+    if len(distances) < 6:
+        extra += 0.45
+    elif len(distances) < 12:
+        extra += 0.20
+    return _clamp_float(extra, 0.0, MAX_ESTIMATION_MARGIN_GB, 0.0)
+
+
 def _calibration_multiplier(
     *,
     mode: str,
@@ -857,6 +977,28 @@ def _estimate_flashvsr_peak_vram_with_margin_gb(
         stream_decode=stream_decode,
         records_csv_path=records_csv_path,
         rows=calibration_rows,
+    )
+    uncertainty_extra = _interpolation_uncertainty_margin_gb(
+        mode=mode,
+        scale=scale,
+        precision=precision,
+        vae_model=vae_model,
+        preprocess_width=preprocess_width,
+        preprocess_height=preprocess_height,
+        tile_size=tile_size,
+        overlap=overlap,
+        frame_chunk_size=frame_chunk_size,
+        keep_models_on_cpu=keep_models_on_cpu,
+        tiled_dit=tiled_dit,
+        tiled_vae=tiled_vae,
+        stream_decode=stream_decode,
+        rows=(list(calibration_rows) if calibration_rows is not None else _load_vram_calibration_samples(records_csv_path)),
+    )
+    margin = _clamp_float(
+        float(margin + uncertainty_extra),
+        MIN_ESTIMATION_MARGIN_GB,
+        MAX_ESTIMATION_MARGIN_GB,
+        DEFAULT_ESTIMATION_MARGIN_GB,
     )
     estimated = float(raw * calib_mul)
     guarded = float(estimated + margin)

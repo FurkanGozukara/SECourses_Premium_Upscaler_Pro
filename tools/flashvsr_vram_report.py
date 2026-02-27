@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+DEFAULT_POLICY_FRAME_CHUNK = 450
+DEFAULT_POLICY_OVERLAP = 48
+
 
 @dataclass(frozen=True)
 class SweepRow:
@@ -52,6 +55,10 @@ class SweepRow:
     @property
     def preprocess_pixels(self) -> int:
         return int(self.preprocess_width * self.preprocess_height)
+
+
+def _is_effective_success(row: SweepRow) -> bool:
+    return bool(row.effective_success and (not row.shared_vram_suspect) and (not row.oom_recovery_override))
 
 
 def _to_bool(value: object) -> bool:
@@ -159,11 +166,7 @@ def _load_rows(csv_path: Path) -> List[SweepRow]:
 
 
 def _build_sensitivity(rows: List[SweepRow]) -> Dict[str, Dict[str, float]]:
-    ok_rows = [
-        r
-        for r in rows
-        if r.effective_success and (not r.shared_vram_suspect) and (not r.oom_recovery_override) and r.peak_vram_gb > 0.0
-    ]
+    ok_rows = [r for r in rows if _is_effective_success(r) and r.peak_vram_gb > 0.0]
 
     tile_slopes: List[float] = []
     chunk_slopes: List[float] = []
@@ -257,7 +260,7 @@ def _build_sensitivity(rows: List[SweepRow]) -> Dict[str, Dict[str, float]]:
 def _best_tile_map(rows: List[SweepRow]) -> List[Dict[str, object]]:
     best: Dict[Tuple[object, ...], SweepRow] = {}
     for r in rows:
-        if (not r.effective_success) or r.shared_vram_suspect or r.oom_recovery_override:
+        if not _is_effective_success(r):
             continue
         key = (
             r.gpu_id,
@@ -312,12 +315,216 @@ def _best_tile_map(rows: List[SweepRow]) -> List[Dict[str, object]]:
     return out
 
 
+def _scenario_label(row: SweepRow) -> str:
+    return (
+        f"{Path(str(row.input_path)).name} "
+        f"({int(row.scale)}x, max_edge={int(row.max_target_resolution)})"
+    )
+
+
+def _effective_resolution_groups(rows: List[SweepRow]) -> List[Dict[str, object]]:
+    grouped: Dict[Tuple[object, ...], set[str]] = {}
+    for row in rows:
+        key = (
+            str(row.mode),
+            str(row.precision),
+            str(row.vae_model),
+            int(row.scale),
+            int(row.preprocess_width),
+            int(row.preprocess_height),
+            int(row.output_width),
+            int(row.output_height),
+        )
+        grouped.setdefault(key, set()).add(_scenario_label(row))
+
+    out: List[Dict[str, object]] = []
+    for key, labels in grouped.items():
+        if len(labels) <= 1:
+            continue
+        out.append(
+            {
+                "mode": key[0],
+                "precision": key[1],
+                "vae_model": key[2],
+                "scale": int(key[3]),
+                "preprocess_resolution": f"{int(key[4])}x{int(key[5])}",
+                "output_resolution": f"{int(key[6])}x{int(key[7])}",
+                "scenario_count": len(labels),
+                "scenarios": sorted(labels),
+            }
+        )
+    out.sort(
+        key=lambda item: (
+            str(item["mode"]),
+            str(item["precision"]),
+            str(item["vae_model"]),
+            int(item["scale"]),
+            str(item["preprocess_resolution"]),
+            str(item["output_resolution"]),
+        )
+    )
+    return out
+
+
+def _best_target_safe_tile_map(
+    rows: List[SweepRow],
+    *,
+    reserve_vram_gb: float,
+) -> List[Dict[str, object]]:
+    safe: Dict[Tuple[object, ...], SweepRow] = {}
+    scenario_labels: Dict[Tuple[object, ...], set[str]] = {}
+    reserve = max(0.0, float(reserve_vram_gb))
+    for row in rows:
+        if not _is_effective_success(row):
+            continue
+        target_vram = max(0.0, float(row.gpu_total_gb) - reserve)
+        if float(row.peak_vram_gb) > target_vram:
+            continue
+        key = (
+            row.gpu_id,
+            row.scale,
+            row.preprocess_width,
+            row.preprocess_height,
+            row.output_width,
+            row.output_height,
+            row.frame_chunk_size,
+            row.overlap,
+            row.mode,
+            row.precision,
+            row.vae_model,
+            row.keep_models_on_cpu,
+            row.tiled_dit,
+            row.tiled_vae,
+            row.stream_decode,
+        )
+        scenario_labels.setdefault(key, set()).add(_scenario_label(row))
+        prev = safe.get(key)
+        if prev is None or row.tile_size > prev.tile_size or (
+            row.tile_size == prev.tile_size and row.peak_vram_gb < prev.peak_vram_gb
+        ):
+            safe[key] = row
+
+    out: List[Dict[str, object]] = []
+    for key, row in safe.items():
+        out.append(
+            {
+                "gpu_id": row.gpu_id,
+                "gpu_target_gb": round(max(0.0, float(row.gpu_total_gb) - reserve), 4),
+                "scale": row.scale,
+                "scenario_labels": sorted(scenario_labels.get(key, {_scenario_label(row)})),
+                "preprocess_resolution": f"{row.preprocess_width}x{row.preprocess_height}",
+                "output_resolution": f"{row.output_width}x{row.output_height}",
+                "frame_chunk_size": row.frame_chunk_size,
+                "overlap": row.overlap,
+                "best_tile_size": row.tile_size,
+                "peak_vram_gb": round(row.peak_vram_gb, 4),
+                "target_headroom_gb": round(max(0.0, float(row.gpu_total_gb) - reserve - row.peak_vram_gb), 4),
+            }
+        )
+    out.sort(
+        key=lambda item: (
+            int(item["gpu_id"]),
+            int(item["scale"]),
+            str(item["preprocess_resolution"]),
+            str(item["output_resolution"]),
+            int(item["frame_chunk_size"]),
+            int(item["best_tile_size"]),
+        )
+    )
+    return out
+
+
+def _best_policy_target_safe_tile_map(
+    rows: List[SweepRow],
+    *,
+    reserve_vram_gb: float,
+    frame_chunk_size: int,
+    overlap: int,
+) -> List[Dict[str, object]]:
+    safe: Dict[Tuple[object, ...], SweepRow] = {}
+    scenario_labels: Dict[Tuple[object, ...], set[str]] = {}
+    reserve = max(0.0, float(reserve_vram_gb))
+    policy_chunk = max(0, int(frame_chunk_size))
+    policy_overlap = max(0, int(overlap))
+
+    for row in rows:
+        if not _is_effective_success(row):
+            continue
+        if int(row.frame_chunk_size) != policy_chunk or int(row.overlap) != policy_overlap:
+            continue
+        if (not row.tiled_dit) or row.tiled_vae or row.stream_decode:
+            continue
+        target_vram = max(0.0, float(row.gpu_total_gb) - reserve)
+        if float(row.peak_vram_gb) > target_vram:
+            continue
+
+        key = (
+            row.gpu_id,
+            row.scale,
+            row.preprocess_width,
+            row.preprocess_height,
+            row.output_width,
+            row.output_height,
+            row.mode,
+            row.precision,
+            row.vae_model,
+            row.keep_models_on_cpu,
+            row.tiled_dit,
+            row.tiled_vae,
+            row.stream_decode,
+            row.frame_chunk_size,
+            row.overlap,
+        )
+        scenario_labels.setdefault(key, set()).add(_scenario_label(row))
+        prev = safe.get(key)
+        if prev is None or row.tile_size > prev.tile_size or (
+            row.tile_size == prev.tile_size and row.peak_vram_gb < prev.peak_vram_gb
+        ):
+            safe[key] = row
+
+    out: List[Dict[str, object]] = []
+    for key, row in safe.items():
+        target_vram = max(0.0, float(row.gpu_total_gb) - reserve)
+        out.append(
+            {
+                "gpu_id": row.gpu_id,
+                "gpu_target_gb": round(target_vram, 4),
+                "scale": row.scale,
+                "scenario_labels": sorted(scenario_labels.get(key, {_scenario_label(row)})),
+                "preprocess_resolution": f"{row.preprocess_width}x{row.preprocess_height}",
+                "output_resolution": f"{row.output_width}x{row.output_height}",
+                "frame_chunk_size": row.frame_chunk_size,
+                "overlap": row.overlap,
+                "best_tile_size": row.tile_size,
+                "peak_vram_gb": round(row.peak_vram_gb, 4),
+                "target_headroom_gb": round(target_vram - float(row.peak_vram_gb), 4),
+            }
+        )
+
+    out.sort(
+        key=lambda item: (
+            int(item["gpu_id"]),
+            int(item["scale"]),
+            str(item["preprocess_resolution"]),
+            str(item["output_resolution"]),
+            int(item["best_tile_size"]),
+        )
+    )
+    return out
+
+
 def _build_markdown(
     *,
     csv_path: Path,
     rows: List[SweepRow],
     sensitivity: Dict[str, Dict[str, float]],
     best_tiles: List[Dict[str, object]],
+    best_target_safe_tiles: List[Dict[str, object]],
+    policy_target_safe_tiles: List[Dict[str, object]],
+    effective_groups: List[Dict[str, object]],
+    reserve_vram_gb: float,
+    policy_frame_chunk_size: int,
+    policy_overlap: int,
 ) -> str:
     total = len(rows)
     raw_success = sum(1 for r in rows if r.raw_success)
@@ -326,11 +533,7 @@ def _build_markdown(
     shared_suspects = sum(1 for r in rows if r.shared_vram_suspect)
     oom_recovery_overrides = sum(1 for r in rows if r.oom_recovery_override)
     oom = sum(1 for r in rows if r.oom)
-    effective_rows = [
-        r
-        for r in rows
-        if r.effective_success and not r.shared_vram_suspect and not r.oom_recovery_override and r.processing_fps > 0.0
-    ]
+    effective_rows = [r for r in rows if _is_effective_success(r) and r.processing_fps > 0.0]
     if effective_rows:
         fps_vals = [r.processing_fps for r in effective_rows]
         fps_median = statistics.median(fps_vals)
@@ -347,6 +550,7 @@ def _build_markdown(
     lines.append("")
     lines.append(f"- Generated: `{now}`")
     lines.append(f"- Source CSV: `{csv_path}`")
+    lines.append(f"- Target reserve per GPU: `{float(reserve_vram_gb):.2f} GB`")
     lines.append(f"- Total cases: `{total}`")
     lines.append(f"- Raw successful cases: `{raw_success}`")
     lines.append(f"- Effective successful cases (shared-VRAM filtered): `{effective_success}`")
@@ -388,6 +592,57 @@ def _build_markdown(
         f"{sensitivity['preprocess_1mp_gb']['p90']:.4f} |"
     )
     lines.append("")
+    lines.append(f"## Production Policy: Chunk {int(policy_frame_chunk_size)} / Overlap {int(policy_overlap)}")
+    lines.append("")
+    lines.append(
+        "- Filter: tiled DiT `ON`, tiled VAE `OFF`, stream decode `OFF`, "
+        "and peak VRAM at or below the GPU target (`total - reserve`)."
+    )
+    lines.append("")
+    if policy_target_safe_tiles:
+        lines.append("| GPU | Target VRAM (GB) | Equivalent Scenarios | Scale | Best Safe Tile | Peak VRAM (GB) | Headroom (GB) | Preprocess | Output |")
+        lines.append("|---:|---:|---|---:|---:|---:|---:|---|---|")
+        for item in policy_target_safe_tiles:
+            scenario_text = "; ".join(str(v) for v in item["scenario_labels"])
+            lines.append(
+                "| "
+                f"{item['gpu_id']} | "
+                f"{float(item['gpu_target_gb']):.3f} | "
+                f"{scenario_text} | "
+                f"{item['scale']} | "
+                f"{item['best_tile_size']} | "
+                f"{float(item['peak_vram_gb']):.3f} | "
+                f"{float(item['target_headroom_gb']):.3f} | "
+                f"{item['preprocess_resolution']} | "
+                f"{item['output_resolution']} |"
+            )
+    else:
+        lines.append("No target-safe production-policy rows were found.")
+    lines.append("")
+    lines.append("## Best Target-Safe Tile By Effective Scenario")
+    lines.append("")
+    if best_target_safe_tiles:
+        lines.append("| GPU | Target VRAM (GB) | Equivalent Scenarios | Scale | Chunk | Overlap | Best Safe Tile | Peak VRAM (GB) | Headroom (GB) | Preprocess | Output |")
+        lines.append("|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---|")
+        for item in best_target_safe_tiles:
+            scenario_text = "; ".join(str(v) for v in item["scenario_labels"])
+            lines.append(
+                "| "
+                f"{item['gpu_id']} | "
+                f"{float(item['gpu_target_gb']):.3f} | "
+                f"{scenario_text} | "
+                f"{item['scale']} | "
+                f"{item['frame_chunk_size']} | "
+                f"{item['overlap']} | "
+                f"{item['best_tile_size']} | "
+                f"{float(item['peak_vram_gb']):.3f} | "
+                f"{float(item['target_headroom_gb']):.3f} | "
+                f"{item['preprocess_resolution']} | "
+                f"{item['output_resolution']} |"
+            )
+    else:
+        lines.append("No target-safe cases found under the configured reserve.")
+    lines.append("")
     lines.append("## Best Successful Tile By Scenario")
     lines.append("")
     lines.append("| GPU | Input | Scale | Max Edge | Chunk | Overlap | Best Tile | Peak VRAM (GB) | Preprocess | Output |")
@@ -406,6 +661,26 @@ def _build_markdown(
             f"{item['preprocess_resolution']} | "
             f"{item['output_resolution']} |"
         )
+    lines.append("")
+    lines.append("## Effective Resolution Groups")
+    lines.append("")
+    if effective_groups:
+        lines.append("| Mode | Precision | VAE | Scale | Preprocess | Output | Equivalent Scenarios |")
+        lines.append("|---|---|---|---:|---|---|---|")
+        for item in effective_groups:
+            scenario_text = "; ".join(str(v) for v in item["scenarios"])
+            lines.append(
+                "| "
+                f"{item['mode']} | "
+                f"{item['precision']} | "
+                f"{item['vae_model']} | "
+                f"{item['scale']} | "
+                f"{item['preprocess_resolution']} | "
+                f"{item['output_resolution']} | "
+                f"{scenario_text} |"
+            )
+    else:
+        lines.append("No duplicate effective preprocess/output groups were found.")
     lines.append("")
     return "\n".join(lines)
 
@@ -428,6 +703,9 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report.json"),
     )
+    parser.add_argument("--reserve-vram-gb", type=float, default=2.0)
+    parser.add_argument("--policy-frame-chunk", type=int, default=DEFAULT_POLICY_FRAME_CHUNK)
+    parser.add_argument("--policy-overlap", type=int, default=DEFAULT_POLICY_OVERLAP)
     return parser.parse_args()
 
 
@@ -444,11 +722,38 @@ def main() -> int:
 
     sensitivity = _build_sensitivity(rows)
     best_tiles = _best_tile_map(rows)
-    md = _build_markdown(csv_path=csv_path, rows=rows, sensitivity=sensitivity, best_tiles=best_tiles)
+    best_target_safe_tiles = _best_target_safe_tile_map(rows, reserve_vram_gb=float(args.reserve_vram_gb))
+    policy_target_safe_tiles = _best_policy_target_safe_tile_map(
+        rows,
+        reserve_vram_gb=float(args.reserve_vram_gb),
+        frame_chunk_size=int(args.policy_frame_chunk),
+        overlap=int(args.policy_overlap),
+    )
+    effective_groups = _effective_resolution_groups(rows)
+    md = _build_markdown(
+        csv_path=csv_path,
+        rows=rows,
+        sensitivity=sensitivity,
+        best_tiles=best_tiles,
+        best_target_safe_tiles=best_target_safe_tiles,
+        policy_target_safe_tiles=policy_target_safe_tiles,
+        effective_groups=effective_groups,
+        reserve_vram_gb=float(args.reserve_vram_gb),
+        policy_frame_chunk_size=int(args.policy_frame_chunk),
+        policy_overlap=int(args.policy_overlap),
+    )
 
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "records_csv": str(csv_path),
+        "reserve_vram_gb": float(args.reserve_vram_gb),
+        "production_policy": {
+            "frame_chunk_size": int(args.policy_frame_chunk),
+            "overlap": int(args.policy_overlap),
+            "tiled_dit": True,
+            "tiled_vae": False,
+            "stream_decode": False,
+        },
         "total_cases": len(rows),
         "raw_successful_cases": sum(1 for r in rows if r.raw_success),
         "effective_successful_cases": sum(1 for r in rows if r.effective_success and not r.shared_vram_suspect),
@@ -459,7 +764,10 @@ def main() -> int:
         "oom_recovery_override_cases": sum(1 for r in rows if r.oom_recovery_override),
         "oom_cases": sum(1 for r in rows if r.oom),
         "sensitivity": sensitivity,
+        "policy_target_safe_tiles": policy_target_safe_tiles,
+        "best_target_safe_tiles": best_target_safe_tiles,
         "best_successful_tiles": best_tiles,
+        "effective_resolution_groups": effective_groups,
     }
 
     out_md.parent.mkdir(parents=True, exist_ok=True)

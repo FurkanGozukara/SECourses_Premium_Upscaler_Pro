@@ -664,6 +664,13 @@ def run_flashvsr(
         if not layout_ok:
             return FlashVSRResult(returncode=1, output_path=None, log="\n".join(log_lines))
 
+        name_hint = (
+            settings.get("_original_filename")
+            or (Path(original_input_path).name if original_input_path else "")
+            or Path(prepared_input_path).name
+        )
+        base_stem = Path(str(name_hint)).stem or "output"
+
         output_override = settings.get("output_override", "")
         explicit_output_file: Optional[Path] = None
         if output_override:
@@ -671,9 +678,8 @@ def run_flashvsr(
             if override_path.suffix:
                 explicit_output_file = collision_safe_path(override_path)
             else:
-                base_stem = Path(original_input_path).stem if original_input_path else "FlashVSR"
                 explicit_output_file = collision_safe_path(
-                    Path(override_path) / f"FlashVSR_{mode}_{base_stem}_{seed}.mp4"
+                    Path(override_path) / f"{base_stem}.mp4"
                 )
         else:
             resolved = resolve_output_location(
@@ -684,7 +690,7 @@ def run_flashvsr(
                 original_filename=settings.get("_original_filename"),
             )
             explicit_output_file = collision_safe_path(
-                resolved if resolved.suffix else (resolved / "FlashVSR_output.mp4")
+                resolved if resolved.suffix else (resolved / f"{base_stem}.mp4")
             )
 
         explicit_output_file.parent.mkdir(parents=True, exist_ok=True)

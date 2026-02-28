@@ -382,7 +382,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "temporal_overlap": 0,
         "color_correction": "lab",
         "input_noise_scale": 0.0,
-        "latent_noise_scale": 0.1,
+        "latent_noise_scale": 0.0,
         # UI semantics: False = keep default safeguard (force 0 for images),
         # True = allow custom latent-noise slider value for images.
         "force_latent_noise_zero_for_images": False,

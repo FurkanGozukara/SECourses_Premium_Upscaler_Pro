@@ -332,7 +332,7 @@ def seedvr2_tab(
                     label="Latent Noise Scale",
                     minimum=0.0, maximum=1.0, step=0.01,
                     value=values[20],  # Was 23, now 20
-                    info="Add noise in latent space during diffusion. Can improve detail generation. 0.0 = no noise. Typical: 0.0-0.05. Default: 0.1.",
+                    info="Add noise in latent space during diffusion. Can improve detail generation. 0.0 = no noise. Typical: 0.0-0.05. Default: 0.0.",
                     scale=2,
                 )
                 allow_custom_image_latent_noise = gr.Checkbox(

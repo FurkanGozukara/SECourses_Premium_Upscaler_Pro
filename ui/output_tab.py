@@ -541,6 +541,16 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                             value=32,
                             info="Default label size for Video A / Video B text in generated comparison video.",
                         )
+                        direct_compare_text_alignment = gr.Dropdown(
+                            label="Label Alignment",
+                            choices=[
+                                ("Center", "center"),
+                                ("Left", "left"),
+                                ("Right", "right"),
+                            ],
+                            value="center",
+                            info="Horizontal alignment for Video A / Video B labels in generated comparison video and preview.",
+                        )
 
                     direct_compare_geometry = gr.Markdown(
                         "Set Video A and Video B to auto-calculate final resolution and aspect ratio."
@@ -1478,6 +1488,12 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             return "top_to_bottom"
         return "auto"
 
+    def _normalize_direct_label_alignment(alignment_choice: str) -> str:
+        key = str(alignment_choice or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if key in {"left", "center", "right"}:
+            return key
+        return "center"
+
     def _resolve_direct_base_dimensions(path_a: str, path_b: str) -> Tuple[int, int, str]:
         candidates = []
         for source_label, candidate in (("Video A", path_a), ("Video B", path_b)):
@@ -1553,6 +1569,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         width_value,
         height_value,
         font_size_value,
+        label_alignment,
         slider_pass_duration,
         slider_slowmo_factor,
         kind: str,
@@ -1570,7 +1587,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
         signature = (
             f"{_sig_for(path_a)}|{_sig_for(path_b)}|{layout_choice}|{width_value}|{height_value}|"
-            f"{font_size_value}|{slider_pass_duration}|{slider_slowmo_factor}|{kind}"
+            f"{font_size_value}|{label_alignment}|{slider_pass_duration}|{slider_slowmo_factor}|{kind}"
         )
         token = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:24]
         return preview_dir / f"{token}_{kind}.png"
@@ -1752,6 +1769,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         width_value,
         height_value,
         font_size_value,
+        label_alignment_value,
         generate_slider_video,
         slider_pass_duration_value,
         slider_slowmo_factor_value,
@@ -1813,6 +1831,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         slider_final_w = custom_w if manual_size_override else int(base_w or 0)
         slider_final_h = custom_h if manual_size_override else int(base_h or 0)
         label_font_size = _coerce_font_size(font_size_value, default=32)
+        label_alignment = _normalize_direct_label_alignment(label_alignment_value)
         slider_enabled = bool(generate_slider_video)
         try:
             slider_pass_duration = float(slider_pass_duration_value or 0.0)
@@ -1868,6 +1887,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             target_width=custom_w if manual_size_override else None,
             target_height=custom_h if manual_size_override else None,
             font_size=label_font_size,
+            label_alignment=label_alignment,
             include_branding=False,
             on_progress=_direct_progress_logger,
         )
@@ -1900,6 +1920,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 target_width=custom_w if manual_size_override else None,
                 target_height=custom_h if manual_size_override else None,
                 font_size=label_font_size,
+                label_alignment=label_alignment,
                 include_branding=False,
                 slider_pass_duration_seconds=slider_pass_duration,
                 slow_motion_factor=slider_slowmo_factor,
@@ -1963,6 +1984,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         width_value,
         height_value,
         font_size_value,
+        label_alignment_value,
         generate_slider_video,
         slider_pass_duration_value,
         slider_slowmo_factor_value,
@@ -2013,6 +2035,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             )
         )
         label_font_size = _coerce_font_size(font_size_value, default=32)
+        label_alignment = _normalize_direct_label_alignment(label_alignment_value)
         slider_enabled = bool(generate_slider_video)
         try:
             slider_pass_duration = float(slider_pass_duration_value or 0.0)
@@ -2035,6 +2058,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             width_value=width_value,
             height_value=height_value,
             font_size_value=label_font_size,
+            label_alignment=label_alignment,
             slider_pass_duration=slider_pass_duration,
             slider_slowmo_factor=slider_slowmo_factor,
             kind="main",
@@ -2050,6 +2074,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             target_width=custom_w if manual_size_override else None,
             target_height=custom_h if manual_size_override else None,
             font_size=label_font_size,
+            label_alignment=label_alignment,
             include_branding=False,
             slider_mode=False,
         )
@@ -2073,6 +2098,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 width_value=width_value,
                 height_value=height_value,
                 font_size_value=label_font_size,
+                label_alignment=label_alignment,
                 slider_pass_duration=slider_pass_duration,
                 slider_slowmo_factor=slider_slowmo_factor,
                 kind="slider",
@@ -2088,6 +2114,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 target_width=custom_w if manual_size_override else None,
                 target_height=custom_h if manual_size_override else None,
                 font_size=label_font_size,
+                label_alignment=label_alignment,
                 include_branding=False,
                 slider_mode=True,
                 slider_pass_duration_seconds=slider_pass_duration,
@@ -2118,6 +2145,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             0,
             0,
             32,
+            "center",
             False,
             0.0,
             1.0,
@@ -2155,6 +2183,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_width,
             direct_compare_height_px,
             direct_compare_font_size,
+            direct_compare_text_alignment,
             direct_generate_slider_video,
             direct_slider_pass_duration,
             direct_slider_slowmo,
@@ -2179,6 +2208,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_width,
             direct_compare_height_px,
             direct_compare_font_size,
+            direct_compare_text_alignment,
             direct_generate_slider_video,
             direct_slider_pass_duration,
             direct_slider_slowmo,
@@ -2201,6 +2231,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             direct_compare_width,
             direct_compare_height_px,
             direct_compare_font_size,
+            direct_compare_text_alignment,
             direct_generate_slider_video,
             direct_slider_pass_duration,
             direct_slider_slowmo,

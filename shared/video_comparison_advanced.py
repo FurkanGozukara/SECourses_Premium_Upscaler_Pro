@@ -65,6 +65,53 @@ def _coerce_slowmo_factor(value: Any, default: float = 1.0) -> float:
     return max(0.1, min(16.0, factor))
 
 
+def _normalize_label_alignment(value: Any, default: str = "left") -> str:
+    """Normalize label alignment mode to left/center/right."""
+    fallback = str(default or "left").strip().lower()
+    if fallback not in {"left", "center", "right"}:
+        fallback = "left"
+    key = str(value or fallback).strip().lower().replace("-", "_").replace(" ", "_")
+    if key in {"left", "center", "right"}:
+        return key
+    return fallback
+
+
+def _label_x_expr(alignment: str, margin: int = 10) -> str:
+    """Build drawtext x-expression from alignment mode."""
+    mode = _normalize_label_alignment(alignment, default="left")
+    safe_margin = max(0, int(margin))
+    if mode == "center":
+        return "(w-tw)/2"
+    if mode == "right":
+        return f"w-tw-{safe_margin}"
+    return str(safe_margin)
+
+
+def _coerce_positive_fps(value: Any) -> float:
+    """Convert an fps-like value to a positive float (or 0.0 when invalid)."""
+    try:
+        fps = float(value)
+    except Exception:
+        return 0.0
+    if fps != fps or fps <= 0.0:
+        return 0.0
+    return float(fps)
+
+
+def _resolve_pair_source_fps(fps_a: Any, fps_b: Any, default: float = 30.0) -> float:
+    """
+    Resolve a stable target FPS from two sources.
+
+    Uses the higher valid source FPS and falls back to `default` when both are unavailable.
+    """
+    src_a = _coerce_positive_fps(fps_a)
+    src_b = _coerce_positive_fps(fps_b)
+    if src_a > 0.0 or src_b > 0.0:
+        return max(1.0, src_a, src_b)
+    default_fps = _coerce_positive_fps(default)
+    return max(1.0, default_fps if default_fps > 0.0 else 30.0)
+
+
 def _resolve_pair_base_dimensions(
     dims_a: Tuple[int, int],
     dims_b: Tuple[int, int],
@@ -800,6 +847,7 @@ def create_input_vs_output_comparison_video(
     target_height: Optional[int] = None,
     font_size: int = 32,
     include_branding: bool = True,
+    label_alignment: str = "left",
 ) -> Tuple[bool, str, str]:
     """
     Create a comparison video of original input vs upscaled output.
@@ -819,6 +867,7 @@ def create_input_vs_output_comparison_video(
         target_height: Optional forced final height (even integer, <=0 ignored)
         font_size: Label drawtext font size (8-200)
         include_branding: When True, draws COMPARISON_BRAND_TEXT on right/bottom video
+        label_alignment: Label horizontal alignment: "left", "center", or "right"
 
     Returns:
         (success, comparison_video_path, error_message)
@@ -827,6 +876,7 @@ def create_input_vs_output_comparison_video(
         normalize_path,
         get_media_dimensions,
         get_media_duration_seconds,
+        get_media_fps,
     )
     from .error_handling import check_ffmpeg_available
 
@@ -873,6 +923,10 @@ def create_input_vs_output_comparison_video(
                 f"Creating comparison video ({layout} layout, {final_w}x{final_h})...\n"
             )
 
+        input_fps = get_media_fps(str(input_path))
+        output_fps = get_media_fps(str(output_path))
+        target_fps = _resolve_pair_source_fps(input_fps, output_fps, default=30.0)
+
         # Build ffmpeg filter complex
         # 1. Scale original input to match output resolution using lanczos for quality
         # 2. Add labels to both videos
@@ -881,13 +935,14 @@ def create_input_vs_output_comparison_video(
         safe_label_output = _escape_drawtext_text(label_output)
         safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
         safe_font_size = _coerce_font_size(font_size, default=32)
+        label_x_expr = _label_x_expr(label_alignment, margin=10)
 
         if layout == "horizontal":
             # Side by side - each video takes half the final width
             # Final video will be 2x the width of output video
             right_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
-                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={target_fps:.6f},"
+                f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -898,8 +953,8 @@ def create_input_vs_output_comparison_video(
             right_drawtext += "[right];"
 
             stacked_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
-                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={target_fps:.6f},"
+                f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
                 f"[left][right]hstack=inputs=2[stacked]"
@@ -908,8 +963,8 @@ def create_input_vs_output_comparison_video(
             # Stacked (vertical) - each video takes half the final height
             # Final video will be 2x the height of output video
             bottom_drawtext = (
-                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
-                f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={target_fps:.6f},"
+                f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -920,8 +975,8 @@ def create_input_vs_output_comparison_video(
             bottom_drawtext += "[bottom];"
 
             stacked_filter = (
-                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
-                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={target_fps:.6f},"
+                f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
                 f"{bottom_drawtext}"
                 f"[top][bottom]vstack=inputs=2[stacked]"
@@ -949,6 +1004,7 @@ def create_input_vs_output_comparison_video(
             "-crf", "18",
             "-preset", "medium",
             "-pix_fmt", "yuv420p",
+            "-r", f"{target_fps:.6f}",
             "-c:a", "aac",
             "-b:a", "192k",
             "-movflags", "+faststart",
@@ -999,6 +1055,7 @@ def create_input_vs_output_slider_comparison_video(
     include_branding: bool = True,
     slider_pass_duration_seconds: Optional[float] = None,
     slow_motion_factor: Optional[float] = 1.0,
+    label_alignment: str = "left",
 ) -> Tuple[bool, str, str]:
     """
     Create an animated slider comparison video (left->right then right->left).
@@ -1063,15 +1120,13 @@ def create_input_vs_output_slider_comparison_video(
             base_cycle_duration = float(source_duration or 0.0)
             duration_was_auto = True
         base_cycle_duration = max(0.5, base_cycle_duration)
-        source_fps = (
-            get_media_fps(str(output_path))
-            or get_media_fps(str(input_path))
-            or 30.0
+        source_fps = _resolve_pair_source_fps(
+            get_media_fps(str(input_path)),
+            get_media_fps(str(output_path)),
+            default=30.0,
         )
-        source_fps = max(1.0, float(source_fps))
         slowmo_factor = _coerce_slowmo_factor(slow_motion_factor, default=1.0)
-        min_slider_fps = 48.0 if max(base_w, base_h) >= 1280 else 36.0
-        timeline_fps = max(1.0, min_slider_fps, source_fps / slowmo_factor)
+        timeline_fps = max(1.0, source_fps / slowmo_factor)
         if duration_was_auto:
             axis_pixels = float(base_h if layout == "vertical" else base_w)
             min_pass_frames = max(60.0, axis_pixels / 14.0)
@@ -1095,6 +1150,7 @@ def create_input_vs_output_slider_comparison_video(
         safe_label_output = _escape_drawtext_text(label_output)
         safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
         safe_font_size = _coerce_font_size(font_size, default=32)
+        label_x_expr = _label_x_expr(label_alignment, margin=10)
 
         slider_scale_flags = "bicubic"
 
@@ -1113,7 +1169,7 @@ def create_input_vs_output_slider_comparison_video(
             chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (
                 f"[1:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
-                f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -1126,7 +1182,7 @@ def create_input_vs_output_slider_comparison_video(
 
             base_filter = (
                 f"[0:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
-                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
                 f"[left][right]blend=c0_expr='{luma_expr}':c1_expr='{chroma_expr}':c2_expr='{chroma_expr}'[slider]"
@@ -1146,7 +1202,7 @@ def create_input_vs_output_slider_comparison_video(
             chroma_expr = f"if({line_mask_expr},128,{split_expr})"
             right_drawtext = (
                 f"[1:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
-                f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5"
             )
             if include_branding:
@@ -1159,7 +1215,7 @@ def create_input_vs_output_slider_comparison_video(
 
             base_filter = (
                 f"[0:v]scale={base_w}:{base_h}:flags={slider_scale_flags},fps={timeline_fps:.6f},"
-                f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                 f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                 f"{right_drawtext}"
                 f"[left][right]blend=c0_expr='{luma_expr}':c1_expr='{chroma_expr}':c2_expr='{chroma_expr}'[slider]"
@@ -1251,6 +1307,7 @@ def create_input_vs_output_comparison_preview_image(
     slider_mode: bool = False,
     slider_pass_duration_seconds: Optional[float] = None,
     on_progress: Optional[callable] = None,
+    label_alignment: str = "left",
 ) -> Tuple[bool, str, str]:
     """
     Render a fast first-frame preview image for comparison settings.
@@ -1305,6 +1362,7 @@ def create_input_vs_output_comparison_preview_image(
         safe_label_output = _escape_drawtext_text(label_output)
         safe_brand_text = _escape_drawtext_text(COMPARISON_BRAND_TEXT)
         safe_font_size = _coerce_font_size(font_size, default=32)
+        label_x_expr = _label_x_expr(label_alignment, margin=10)
 
         if slider_mode:
             dur_out = get_media_duration_seconds(str(output_path)) or 0.0
@@ -1317,12 +1375,11 @@ def create_input_vs_output_comparison_preview_image(
             if pass_duration <= 0.0:
                 pass_duration = float(source_duration or 0.0)
             pass_duration = max(0.5, pass_duration)
-            source_fps = (
-                get_media_fps(str(output_path))
-                or get_media_fps(str(input_path))
-                or 30.0
+            source_fps = _resolve_pair_source_fps(
+                get_media_fps(str(input_path)),
+                get_media_fps(str(output_path)),
+                default=30.0,
             )
-            source_fps = max(1.0, float(source_fps))
             pass_frames = max(1, int(round(pass_duration * source_fps)))
             total_frames = pass_frames * 2
             pass_duration = pass_frames / source_fps
@@ -1341,7 +1398,7 @@ def create_input_vs_output_comparison_preview_image(
                 split_expr = f"if(lt(Y,{boundary_expr}),A,B)"
                 right_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
@@ -1359,7 +1416,7 @@ def create_input_vs_output_comparison_preview_image(
                 )
                 base_filter = (
                     f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                     f"{right_drawtext}"
                     f"[left][right]blend=all_expr='{blend_expr}'[slider]"
@@ -1377,7 +1434,7 @@ def create_input_vs_output_comparison_preview_image(
                 split_expr = f"if(lt(X,{boundary_expr}),A,B)"
                 right_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_output}':x=w-tw-10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
@@ -1395,7 +1452,7 @@ def create_input_vs_output_comparison_preview_image(
                 )
                 base_filter = (
                     f"[0:v]scale={base_w}:{base_h}:flags=lanczos,fps={source_fps:.6f},format=gbrp,"
-                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                     f"{right_drawtext}"
                     f"[left][right]blend=all_expr='{blend_expr}'[slider]"
@@ -1412,7 +1469,7 @@ def create_input_vs_output_comparison_preview_image(
             if layout == "horizontal":
                 right_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
-                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
@@ -1423,7 +1480,7 @@ def create_input_vs_output_comparison_preview_image(
                 right_drawtext += "[right];"
                 stacked_filter = (
                     f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
-                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5[left];"
                     f"{right_drawtext}"
                     f"[left][right]hstack=inputs=2[stacked]"
@@ -1431,7 +1488,7 @@ def create_input_vs_output_comparison_preview_image(
             else:
                 bottom_drawtext = (
                     f"[1:v]scale={base_w}:{base_h}:flags=lanczos,"
-                    f"drawtext=text='{safe_label_output}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_output}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5"
                 )
                 if include_branding:
@@ -1442,7 +1499,7 @@ def create_input_vs_output_comparison_preview_image(
                 bottom_drawtext += "[bottom];"
                 stacked_filter = (
                     f"[0:v]scale={base_w}:{base_h}:flags=lanczos,"
-                    f"drawtext=text='{safe_label_input}':x=10:y=10:fontsize={safe_font_size}:fontcolor=white:"
+                    f"drawtext=text='{safe_label_input}':x={label_x_expr}:y=10:fontsize={safe_font_size}:fontcolor=white:"
                     f"box=1:boxcolor=black@0.6:boxborderw=5[top];"
                     f"{bottom_drawtext}"
                     f"[top][bottom]vstack=inputs=2[stacked]"

@@ -4,6 +4,8 @@ Handles all SeedVR2 processing logic, presets, and callbacks
 """
 
 import html
+import hashlib
+import json
 import re
 import shutil
 import queue
@@ -904,6 +906,445 @@ def _list_media_files(folder: str, video_exts: set, image_exts: set) -> List[str
         return items
     except Exception:
         return []
+
+
+# Auto-tune helpers ------------------------------------------------------------
+AUTOTUNE_MODEL_ID = "seedvr2"
+AUTOTUNE_LOG_PREFIX = "seedvr2_autotune"
+AUTOTUNE_TARGET_FRAMES = 201
+AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
+AUTOTUNE_MIN_TILE_SIZE = 64
+AUTOTUNE_BATCH_SEQUENCE = tuple(range(5, AUTOTUNE_TARGET_FRAMES + 1, 4))
+
+
+def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
+    """Relative numeric comparison helper."""
+    try:
+        lhs_f = float(lhs)
+        rhs_f = float(rhs)
+        tol_f = abs(float(tolerance))
+    except Exception:
+        return False
+    base = max(abs(lhs_f), abs(rhs_f), 1e-9)
+    return abs(lhs_f - rhs_f) / base <= tol_f
+
+
+def _parse_cuda_device_ids(cuda_spec: Any) -> List[int]:
+    """Parse CSV CUDA device spec into a stable list of device IDs."""
+    raw = str(cuda_spec or "").strip().lower()
+    if not raw:
+        return []
+    out: List[int] = []
+    for token in raw.split(","):
+        norm = token.strip()
+        if norm.startswith("cuda:"):
+            norm = norm.split(":", 1)[1].strip()
+        if not norm.isdigit():
+            continue
+        idx = int(norm)
+        if idx not in out:
+            out.append(idx)
+    return out
+
+
+def _query_gpu_memory_snapshot_gb() -> Dict[int, Tuple[float, float]]:
+    """
+    Query per-GPU memory (used,total) in GB via nvidia-smi.
+
+    Uses NVML-backed `nvidia-smi` so the parent app process does not create
+    a CUDA context.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.5,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        rows = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        out: Dict[int, Tuple[float, float]] = {}
+        for row in rows:
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) < 3:
+                continue
+            if not parts[0].isdigit():
+                continue
+            idx = int(parts[0])
+            used_mb = float(parts[1]) if parts[1] else 0.0
+            total_mb = float(parts[2]) if parts[2] else 0.0
+            out[idx] = (used_mb / 1024.0, total_mb / 1024.0)
+        return out
+    except Exception:
+        return {}
+
+
+def _sample_peak_vram_gb(
+    stop_event: threading.Event,
+    result_box: Dict[str, Any],
+    device_ids: List[int],
+    interval_sec: float = 0.25,
+    phase_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Background sampler that tracks peak VRAM usage while a subprocess runs."""
+    peak_used = 0.0
+    peak_phase2 = 0.0
+    total_seen = 0.0
+    telemetry_ok = False
+    samples = 0
+    phase2_samples = 0
+    while not stop_event.is_set():
+        snap = _query_gpu_memory_snapshot_gb()
+        if snap:
+            selected = [d for d in device_ids if d in snap] if device_ids else sorted(snap.keys())
+            if selected:
+                telemetry_ok = True
+                used_sum = sum(float(snap[d][0]) for d in selected)
+                total_sum = sum(float(snap[d][1]) for d in selected)
+                peak_used = max(peak_used, used_sum)
+                samples += 1
+                cur_phase = str((phase_state or {}).get("phase") or "").strip().lower()
+                if cur_phase == "phase2":
+                    peak_phase2 = max(peak_phase2, used_sum)
+                    phase2_samples += 1
+                if total_sum > 0:
+                    total_seen = total_sum
+        stop_event.wait(interval_sec)
+    result_box["max_used_gb"] = float(peak_used)
+    result_box["max_used_phase2_gb"] = float(peak_phase2)
+    result_box["samples"] = int(samples)
+    result_box["phase2_samples"] = int(phase2_samples)
+    if total_seen > 0:
+        result_box["total_gb"] = float(total_seen)
+    result_box["telemetry_ok"] = bool(telemetry_ok)
+
+
+def _looks_like_oom(log_text: str) -> bool:
+    """Heuristic OOM detector from CLI/subprocess logs."""
+    lc = str(log_text or "").lower()
+    tokens = (
+        "out of memory",
+        "cuda out of memory",
+        "torch.cuda.outofmemoryerror",
+        "c10::error",
+        "allocation on device",
+        "failed to allocate memory",
+    )
+    return any(tok in lc for tok in tokens)
+
+
+def _detect_oom_phase(log_text: str) -> str:
+    """Best-effort phase classification for OOM events."""
+    lc = str(log_text or "").lower()
+    if "phase 1" in lc or "encoding batch" in lc or "vae encoding" in lc:
+        return "phase1_encode"
+    if "phase 2" in lc or "upscaling batch" in lc or "dit upscaling" in lc:
+        return "phase2_upscale"
+    if "phase 3" in lc or "decoding batch" in lc or "vae decoding" in lc:
+        return "phase3_decode"
+    return "unknown"
+
+
+def _halve_vae_tile_sizes(settings: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Reduce VAE tile sizes by half with overlap safety guards."""
+    changed = False
+    notes: List[str] = []
+    for size_key, overlap_key in (
+        ("vae_encode_tile_size", "vae_encode_tile_overlap"),
+        ("vae_decode_tile_size", "vae_decode_tile_overlap"),
+    ):
+        try:
+            cur_size = int(settings.get(size_key) or 0)
+        except Exception:
+            cur_size = 0
+        if cur_size <= AUTOTUNE_MIN_TILE_SIZE:
+            continue
+        new_size = max(AUTOTUNE_MIN_TILE_SIZE, cur_size // 2)
+        if new_size >= cur_size:
+            continue
+
+        try:
+            cur_overlap = int(settings.get(overlap_key) or 0)
+        except Exception:
+            cur_overlap = 0
+        new_overlap = max(0, min(new_size - 1, cur_overlap // 2 if cur_overlap > 0 else 0))
+
+        settings[size_key] = int(new_size)
+        settings[overlap_key] = int(new_overlap)
+        notes.append(f"{size_key}:{cur_size}->{new_size}, {overlap_key}:{cur_overlap}->{new_overlap}")
+        changed = True
+    return changed, notes
+
+
+def _build_autotune_signature(
+    settings: Dict[str, Any],
+    *,
+    target_w: int,
+    target_h: int,
+    effective_in_w: int,
+    effective_in_h: int,
+    global_gpu_device: str,
+    total_vram_gb: float,
+) -> Dict[str, Any]:
+    """Create a stable VRAM-impact signature for cache lookups."""
+    exact_payload = {
+        "autotune_model": AUTOTUNE_MODEL_ID,
+        "dit_model": str(settings.get("dit_model") or ""),
+        "attention_mode": str(settings.get("attention_mode") or "sdpa"),
+        "compile_dit": bool(settings.get("compile_dit", False)),
+        "compile_vae": bool(settings.get("compile_vae", False)),
+        "compile_backend": str(settings.get("compile_backend") or "inductor"),
+        "compile_mode": str(settings.get("compile_mode") or "default"),
+        "compile_fullgraph": bool(settings.get("compile_fullgraph", False)),
+        "compile_dynamic": bool(settings.get("compile_dynamic", False)),
+        "compile_dynamo_cache_size_limit": int(settings.get("compile_dynamo_cache_size_limit") or 64),
+        "compile_dynamo_recompile_limit": int(settings.get("compile_dynamo_recompile_limit") or 128),
+        "cache_dit": bool(settings.get("cache_dit", False)),
+        "cache_vae": bool(settings.get("cache_vae", False)),
+        "dit_offload_device": str(settings.get("dit_offload_device") or "none"),
+        "vae_offload_device": str(settings.get("vae_offload_device") or "none"),
+        "tensor_offload_device": str(settings.get("tensor_offload_device") or "cpu"),
+        "swap_io_components": bool(settings.get("swap_io_components", False)),
+        "uniform_batch_size": bool(settings.get("uniform_batch_size", False)),
+        "vae_encode_tiled": bool(settings.get("vae_encode_tiled", False)),
+        "vae_decode_tiled": bool(settings.get("vae_decode_tiled", False)),
+        "vae_encode_tile_size": int(settings.get("vae_encode_tile_size") or 0),
+        "vae_encode_tile_overlap": int(settings.get("vae_encode_tile_overlap") or 0),
+        "vae_decode_tile_size": int(settings.get("vae_decode_tile_size") or 0),
+        "vae_decode_tile_overlap": int(settings.get("vae_decode_tile_overlap") or 0),
+        "upscale_factor": round(float(settings.get("upscale_factor") or 1.0), 4),
+        "max_resolution": int(settings.get("max_resolution") or 0),
+        "pre_downscale_then_upscale": bool(settings.get("pre_downscale_then_upscale", True)),
+        "global_gpu_device": str(global_gpu_device or ""),
+    }
+    exact_blob = json.dumps(exact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return {
+        "exact": exact_payload,
+        "exact_hash": hashlib.sha1(exact_blob.encode("utf-8")).hexdigest(),
+        "target_pixels": int(max(1, int(target_w) * int(target_h))),
+        "effective_input_pixels": int(max(1, int(effective_in_w) * int(effective_in_h))),
+        "target_width": int(target_w),
+        "target_height": int(target_h),
+        "effective_input_width": int(effective_in_w),
+        "effective_input_height": int(effective_in_h),
+        "gpu_total_vram_gb": float(total_vram_gb or 0.0),
+    }
+
+
+def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    """Match cached signature against current request (with 5% target-pixel tolerance)."""
+    if not isinstance(candidate, dict) or not isinstance(expected, dict):
+        return False
+    if str(candidate.get("exact_hash") or "") != str(expected.get("exact_hash") or ""):
+        return False
+
+    if not _within_ratio(
+        float(candidate.get("target_pixels", 0) or 0),
+        float(expected.get("target_pixels", 0) or 0),
+        tolerance=0.05,
+    ):
+        return False
+
+    # Effective input pixels matter when pre-downscale is active; keep this strict-ish.
+    if not _within_ratio(
+        float(candidate.get("effective_input_pixels", 0) or 0),
+        float(expected.get("effective_input_pixels", 0) or 0),
+        tolerance=0.05,
+    ):
+        return False
+
+    cand_vram = float(candidate.get("gpu_total_vram_gb", 0) or 0)
+    exp_vram = float(expected.get("gpu_total_vram_gb", 0) or 0)
+    if cand_vram > 0 and exp_vram > 0 and (not _within_ratio(cand_vram, exp_vram, tolerance=0.05)):
+        return False
+    return True
+
+
+def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return newest matching autotune log that contains a usable best_config."""
+    try:
+        if not log_dir.exists():
+            return None
+        candidates = sorted(
+            [p for p in log_dir.glob("*.json") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return None
+
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        is_seedvr2_file = path.name.lower().startswith(f"{AUTOTUNE_LOG_PREFIX}_")
+        model_id = str(payload.get("model") or "").strip().lower()
+        if model_id and model_id != AUTOTUNE_MODEL_ID:
+            continue
+        if (not model_id) and (not is_seedvr2_file):
+            continue
+        best = payload.get("best_config")
+        if not isinstance(best, dict) or (not best):
+            continue
+        if _autotune_signature_matches(payload.get("signature", {}), expected_signature):
+            payload["_log_path"] = str(path)
+            return payload
+    return None
+
+
+def _write_autotune_log(
+    log_dir: Path,
+    payload: Dict[str, Any],
+    *,
+    existing_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Persist autotune run details as JSON."""
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = Path(existing_path) if existing_path else None
+        if not path:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = log_dir / f"{AUTOTUNE_LOG_PREFIX}_{ts}.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
+def _create_autotune_demo_video(
+    input_path: str,
+    output_path: Path,
+    *,
+    target_frames: int = AUTOTUNE_TARGET_FRAMES,
+    resize_to: Optional[Tuple[int, int]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a deterministic 201-frame demo clip for autotune.
+
+    The clip reuses user input content while enforcing a fixed frame count so
+    batch-size sweeps stay stable and fast.
+    """
+    import cv2  # type: ignore
+
+    input_kind = detect_input_type(str(input_path or ""))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink(missing_ok=True)
+
+    resize_w = int(resize_to[0]) if resize_to else 0
+    resize_h = int(resize_to[1]) if resize_to else 0
+    if resize_w <= 0 or resize_h <= 0:
+        dims = get_media_dimensions(str(input_path))
+        if not dims:
+            raise RuntimeError("Could not determine input dimensions for autotune demo.")
+        resize_w, resize_h = int(dims[0]), int(dims[1])
+    resize_w = max(16, resize_w - (resize_w % 2))
+    resize_h = max(16, resize_h - (resize_h % 2))
+
+    fps = 30.0
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (resize_w, resize_h),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to create demo video writer: {output_path}")
+
+    written = 0
+    source_frames = 0
+    last_frame = None
+
+    def _resize_if_needed(frame):
+        if frame is None:
+            return None
+        if frame.shape[1] == resize_w and frame.shape[0] == resize_h:
+            return frame
+        interpolation = cv2.INTER_AREA if (frame.shape[1] >= resize_w and frame.shape[0] >= resize_h) else cv2.INTER_LANCZOS4
+        return cv2.resize(frame, (resize_w, resize_h), interpolation=interpolation)
+
+    try:
+        if input_kind == "video":
+            cap = cv2.VideoCapture(str(input_path))
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open input video for autotune: {input_path}")
+            source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            while written < int(target_frames):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frame = _resize_if_needed(frame)
+                if frame is None:
+                    continue
+                writer.write(frame)
+                last_frame = frame
+                written += 1
+            cap.release()
+
+        elif input_kind == "image":
+            frame = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise RuntimeError(f"Failed to read input image for autotune: {input_path}")
+            frame = _resize_if_needed(frame)
+            if frame is None:
+                raise RuntimeError("Autotune image resize failed.")
+            source_frames = 1
+            last_frame = frame
+            while written < int(target_frames):
+                writer.write(frame)
+                written += 1
+
+        elif input_kind == "directory":
+            frames = [
+                p
+                for p in _list_media_files(str(input_path), SEEDVR2_VIDEO_EXTS, SEEDVR2_IMAGE_EXTS)
+                if Path(p).suffix.lower() in SEEDVR2_IMAGE_EXTS
+            ]
+            if not frames:
+                raise RuntimeError("No image frames found in input directory for autotune.")
+            source_frames = len(frames)
+            for fp in frames:
+                if written >= int(target_frames):
+                    break
+                frame = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                frame = _resize_if_needed(frame)
+                if frame is None:
+                    continue
+                writer.write(frame)
+                last_frame = frame
+                written += 1
+
+        else:
+            raise RuntimeError(f"Unsupported input type for autotune: {input_kind}")
+
+        if last_frame is None or written <= 0:
+            raise RuntimeError("No frames available for autotune demo clip.")
+        while written < int(target_frames):
+            writer.write(last_frame)
+            written += 1
+    finally:
+        writer.release()
+
+    return {
+        "input_kind": input_kind,
+        "fps": float(fps),
+        "width": int(resize_w),
+        "height": int(resize_h),
+        "source_frames": int(source_frames),
+        "written_frames": int(written),
+        "path": str(output_path),
+    }
 
 
 # Preset helpers ---------------------------------------------------------------
@@ -2882,6 +3323,709 @@ def build_seedvr2_callbacks(
         _emit_progress(100, "Finalizing analysis report...")
         return gr.update(value=html_block, visible=True), state
 
+    def auto_tune_action(
+        uploaded_file,
+        *args,
+        state: Dict[str, Any] = None,
+        progress=None,
+        global_settings_snapshot: Dict[str, Any] | None = None,
+        _global_settings: Dict[str, Any] = global_settings,
+    ):
+        """
+        SeedVR2 DiT-oriented VRAM autotune sweep.
+
+        Strategy:
+        - Build a 201-frame demo clip from current input.
+        - Sweep batch sizes (4n+1) with blocks_to_swap=36.
+        - Keep ~2GB free VRAM headroom.
+        - If 201 passes, reduce blocks_to_swap by 2 for higher quality.
+        - Persist logs to vram_usages/ and reuse matching results later.
+        """
+        global_cfg = (
+            dict(global_settings_snapshot)
+            if isinstance(global_settings_snapshot, dict)
+            else dict(_global_settings)
+        )
+        state = state or {"seed_controls": {}, "operation_status": "ready"}
+        state.setdefault("seed_controls", {})
+        seed_controls = state.get("seed_controls", {})
+        output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
+        if not isinstance(output_settings, dict):
+            output_settings = {}
+
+        def _indicator(title: str, subtitle: str) -> Dict[str, Any]:
+            safe_title = html.escape(str(title or ""))
+            safe_sub = html.escape(str(subtitle or ""))
+            block = (
+                '<div class="processing-banner">'
+                '<div class="processing-spinner"></div>'
+                '<div class="processing-col">'
+                f'<div class="processing-text">{safe_title}</div>'
+                f'<div class="processing-sub">{safe_sub}</div>'
+                "</div></div>"
+            )
+            return gr.update(value=block, visible=True)
+
+        log_lines: List[str] = []
+
+        def _payload(
+            status_text: str,
+            *,
+            show_indicator: bool,
+            indicator_title: str = "Auto Tune in progress...",
+            batch_value: Optional[int] = None,
+            blocks_value: Optional[int] = None,
+            encode_tile_value: Optional[int] = None,
+            decode_tile_value: Optional[int] = None,
+        ):
+            return (
+                str(status_text or ""),
+                "\n".join(log_lines[-240:]),
+                (_indicator(indicator_title, status_text) if show_indicator else gr.update(value="", visible=False)),
+                (gr.update(value=int(batch_value)) if batch_value is not None else gr.update()),
+                (gr.update(value=int(blocks_value)) if blocks_value is not None else gr.update()),
+                (gr.update(value=int(encode_tile_value)) if encode_tile_value is not None else gr.update()),
+                (gr.update(value=int(decode_tile_value)) if decode_tile_value is not None else gr.update()),
+                state,
+            )
+
+        def _append_log(text: str) -> None:
+            msg = str(text or "").strip()
+            if not msg:
+                return
+            print(f"[SeedVR2 AutoTune] {msg}", flush=True)
+            log_lines.append(msg)
+
+        try:
+            state["operation_status"] = "running"
+            clear_vram_oom_alert(state)
+            reset_cancel = getattr(runner, "reset_cancel_state", None)
+            if callable(reset_cancel):
+                reset_cancel()
+
+            if len(args) != len(SEEDVR2_ORDER):
+                _append_log(
+                    f"Schema mismatch: received {len(args)} settings values but expected {len(SEEDVR2_ORDER)}."
+                )
+                yield _payload("Auto Tune aborted: schema mismatch.", show_indicator=False)
+                return
+
+            settings = dict(zip(SEEDVR2_ORDER, list(args)))
+            settings["force_latent_noise_zero_for_images"] = _coerce_bool(
+                settings.get("force_latent_noise_zero_for_images"),
+                default=bool(defaults.get("force_latent_noise_zero_for_images", False)),
+            )
+            settings["batch_enable"] = False  # Auto tune runs single-input probes only.
+            settings["resume_run_dir"] = ""
+
+            input_path, original_filename = _resolve_input_path(
+                uploaded_file,
+                settings.get("input_path"),
+                bool(settings.get("batch_enable", False)),
+                settings.get("batch_input_path", ""),
+            )
+            input_path = normalize_path(input_path)
+            if not input_path or not Path(input_path).exists():
+                _append_log("Input path is missing or does not exist.")
+                yield _payload("Auto Tune requires a valid input file/path.", show_indicator=False)
+                return
+
+            global_gpu_device = get_global_gpu_override(seed_controls, global_cfg)
+            settings["cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
+            settings = _enforce_seedvr2_guardrails(settings, defaults, state=state)
+
+            if global_gpu_device == "cpu":
+                _append_log("Global GPU selector is set to CPU. Auto Tune requires CUDA GPU mode.")
+                yield _payload("Auto Tune unavailable in CPU mode.", show_indicator=False)
+                return
+
+            if not _ffmpeg_available():
+                _append_log("ffmpeg is required for demo clip generation.")
+                yield _payload("Auto Tune requires ffmpeg in PATH.", show_indicator=False)
+                return
+
+            dims = get_media_dimensions(input_path)
+            if not dims:
+                _append_log("Could not read input dimensions.")
+                yield _payload("Failed to probe input dimensions.", show_indicator=False)
+                return
+            input_w, input_h = int(dims[0]), int(dims[1])
+
+            plan = estimate_seedvr2_upscale_plan_from_dims(
+                input_w,
+                input_h,
+                upscale_factor=float(settings.get("upscale_factor") or 1.0),
+                max_edge=int(settings.get("max_resolution") or 0),
+                pre_downscale_then_upscale=bool(settings.get("pre_downscale_then_upscale", True)),
+            )
+            target_w = int(plan.final_saved_width or plan.resize_width or 0)
+            target_h = int(plan.final_saved_height or plan.resize_height or 0)
+            if target_w <= 0 or target_h <= 0:
+                _append_log("Could not determine target output dimensions for autotune.")
+                yield _payload("Auto Tune failed to calculate target dimensions.", show_indicator=False)
+                return
+
+            effective_in_w = int(plan.preprocess_width if plan.pre_downscale_then_upscale else input_w)
+            effective_in_h = int(plan.preprocess_height if plan.pre_downscale_then_upscale else input_h)
+            if effective_in_w <= 0 or effective_in_h <= 0:
+                effective_in_w, effective_in_h = input_w, input_h
+
+            gpu_ids = _parse_cuda_device_ids(settings.get("cuda_device", ""))
+            if not gpu_ids and str(global_gpu_device).isdigit():
+                gpu_ids = [int(global_gpu_device)]
+            gpu_snapshot = _query_gpu_memory_snapshot_gb()
+            total_vram_gb = 0.0
+            if gpu_ids and gpu_snapshot:
+                total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in gpu_ids if g in gpu_snapshot)
+            if total_vram_gb <= 0:
+                gpus = get_gpu_info()
+                if gpus:
+                    if gpu_ids:
+                        by_id = {int(g.id): g for g in gpus}
+                        total_vram_gb = sum(float(by_id[g].total_memory_gb) for g in gpu_ids if g in by_id)
+                    else:
+                        total_vram_gb = float(gpus[0].total_memory_gb)
+            if total_vram_gb <= 0:
+                _append_log("Could not detect total VRAM for selected GPU.")
+                yield _payload("Auto Tune failed to detect GPU VRAM.", show_indicator=False)
+                return
+
+            telemetry_gpu_ids: List[int] = []
+            if gpu_snapshot:
+                preferred_ids = list(gpu_ids) if gpu_ids else sorted(gpu_snapshot.keys())
+                telemetry_gpu_ids = [idx for idx in preferred_ids if idx in gpu_snapshot]
+            if not telemetry_gpu_ids:
+                _append_log(
+                    "Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi "
+                    "memory query support to enforce the 2GB free headroom target."
+                )
+                yield _payload(
+                    "Auto Tune requires live VRAM telemetry from nvidia-smi.",
+                    show_indicator=False,
+                )
+                return
+
+            signature = _build_autotune_signature(
+                settings,
+                target_w=target_w,
+                target_h=target_h,
+                effective_in_w=effective_in_w,
+                effective_in_h=effective_in_h,
+                global_gpu_device=str(global_gpu_device),
+                total_vram_gb=total_vram_gb,
+            )
+            logs_dir = Path(getattr(runner, "base_dir", Path.cwd())) / "vram_usages"
+            cached_log = _find_cached_autotune_log(logs_dir, signature)
+            if cached_log:
+                best_cfg = cached_log.get("best_config", {}) if isinstance(cached_log.get("best_config"), dict) else {}
+                if best_cfg:
+                    seed_cfg = state.setdefault("seed_controls", {}).setdefault("seedvr2_settings", {})
+                    seed_cfg["batch_size"] = int(best_cfg.get("batch_size") or settings.get("batch_size") or 5)
+                    seed_cfg["blocks_to_swap"] = int(best_cfg.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36)
+                    seed_cfg["vae_encode_tile_size"] = int(
+                        best_cfg.get("vae_encode_tile_size") or settings.get("vae_encode_tile_size") or 1024
+                    )
+                    seed_cfg["vae_decode_tile_size"] = int(
+                        best_cfg.get("vae_decode_tile_size") or settings.get("vae_decode_tile_size") or 1024
+                    )
+                    cache_path = cached_log.get("_log_path", "(unknown log)")
+                    _append_log(f"Matched existing autotune log: {cache_path}")
+                    _append_log(
+                        f"Reusing best config -> batch_size={best_cfg.get('batch_size')}, "
+                        f"blocks_to_swap={best_cfg.get('blocks_to_swap')}, "
+                        f"encode_tile={best_cfg.get('vae_encode_tile_size')}, "
+                        f"decode_tile={best_cfg.get('vae_decode_tile_size')}"
+                    )
+                    state["operation_status"] = "completed"
+                    yield _payload(
+                        "Auto Tune reused a matching cached result.",
+                        show_indicator=False,
+                        batch_value=int(best_cfg.get("batch_size") or settings.get("batch_size") or 5),
+                        blocks_value=int(best_cfg.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36),
+                        encode_tile_value=int(best_cfg.get("vae_encode_tile_size") or settings.get("vae_encode_tile_size") or 1024),
+                        decode_tile_value=int(best_cfg.get("vae_decode_tile_size") or settings.get("vae_decode_tile_size") or 1024),
+                    )
+                    return
+
+            live_temp_dir = Path(global_cfg.get("temp_dir", temp_dir))
+            session_tag = time.strftime("%Y%m%d_%H%M%S")
+            session_dir = live_temp_dir / "seedvr2_autotune" / session_tag
+            session_dir.mkdir(parents=True, exist_ok=True)
+            demo_video_path = session_dir / "seedvr2_autotune_demo_201f.mp4"
+
+            _append_log(
+                f"Input: {input_path} ({input_w}x{input_h}) | "
+                f"target: {target_w}x{target_h} | GPU total VRAM: {total_vram_gb:.2f}GB"
+            )
+            _append_log("Creating 201-frame demo clip for deterministic VRAM testing...")
+            yield _payload(
+                "Preparing 201-frame demo clip...",
+                show_indicator=True,
+                indicator_title="Auto Tune setup",
+            )
+
+            demo_meta = _create_autotune_demo_video(
+                input_path=input_path,
+                output_path=demo_video_path,
+                target_frames=AUTOTUNE_TARGET_FRAMES,
+                resize_to=(effective_in_w, effective_in_h),
+            )
+            _append_log(
+                f"Demo clip ready: {demo_meta['path']} ({demo_meta['width']}x{demo_meta['height']}, "
+                f"{demo_meta['written_frames']} frames)"
+            )
+
+            working_settings = settings.copy()
+            working_settings["input_path"] = str(demo_video_path)
+            working_settings["output_format"] = "mp4"
+            working_settings["load_cap"] = 0
+            working_settings["skip_first_frames"] = 0
+            working_settings["batch_enable"] = False
+            working_settings["batch_input_path"] = ""
+            working_settings["batch_output_path"] = ""
+            working_settings["resume_run_dir"] = ""
+            working_settings["chunk_size"] = 0
+            working_settings["save_metadata"] = False
+            working_settings["cuda_device"] = settings.get("cuda_device", "")
+            working_settings["resolution"] = int(plan.seedvr2_resolution or settings.get("resolution") or 1080)
+            working_settings["max_resolution"] = int(settings.get("max_resolution") or 0)
+            working_settings["face_restore_after_upscale"] = False
+            working_settings["video_backend"] = str(
+                settings.get("video_backend")
+                or seed_controls.get("seedvr2_video_backend_val")
+                or output_settings.get("seedvr2_video_backend", "opencv")
+                or "opencv"
+            ).strip().lower()
+            working_settings["use_10bit"] = bool(
+                settings.get("use_10bit")
+                or seed_controls.get("seedvr2_use_10bit_val")
+                or output_settings.get("seedvr2_use_10bit", False)
+            ) and working_settings["video_backend"] == "ffmpeg"
+
+            working_settings["blocks_to_swap"] = 36
+            working_settings.setdefault("vae_encode_tiled", True)
+            working_settings.setdefault("vae_decode_tiled", True)
+            working_settings.setdefault("vae_encode_tile_size", int(defaults.get("vae_encode_tile_size", 1024)))
+            working_settings.setdefault("vae_decode_tile_size", int(defaults.get("vae_decode_tile_size", 1024)))
+            working_settings.setdefault("vae_encode_tile_overlap", int(defaults.get("vae_encode_tile_overlap", 128)))
+            working_settings.setdefault("vae_decode_tile_overlap", int(defaults.get("vae_decode_tile_overlap", 128)))
+
+            best_config: Optional[Dict[str, Any]] = None
+            tests: List[Dict[str, Any]] = []
+            status_reason = "running"
+            created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            autotune_log_path: Optional[Path] = None
+            run_counter = 0
+            total_estimated_runs = len(AUTOTUNE_BATCH_SEQUENCE) + 18
+
+            def _persist_autotune_progress(status_override: Optional[str] = None) -> None:
+                nonlocal autotune_log_path
+                payload = {
+                    "model": AUTOTUNE_MODEL_ID,
+                    "created_at": created_at,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": str(status_override or status_reason),
+                    "signature": signature,
+                    "input": {
+                        "path": input_path,
+                        "width": int(input_w),
+                        "height": int(input_h),
+                        "effective_input_width": int(effective_in_w),
+                        "effective_input_height": int(effective_in_h),
+                    },
+                    "target": {
+                        "width": int(target_w),
+                        "height": int(target_h),
+                        "pixels": int(target_w * target_h),
+                    },
+                    "gpu": {
+                        "selected_device": str(global_gpu_device),
+                        "selected_ids": list(gpu_ids),
+                        "total_vram_gb": float(total_vram_gb),
+                        "min_free_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                    },
+                    "demo_clip": dict(demo_meta) if isinstance(demo_meta, dict) else {},
+                    "tests": list(tests),
+                    "best_config": dict(best_config) if isinstance(best_config, dict) else {},
+                }
+                saved = _write_autotune_log(logs_dir, payload, existing_path=autotune_log_path)
+                if saved and autotune_log_path is None:
+                    autotune_log_path = Path(saved)
+                    _append_log(f"Auto Tune log file created: {autotune_log_path}")
+
+            _persist_autotune_progress(status_override="running")
+
+            def _run_probe_once(test_batch: int, test_blocks: int) -> Tuple[RunResult, Dict[str, Any]]:
+                nonlocal run_counter
+                run_counter += 1
+                probe_settings = working_settings.copy()
+                probe_settings["batch_size"] = int(test_batch)
+                probe_settings["load_cap"] = int(test_batch)
+                probe_settings["blocks_to_swap"] = int(test_blocks)
+                probe_settings["output_override"] = str(
+                    session_dir / f"probe_b{test_batch}_s{test_blocks}_{run_counter:03d}.mp4"
+                )
+                probe_settings["save_metadata"] = False
+                probe_settings["_original_filename"] = (
+                    Path(str(original_filename)).name if original_filename else Path(input_path).name
+                )
+
+                probe_label = f"Test {run_counter}: batch={test_batch}, blocks={test_blocks}"
+                _append_log(f"{probe_label} - starting")
+                if progress:
+                    pct = min(0.99, float(run_counter) / float(max(1, total_estimated_runs)))
+                    progress(pct, desc=probe_label[:120])
+                yield_status = (
+                    f"{probe_label} | target {target_w}x{target_h} | keep >= {AUTOTUNE_MIN_FREE_VRAM_GB:.1f}GB free"
+                )
+                yield _payload(
+                    yield_status,
+                    show_indicator=True,
+                    indicator_title="Auto Tune running",
+                    batch_value=int(test_batch),
+                    blocks_value=int(test_blocks),
+                    encode_tile_value=int(probe_settings.get("vae_encode_tile_size") or 0),
+                    decode_tile_value=int(probe_settings.get("vae_decode_tile_size") or 0),
+                )
+
+                phase_state: Dict[str, Any] = {"phase": "startup"}
+                probe_meta: Dict[str, Any] = {
+                    "cli_batch_size": None,
+                    "cli_load_cap": None,
+                    "encode_batches_seen": 0,
+                    "encode_batches_total": 0,
+                    "upscale_batches_seen": 0,
+                    "upscale_batches_total": 0,
+                    "decode_batches_seen": 0,
+                    "decode_batches_total": 0,
+                    "sequence_frames_max": 0,
+                }
+
+                def _probe_progress(msg: str) -> None:
+                    text = str(msg or "")
+                    if not text:
+                        return
+                    line = text.strip()
+                    if not line:
+                        return
+                    lc = line.lower()
+                    if ("phase 1" in lc and ("encoding" in lc or "vae" in lc)) or ("encoding batch" in lc):
+                        phase_state["phase"] = "phase1"
+                    elif ("phase 2" in lc and ("upscaling" in lc or "dit" in lc)) or ("upscaling batch" in lc):
+                        phase_state["phase"] = "phase2"
+                    elif ("phase 3" in lc and ("decoding" in lc or "vae" in lc)) or ("decoding batch" in lc):
+                        phase_state["phase"] = "phase3"
+                    elif ("phase 4" in lc and "post" in lc):
+                        phase_state["phase"] = "phase4"
+
+                    m = re.search(r"--batch_size\s+(\d+)", line)
+                    if m:
+                        probe_meta["cli_batch_size"] = int(m.group(1))
+                    m = re.search(r"--load_cap\s+(\d+)", line)
+                    if m:
+                        probe_meta["cli_load_cap"] = int(m.group(1))
+
+                    m = re.search(r"encoding batch\s+(\d+)\s*/\s*(\d+)", lc)
+                    if m:
+                        probe_meta["encode_batches_seen"] = max(probe_meta["encode_batches_seen"], int(m.group(1)))
+                        probe_meta["encode_batches_total"] = max(probe_meta["encode_batches_total"], int(m.group(2)))
+                    m = re.search(r"upscaling batch\s+(\d+)\s*/\s*(\d+)", lc)
+                    if m:
+                        probe_meta["upscale_batches_seen"] = max(probe_meta["upscale_batches_seen"], int(m.group(1)))
+                        probe_meta["upscale_batches_total"] = max(probe_meta["upscale_batches_total"], int(m.group(2)))
+                    m = re.search(r"decoding batch\s+(\d+)\s*/\s*(\d+)", lc)
+                    if m:
+                        probe_meta["decode_batches_seen"] = max(probe_meta["decode_batches_seen"], int(m.group(1)))
+                        probe_meta["decode_batches_total"] = max(probe_meta["decode_batches_total"], int(m.group(2)))
+
+                    m = re.search(r"sequence of\s+(\d+)\s+frames", lc)
+                    if m:
+                        probe_meta["sequence_frames_max"] = max(probe_meta["sequence_frames_max"], int(m.group(1)))
+
+                sampler_stop = threading.Event()
+                sampler_box: Dict[str, Any] = {}
+                sampler_thread = threading.Thread(
+                    target=_sample_peak_vram_gb,
+                    args=(sampler_stop, sampler_box, telemetry_gpu_ids, 0.25, phase_state),
+                    daemon=True,
+                )
+                sampler_thread.start()
+                try:
+                    result = runner.run_seedvr2(probe_settings, on_progress=_probe_progress, preview_only=False)
+                finally:
+                    sampler_stop.set()
+                    sampler_thread.join(timeout=2.0)
+
+                max_used_gb = float(sampler_box.get("max_used_gb", 0.0) or 0.0)
+                max_used_phase2_gb = float(sampler_box.get("max_used_phase2_gb", 0.0) or 0.0)
+                measured_total = float(sampler_box.get("total_gb", 0.0) or 0.0)
+                telemetry_ok = bool(sampler_box.get("telemetry_ok", False))
+                phase2_samples = int(sampler_box.get("phase2_samples", 0) or 0)
+                if measured_total > 0:
+                    total_for_eval = measured_total
+                else:
+                    total_for_eval = float(total_vram_gb)
+                peak_source = "phase2" if (phase2_samples > 0 and max_used_phase2_gb > 0) else "whole_run"
+                selected_peak_gb = max_used_phase2_gb if peak_source == "phase2" else max_used_gb
+                free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
+
+                outcome = {
+                    "batch_size": int(test_batch),
+                    "blocks_to_swap": int(test_blocks),
+                    "vae_encode_tiled": bool(probe_settings.get("vae_encode_tiled", False)),
+                    "vae_decode_tiled": bool(probe_settings.get("vae_decode_tiled", False)),
+                    "vae_encode_tile_size": int(probe_settings.get("vae_encode_tile_size") or 0),
+                    "vae_decode_tile_size": int(probe_settings.get("vae_decode_tile_size") or 0),
+                    "returncode": int(result.returncode),
+                    "oom": bool(_looks_like_oom(result.log)),
+                    "oom_phase": _detect_oom_phase(result.log) if _looks_like_oom(result.log) else "",
+                    "max_vram_used_gb": round(selected_peak_gb, 3),
+                    "peak_source": str(peak_source),
+                    "phase2_peak_vram_used_gb": round(max_used_phase2_gb, 3),
+                    "whole_run_peak_vram_used_gb": round(max_used_gb, 3),
+                    "total_vram_gb": round(total_for_eval, 3),
+                    "estimated_free_gb": round(free_gb, 3),
+                    "telemetry_ok": bool(telemetry_ok),
+                    "phase2_samples": int(phase2_samples),
+                    "cli_batch_size": probe_meta.get("cli_batch_size"),
+                    "cli_load_cap": probe_meta.get("cli_load_cap"),
+                    "encode_batches_total": int(probe_meta.get("encode_batches_total") or 0),
+                    "upscale_batches_total": int(probe_meta.get("upscale_batches_total") or 0),
+                    "decode_batches_total": int(probe_meta.get("decode_batches_total") or 0),
+                    "sequence_frames_max": int(probe_meta.get("sequence_frames_max") or 0),
+                }
+                return result, outcome
+
+            # Stage A: sweep batch size with max block swap.
+            status_reason = "completed"
+            reached_batch_201 = False
+            for batch_candidate in AUTOTUNE_BATCH_SEQUENCE:
+                if runner.is_canceled():
+                    status_reason = "cancelled"
+                    _append_log("Autotune cancelled before next test.")
+                    break
+
+                while True:
+                    result, outcome = yield from _run_probe_once(batch_candidate, int(working_settings["blocks_to_swap"]))
+                    passed = (
+                        outcome["returncode"] == 0
+                        and (not outcome["oom"])
+                        and float(outcome["estimated_free_gb"]) >= AUTOTUNE_MIN_FREE_VRAM_GB
+                    )
+                    outcome["passed"] = bool(passed)
+                    tests.append(outcome)
+                    _persist_autotune_progress()
+
+                    _append_log(
+                        f"Result batch={outcome['batch_size']} blocks={outcome['blocks_to_swap']} -> "
+                        f"rc={outcome['returncode']}, peak={outcome['max_vram_used_gb']:.2f}GB "
+                        f"({outcome.get('peak_source','whole_run')}), "
+                        f"free={outcome['estimated_free_gb']:.2f}GB, "
+                        f"telemetry_ok={bool(outcome.get('telemetry_ok', False))}, "
+                        f"cli_batch={outcome.get('cli_batch_size')}, cli_cap={outcome.get('cli_load_cap')}, "
+                        f"upscale_batches={outcome.get('upscale_batches_total')}, "
+                        f"seq_max={outcome.get('sequence_frames_max')}, passed={passed}"
+                    )
+
+                    if runner.is_canceled():
+                        status_reason = "cancelled"
+                        break
+
+                    if passed:
+                        best_config = {
+                            "batch_size": int(outcome["batch_size"]),
+                            "blocks_to_swap": int(outcome["blocks_to_swap"]),
+                            "vae_encode_tiled": bool(working_settings.get("vae_encode_tiled", False)),
+                            "vae_decode_tiled": bool(working_settings.get("vae_decode_tiled", False)),
+                            "vae_encode_tile_size": int(working_settings.get("vae_encode_tile_size") or 0),
+                            "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
+                            "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
+                            "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
+                            "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                            "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
+                            "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
+                        }
+                        if int(batch_candidate) >= AUTOTUNE_TARGET_FRAMES:
+                            reached_batch_201 = True
+                        _persist_autotune_progress()
+                        break
+
+                    # OOM during VAE phases (encode/decode): halve tile sizes and retry same point.
+                    if outcome["oom"] and outcome["oom_phase"] in {"phase1_encode", "phase3_decode"}:
+                        phase_label = "Phase 1" if outcome["oom_phase"] == "phase1_encode" else "Phase 3"
+                        if not bool(working_settings.get("vae_encode_tiled", False)):
+                            working_settings["vae_encode_tiled"] = True
+                            _append_log(f"Enabled VAE encode tiling after {phase_label} OOM.")
+                        if not bool(working_settings.get("vae_decode_tiled", False)):
+                            working_settings["vae_decode_tiled"] = True
+                            _append_log(f"Enabled VAE decode tiling after {phase_label} OOM.")
+
+                        changed, notes = _halve_vae_tile_sizes(working_settings)
+                        if changed:
+                            for note in notes:
+                                _append_log(f"Adjusted tile settings: {note}")
+                            yield _payload(
+                                f"{phase_label} OOM detected, reduced VAE tile sizes and retrying...",
+                                show_indicator=True,
+                                indicator_title="Auto Tune retry",
+                                batch_value=int(batch_candidate),
+                                blocks_value=int(working_settings["blocks_to_swap"]),
+                                encode_tile_value=int(working_settings.get("vae_encode_tile_size") or 0),
+                                decode_tile_value=int(working_settings.get("vae_decode_tile_size") or 0),
+                            )
+                            continue
+
+                    # Any other failure means threshold reached (or hard failure).
+                    if not bool(outcome.get("telemetry_ok", False)):
+                        status_reason = "failed"
+                    elif outcome["oom"] or (outcome["returncode"] == 0):
+                        status_reason = "threshold_reached"
+                    else:
+                        status_reason = "failed"
+                    break
+
+                if status_reason in {"cancelled", "threshold_reached", "failed"}:
+                    break
+
+            # Stage B: if 201 batch passed, reduce blocks_to_swap in steps of 2.
+            if status_reason == "completed" and reached_batch_201 and best_config:
+                for blocks_candidate in range(34, -2, -2):
+                    if blocks_candidate < 0:
+                        break
+                    if runner.is_canceled():
+                        status_reason = "cancelled"
+                        _append_log("Autotune cancelled during block-swap sweep.")
+                        break
+
+                    while True:
+                        result, outcome = yield from _run_probe_once(AUTOTUNE_TARGET_FRAMES, blocks_candidate)
+                        passed = (
+                            outcome["returncode"] == 0
+                            and (not outcome["oom"])
+                            and float(outcome["estimated_free_gb"]) >= AUTOTUNE_MIN_FREE_VRAM_GB
+                        )
+                        outcome["passed"] = bool(passed)
+                        tests.append(outcome)
+                        _persist_autotune_progress()
+
+                        _append_log(
+                            f"Block sweep blocks={blocks_candidate} -> rc={outcome['returncode']}, "
+                            f"peak={outcome['max_vram_used_gb']:.2f}GB ({outcome.get('peak_source','whole_run')}), "
+                            f"free={outcome['estimated_free_gb']:.2f}GB, "
+                            f"telemetry_ok={bool(outcome.get('telemetry_ok', False))}, "
+                            f"upscale_batches={outcome.get('upscale_batches_total')}, "
+                            f"seq_max={outcome.get('sequence_frames_max')}, passed={passed}"
+                        )
+
+                        if runner.is_canceled():
+                            status_reason = "cancelled"
+                            break
+
+                        if passed:
+                            best_config = {
+                                "batch_size": AUTOTUNE_TARGET_FRAMES,
+                                "blocks_to_swap": int(blocks_candidate),
+                                "vae_encode_tiled": bool(working_settings.get("vae_encode_tiled", False)),
+                                "vae_decode_tiled": bool(working_settings.get("vae_decode_tiled", False)),
+                                "vae_encode_tile_size": int(working_settings.get("vae_encode_tile_size") or 0),
+                                "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
+                                "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
+                                "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
+                                "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                                "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
+                                "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
+                            }
+                            _persist_autotune_progress()
+                            break
+
+                        if outcome["oom"] and outcome["oom_phase"] in {"phase1_encode", "phase3_decode"}:
+                            phase_label = "Phase 1" if outcome["oom_phase"] == "phase1_encode" else "Phase 3"
+                            if not bool(working_settings.get("vae_encode_tiled", False)):
+                                working_settings["vae_encode_tiled"] = True
+                                _append_log(f"Enabled VAE encode tiling after {phase_label} OOM.")
+                            if not bool(working_settings.get("vae_decode_tiled", False)):
+                                working_settings["vae_decode_tiled"] = True
+                                _append_log(f"Enabled VAE decode tiling after {phase_label} OOM.")
+                            changed, notes = _halve_vae_tile_sizes(working_settings)
+                            if changed:
+                                for note in notes:
+                                    _append_log(f"Adjusted tile settings: {note}")
+                                continue
+
+                        if not bool(outcome.get("telemetry_ok", False)):
+                            status_reason = "failed"
+                        else:
+                            status_reason = "threshold_reached"
+                        break
+
+                    if status_reason in {"cancelled", "threshold_reached", "failed"}:
+                        break
+
+            # Persist final autotune status in the same log file.
+            _persist_autotune_progress(status_override=status_reason)
+            if autotune_log_path:
+                _append_log(f"Saved autotune log: {autotune_log_path}")
+
+            # Clean temporary probes/demos.
+            try:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+            if progress:
+                progress(1.0, desc="Auto Tune complete")
+
+            if best_config:
+                seed_cfg = state.setdefault("seed_controls", {}).setdefault("seedvr2_settings", {})
+                seed_cfg["batch_size"] = int(best_config.get("batch_size") or settings.get("batch_size") or 5)
+                seed_cfg["blocks_to_swap"] = int(best_config.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36)
+                seed_cfg["vae_encode_tile_size"] = int(
+                    best_config.get("vae_encode_tile_size") or working_settings.get("vae_encode_tile_size") or 1024
+                )
+                seed_cfg["vae_decode_tile_size"] = int(
+                    best_config.get("vae_decode_tile_size") or working_settings.get("vae_decode_tile_size") or 1024
+                )
+                if status_reason == "cancelled":
+                    final_status = "Auto Tune cancelled. Applied best-so-far config."
+                elif status_reason == "threshold_reached":
+                    final_status = "Auto Tune reached VRAM threshold. Applied best-so-far config."
+                elif status_reason == "failed":
+                    final_status = "Auto Tune hit an error. Applied best-so-far config."
+                else:
+                    final_status = "Auto Tune complete. Applied recommended config."
+                _append_log(
+                    f"Recommended -> batch_size={best_config['batch_size']}, "
+                    f"blocks_to_swap={best_config['blocks_to_swap']}, "
+                    f"encode_tile={best_config['vae_encode_tile_size']}, "
+                    f"decode_tile={best_config['vae_decode_tile_size']}"
+                )
+                state["operation_status"] = "completed" if status_reason in {"completed", "threshold_reached"} else "ready"
+                yield _payload(
+                    final_status,
+                    show_indicator=False,
+                    batch_value=int(best_config.get("batch_size") or settings.get("batch_size") or 5),
+                    blocks_value=int(best_config.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36),
+                    encode_tile_value=int(best_config.get("vae_encode_tile_size") or working_settings.get("vae_encode_tile_size") or 1024),
+                    decode_tile_value=int(best_config.get("vae_decode_tile_size") or working_settings.get("vae_decode_tile_size") or 1024),
+                )
+                return
+
+            state["operation_status"] = "error" if status_reason == "failed" else "ready"
+            if status_reason == "cancelled":
+                final_msg = "Auto Tune cancelled before a stable config was found."
+            elif status_reason == "threshold_reached":
+                final_msg = "Auto Tune stopped at VRAM threshold before finding a safe config."
+            else:
+                final_msg = "Auto Tune failed before finding a safe config."
+            yield _payload(final_msg, show_indicator=False)
+            return
+
+        except Exception as e:
+            state["operation_status"] = "error"
+            _append_log(f"Auto Tune error: {e}")
+            yield _payload("Auto Tune failed due to an internal error.", show_indicator=False)
+            return
+
     def run_action(
         uploaded_file,
         *args,
@@ -4675,6 +5819,7 @@ def build_seedvr2_callbacks(
         "safe_defaults": safe_defaults,
         "check_resume_status": check_resume_status,
         "run_action": run_action,
+        "auto_tune_action": auto_tune_action,
         "cancel_action": cancel,
         "open_outputs_folder": open_outputs_folder_seedvr2,
         "clear_temp_folder": clear_temp_folder_seedvr2,

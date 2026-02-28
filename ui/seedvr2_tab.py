@@ -249,6 +249,22 @@ def seedvr2_tab(
                     info="Force all batches to same size by padding. Improves compilation efficiency but may use more memory. Recommended ON with torch.compile.",
                     scale=1,
                 )
+                auto_tune_btn = gr.Button(
+                    "Auto Tune for Max Quality - VRAM Optimized",
+                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    scale=2,
+                )
+            gr.Markdown(
+                (
+                    "**Auto Tune (DiT-focused):** Creates a temporary 201-frame demo clip from your current input, "
+                    "tests increasing batch sizes with `Blocks to Swap = 36`, keeps ~2GB VRAM free, then optionally "
+                    "reduces block swap for higher quality if headroom remains. Results are cached in `vram_usages` "
+                    "for faster reuse. Cache reuse requires matching SeedVR2 settings/model plus similar output size "
+                    "(about +/-5% total pixels), similar effective input pixels (+/-5%), and similar total GPU VRAM "
+                    "(+/-5%). You can cancel anytime and keep the best-so-far config."
+                )
+            )
+            with gr.Row():
                 copy_output_into_input_btn = gr.Button(
                     "Copy Output Into Input",
                     elem_classes=["action-btn", "action-btn-source-seed"],
@@ -1926,6 +1942,109 @@ def seedvr2_tab(
                 queue_manager.complete(ticket.job_id)
             else:
                 queue_manager.cancel_waiting([ticket.job_id])
+
+    def _autotune_waiting_output(state, ticket_id: str, position: int):
+        safe_state = state or {}
+        pos = max(1, int(position)) if position else "?"
+        title = f"Queue waiting: {ticket_id} (position {pos})"
+        subtitle = "Auto Tune is queued. It will start when the current processing job finishes."
+        return (
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=True),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def _autotune_cancelled_output(state, ticket_id: str):
+        safe_state = state or {}
+        title = f"Queue item removed: {ticket_id}"
+        subtitle = "This Auto Tune request was removed before it started."
+        return (
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def _autotune_busy_output(state):
+        safe_state = state or {}
+        title = "Processing already in progress (queue disabled)."
+        subtitle = "Enable queue in Global Settings to run Auto Tune after the active job."
+        return (
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def run_autotune_wrapper(*args, progress=gr.Progress()):
+        """Queue-aware wrapper for SeedVR2 Auto Tune action."""
+        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
+        queued_state = snapshot_queue_state(live_state)
+        queued_global_settings = snapshot_global_settings(global_settings)
+        queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
+        ticket = queue_manager.submit("SeedVR2", "Auto Tune")
+        acquired_slot = queue_manager.is_active(ticket.job_id)
+
+        try:
+            if not queue_enabled:
+                if not acquired_slot:
+                    queue_manager.cancel_waiting([ticket.job_id])
+                    yield _autotune_busy_output(live_state)
+                    return
+                for payload in service["auto_tune_action"](
+                    *args[:-1],
+                    state=queued_state,
+                    progress=progress,
+                    global_settings_snapshot=queued_global_settings,
+                ):
+                    yield merge_payload_state(payload, live_state)
+                return
+
+            wait_notice_sent = False
+            while not ticket.start_event.wait(timeout=0.5):
+                if ticket.cancel_event.is_set():
+                    yield _autotune_cancelled_output(live_state, ticket.job_id)
+                    return
+                if not wait_notice_sent:
+                    try:
+                        pos = queue_manager.waiting_position(ticket.job_id)
+                        pos_text = max(1, int(pos)) if pos else "?"
+                        gr.Info(f"Queued: {ticket.job_id} (position {pos_text})")
+                        yield _autotune_waiting_output(live_state, ticket.job_id, int(pos) if pos else 0)
+                    except Exception:
+                        pass
+                    wait_notice_sent = True
+
+            if ticket.cancel_event.is_set() and not queue_manager.is_active(ticket.job_id):
+                yield _autotune_cancelled_output(live_state, ticket.job_id)
+                return
+
+            acquired_slot = True
+            for payload in service["auto_tune_action"](
+                *args[:-1],
+                state=queued_state,
+                progress=progress,
+                global_settings_snapshot=queued_global_settings,
+            ):
+                yield merge_payload_state(payload, live_state)
+        finally:
+            if acquired_slot:
+                queue_manager.complete(ticket.job_id)
+            else:
+                queue_manager.cancel_waiting([ticket.job_id])
     
     seedvr2_pre_run_output_signature = gr.State(value="")
 
@@ -1958,6 +2077,24 @@ def seedvr2_tab(
         outputs=[
             status_box, log_box, progress_indicator, output_video, output_image,
             chunk_info, resume_status, chunk_progress, comparison_note, image_slider, video_comparison_html, chunk_gallery, chunk_preview_video, batch_gallery, shared_state
+        ],
+        concurrency_limit=32,
+        concurrency_id="app_processing_queue",
+        trigger_mode="multiple",
+    )
+
+    auto_tune_btn.click(
+        fn=run_autotune_wrapper,
+        inputs=[input_file] + inputs_list + [shared_state],
+        outputs=[
+            status_box,
+            log_box,
+            progress_indicator,
+            batch_size,
+            blocks_to_swap,
+            vae_encode_tile_size,
+            vae_decode_tile_size,
+            shared_state,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",

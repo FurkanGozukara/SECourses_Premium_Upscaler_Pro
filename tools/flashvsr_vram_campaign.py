@@ -6,6 +6,11 @@ after interruption by re-running the same command.
 
 Usage:
     .\venv\Scripts\python.exe tools\flashvsr_vram_campaign.py
+
+Default profiling policy:
+- 2-minute max runtime per case
+- overlap=48, tiled DiT ON, tiled VAE OFF (enforced by sweep tool)
+- shared-VRAM pressure guard enabled
 """
 
 from __future__ import annotations
@@ -77,6 +82,43 @@ def _default_scenarios(base_dir: Path, scenario_set: str) -> List[Scenario]:
         ]
     )
     return wide
+
+
+def _load_manifest_scenarios(manifest_path: Path) -> List[Scenario]:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"failed to read scenario manifest {manifest_path}: {exc}") from exc
+
+    raw_items = payload.get("scenarios") if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        raise RuntimeError("scenario manifest must be a list or an object with 'scenarios' list")
+
+    scenarios: List[Scenario] = []
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or f"custom_{idx+1}").strip()
+        input_path_raw = str(item.get("input_path") or "").strip()
+        if not input_path_raw:
+            continue
+        try:
+            scale = 2 if int(float(item.get("scale", 4))) <= 2 else 4
+        except Exception:
+            scale = 4
+        try:
+            max_edge = max(0, int(float(item.get("max_target_resolution", 0))))
+        except Exception:
+            max_edge = 0
+        scenarios.append(
+            Scenario(
+                name=(name or f"custom_{idx+1}"),
+                input_path=Path(input_path_raw).resolve(),
+                scale=int(scale),
+                max_target_resolution=int(max_edge),
+            )
+        )
+    return scenarios
 
 
 def _scenario_effective_signature(scenario: Scenario) -> Tuple[int, int, int, int, int]:
@@ -173,18 +215,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-list", type=str, default="450,384,320,256,224,192,160,128,96,64,48,32")
     parser.add_argument("--keep-models-on-cpu", action="store_true", default=True)
     parser.add_argument("--no-keep-models-on-cpu", action="store_false", dest="keep_models_on_cpu")
-    parser.add_argument("--timeout-minutes", type=float, default=5.0)
-    parser.add_argument("--stall-seconds", type=float, default=240.0)
+    parser.add_argument("--timeout-minutes", type=float, default=2.0)
+    parser.add_argument("--stall-seconds", type=float, default=95.0)
     parser.add_argument("--min-effective-fps", type=float, default=0.20)
     parser.add_argument("--shared-low-util-pct", type=float, default=12.0)
     parser.add_argument("--shared-near-full-margin-mb", type=float, default=768.0)
-    parser.add_argument("--shared-pressure-seconds", type=float, default=120.0)
-    parser.add_argument("--min-shared-check-runtime-sec", type=float, default=90.0)
+    parser.add_argument("--shared-pressure-seconds", type=float, default=45.0)
+    parser.add_argument("--min-shared-check-runtime-sec", type=float, default=45.0)
     parser.add_argument("--accept-timeout-profile", action="store_true", default=True)
     parser.add_argument("--no-accept-timeout-profile", action="store_false", dest="accept_timeout_profile")
-    parser.add_argument("--profile-min-elapsed-sec", type=float, default=75.0)
+    parser.add_argument("--profile-min-elapsed-sec", type=float, default=55.0)
     parser.add_argument("--max-cases-per-scenario", type=int, default=0)
     parser.add_argument("--scenario-set", type=str, choices=["common", "wide"], default="common")
+    parser.add_argument(
+        "--scenario-manifest",
+        type=str,
+        default="",
+        help="Optional JSON scenario list: {\"scenarios\": [{name,input_path,scale,max_target_resolution}, ...]}",
+    )
     parser.add_argument(
         "--scenario-filter",
         type=str,
@@ -201,7 +249,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-root",
         type=str,
-        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "campaign_runs"),
+        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "campaign_runs_2min"),
     )
     parser.add_argument(
         "--manifest",
@@ -212,12 +260,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--report-md",
         type=str,
-        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report.md"),
+        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report_2min.md"),
     )
     parser.add_argument(
         "--report-json",
         type=str,
-        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report.json"),
+        default=str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_report_2min.json"),
     )
     parser.add_argument("--skip-report", action="store_true", default=False)
     parser.add_argument("--dedupe-effective-scenarios", action="store_true", default=True)
@@ -244,7 +292,14 @@ def main() -> int:
         _safe_print(f"ERROR: missing report script: {report_script}")
         return 2
 
-    scenarios = _default_scenarios(base_dir, args.scenario_set)
+    if str(args.scenario_manifest or "").strip():
+        try:
+            scenarios = _load_manifest_scenarios(Path(str(args.scenario_manifest)).resolve())
+        except Exception as exc:
+            _safe_print(f"ERROR: {exc}")
+            return 2
+    else:
+        scenarios = _default_scenarios(base_dir, args.scenario_set)
     if str(args.scenario_filter or "").strip():
         allowed = {part.strip() for part in str(args.scenario_filter).split(",") if part.strip()}
         scenarios = [s for s in scenarios if s.name in allowed]
@@ -284,6 +339,7 @@ def main() -> int:
     manifest = _load_manifest(manifest_path)
     manifest["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     manifest["scenario_set"] = str(args.scenario_set)
+    manifest["scenario_manifest"] = str(args.scenario_manifest or "")
     manifest["gpu_id"] = int(args.gpu_id)
     manifest["records_csv"] = str(records_csv)
     manifest["guardrails"] = {

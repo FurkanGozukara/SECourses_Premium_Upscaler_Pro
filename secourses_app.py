@@ -68,7 +68,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V3.0 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V3.01 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -663,11 +663,12 @@ def main(argv=None):
     /* Optimize parameters */
     .action-btn-optimize button,
     button.action-btn-optimize {
-      background: linear-gradient(132deg, #0b1222 0%, #0f766e 43%, #0ea5e9 100%) !important;
+      background: linear-gradient(132deg, #0b1222 0%, #0f766e 33%, #0ea5e9 70%, #22d3ee 100%) !important;
       border-color: rgba(153, 246, 228, 1) !important;
       box-shadow: 0 13px 30px rgba(8, 145, 178, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
       letter-spacing: 0.25px;
       font-weight: 800;
+      animation: optimizePulse 1.9s ease-in-out infinite;
     }
     .action-btn-optimize button::after,
     button.action-btn-optimize::after {
@@ -684,6 +685,7 @@ def main(argv=None):
     button.action-btn-optimize:hover {
       box-shadow: 0 17px 34px rgba(8, 145, 178, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.27) !important;
       border-color: rgba(204, 251, 241, 1) !important;
+      animation-duration: 1.35s;
     }
 
     /* Cancel */
@@ -797,6 +799,16 @@ def main(argv=None):
       }
       100% {
         left: 115%;
+      }
+    }
+
+    @keyframes optimizePulse {
+      0%,
+      100% {
+        box-shadow: 0 13px 30px rgba(8, 145, 178, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.24);
+      }
+      50% {
+        box-shadow: 0 17px 36px rgba(8, 145, 178, 0.56), inset 0 1px 0 rgba(255, 255, 255, 0.28);
       }
     }
 

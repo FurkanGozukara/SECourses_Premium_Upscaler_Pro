@@ -436,8 +436,9 @@ def flashvsr_tab(
                             info="After upscale completes, automatically copy the latest output path into Input Path.",
                         )
                     optimize_params_btn = gr.Button(
-                        "Optimize Parameters",
+                        "Optimize Parameters (VRAM)",
                         size="md",
+                        min_width=220,
                         elem_classes=["action-btn", "action-btn-optimize"],
                     )
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])

@@ -3,7 +3,7 @@ Validate optimizer-picked FlashVSR cases for unique effective scenarios.
 
 This script deduplicates scenarios by effective preprocess/output resolution,
 computes the current optimizer recommendation for each unique scenario, and
-either reuses an equivalent validated CSV row or runs a bounded 5-minute
+either reuses an equivalent validated CSV row or runs a bounded 2-minute
 validation case and appends the result to the sweep CSV.
 """
 
@@ -87,16 +87,16 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Exclude rows with the same effective signature during per-scenario prediction.",
     )
-    parser.add_argument("--timeout-minutes", type=float, default=5.0)
-    parser.add_argument("--stall-seconds", type=float, default=120.0)
+    parser.add_argument("--timeout-minutes", type=float, default=2.0)
+    parser.add_argument("--stall-seconds", type=float, default=95.0)
     parser.add_argument("--min-effective-fps", type=float, default=0.20)
     parser.add_argument("--shared-low-util-pct", type=float, default=12.0)
     parser.add_argument("--shared-near-full-margin-mb", type=float, default=768.0)
-    parser.add_argument("--shared-pressure-seconds", type=float, default=120.0)
-    parser.add_argument("--min-shared-check-runtime-sec", type=float, default=90.0)
+    parser.add_argument("--shared-pressure-seconds", type=float, default=45.0)
+    parser.add_argument("--min-shared-check-runtime-sec", type=float, default=45.0)
     parser.add_argument("--accept-timeout-profile", action="store_true", default=True)
     parser.add_argument("--no-accept-timeout-profile", action="store_false", dest="accept_timeout_profile")
-    parser.add_argument("--profile-min-elapsed-sec", type=float, default=75.0)
+    parser.add_argument("--profile-min-elapsed-sec", type=float, default=55.0)
     parser.add_argument(
         "--records-csv",
         type=str,

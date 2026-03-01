@@ -430,18 +430,27 @@ def flashvsr_tab(
                             value=bool(_value("auto_transfer_output_to_input", False)),
                             info="After upscale completes, automatically copy the latest output path into Input Path.",
                         )
-                    auto_tune_btn = gr.Button(
-                        "Auto Tune for Max Quality - VRAM Optimized",
-                        size="md",
-                        min_width=220,
-                        elem_classes=["action-btn", "action-btn-optimize"],
-                    )
+                    with gr.Column(scale=1):
+                        auto_tune_btn = gr.Button(
+                            "Auto Tune for Max Quality - VRAM Optimized",
+                            size="md",
+                            min_width=220,
+                            elem_classes=["action-btn", "action-btn-optimize"],
+                        )
+                        save_vram_gb = gr.Slider(
+                            label="Save VRAM (GB)",
+                            minimum=0.0,
+                            maximum=9.9,
+                            step=0.1,
+                            value=float(_value("save_vram_gb", 2.0) or 2.0),
+                        )
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
                 gr.Markdown(
                     (
                         "**Auto Tune (DiT-focused):** Creates a temporary 450-frame demo clip from your current input "
                         "(using current resize/output sizing), then runs fast VRAM probes to find the highest-quality "
-                        "safe FlashVSR+ settings while keeping about 2GB VRAM free. It starts from `Frame Chunk Size = 450`, "
+                        "safe FlashVSR+ settings while keeping your `Save VRAM (GB)` target free (default `2.0GB`). "
+                        "It starts from `Frame Chunk Size = 450`, "
                         "`DiT Tiling = ON`, `Tile = 256`, `Overlap = 48`, increases tile size in `+32` steps, and if `256` fails "
                         "it falls back to `Overlap = 24` and lower tile/chunk tests. Results are cached in `vram_usages` and reused "
                         "on future runs when settings + approximate target/effective pixels (+/-5%) + GPU VRAM (+/-5%) match. You can cancel anytime."
@@ -957,6 +966,7 @@ def flashvsr_tab(
         save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
+        save_vram_gb,
     ]
 
     # Development validation: inputs_list must stay aligned with FLASHVSR_ORDER

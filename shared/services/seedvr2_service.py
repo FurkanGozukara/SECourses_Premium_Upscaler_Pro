@@ -378,6 +378,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "uniform_batch_size": False,
         "seed": 42,
         "auto_transfer_output_to_input": False,
+        "save_vram_gb": 2.0,
         "skip_first_frames": 0,
         "load_cap": 0,
         "prepend_frames": 0,
@@ -648,6 +649,8 @@ SEEDVR2_ORDER: List[str] = [
     "force_latent_noise_zero_for_images",
     # Auto-copy latest output back into Input Path after successful upscale.
     "auto_transfer_output_to_input",
+    # Auto Tune free VRAM target (GB).
+    "save_vram_gb",
 ]
 
 
@@ -733,6 +736,11 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
         cfg.get("auto_transfer_output_to_input", defaults.get("auto_transfer_output_to_input", False)),
         default=bool(defaults.get("auto_transfer_output_to_input", False)),
     )
+    try:
+        save_vram_raw = float(cfg.get("save_vram_gb", defaults.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB)))
+    except Exception:
+        save_vram_raw = float(defaults.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB))
+    cfg["save_vram_gb"] = round(max(0.0, min(9.9, save_vram_raw)), 1)
     
     # Apply model-specific metadata constraints
     model_name = cfg.get("dit_model", "")
@@ -917,6 +925,14 @@ AUTOTUNE_MIN_TILE_SIZE = 64
 AUTOTUNE_BATCH_SEQUENCE = tuple(range(5, AUTOTUNE_TARGET_FRAMES + 1, 4))
 
 
+def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VRAM_GB) -> float:
+    try:
+        raw = float(value)
+    except Exception:
+        raw = float(default)
+    return round(max(0.0, min(9.9, raw)), 1)
+
+
 def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
     """Relative numeric comparison helper."""
     try:
@@ -1091,6 +1107,7 @@ def _build_autotune_signature(
     effective_in_h: int,
     global_gpu_device: str,
     total_vram_gb: float,
+    min_free_target_gb: float,
 ) -> Dict[str, Any]:
     """Create a stable VRAM-impact signature for cache lookups."""
     exact_payload = {
@@ -1122,6 +1139,7 @@ def _build_autotune_signature(
         "max_resolution": int(settings.get("max_resolution") or 0),
         "pre_downscale_then_upscale": bool(settings.get("pre_downscale_then_upscale", True)),
         "global_gpu_device": str(global_gpu_device or ""),
+        "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb),
     }
     exact_blob = json.dumps(exact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return {
@@ -1146,6 +1164,9 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Same output target can be reached via different upscale routes (e.g. 960x540@x4 vs 1920x1080@x2).
     # Reuse the same cache lane by ignoring route-only scale differences.
     out.pop("upscale_factor", None)
+    # Reserve target is dynamic and evaluated from historical VRAM usage;
+    # changing it should not invalidate cache matching.
+    out.pop("save_vram_gb", None)
     return out
 
 
@@ -1182,6 +1203,11 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         tests = payload.get("tests")
         if not isinstance(best, dict) or (not best) or (not isinstance(tests, list)):
             return False
+        sig_exact = ((payload.get("signature") or {}).get("exact") or {})
+        sig_target = _clamp_save_vram_target_gb(
+            sig_exact.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
+            AUTOTUNE_MIN_FREE_VRAM_GB,
+        )
 
         def _rank(batch_size_val: int, blocks_to_swap_val: int) -> int:
             return int(batch_size_val) * 1000 + (200 - int(blocks_to_swap_val))
@@ -1209,7 +1235,11 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
                 free_gb = 1e9
             if bool(item.get("oom", False)):
                 return True
-            if free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+            item_target = _clamp_save_vram_target_gb(
+                item.get("min_free_vram_target_gb", sig_target),
+                sig_target,
+            )
+            if free_gb < float(item_target):
                 return True
 
         # Top-of-search candidate reached; no higher-quality candidate exists.
@@ -3402,7 +3432,7 @@ def build_seedvr2_callbacks(
         Strategy:
         - Build a 201-frame demo clip from current input.
         - Sweep batch sizes (4n+1) with blocks_to_swap=36.
-        - Keep ~2GB free VRAM headroom.
+        - Keep configurable free VRAM headroom (`save_vram_gb`, default 2.0GB).
         - If 201 passes, reduce blocks_to_swap by 2 for higher quality.
         - Persist logs to vram_usages/ and reuse matching results later.
         """
@@ -3498,6 +3528,11 @@ def build_seedvr2_callbacks(
             global_gpu_device = get_global_gpu_override(seed_controls, global_cfg)
             settings["cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
             settings = _enforce_seedvr2_guardrails(settings, defaults, state=state)
+            min_free_vram_target_gb = _clamp_save_vram_target_gb(
+                settings.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
+                AUTOTUNE_MIN_FREE_VRAM_GB,
+            )
+            settings["save_vram_gb"] = float(min_free_vram_target_gb)
 
             if global_gpu_device == "cpu":
                 _append_log("Global GPU selector is set to CPU. Auto Tune requires CUDA GPU mode.")
@@ -3562,7 +3597,7 @@ def build_seedvr2_callbacks(
             if not telemetry_gpu_ids:
                 _append_log(
                     "Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi "
-                    "memory query support to enforce the 2GB free headroom target."
+                    f"memory query support to enforce the {min_free_vram_target_gb:.1f}GB free headroom target."
                 )
                 yield _payload(
                     "Auto Tune requires live VRAM telemetry from nvidia-smi.",
@@ -3578,10 +3613,12 @@ def build_seedvr2_callbacks(
                 effective_in_h=effective_in_h,
                 global_gpu_device=str(global_gpu_device),
                 total_vram_gb=total_vram_gb,
+                min_free_target_gb=min_free_vram_target_gb,
             )
             logs_dir = Path(getattr(runner, "base_dir", Path.cwd())) / "vram_usages"
             history_sources: List[str] = []
             history_outcomes_by_key: Dict[Tuple[int, int, int, int, bool, bool], Dict[str, Any]] = {}
+            history_has_completed_frontier = False
 
             def _history_key_from_outcome(item: Dict[str, Any]) -> Tuple[int, int, int, int, bool, bool]:
                 return (
@@ -3600,7 +3637,7 @@ def build_seedvr2_callbacks(
                     free_gb = 1e9
                 if bool(item.get("oom", False)):
                     return True
-                if bool(item.get("telemetry_ok", False)) and free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+                if bool(item.get("telemetry_ok", False)) and free_gb < float(min_free_vram_target_gb):
                     return True
                 return False
 
@@ -3628,6 +3665,13 @@ def build_seedvr2_callbacks(
                 if not _autotune_signature_matches(payload.get("signature", {}), signature):
                     continue
                 history_sources.append(str(log_path))
+                status_raw = str(payload.get("status") or "").strip().lower()
+                if (
+                    bool(payload.get("finalized", False))
+                    and bool(payload.get("frontier_verified", False))
+                    and status_raw in {"completed", "threshold_reached"}
+                ):
+                    history_has_completed_frontier = True
                 tests_blob = payload.get("tests")
                 if not isinstance(tests_blob, list):
                     continue
@@ -3644,15 +3688,30 @@ def build_seedvr2_callbacks(
                     item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                     item["oom"] = bool(item.get("oom", False))
                     try:
-                        item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
+                        peak_used = float(item.get("max_vram_used_gb", 0.0) or 0.0)
                     except Exception:
-                        item["estimated_free_gb"] = 0.0
-                    returncode_ok = bool(int(item.get("returncode", 1) or 1) == 0)
+                        peak_used = 0.0
+                    try:
+                        historical_total = float(item.get("total_vram_gb", 0.0) or 0.0)
+                    except Exception:
+                        historical_total = 0.0
+                    total_for_eval = float(total_vram_gb if total_vram_gb > 0 else historical_total)
+                    if peak_used > 0 and total_for_eval > 0:
+                        item["estimated_free_gb"] = max(0.0, total_for_eval - peak_used)
+                    else:
+                        try:
+                            item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
+                        except Exception:
+                            item["estimated_free_gb"] = 0.0
+                    try:
+                        returncode_ok = int(item.get("returncode", 1)) == 0
+                    except Exception:
+                        returncode_ok = False
                     item["passed"] = bool(
                         returncode_ok
                         and item["telemetry_ok"]
                         and (not item["oom"])
-                        and float(item["estimated_free_gb"]) >= float(AUTOTUNE_MIN_FREE_VRAM_GB)
+                        and float(item["estimated_free_gb"]) >= float(min_free_vram_target_gb)
                     )
                     history_outcomes_by_key[_history_key_from_outcome(item)] = item
 
@@ -3675,7 +3734,7 @@ def build_seedvr2_callbacks(
                     "vae_encode_tile_overlap": int(item.get("vae_encode_tile_overlap") or 128),
                     "vae_decode_tile_size": int(item.get("vae_decode_tile_size") or 1024),
                     "vae_decode_tile_overlap": int(item.get("vae_decode_tile_overlap") or 128),
-                    "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                    "min_free_vram_target_gb": float(min_free_vram_target_gb),
                     "measured_peak_vram_used_gb": float(item.get("max_vram_used_gb") or 0.0),
                     "estimated_free_vram_gb": float(item.get("estimated_free_gb") or 0.0),
                 }
@@ -3704,6 +3763,23 @@ def build_seedvr2_callbacks(
                         if fail_rank > history_best_rank:
                             history_frontier_best = dict(history_best_safe)
                             break
+
+            if history_has_completed_frontier and history_best_safe is None:
+                _append_log(
+                    f"Matched completed historical Auto Tune logs, but none keep >= {min_free_vram_target_gb:.1f}GB free."
+                )
+                state["operation_status"] = "error"
+                yield _payload(
+                    (
+                        "Auto Tune found no previously tested config that can satisfy the current Save VRAM target. "
+                        "Lower the Save VRAM (GB) value and retry."
+                    ),
+                    show_indicator=False,
+                )
+                return
+
+            if history_has_completed_frontier and history_frontier_best is None and history_best_safe is not None:
+                history_frontier_best = dict(history_best_safe)
 
             if history_frontier_best:
                 seed_cfg = state.setdefault("seed_controls", {}).setdefault("seedvr2_settings", {})
@@ -3850,7 +3926,7 @@ def build_seedvr2_callbacks(
                         "selected_device": str(global_gpu_device),
                         "selected_ids": list(gpu_ids),
                         "total_vram_gb": float(total_vram_gb),
-                        "min_free_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                        "min_free_target_gb": float(min_free_vram_target_gb),
                     },
                     "demo_clip": dict(demo_meta) if isinstance(demo_meta, dict) else {},
                     "tests": list(tests),
@@ -3884,7 +3960,7 @@ def build_seedvr2_callbacks(
                     pct = min(0.99, float(run_counter) / float(max(1, total_estimated_runs)))
                     progress(pct, desc=probe_label[:120])
                 yield_status = (
-                    f"{probe_label} | target {target_w}x{target_h} | keep >= {AUTOTUNE_MIN_FREE_VRAM_GB:.1f}GB free"
+                    f"{probe_label} | target {target_w}x{target_h} | keep >= {min_free_vram_target_gb:.1f}GB free"
                 )
                 yield _payload(
                     yield_status,
@@ -4035,7 +4111,7 @@ def build_seedvr2_callbacks(
                         passed = (
                             outcome["returncode"] == 0
                             and (not outcome["oom"])
-                            and float(outcome["estimated_free_gb"]) >= AUTOTUNE_MIN_FREE_VRAM_GB
+                            and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
                         )
                         outcome["passed"] = bool(passed)
                         tests.append(outcome)
@@ -4067,7 +4143,7 @@ def build_seedvr2_callbacks(
                             "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
                             "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
                             "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
-                            "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                            "min_free_vram_target_gb": float(min_free_vram_target_gb),
                             "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
                             "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
                         }
@@ -4145,7 +4221,7 @@ def build_seedvr2_callbacks(
                             passed = (
                                 outcome["returncode"] == 0
                                 and (not outcome["oom"])
-                                and float(outcome["estimated_free_gb"]) >= AUTOTUNE_MIN_FREE_VRAM_GB
+                                and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
                             )
                             outcome["passed"] = bool(passed)
                             tests.append(outcome)
@@ -4175,7 +4251,7 @@ def build_seedvr2_callbacks(
                                 "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
                                 "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
                                 "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
-                                "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                                "min_free_vram_target_gb": float(min_free_vram_target_gb),
                                 "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
                                 "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
                             }
@@ -4217,7 +4293,7 @@ def build_seedvr2_callbacks(
                     free_gb = 1e9
                 if bool(test_item.get("oom", False)):
                     return True
-                if free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+                if free_gb < float(min_free_vram_target_gb):
                     return True
                 return False
 

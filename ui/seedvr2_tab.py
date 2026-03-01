@@ -249,15 +249,23 @@ def seedvr2_tab(
                     info="Force all batches to same size by padding. Improves compilation efficiency but may use more memory. Recommended ON with torch.compile.",
                     scale=1,
                 )
-                auto_tune_btn = gr.Button(
-                    "Auto Tune for Max Quality - VRAM Optimized",
-                    elem_classes=["action-btn", "action-btn-source-seed"],
-                    scale=2,
-                )
+                with gr.Column(scale=2):
+                    auto_tune_btn = gr.Button(
+                        "Auto Tune for Max Quality - VRAM Optimized",
+                        elem_classes=["action-btn", "action-btn-optimize"],
+                    )
+                    save_vram_gb = gr.Slider(
+                        label="Save VRAM (GB)",
+                        minimum=0.0,
+                        maximum=9.9,
+                        step=0.1,
+                        value=float(merged_defaults.get("save_vram_gb", 2.0) or 2.0),
+                    )
             gr.Markdown(
                 (
                     "**Auto Tune (DiT-focused):** Creates a temporary 201-frame demo clip from your current input, "
-                    "tests increasing batch sizes with `Blocks to Swap = 36`, keeps ~2GB VRAM free, then optionally "
+                    "tests increasing batch sizes with `Blocks to Swap = 36`, keeps your `Save VRAM (GB)` target free "
+                    "(default `2.0GB`), then optionally "
                     "reduces block swap for higher quality if headroom remains. Results are cached in `vram_usages` "
                     "for faster reuse. Cache reuse requires matching SeedVR2 settings/model plus similar output size "
                     "(about +/-5% total pixels), similar effective input pixels (+/-5%), and similar total GPU VRAM "
@@ -1010,7 +1018,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 53, len(inputs_list) must also = 53
+    # Current count: len(SEEDVR2_ORDER) = 54, len(inputs_list) must also = 54
     # ============================================================================
     
     inputs_list = [
@@ -1037,6 +1045,8 @@ def seedvr2_tab(
         allow_custom_image_latent_noise,
         # Auto-copy output into input after run
         auto_transfer_output_to_input,
+        # Auto Tune free VRAM target (GB)
+        save_vram_gb,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

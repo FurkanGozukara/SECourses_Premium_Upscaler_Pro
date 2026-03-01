@@ -317,6 +317,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "upscale_factor": float(scale),
         "max_target_resolution": 1920,
         "pre_downscale_then_upscale": True,
+        "save_vram_gb": 2.0,
     }
 
 
@@ -365,6 +366,7 @@ FLASHVSR_ORDER: List[str] = [
     "max_target_resolution",
     "pre_downscale_then_upscale",
     "resume_run_dir",
+    "save_vram_gb",
 ]
 
 
@@ -454,6 +456,16 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["kv_ratio"] = max(1.0, min(3.0, _to_float(cfg.get("kv_ratio"), 3.0)))
     cfg["local_range"] = 9 if _to_int(cfg.get("local_range"), 11) == 9 else 11
     cfg["frame_chunk_size"] = max(0, _to_int(cfg.get("frame_chunk_size"), 0))
+    cfg["save_vram_gb"] = round(
+        max(
+            0.0,
+            min(
+                9.9,
+                _to_float(cfg.get("save_vram_gb"), _to_float(defaults.get("save_vram_gb", 2.0), 2.0)),
+            ),
+        ),
+        1,
+    )
 
     cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
     codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()

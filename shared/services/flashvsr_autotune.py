@@ -40,6 +40,14 @@ AUTOTUNE_PHASE2_MIN_SECONDS_FOR_EARLY_STOP = 0.60
 AUTOTUNE_PHASE2_MIN_ITER_FOR_GATE = 3
 
 
+def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VRAM_GB) -> float:
+    try:
+        raw = float(value)
+    except Exception:
+        raw = float(default)
+    return round(max(0.0, min(9.9, raw)), 1)
+
+
 def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
     try:
         lhs_f = float(lhs)
@@ -60,6 +68,9 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Same output target can be reached via different requested scales (e.g. 960x540@x4 vs 1920x1080@x2).
     # Reuse the same cache lane by ignoring scale-only route differences.
     out.pop("scale", None)
+    # Reserve target is dynamic and evaluated from historical VRAM usage;
+    # changing it should not invalidate cache matching.
+    out.pop("save_vram_gb", None)
     return out
 
 
@@ -142,7 +153,7 @@ def _sample_peak_vram_gb(
     Track peak VRAM and optionally stop probe early once phase2 has enough samples.
 
     Probe cancellation is triggered by:
-    - crossing free-VRAM threshold (<2GB free), or
+    - crossing the configured free-VRAM threshold, or
     - collecting enough phase2 samples (~0.6s+) for fast pass/fail inference.
     """
     peak_used = 0.0
@@ -249,6 +260,7 @@ def _build_autotune_signature(
     effective_in_h: int,
     global_gpu_device: str,
     total_vram_gb: float,
+    min_free_target_gb: float,
 ) -> Dict[str, Any]:
     exact_payload = {
         "autotune_model": AUTOTUNE_MODEL_ID,
@@ -273,6 +285,7 @@ def _build_autotune_signature(
         "pre_downscale_then_upscale": bool(settings.get("pre_downscale_then_upscale", True)),
         "use_resolution_tab": bool(settings.get("use_resolution_tab", True)),
         "global_gpu_device": str(global_gpu_device or ""),
+        "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb),
         "test_target_frames": int(AUTOTUNE_TARGET_FRAMES),
         "test_overlap_primary": int(AUTOTUNE_PRIMARY_OVERLAP),
         "test_overlap_fallback": int(AUTOTUNE_FALLBACK_OVERLAP),
@@ -320,6 +333,11 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         tests = payload.get("tests")
         if not isinstance(best, dict) or (not best) or (not isinstance(tests, list)):
             return False
+        sig_exact = ((payload.get("signature") or {}).get("exact") or {})
+        sig_target = _clamp_save_vram_target_gb(
+            sig_exact.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
+            AUTOTUNE_MIN_FREE_VRAM_GB,
+        )
 
         def _rank(cfg: Dict[str, Any]) -> int:
             chunk = int(cfg.get("frame_chunk_size") or 0)
@@ -356,7 +374,11 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
                 return True
             if str(item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
                 return True
-            if free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+            item_target = _clamp_save_vram_target_gb(
+                item.get("min_free_vram_target_gb", sig_target),
+                sig_target,
+            )
+            if free_gb < float(item_target):
                 return True
 
         # Top-of-search candidate reached; no higher-quality candidate exists.
@@ -706,6 +728,11 @@ def flashvsr_auto_tune_action(
         settings["output_format"] = "mp4"
         settings["start_frame"] = 0
         settings["end_frame"] = -1
+        min_free_vram_target_gb = _clamp_save_vram_target_gb(
+            settings.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
+            AUTOTUNE_MIN_FREE_VRAM_GB,
+        )
+        settings["save_vram_gb"] = float(min_free_vram_target_gb)
 
         input_path = _resolve_uploaded_path(uploaded_file) or normalize_path(settings.get("input_path"))
         if not input_path or not Path(input_path).exists():
@@ -799,7 +826,7 @@ def flashvsr_auto_tune_action(
         if not telemetry_gpu_ids:
             _append_log(
                 "Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi "
-                "memory query support to enforce the 2GB free headroom target."
+                f"memory query support to enforce the {min_free_vram_target_gb:.1f}GB free headroom target."
             )
             yield _payload("Auto Tune requires live VRAM telemetry from nvidia-smi.", show_indicator=False)
             return
@@ -812,10 +839,12 @@ def flashvsr_auto_tune_action(
             effective_in_h=effective_in_h,
             global_gpu_device=str(global_gpu_device),
             total_vram_gb=total_vram_gb,
+            min_free_target_gb=min_free_vram_target_gb,
         )
         logs_dir = Path(getattr(runner, "base_dir", Path.cwd())) / "vram_usages"
         history_sources: List[str] = []
         history_outcomes_by_key: Dict[Tuple[int, int, int, bool], Dict[str, Any]] = {}
+        history_has_completed_frontier = False
 
         def _history_key_from_outcome(item: Dict[str, Any]) -> Tuple[int, int, int, bool]:
             return (
@@ -834,7 +863,7 @@ def flashvsr_auto_tune_action(
                 return True
             if str(item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
                 return True
-            if bool(item.get("telemetry_ok", False)) and free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+            if bool(item.get("telemetry_ok", False)) and free_gb < float(min_free_vram_target_gb):
                 return True
             return False
 
@@ -862,6 +891,13 @@ def flashvsr_auto_tune_action(
             if not _autotune_signature_matches(payload.get("signature", {}), signature):
                 continue
             history_sources.append(str(log_path))
+            status_raw = str(payload.get("status") or "").strip().lower()
+            if (
+                bool(payload.get("finalized", False))
+                and bool(payload.get("frontier_verified", False))
+                and status_raw in {"completed", "threshold_reached"}
+            ):
+                history_has_completed_frontier = True
             tests_blob = payload.get("tests")
             if not isinstance(tests_blob, list):
                 continue
@@ -876,17 +912,32 @@ def flashvsr_auto_tune_action(
                 item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                 item["oom"] = bool(item.get("oom", False))
                 try:
-                    item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
+                    peak_used = float(item.get("max_vram_used_gb", 0.0) or 0.0)
                 except Exception:
-                    item["estimated_free_gb"] = 0.0
-                returncode_ok = bool(int(item.get("returncode", 1) or 1) == 0)
+                    peak_used = 0.0
+                try:
+                    historical_total = float(item.get("total_vram_gb", 0.0) or 0.0)
+                except Exception:
+                    historical_total = 0.0
+                total_for_eval = float(total_vram_gb if total_vram_gb > 0 else historical_total)
+                if peak_used > 0 and total_for_eval > 0:
+                    item["estimated_free_gb"] = max(0.0, total_for_eval - peak_used)
+                else:
+                    try:
+                        item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
+                    except Exception:
+                        item["estimated_free_gb"] = 0.0
+                try:
+                    returncode_ok = int(item.get("returncode", 1)) == 0
+                except Exception:
+                    returncode_ok = False
                 fast_probe_ok = bool(item.get("fast_probe_stop", False))
                 probe_stop = str(item.get("probe_cancel_reason") or "").strip().lower()
                 item["passed"] = bool(
                     (returncode_ok or fast_probe_ok)
                     and item["telemetry_ok"]
                     and (not item["oom"])
-                    and float(item["estimated_free_gb"]) >= float(AUTOTUNE_MIN_FREE_VRAM_GB)
+                    and float(item["estimated_free_gb"]) >= float(min_free_vram_target_gb)
                     and probe_stop != "threshold_reached"
                 )
                 history_outcomes_by_key[_history_key_from_outcome(item)] = item
@@ -902,7 +953,7 @@ def flashvsr_auto_tune_action(
                 "overlap": int(item.get("overlap") or AUTOTUNE_PRIMARY_OVERLAP),
                 "frame_chunk_size": int(item.get("frame_chunk_size") or AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]),
                 "tiled_dit": bool(item.get("tiled_dit", True)),
-                "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                "min_free_vram_target_gb": float(min_free_vram_target_gb),
                 "measured_peak_vram_used_gb": float(item.get("max_vram_used_gb") or 0.0),
                 "estimated_free_vram_gb": float(item.get("estimated_free_gb") or 0.0),
             }
@@ -936,6 +987,23 @@ def flashvsr_auto_tune_action(
                     if fail_rank > history_best_rank:
                         history_frontier_best = dict(history_best_safe)
                         break
+
+        if history_has_completed_frontier and history_best_safe is None:
+            _append_log(
+                f"Matched completed historical Auto Tune logs, but none keep >= {min_free_vram_target_gb:.1f}GB free."
+            )
+            state["operation_status"] = "error"
+            yield _payload(
+                (
+                    "Auto Tune found no previously tested config that can satisfy the current Save VRAM target. "
+                    "Lower the Save VRAM (GB) value and retry."
+                ),
+                show_indicator=False,
+            )
+            return
+
+        if history_has_completed_frontier and history_frontier_best is None and history_best_safe is not None:
+            history_frontier_best = dict(history_best_safe)
 
         if history_frontier_best:
             flash_cfg = state.setdefault("seed_controls", {}).setdefault("flashvsr_settings", {})
@@ -1075,7 +1143,7 @@ def flashvsr_auto_tune_action(
                     "selected_device": str(global_gpu_device),
                     "selected_ids": list(gpu_ids),
                     "total_vram_gb": float(total_vram_gb),
-                    "min_free_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                    "min_free_target_gb": float(min_free_vram_target_gb),
                 },
                 "demo_clip": dict(demo_meta) if isinstance(demo_meta, dict) else {},
                 "tests": list(tests),
@@ -1122,7 +1190,7 @@ def flashvsr_auto_tune_action(
                 pct = min(0.99, float(run_counter) / float(max(1, total_estimated_runs)))
                 progress(pct, desc=probe_label[:120])
             yield _payload(
-                f"{probe_label} | target {target_w}x{target_h} | keep >= {AUTOTUNE_MIN_FREE_VRAM_GB:.1f}GB free",
+                f"{probe_label} | target {target_w}x{target_h} | keep >= {min_free_vram_target_gb:.1f}GB free",
                 show_indicator=True,
                 indicator_title="Auto Tune running",
                 tile_value=int(test_tile),
@@ -1203,7 +1271,7 @@ def flashvsr_auto_tune_action(
                     0.20,
                     phase_state,
                     probe_cancel_event,
-                    AUTOTUNE_MIN_FREE_VRAM_GB,
+                    min_free_vram_target_gb,
                     float(total_vram_gb),
                 ),
                 daemon=True,
@@ -1253,7 +1321,7 @@ def flashvsr_auto_tune_action(
                 and return_ok
                 and (not oom)
                 and (not canceled_by_user)
-                and float(free_gb) >= float(AUTOTUNE_MIN_FREE_VRAM_GB)
+                and float(free_gb) >= float(min_free_vram_target_gb)
                 and early_stop_reason != "threshold_reached"
             )
 
@@ -1293,7 +1361,7 @@ def flashvsr_auto_tune_action(
                 "overlap": int(outcome.get("overlap") or AUTOTUNE_PRIMARY_OVERLAP),
                 "frame_chunk_size": int(outcome.get("frame_chunk_size") or AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]),
                 "tiled_dit": bool(outcome.get("tiled_dit", True)),
-                "min_free_vram_target_gb": float(AUTOTUNE_MIN_FREE_VRAM_GB),
+                "min_free_vram_target_gb": float(min_free_vram_target_gb),
                 "measured_peak_vram_used_gb": float(outcome.get("max_vram_used_gb") or 0.0),
                 "estimated_free_vram_gb": float(outcome.get("estimated_free_gb") or 0.0),
             }
@@ -1506,7 +1574,7 @@ def flashvsr_auto_tune_action(
                 return True
             if str(test_item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
                 return True
-            if free_gb < float(AUTOTUNE_MIN_FREE_VRAM_GB):
+            if free_gb < float(min_free_vram_target_gb):
                 return True
             return False
 
@@ -1577,7 +1645,7 @@ def flashvsr_auto_tune_action(
                 f"- Frame Chunk Size: `{flash_cfg['frame_chunk_size']}`\n"
                 f"- Peak VRAM: `{float(best_config.get('measured_peak_vram_used_gb') or 0.0):.2f} GB`\n"
                 f"- Free VRAM estimate: `{float(best_config.get('estimated_free_vram_gb') or 0.0):.2f} GB` "
-                f"(target >= `{AUTOTUNE_MIN_FREE_VRAM_GB:.1f} GB`)\n"
+                f"(target >= `{min_free_vram_target_gb:.1f} GB`)\n"
                 f"- Log file: `{str(autotune_log_path) if autotune_log_path else 'not saved'}`"
             )
 

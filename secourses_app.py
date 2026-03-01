@@ -717,9 +717,9 @@ def main(argv=None):
     /* Optimize parameters */
     .action-btn-optimize button,
     button.action-btn-optimize {
-      background: linear-gradient(132deg, #0b1222 0%, #0f766e 33%, #0ea5e9 70%, #22d3ee 100%) !important;
-      border-color: rgba(153, 246, 228, 1) !important;
-      box-shadow: 0 13px 30px rgba(8, 145, 178, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+      background: linear-gradient(132deg, #1a0f18 0%, #7f1d1d 34%, #dc2626 70%, #fb7185 100%) !important;
+      border-color: rgba(254, 205, 211, 0.98) !important;
+      box-shadow: 0 13px 30px rgba(220, 38, 38, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
       letter-spacing: 0.25px;
       font-weight: 800;
       animation: optimizePulse 1.9s ease-in-out infinite;
@@ -737,8 +737,8 @@ def main(argv=None):
     }
     .action-btn-optimize button:hover,
     button.action-btn-optimize:hover {
-      box-shadow: 0 17px 34px rgba(8, 145, 178, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.27) !important;
-      border-color: rgba(204, 251, 241, 1) !important;
+      box-shadow: 0 17px 34px rgba(220, 38, 38, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.27) !important;
+      border-color: rgba(255, 228, 230, 1) !important;
       animation-duration: 1.35s;
     }
 
@@ -859,10 +859,10 @@ def main(argv=None):
     @keyframes optimizePulse {
       0%,
       100% {
-        box-shadow: 0 13px 30px rgba(8, 145, 178, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.24);
+        box-shadow: 0 13px 30px rgba(220, 38, 38, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.24);
       }
       50% {
-        box-shadow: 0 17px 36px rgba(8, 145, 178, 0.56), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+        box-shadow: 0 17px 36px rgba(251, 113, 133, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.28);
       }
     }
 

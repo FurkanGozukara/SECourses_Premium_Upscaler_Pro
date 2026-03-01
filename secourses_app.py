@@ -1518,7 +1518,7 @@ def main(argv=None):
                 "fps_override_val": startup_output_settings.get("fps_override", 0),
                 "image_output_format_val": startup_output_settings.get("image_output_format", "png"),
                 "image_output_quality_val": startup_output_settings.get("image_output_quality", 95),
-                "seedvr2_video_backend_val": startup_output_settings.get("seedvr2_video_backend", "opencv"),
+                "seedvr2_video_backend_val": startup_output_settings.get("seedvr2_video_backend", "ffmpeg"),
                 "seedvr2_use_10bit_val": bool(startup_output_settings.get("seedvr2_use_10bit", False)),
                 "video_codec_val": str(startup_output_settings.get("video_codec", "h264") or "h264"),
                 "video_quality_val": int(startup_output_settings.get("video_quality", 18) or 18),

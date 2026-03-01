@@ -146,9 +146,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         image_output_quality_value = 95
     image_output_quality_value = max(1, min(100, image_output_quality_value))
 
-    seedvr2_video_backend_value = str(_value("seedvr2_video_backend", "opencv") or "opencv").strip().lower()
+    seedvr2_video_backend_value = str(_value("seedvr2_video_backend", "ffmpeg") or "ffmpeg").strip().lower()
     if seedvr2_video_backend_value not in {"opencv", "ffmpeg"}:
-        seedvr2_video_backend_value = "opencv"
+        seedvr2_video_backend_value = "ffmpeg"
     seedvr2_use_10bit_value = bool(_value("seedvr2_use_10bit", False))
 
     default_codec = _value("video_codec", "h264")

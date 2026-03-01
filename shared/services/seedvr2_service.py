@@ -419,7 +419,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "save_metadata": True,  # Per-run metadata toggle (respects global telemetry)
         "fps_override": 0,  # FPS override (0 = use source FPS, >0 = set specific FPS)
         # ADDED v2.5.22: FFmpeg 10-bit encoding support for reduced banding in gradients
-        "video_backend": "opencv",  # "opencv" (default, 8-bit) or "ffmpeg" (10-bit capable)
+        "video_backend": "ffmpeg",  # "ffmpeg" (default, codec-honoring) or "opencv" (legacy 8-bit writer)
         "use_10bit": False,  # Enable 10-bit color depth (requires video_backend="ffmpeg", x265 codec)
         # Persist per-run face restoration toggle from SeedVR2 tab.
         "face_restore_after_upscale": False,
@@ -697,7 +697,7 @@ def _migrate_preset_values(cfg: Dict[str, Any], defaults: Dict[str, Any], silent
     current_backend = cfg.get("video_backend", "")
     if current_backend not in ["opencv", "ffmpeg"]:
         # Old presets might have numeric values or missing values
-        default_backend = defaults.get("video_backend", "opencv")
+        default_backend = defaults.get("video_backend", "ffmpeg")
         if current_backend not in ["", None]:
             error_logger.info(f"Migrated video_backend: '{current_backend}'  '{default_backend}'")
         cfg["video_backend"] = default_backend
@@ -3863,8 +3863,8 @@ def build_seedvr2_callbacks(
             working_settings["video_backend"] = str(
                 settings.get("video_backend")
                 or seed_controls.get("seedvr2_video_backend_val")
-                or output_settings.get("seedvr2_video_backend", "opencv")
-                or "opencv"
+                or output_settings.get("seedvr2_video_backend", "ffmpeg")
+                or "ffmpeg"
             ).strip().lower()
             working_settings["use_10bit"] = bool(
                 settings.get("use_10bit")
@@ -4551,12 +4551,12 @@ def build_seedvr2_callbacks(
             backend_val = str(
                 seed_controls.get(
                     "seedvr2_video_backend_val",
-                    output_settings.get("seedvr2_video_backend", defaults.get("video_backend", "opencv")),
+                    output_settings.get("seedvr2_video_backend", defaults.get("video_backend", "ffmpeg")),
                 )
-                or "opencv"
+                or "ffmpeg"
             ).strip().lower()
             if backend_val not in {"opencv", "ffmpeg"}:
-                backend_val = "opencv"
+                backend_val = "ffmpeg"
             settings["video_backend"] = backend_val
             settings["use_10bit"] = bool(
                 seed_controls.get(
@@ -4890,11 +4890,11 @@ def build_seedvr2_callbacks(
             # SeedVR2 encoding controls moved to Output tab and apply globally.
             backend_pref = seed_controls.get(
                 "seedvr2_video_backend_val",
-                output_settings.get("seedvr2_video_backend", settings.get("video_backend", "opencv")),
+                output_settings.get("seedvr2_video_backend", settings.get("video_backend", "ffmpeg")),
             )
-            backend_pref = str(backend_pref or "opencv").strip().lower()
+            backend_pref = str(backend_pref or "ffmpeg").strip().lower()
             if backend_pref not in {"opencv", "ffmpeg"}:
-                backend_pref = "opencv"
+                backend_pref = "ffmpeg"
             settings["video_backend"] = backend_pref
             use_10bit_pref = seed_controls.get(
                 "seedvr2_use_10bit_val",

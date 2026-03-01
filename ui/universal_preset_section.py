@@ -598,7 +598,7 @@ def sync_tab_to_shared_state(
         seed_controls["fps_override_val"] = float(tab_dict.get("fps_override", 0) or 0)
         seed_controls["image_output_format_val"] = str(tab_dict.get("image_output_format", "png") or "png")
         seed_controls["image_output_quality_val"] = int(tab_dict.get("image_output_quality", 95) or 95)
-        seed_controls["seedvr2_video_backend_val"] = str(tab_dict.get("seedvr2_video_backend", "opencv") or "opencv")
+        seed_controls["seedvr2_video_backend_val"] = str(tab_dict.get("seedvr2_video_backend", "ffmpeg") or "ffmpeg")
         seed_controls["seedvr2_use_10bit_val"] = bool(tab_dict.get("seedvr2_use_10bit", False))
         seed_controls["video_codec_val"] = str(tab_dict.get("video_codec", "h264") or "h264")
         seed_controls["video_quality_val"] = int(tab_dict.get("video_quality", 18) or 18)

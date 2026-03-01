@@ -484,10 +484,10 @@ class PresetManager:
         
         # ADDED v2.5.22: Validate video backend and 10-bit encoding
         # Ensure video_backend is valid choice
-        video_backend = str(validated.get("video_backend", "opencv")).lower()
+        video_backend = str(validated.get("video_backend", "ffmpeg")).lower()
         if video_backend not in ("opencv", "ffmpeg"):
-            validated["video_backend"] = "opencv"
-            print(f"⚠️ Preset had invalid video_backend '{video_backend}', reset to 'opencv'")
+            validated["video_backend"] = "ffmpeg"
+            print(f"⚠️ Preset had invalid video_backend '{video_backend}', reset to 'ffmpeg'")
         
         # Auto-disable 10-bit if backend is not ffmpeg
         use_10bit = bool(validated.get("use_10bit", False))

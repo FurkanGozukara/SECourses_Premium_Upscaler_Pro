@@ -30,7 +30,7 @@ def output_defaults(models: List[str]) -> Dict[str, Any]:
         "image_output_format": "png",
         "image_output_quality": 95,
         # SeedVR2 encoding controls moved from SeedVR2 tab into global Output tab.
-        "seedvr2_video_backend": "opencv",
+        "seedvr2_video_backend": "ffmpeg",
         "seedvr2_use_10bit": False,
         "video_codec": "h264",
         "video_quality": 18,
@@ -130,9 +130,9 @@ def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         image_quality = 95
     cfg["image_output_quality"] = max(1, min(100, image_quality))
 
-    backend = str(cfg.get("seedvr2_video_backend", "opencv") or "opencv").strip().lower()
+    backend = str(cfg.get("seedvr2_video_backend", "ffmpeg") or "ffmpeg").strip().lower()
     if backend not in {"opencv", "ffmpeg"}:
-        backend = "opencv"
+        backend = "ffmpeg"
     cfg["seedvr2_video_backend"] = backend
     cfg["seedvr2_use_10bit"] = bool(cfg.get("seedvr2_use_10bit", False)) and backend == "ffmpeg"
 

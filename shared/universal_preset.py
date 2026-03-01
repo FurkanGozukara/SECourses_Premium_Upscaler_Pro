@@ -227,9 +227,9 @@ def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
         image_quality = 95
     cfg["image_output_quality"] = max(1, min(100, image_quality))
 
-    backend = str(cfg.get("seedvr2_video_backend", "opencv") or "opencv").strip().lower()
+    backend = str(cfg.get("seedvr2_video_backend", "ffmpeg") or "ffmpeg").strip().lower()
     if backend not in {"opencv", "ffmpeg"}:
-        backend = "opencv"
+        backend = "ffmpeg"
     cfg["seedvr2_video_backend"] = backend
     cfg["seedvr2_use_10bit"] = bool(cfg.get("seedvr2_use_10bit", False)) and backend == "ffmpeg"
 
@@ -671,7 +671,7 @@ def update_shared_state_from_preset(
     seed_controls["fps_override_val"] = out_settings.get("fps_override", 0)
     seed_controls["image_output_format_val"] = out_settings.get("image_output_format", "png")
     seed_controls["image_output_quality_val"] = out_settings.get("image_output_quality", 95)
-    seed_controls["seedvr2_video_backend_val"] = out_settings.get("seedvr2_video_backend", "opencv")
+    seed_controls["seedvr2_video_backend_val"] = out_settings.get("seedvr2_video_backend", "ffmpeg")
     seed_controls["seedvr2_use_10bit_val"] = bool(out_settings.get("seedvr2_use_10bit", False))
     seed_controls["video_codec_val"] = str(out_settings.get("video_codec", "h264") or "h264")
     seed_controls["video_quality_val"] = int(out_settings.get("video_quality", 18) or 18)

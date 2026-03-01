@@ -435,7 +435,7 @@ def flashvsr_tab(
                             "Auto Tune for Max Quality - VRAM Optimized",
                             size="md",
                             min_width=220,
-                            elem_classes=["action-btn", "action-btn-optimize"],
+                            elem_classes=["action-btn", "action-btn-optimize", "flashvsr-autotune-tall"],
                         )
                         save_vram_gb = gr.Slider(
                             label="Save VRAM (GB)",

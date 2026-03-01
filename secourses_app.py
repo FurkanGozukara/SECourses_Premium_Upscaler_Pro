@@ -68,7 +68,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V3.15 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V3.2 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -814,6 +814,11 @@ def main(argv=None):
       padding-bottom: 0.24rem !important;
       font-size: 0.98rem !important;
       line-height: 1.15 !important;
+    }
+    /* FlashVSR+ Auto Tune button: 1.5x height for stronger emphasis. */
+    .flashvsr-autotune-tall button,
+    button.flashvsr-autotune-tall {
+      min-height: 69px !important;
     }
     .action-btn-source-gan button,
     button.action-btn-source-gan {

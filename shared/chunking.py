@@ -8,6 +8,7 @@ import subprocess
 import threading
 import tempfile
 import time
+from statistics import median
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1178,6 +1179,170 @@ def _run_ffmpeg(cmd: List[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _parse_fraction_to_float(value: Any) -> Optional[float]:
+    """
+    Parse ffprobe fraction-like values (e.g. "30000/1001", "20/1", "19.97").
+    """
+    try:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw or raw.lower() in {"n/a", "nan"}:
+            return None
+        if "/" in raw:
+            num_raw, den_raw = raw.split("/", 1)
+            num = float(num_raw.strip())
+            den = float(den_raw.strip())
+            if abs(den) < 1e-12:
+                return None
+            out = num / den
+        else:
+            out = float(raw)
+        if not math.isfinite(out) or out <= 0:
+            return None
+        return float(out)
+    except Exception:
+        return None
+
+
+def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Probe merge-relevant video stream fields for concat compatibility decisions.
+    """
+    try:
+        p = Path(video_path)
+        if not p.exists() or not p.is_file():
+            return None
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt,width,height,time_base,r_frame_rate,avg_frame_rate,start_time,duration,nb_frames",
+                "-of",
+                "json",
+                str(p),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        if proc.returncode != 0:
+            return None
+        payload = json.loads(proc.stdout or "{}")
+        streams = payload.get("streams") or []
+        if not streams:
+            return None
+        st = streams[0] or {}
+
+        codec = str(st.get("codec_name") or "").strip().lower()
+        pix_fmt = str(st.get("pix_fmt") or "").strip().lower()
+        time_base = str(st.get("time_base") or "").strip()
+        r_fps_raw = str(st.get("r_frame_rate") or "").strip()
+        avg_fps_raw = str(st.get("avg_frame_rate") or "").strip()
+
+        try:
+            width = int(float(st.get("width") or 0))
+            height = int(float(st.get("height") or 0))
+        except Exception:
+            width = 0
+            height = 0
+
+        fps_r = _parse_fraction_to_float(r_fps_raw)
+        fps_avg = _parse_fraction_to_float(avg_fps_raw)
+        fps = fps_r or fps_avg
+
+        duration = _parse_fraction_to_float(st.get("duration"))
+        start_time = _parse_fraction_to_float(st.get("start_time"))
+
+        frame_count: Optional[int] = None
+        try:
+            raw_frames = str(st.get("nb_frames") or "").strip()
+            if raw_frames and raw_frames.lower() not in {"n/a", "nan"}:
+                frame_count = int(float(raw_frames))
+        except Exception:
+            frame_count = None
+
+        if not codec:
+            return None
+        return {
+            "codec_name": codec,
+            "pix_fmt": pix_fmt,
+            "width": width,
+            "height": height,
+            "time_base": time_base,
+            "r_frame_rate": r_fps_raw,
+            "avg_frame_rate": avg_fps_raw,
+            "fps": fps,
+            "duration": duration,
+            "start_time": start_time,
+            "nb_frames": frame_count,
+        }
+    except Exception:
+        return None
+
+
+def _merge_stream_copy_is_safe(signatures: List[Optional[Dict[str, Any]]]) -> Tuple[bool, str]:
+    """
+    Decide whether ffmpeg stream-copy concat is safe for the full chunk set.
+    """
+    sigs: List[Dict[str, Any]] = [s for s in signatures if isinstance(s, dict)]
+    if not sigs or len(sigs) != len(signatures):
+        return False, "missing ffprobe stream signatures"
+
+    # Stream-copy concat is sensitive to per-chunk timing fields.
+    required_fields = ["codec_name", "pix_fmt", "width", "height", "time_base", "r_frame_rate"]
+    mismatched: List[str] = []
+    for field in required_fields:
+        values = {str(sig.get(field) or "").strip().lower() for sig in sigs}
+        values.discard("")
+        if len(values) > 1:
+            mismatched.append(field)
+
+    if mismatched:
+        return False, f"mixed chunk stream fields: {', '.join(mismatched)}"
+    return True, ""
+
+
+def _pick_merge_fps(
+    signatures: List[Optional[Dict[str, Any]]],
+    chunk_paths: List[Path],
+) -> Optional[float]:
+    """
+    Pick a robust target FPS for merge re-encode fallback.
+    """
+    fps_values: List[float] = []
+    for sig in signatures:
+        if not isinstance(sig, dict):
+            continue
+        fps_val = _parse_fraction_to_float(sig.get("r_frame_rate")) or _parse_fraction_to_float(
+            sig.get("avg_frame_rate")
+        )
+        if fps_val and 1.0 <= fps_val <= 240.0:
+            fps_values.append(float(fps_val))
+
+    if not fps_values and chunk_paths:
+        try:
+            guessed = float(get_media_fps(str(chunk_paths[0])) or 0.0)
+            if guessed > 0:
+                fps_values.append(guessed)
+        except Exception:
+            pass
+
+    if not fps_values:
+        return None
+
+    picked = float(median(fps_values))
+    # Stabilize near-integer frame rates to avoid tiny rational drift.
+    nearest_int = round(picked)
+    if abs(picked - nearest_int) <= 0.05:
+        picked = float(nearest_int)
+    return max(1.0, min(240.0, picked))
+
+
 def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = dict(encode_settings or {})
     codec_raw = str(cfg.get("video_codec", "h264") or "h264").strip().lower()
@@ -1492,114 +1657,312 @@ def concat_videos(
         except Exception:
             return False
 
-    # Preferred path for H.264/H.265: convert each MP4 segment to MPEG-TS (Annex B),
-    # then concat-copy back to MP4. This avoids timestamp/PPS issues seen with direct
-    # MP4 stream-copy concat and keeps video bit-exact (no re-encode).
-    codec_keys = [_probe_video_codec_key_with_retry(p, attempts=4, delay_sec=0.15) for p in stable_chunks]
-    common_codec: Optional[str] = None
-    if codec_keys and all(k == codec_keys[0] and k for k in codec_keys):
-        common_codec = str(codec_keys[0] or "").strip().lower()
+    signatures = [_probe_concat_video_signature(p) for p in stable_chunks]
+    stream_copy_safe, stream_copy_reason = _merge_stream_copy_is_safe(signatures)
 
-    if common_codec in {"h264", "h265"}:
-        bsf = "h264_mp4toannexb" if common_codec == "h264" else "hevc_mp4toannexb"
-        output_path.unlink(missing_ok=True)
-        with tempfile.TemporaryDirectory(prefix="merge_ts_copy_") as td:
-            td_path = Path(td)
-            ts_paths: List[Path] = []
-            ts_ok = True
-            for i, src in enumerate(stable_chunks, 1):
-                ts_path = td_path / f"chunk_{i:04d}.ts"
-                cmd_to_ts = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(src),
-                    "-map",
-                    "0:v:0",
-                    "-c:v",
-                    "copy",
-                    "-bsf:v",
-                    bsf,
-                    "-an",
-                    "-f",
-                    "mpegts",
-                    str(ts_path),
-                ]
-                proc_to_ts = _run_ffmpeg(cmd_to_ts)
-                if proc_to_ts.returncode != 0 or not ts_path.exists() or ts_path.stat().st_size <= 512:
-                    ts_ok = False
-                    if on_progress:
-                        tail = (proc_to_ts.stderr or proc_to_ts.stdout or "").strip()[-300:]
-                        on_progress(f"WARN: TS conversion failed for chunk {i}: {tail}\n")
-                    break
-                ts_paths.append(ts_path)
+    def _build_fallback_encode_args() -> Tuple[List[str], str]:
+        enc = _normalize_video_encode_settings(encode_settings)
+        fallback_fps = _pick_merge_fps(signatures, stable_chunks)
+        if not fallback_fps or fallback_fps <= 0:
+            fallback_fps = 30.0
+        fps_str = f"{float(fallback_fps):.6f}".rstrip("0").rstrip(".")
+        if not fps_str:
+            fps_str = "30"
+        video_encode_args = build_ffmpeg_video_encode_args(
+            codec=enc["codec"],
+            quality=int(enc["quality"]),
+            pixel_format=str(enc["pixel_format"]),
+            preset=str(enc["preset"]),
+            audio_codec="none",
+            audio_bitrate=None,
+            h265_tune=str(enc["h265_tune"]),
+            av1_film_grain=int(enc["av1_film_grain"]),
+            av1_film_grain_denoise=bool(enc["av1_film_grain_denoise"]),
+        )
+        return video_encode_args, fps_str
 
-            if ts_ok and len(ts_paths) == len(stable_chunks):
-                ts_txt = td_path / "concat_ts.txt"
-                _write_concat_list(ts_txt, ts_paths)
-                cmd_ts_concat = [
-                    "ffmpeg",
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(ts_txt),
-                    "-map",
-                    "0:v:0",
-                    "-c:v",
-                    "copy",
-                    "-an",
-                    "-movflags",
-                    "+faststart",
-                    str(output_path),
-                ]
-                proc_ts_concat = _run_ffmpeg(cmd_ts_concat)
-                if proc_ts_concat.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
-                    if on_progress:
-                        on_progress(
-                            f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
-                        )
-                    return True
-                if on_progress:
-                    tail = (proc_ts_concat.stderr or proc_ts_concat.stdout or "").strip()[-400:]
-                    on_progress("WARN: TS stream-copy concat failed; trying generic copy merge.\n")
-                    if tail:
-                        on_progress(f"ffmpeg: {tail}\n")
-
-    # Secondary copy path: direct concat demuxer + stream copy (fast, but some files can break).
-    output_path.unlink(missing_ok=True)
-    cmd_copy = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(txt),
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "copy",
-        "-an",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    proc_copy = _run_ffmpeg(cmd_copy)
-    if proc_copy.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+    def _try_framepipe_reencode_concat(reason: str) -> bool:
+        video_encode_args, fps_str = _build_fallback_encode_args()
         if on_progress:
             on_progress(
-                f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
+                "WARN: Falling back to frame-stream concat re-encode "
+                f"(reason: {reason}; target_fps={fps_str}).\n"
             )
+
+        output_path.unlink(missing_ok=True)
+
+        first_frame = None
+        width = 0
+        height = 0
+        for chunk_path in stable_chunks:
+            cap = cv2.VideoCapture(str(chunk_path))
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                first_frame = frame
+                height, width = frame.shape[:2]
+                break
+
+        if first_frame is None or width <= 0 or height <= 0:
+            if on_progress:
+                on_progress("WARN: Frame-stream fallback could not decode any input frames.\n")
+            return False
+
+        cmd_pipe = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{int(width)}x{int(height)}",
+            "-r",
+            fps_str,
+            "-i",
+            "-",
+            "-map",
+            "0:v:0",
+            *video_encode_args,
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+
+        proc_pipe: Optional[subprocess.Popen] = None
+        frames_written = 0
+        try:
+            proc_pipe = subprocess.Popen(
+                cmd_pipe,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if proc_pipe.stdin is None:
+                raise RuntimeError("ffmpeg stdin pipe unavailable")
+
+            for chunk_path in stable_chunks:
+                cap = cv2.VideoCapture(str(chunk_path))
+                if not cap.isOpened():
+                    cap.release()
+                    if on_progress:
+                        on_progress(f"WARN: Frame-stream fallback could not open chunk: {chunk_path.name}\n")
+                    continue
+                try:
+                    while True:
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            break
+                        if frame.shape[1] != width or frame.shape[0] != height:
+                            # Keep merge resilient when a rare chunk has mismatched dimensions.
+                            frame = cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_LINEAR)
+                        proc_pipe.stdin.write(frame.tobytes())
+                        frames_written += 1
+                finally:
+                    cap.release()
+
+            proc_pipe.stdin.close()
+            _stdout, _stderr = proc_pipe.communicate()
+            if proc_pipe.returncode == 0 and frames_written > 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+                if on_progress:
+                    on_progress(
+                        f"Concatenated {len(stable_chunks)} chunk(s) via frame-stream fallback "
+                        f"(frames={frames_written}).\n"
+                    )
+                return True
+
+            if on_progress:
+                tail = (_stderr.decode(errors="ignore") if isinstance(_stderr, (bytes, bytearray)) else str(_stderr or ""))[-500:]
+                on_progress("WARN: Frame-stream fallback failed.\n")
+                if tail:
+                    on_progress(f"ffmpeg: {tail}\n")
+            return False
+        except Exception as e:
+            if on_progress:
+                on_progress(f"WARN: Frame-stream fallback exception: {str(e)}\n")
+            return False
+        finally:
+            if proc_pipe is not None:
+                with suppress(Exception):
+                    if proc_pipe.stdin:
+                        proc_pipe.stdin.close()
+                with suppress(Exception):
+                    proc_pipe.kill()
+
+    def _try_demuxer_reencode_concat(reason: str) -> bool:
+        video_encode_args, fps_str = _build_fallback_encode_args()
+        if on_progress:
+            on_progress(
+                "WARN: Falling back to concat-demuxer re-encode "
+                f"(reason: {reason}; target_fps={fps_str}).\n"
+            )
+
+        output_path.unlink(missing_ok=True)
+        cmd_reencode = [
+            "ffmpeg",
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(txt),
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"setpts=N/({fps_str}*TB)",
+            "-r",
+            fps_str,
+            "-fps_mode",
+            "cfr",
+            *video_encode_args,
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        proc_reencode = _run_ffmpeg(cmd_reencode)
+        if proc_reencode.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+            if on_progress:
+                on_progress(
+                    f"Concatenated {len(stable_chunks)} chunk(s) via concat-demuxer re-encode fallback.\n"
+                )
+            return True
+
+        if on_progress:
+            tail = (proc_reencode.stderr or proc_reencode.stdout or "").strip()[-500:]
+            on_progress("ERROR: Concat-demuxer re-encode fallback failed.\n")
+            if tail:
+                on_progress(f"ffmpeg: {tail}\n")
+        return False
+
+    if not stream_copy_safe and on_progress:
+        on_progress(f"WARN: Stream-copy concat skipped: {stream_copy_reason}.\n")
+
+    # Stream-copy path (fast, no extra generation loss) only for homogeneous streams.
+    if stream_copy_safe:
+        # Preferred path for H.264/H.265: convert each MP4 segment to MPEG-TS (Annex B),
+        # then concat-copy back to MP4. This avoids timestamp/PPS issues seen with direct
+        # MP4 stream-copy concat and keeps video bit-exact (no re-encode).
+        codec_keys = [_probe_video_codec_key_with_retry(p, attempts=4, delay_sec=0.15) for p in stable_chunks]
+        common_codec: Optional[str] = None
+        if codec_keys and all(k == codec_keys[0] and k for k in codec_keys):
+            common_codec = str(codec_keys[0] or "").strip().lower()
+
+        if common_codec in {"h264", "h265"}:
+            bsf = "h264_mp4toannexb" if common_codec == "h264" else "hevc_mp4toannexb"
+            output_path.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(prefix="merge_ts_copy_") as td:
+                td_path = Path(td)
+                ts_paths: List[Path] = []
+                ts_ok = True
+                for i, src in enumerate(stable_chunks, 1):
+                    ts_path = td_path / f"chunk_{i:04d}.ts"
+                    cmd_to_ts = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(src),
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "copy",
+                        "-bsf:v",
+                        bsf,
+                        "-an",
+                        "-f",
+                        "mpegts",
+                        str(ts_path),
+                    ]
+                    proc_to_ts = _run_ffmpeg(cmd_to_ts)
+                    if proc_to_ts.returncode != 0 or not ts_path.exists() or ts_path.stat().st_size <= 512:
+                        ts_ok = False
+                        if on_progress:
+                            tail = (proc_to_ts.stderr or proc_to_ts.stdout or "").strip()[-300:]
+                            on_progress(f"WARN: TS conversion failed for chunk {i}: {tail}\n")
+                        break
+                    ts_paths.append(ts_path)
+
+                if ts_ok and len(ts_paths) == len(stable_chunks):
+                    ts_txt = td_path / "concat_ts.txt"
+                    _write_concat_list(ts_txt, ts_paths)
+                    cmd_ts_concat = [
+                        "ffmpeg",
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(ts_txt),
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "copy",
+                        "-an",
+                        "-movflags",
+                        "+faststart",
+                        str(output_path),
+                    ]
+                    proc_ts_concat = _run_ffmpeg(cmd_ts_concat)
+                    if proc_ts_concat.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+                        if on_progress:
+                            on_progress(
+                                f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
+                            )
+                        return True
+                    if on_progress:
+                        tail = (proc_ts_concat.stderr or proc_ts_concat.stdout or "").strip()[-400:]
+                        on_progress("WARN: TS stream-copy concat failed; trying generic copy merge.\n")
+                        if tail:
+                            on_progress(f"ffmpeg: {tail}\n")
+
+        # Secondary copy path: direct concat demuxer + stream copy.
+        output_path.unlink(missing_ok=True)
+        cmd_copy = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(txt),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        proc_copy = _run_ffmpeg(cmd_copy)
+        if proc_copy.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+            if on_progress:
+                on_progress(
+                    f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
+                )
+            return True
+        if on_progress:
+            tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
+            on_progress("WARN: Direct stream-copy concat failed validation; trying robust fallback.\n")
+            if tail:
+                on_progress(f"ffmpeg: {tail}\n")
+
+    # Robust fallback path for mixed-timestamp chunks or failed stream-copy concat.
+    if _try_framepipe_reencode_concat(stream_copy_reason or "stream-copy merge failed"):
         return True
-    if on_progress:
-        tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
-        on_progress("ERROR: Direct stream-copy concat failed; merge aborted (post re-encode disabled).\n")
-        if tail:
-            on_progress(f"ffmpeg: {tail}\n")
+    if _try_demuxer_reencode_concat(stream_copy_reason or "stream-copy merge failed"):
+        return True
+
+    # Avoid leaving a broken file with the final output name.
+    with suppress(Exception):
+        output_path.unlink(missing_ok=True)
     return False
 
 

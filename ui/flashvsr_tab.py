@@ -40,11 +40,6 @@ from shared.queue_state import (
     snapshot_global_settings,
     merge_payload_state,
 )
-from shared.gpu_utils import get_gpu_info, get_global_gpu_override
-from shared.flashvsr_optimizer import (
-    optimize_flashvsr_settings,
-    format_flashvsr_optimization_summary,
-)
 
 
 def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> float | None:
@@ -435,13 +430,23 @@ def flashvsr_tab(
                             value=bool(_value("auto_transfer_output_to_input", False)),
                             info="After upscale completes, automatically copy the latest output path into Input Path.",
                         )
-                    optimize_params_btn = gr.Button(
-                        "Optimize Parameters (VRAM)",
+                    auto_tune_btn = gr.Button(
+                        "Auto Tune for Max Quality - VRAM Optimized",
                         size="md",
                         min_width=220,
                         elem_classes=["action-btn", "action-btn-optimize"],
                     )
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
+                gr.Markdown(
+                    (
+                        "**Auto Tune (DiT-focused):** Creates a temporary 450-frame demo clip from your current input "
+                        "(using current resize/output sizing), then runs fast VRAM probes to find the highest-quality "
+                        "safe FlashVSR+ settings while keeping about 2GB VRAM free. It starts from `Frame Chunk Size = 450`, "
+                        "`DiT Tiling = ON`, `Tile = 256`, `Overlap = 48`, increases tile size in `+32` steps, and if `256` fails "
+                        "it falls back to `Overlap = 24` and lower tile/chunk tests. Results are cached in `vram_usages` and reused "
+                        "on future runs when settings + approximate target/effective pixels (+/-5%) + GPU VRAM (+/-5%) match. You can cancel anytime."
+                    )
+                )
 
                 with gr.Row():
                     frame_chunk_size = gr.Slider(
@@ -711,6 +716,14 @@ def flashvsr_tab(
             gr.Markdown("####  Output & Actions")
             status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
             progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
+            with gr.Group(visible=False, elem_classes=["autotune-modal-overlay"]) as flash_autotune_notice_modal:
+                with gr.Group(elem_classes=["autotune-modal-card"]):
+                    with gr.Row(elem_classes=["autotune-modal-header"]):
+                        gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
+                        flash_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close"])
+                    flash_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
+                    with gr.Row(elem_classes=["autotune-modal-actions"]):
+                        flash_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok"])
 
             with gr.Group():
                 _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
@@ -1646,94 +1659,6 @@ def flashvsr_tab(
         trigger_mode="always_last",
     )
 
-    def optimize_parameters_for_vram(
-        path_val,
-        mode_val,
-        precision_val,
-        vae_model_val,
-        keep_models_on_cpu_val,
-        stream_decode_val,
-        scale_state_val,
-        use_global_val,
-        local_upscale_val,
-        max_edge_val,
-        pre_downscale_val,
-        state,
-    ):
-        resolved_scale = resolve_flashvsr_effective_scale(
-            scale_state_val=scale_state_val,
-            use_global=bool(use_global_val),
-            local_upscale_factor=local_upscale_val,
-            state=state if isinstance(state, dict) else None,
-        )
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        selected_gpu = get_global_gpu_override(seed_controls, global_settings)
-        records_csv_path = str(base_dir / "outputs" / "flashvsr_vram_sweeps" / "flashvsr_vram_records.csv")
-
-        result = optimize_flashvsr_settings(
-            input_path=path_val or "",
-            requested_scale=int(resolved_scale or 4),
-            mode=str(mode_val or "full"),
-            precision=str(precision_val or "bf16"),
-            vae_model=str(vae_model_val or "Wan2.2"),
-            keep_models_on_cpu=bool(keep_models_on_cpu_val),
-            stream_decode=bool(stream_decode_val),
-            selected_gpu_value=selected_gpu,
-            max_target_resolution=int(max_edge_val or 0),
-            pre_downscale_then_upscale=bool(pre_downscale_val),
-            reserve_vram_gb=2.0,
-            records_csv_path=records_csv_path,
-        )
-        summary = format_flashvsr_optimization_summary(result)
-
-        if result.stage_label in {"invalid_input", "missing_dimensions", "cpu_mode"}:
-            return (
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.update(value=summary, visible=True),
-                gr.update(value="Optimization skipped. Check input path and CUDA GPU availability.", visible=True),
-            )
-
-        next_use_global = bool(use_global_val)
-        if next_use_global and int(result.scale) != int(resolved_scale or 4):
-            next_use_global = False
-            summary = (
-                f"{summary}\n"
-                "- Note: Disabled `Use Resolution & Scene Split Tab Settings` so optimized scale can be applied."
-            )
-
-        status_line = (
-            "Optimization applied. "
-            f"Estimated VRAM {result.estimated_peak_vram_gb:.2f} GB "
-            f"(guarded {result.estimated_guarded_vram_gb:.2f} GB) / target {result.budget.target_vram_gb:.2f} GB."
-        )
-        if not result.success:
-            status_line = (
-                "Optimization applied with minimum-safe constraints, but estimate is still above target. "
-                f"Guarded estimate {result.estimated_guarded_vram_gb:.2f} GB / target {result.budget.target_vram_gb:.2f} GB."
-            )
-
-        return (
-            gr.update(value=int(result.tile_size)),
-            gr.update(value=int(result.overlap)),
-            gr.update(value=int(result.frame_chunk_size)),
-            gr.update(value=bool(result.tiled_dit)),
-            gr.update(value=bool(result.tiled_vae)),
-            gr.update(value=float(result.scale)),
-            gr.update(value=str(int(result.scale))),
-            gr.update(value=int(result.max_target_resolution)),
-            gr.update(value=bool(next_use_global)),
-            gr.update(value=summary, visible=True),
-            gr.update(value=status_line, visible=True),
-        )
-
     def refresh_chunk_preview_ui(state):
         preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})
         if not isinstance(preview, dict):
@@ -1754,53 +1679,6 @@ def flashvsr_tab(
             gr.update(value=gallery, visible=bool(gallery)),
             gr.update(value=first_video, visible=bool(first_video)),
         )
-
-    optimize_evt = optimize_params_btn.click(
-        fn=optimize_parameters_for_vram,
-        inputs=[
-            input_path,
-            mode,
-            precision,
-            vae_model,
-            keep_models_on_cpu,
-            stream_decode,
-            scale,
-            use_resolution_tab,
-            upscale_factor,
-            max_target_resolution,
-            pre_downscale_then_upscale,
-            shared_state,
-        ],
-        outputs=[
-            tile_size,
-            overlap,
-            frame_chunk_size,
-            tiled_dit,
-            tiled_vae,
-            upscale_factor,
-            scale,
-            max_target_resolution,
-            use_resolution_tab,
-            optimize_summary,
-            status_box,
-        ],
-    )
-    optimize_evt.then(
-        fn=refresh_sizing,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[sizing_info],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-    optimize_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
 
     def on_chunk_gallery_select(evt: gr.SelectData, state):
         try:
@@ -2099,6 +1977,181 @@ def flashvsr_tab(
         ):
             yield _expand_service_payload(payload, live_state)
 
+    def _autotune_waiting_output(state, ticket_id: str, position: int):
+        safe_state = state or {}
+        pos = max(1, int(position)) if position else "?"
+        title = f"Queue waiting: {ticket_id} (position {pos})"
+        subtitle = "Auto Tune is queued and will start when a processing slot becomes available."
+        return (
+            gr.update(value=title),
+            gr.update(value=f"Queued and waiting for processing slot. Queue position: {pos}."),
+            _queue_status_indicator(title, subtitle, spinning=True),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def _autotune_cancelled_output(state, ticket_id: str):
+        safe_state = state or {}
+        title = f"Queue item removed: {ticket_id}"
+        subtitle = "This Auto Tune request was removed before it started."
+        return (
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def _autotune_busy_output(state):
+        safe_state = state or {}
+        title = "Processing already in progress (queue disabled)."
+        subtitle = "Enable queue in Global Settings to run Auto Tune after the active job."
+        return (
+            gr.update(value=title),
+            gr.update(value=subtitle),
+            _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            safe_state,
+        )
+
+    def _merge_autotune_payload_state(payload, live_state):
+        merged = merge_payload_state(payload, live_state)
+        if not (isinstance(payload, tuple) and payload):
+            return merged
+        worker_state = payload[-1] if isinstance(payload[-1], dict) else {}
+        if not worker_state:
+            return merged
+        merged_state = merged[-1] if (isinstance(merged, tuple) and isinstance(merged[-1], dict)) else {}
+        if not merged_state:
+            return merged
+        worker_seed = worker_state.get("seed_controls", {})
+        merged_seed = merged_state.get("seed_controls", {})
+        if not (isinstance(worker_seed, dict) and isinstance(merged_seed, dict)):
+            return merged
+        if "flashvsr_settings" in worker_seed:
+            try:
+                merged_seed["flashvsr_settings"] = dict(worker_seed.get("flashvsr_settings") or {})
+                merged_state["seed_controls"] = merged_seed
+                return (*merged[:-1], merged_state)
+            except Exception:
+                return merged
+        return merged
+
+    def _autotune_modal_message(payload) -> str | None:
+        if not (isinstance(payload, tuple) and payload):
+            return None
+        status_text = str(payload[0] or "").strip()
+        if not status_text:
+            return None
+        status_lower = status_text.lower()
+        if "reused a matching cached result" in status_lower:
+            return (
+                "Auto Tune found a matching cached config and applied it instantly.\n"
+                "No new scan was needed for this input and GPU profile."
+            )
+        state_payload = payload[-1] if isinstance(payload[-1], dict) else {}
+        operation_status = str(state_payload.get("operation_status") or "").strip().lower()
+        if operation_status in {"completed", "ready", "error"} and status_lower.startswith("auto tune"):
+            return f"{status_text}\nCheck Run Log for full details."
+        return None
+
+    def _with_autotune_modal(base_payload, payload=None, *, hide_if_no_message: bool = False):
+        if not (isinstance(base_payload, tuple) and base_payload):
+            return base_payload
+        modal_message = _autotune_modal_message(payload if payload is not None else base_payload)
+        if modal_message:
+            return (
+                *base_payload,
+                gr.update(value=str(modal_message)),
+                gr.update(visible=True),
+            )
+        if hide_if_no_message:
+            return (
+                *base_payload,
+                gr.update(value=""),
+                gr.update(visible=False),
+            )
+        return (*base_payload, gr.update(), gr.update())
+
+    def run_autotune_wrapper(*args, progress=gr.Progress()):
+        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
+        queued_state = snapshot_queue_state(live_state)
+        queued_global_settings = snapshot_global_settings(global_settings)
+        queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
+        ticket = queue_manager.submit("FlashVSR+", "Auto Tune")
+        acquired_slot = queue_manager.is_active(ticket.job_id)
+
+        try:
+            if not queue_enabled:
+                if not acquired_slot:
+                    queue_manager.cancel_waiting([ticket.job_id])
+                    yield _with_autotune_modal(_autotune_busy_output(live_state), hide_if_no_message=True)
+                    return
+                for payload in service["auto_tune_action"](
+                    *args[:-1],
+                    state=queued_state,
+                    progress=progress,
+                    global_settings_snapshot=queued_global_settings,
+                ):
+                    merged_payload = _merge_autotune_payload_state(payload, live_state)
+                    yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
+                return
+
+            wait_notice_sent = False
+            while not ticket.start_event.wait(timeout=0.5):
+                if ticket.cancel_event.is_set():
+                    yield _with_autotune_modal(
+                        _autotune_cancelled_output(live_state, ticket.job_id),
+                        hide_if_no_message=True,
+                    )
+                    return
+                if not wait_notice_sent:
+                    try:
+                        pos = queue_manager.waiting_position(ticket.job_id)
+                        pos_text = max(1, int(pos)) if pos else "?"
+                        gr.Info(f"Queued: {ticket.job_id} (position {pos_text})")
+                        yield _with_autotune_modal(
+                            _autotune_waiting_output(live_state, ticket.job_id, int(pos) if pos else 0),
+                            hide_if_no_message=True,
+                        )
+                    except Exception:
+                        pass
+                    wait_notice_sent = True
+
+            if ticket.cancel_event.is_set() and not queue_manager.is_active(ticket.job_id):
+                yield _with_autotune_modal(
+                    _autotune_cancelled_output(live_state, ticket.job_id),
+                    hide_if_no_message=True,
+                )
+                return
+
+            acquired_slot = True
+            for payload in service["auto_tune_action"](
+                *args[:-1],
+                state=queued_state,
+                progress=progress,
+                global_settings_snapshot=queued_global_settings,
+            ):
+                merged_payload = _merge_autotune_payload_state(payload, live_state)
+                yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
+        finally:
+            if acquired_slot:
+                queue_manager.complete(ticket.job_id)
+            else:
+                queue_manager.cancel_waiting([ticket.job_id])
+
     flashvsr_upscale_sync_signature = gr.State(value="")
     flashvsr_chunk_sync_signature = gr.State(value="")
     flashvsr_pre_run_output_signature = gr.State(value="")
@@ -2222,6 +2275,51 @@ def flashvsr_tab(
         fn=_refresh_chunk_preview_ui_if_needed,
         inputs=[shared_state, flashvsr_chunk_sync_signature],
         outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
+    )
+
+    autotune_evt = auto_tune_btn.click(
+        fn=run_autotune_wrapper,
+        inputs=[input_file] + inputs_list + [shared_state],
+        outputs=[
+            status_box,
+            log_box,
+            progress_indicator,
+            tile_size,
+            overlap,
+            frame_chunk_size,
+            tiled_dit,
+            optimize_summary,
+            shared_state,
+            flash_autotune_notice_text,
+            flash_autotune_notice_modal,
+        ],
+        concurrency_limit=32,
+        concurrency_id="app_processing_queue",
+        trigger_mode="multiple",
+    )
+    autotune_evt.then(
+        fn=refresh_tile_count,
+        inputs=tile_count_inputs,
+        outputs=[dit_tile_count],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+    )
+
+    def _dismiss_flash_autotune_notice():
+        return gr.update(value=""), gr.update(visible=False)
+
+    flash_autotune_notice_ok_btn.click(
+        fn=_dismiss_flash_autotune_notice,
+        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
+        queue=False,
+        show_progress="hidden",
+    )
+    flash_autotune_notice_close_btn.click(
+        fn=_dismiss_flash_autotune_notice,
+        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
+        queue=False,
+        show_progress="hidden",
     )
 
     shared_scale_sync_evt = shared_state.change(

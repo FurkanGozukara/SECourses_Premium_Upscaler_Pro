@@ -470,12 +470,66 @@ def main(argv=None):
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .autotune-modal-overlay {
+      position: fixed !important;
+      inset: 0;
+      z-index: 3000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 22px;
+      background: rgba(2, 6, 23, 0.58);
+      backdrop-filter: blur(2px);
+    }
+    .autotune-modal-card {
+      width: min(560px, 94vw);
+      border-radius: 14px;
+      border: 1px solid rgba(59, 130, 246, 0.35);
+      background: linear-gradient(160deg, rgba(15, 23, 42, 0.96), rgba(30, 64, 175, 0.82));
+      box-shadow: 0 18px 48px rgba(2, 6, 23, 0.55);
+      padding: 14px 14px 12px 14px;
+    }
+    .autotune-modal-title .md p,
+    .autotune-modal-title .prose p {
+      margin: 0 !important;
+      font-weight: 850;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+    }
+    .autotune-modal-body .md p,
+    .autotune-modal-body .prose p {
+      margin: 8px 0 0 0 !important;
+      line-height: 1.42;
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+    .autotune-modal-header {
+      align-items: center;
+      gap: 8px;
+    }
+    .autotune-modal-close {
+      min-width: 38px !important;
+      max-width: 38px;
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+    }
+    .autotune-modal-actions {
+      margin-top: 12px;
+      justify-content: flex-end;
+    }
+    .autotune-modal-ok {
+      min-width: 110px !important;
+    }
     @media (max-width: 900px) {
       .runtime-status-box {
         --runtime-status-height: 32px;
       }
       .runtime-progress-box {
         --runtime-progress-height: 68px;
+      }
+      .autotune-modal-card {
+        width: min(520px, 95vw);
+        padding: 12px;
       }
     }
     @keyframes secSpin {

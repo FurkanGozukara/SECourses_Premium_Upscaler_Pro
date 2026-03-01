@@ -586,6 +586,35 @@ def build_flashvsr_callbacks(
         normalized = _enforce_flashvsr_guardrails(defaults.copy(), defaults)
         return [normalized[key] for key in FLASHVSR_ORDER]
 
+    def auto_tune_action(
+        uploaded_file,
+        *args,
+        state: Dict[str, Any] = None,
+        progress=None,
+        global_settings_snapshot: Dict[str, Any] | None = None,
+        _global_settings: Dict[str, Any] = global_settings,
+    ):
+        from shared.services.flashvsr_autotune import flashvsr_auto_tune_action
+
+        yield from flashvsr_auto_tune_action(
+            uploaded_file=uploaded_file,
+            args=tuple(args),
+            state=state,
+            progress=progress,
+            global_settings_snapshot=global_settings_snapshot,
+            global_settings_fallback=_global_settings,
+            defaults=defaults,
+            flashvsr_order=FLASHVSR_ORDER,
+            parse_args_fn=_flashvsr_dict_from_args,
+            guardrail_fn=_enforce_flashvsr_guardrails,
+            canonical_scale_fn=canonical_flashvsr_scale,
+            runner=runner,
+            base_dir=base_dir,
+            temp_dir=temp_dir,
+            cancel_event=_flashvsr_cancel_event,
+        )
+        return
+
     def run_action(
         upload,
         *args,
@@ -2520,6 +2549,7 @@ def build_flashvsr_callbacks(
         "save_preset": save_preset,
         "load_preset": load_preset,
         "safe_defaults": safe_defaults,
+        "auto_tune_action": auto_tune_action,
         "run_action": run_action,
         "cancel_action": cancel_action,
         "open_outputs_folder": open_outputs_folder_flashvsr,

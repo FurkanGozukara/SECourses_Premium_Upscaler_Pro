@@ -622,6 +622,14 @@ def seedvr2_tab(
             
             # Progress tracking
             progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
+            with gr.Group(visible=False, elem_classes=["autotune-modal-overlay"]) as seed_autotune_notice_modal:
+                with gr.Group(elem_classes=["autotune-modal-card"]):
+                    with gr.Row(elem_classes=["autotune-modal-header"]):
+                        gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
+                        seed_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close"])
+                    seed_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
+                    with gr.Row(elem_classes=["autotune-modal-actions"]):
+                        seed_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok"])
             
             # Upscale factor + action buttons (placed directly above  Run Log)
             with gr.Group():
@@ -1989,6 +1997,42 @@ def seedvr2_tab(
             safe_state,
         )
 
+    def _autotune_modal_message(payload) -> str | None:
+        if not (isinstance(payload, tuple) and payload):
+            return None
+        status_text = str(payload[0] or "").strip()
+        if not status_text:
+            return None
+        status_lower = status_text.lower()
+        if "reused a matching cached result" in status_lower:
+            return (
+                "Auto Tune found a matching cached config and applied it instantly.\n"
+                "No new scan was needed for this input and GPU profile."
+            )
+        state_payload = payload[-1] if isinstance(payload[-1], dict) else {}
+        operation_status = str(state_payload.get("operation_status") or "").strip().lower()
+        if operation_status in {"completed", "ready", "error"} and status_lower.startswith("auto tune"):
+            return f"{status_text}\nCheck Run Log for full details."
+        return None
+
+    def _with_autotune_modal(base_payload, payload=None, *, hide_if_no_message: bool = False):
+        if not (isinstance(base_payload, tuple) and base_payload):
+            return base_payload
+        modal_message = _autotune_modal_message(payload if payload is not None else base_payload)
+        if modal_message:
+            return (
+                *base_payload,
+                gr.update(value=str(modal_message)),
+                gr.update(visible=True),
+            )
+        if hide_if_no_message:
+            return (
+                *base_payload,
+                gr.update(value=""),
+                gr.update(visible=False),
+            )
+        return (*base_payload, gr.update(), gr.update())
+
     def run_autotune_wrapper(*args, progress=gr.Progress()):
         """Queue-aware wrapper for SeedVR2 Auto Tune action."""
         live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
@@ -2002,7 +2046,7 @@ def seedvr2_tab(
             if not queue_enabled:
                 if not acquired_slot:
                     queue_manager.cancel_waiting([ticket.job_id])
-                    yield _autotune_busy_output(live_state)
+                    yield _with_autotune_modal(_autotune_busy_output(live_state), hide_if_no_message=True)
                     return
                 for payload in service["auto_tune_action"](
                     *args[:-1],
@@ -2010,26 +2054,36 @@ def seedvr2_tab(
                     progress=progress,
                     global_settings_snapshot=queued_global_settings,
                 ):
-                    yield merge_payload_state(payload, live_state)
+                    merged_payload = merge_payload_state(payload, live_state)
+                    yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
                 return
 
             wait_notice_sent = False
             while not ticket.start_event.wait(timeout=0.5):
                 if ticket.cancel_event.is_set():
-                    yield _autotune_cancelled_output(live_state, ticket.job_id)
+                    yield _with_autotune_modal(
+                        _autotune_cancelled_output(live_state, ticket.job_id),
+                        hide_if_no_message=True,
+                    )
                     return
                 if not wait_notice_sent:
                     try:
                         pos = queue_manager.waiting_position(ticket.job_id)
                         pos_text = max(1, int(pos)) if pos else "?"
                         gr.Info(f"Queued: {ticket.job_id} (position {pos_text})")
-                        yield _autotune_waiting_output(live_state, ticket.job_id, int(pos) if pos else 0)
+                        yield _with_autotune_modal(
+                            _autotune_waiting_output(live_state, ticket.job_id, int(pos) if pos else 0),
+                            hide_if_no_message=True,
+                        )
                     except Exception:
                         pass
                     wait_notice_sent = True
 
             if ticket.cancel_event.is_set() and not queue_manager.is_active(ticket.job_id):
-                yield _autotune_cancelled_output(live_state, ticket.job_id)
+                yield _with_autotune_modal(
+                    _autotune_cancelled_output(live_state, ticket.job_id),
+                    hide_if_no_message=True,
+                )
                 return
 
             acquired_slot = True
@@ -2039,7 +2093,8 @@ def seedvr2_tab(
                 progress=progress,
                 global_settings_snapshot=queued_global_settings,
             ):
-                yield merge_payload_state(payload, live_state)
+                merged_payload = merge_payload_state(payload, live_state)
+                yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
         finally:
             if acquired_slot:
                 queue_manager.complete(ticket.job_id)
@@ -2095,10 +2150,28 @@ def seedvr2_tab(
             vae_encode_tile_size,
             vae_decode_tile_size,
             shared_state,
+            seed_autotune_notice_text,
+            seed_autotune_notice_modal,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",
         trigger_mode="multiple",
+    )
+
+    def _dismiss_seed_autotune_notice():
+        return gr.update(value=""), gr.update(visible=False)
+
+    seed_autotune_notice_ok_btn.click(
+        fn=_dismiss_seed_autotune_notice,
+        outputs=[seed_autotune_notice_text, seed_autotune_notice_modal],
+        queue=False,
+        show_progress="hidden",
+    )
+    seed_autotune_notice_close_btn.click(
+        fn=_dismiss_seed_autotune_notice,
+        outputs=[seed_autotune_notice_text, seed_autotune_notice_modal],
+        queue=False,
+        show_progress="hidden",
     )
 
     # Cancel button with confirmation requirement

@@ -1137,24 +1137,33 @@ def _build_autotune_signature(
     }
 
 
+def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize signature.exact for cache matching across different input-scale routes."""
+    exact = signature.get("exact")
+    if not isinstance(exact, dict):
+        return {}
+    out = dict(exact)
+    # Same output target can be reached via different upscale routes (e.g. 960x540@x4 vs 1920x1080@x2).
+    # Reuse the same cache lane by ignoring route-only scale differences.
+    out.pop("upscale_factor", None)
+    return out
+
+
 def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
-    """Match cached signature against current request (with 5% target-pixel tolerance)."""
+    """Match cached signature against current request using output-target pixels as the size key."""
     if not isinstance(candidate, dict) or not isinstance(expected, dict):
         return False
-    if str(candidate.get("exact_hash") or "") != str(expected.get("exact_hash") or ""):
-        return False
+    cand_hash = str(candidate.get("exact_hash") or "")
+    exp_hash = str(expected.get("exact_hash") or "")
+    if cand_hash != exp_hash:
+        cand_exact = _exact_payload_for_cache_lookup(candidate)
+        exp_exact = _exact_payload_for_cache_lookup(expected)
+        if (not cand_exact) or (not exp_exact) or cand_exact != exp_exact:
+            return False
 
     if not _within_ratio(
         float(candidate.get("target_pixels", 0) or 0),
         float(expected.get("target_pixels", 0) or 0),
-        tolerance=0.05,
-    ):
-        return False
-
-    # Effective input pixels matter when pre-downscale is active; keep this strict-ish.
-    if not _within_ratio(
-        float(candidate.get("effective_input_pixels", 0) or 0),
-        float(expected.get("effective_input_pixels", 0) or 0),
         tolerance=0.05,
     ):
         return False

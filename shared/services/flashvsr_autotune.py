@@ -51,6 +51,18 @@ def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
     return abs(lhs_f - rhs_f) / base <= tol_f
 
 
+def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize signature.exact for cache matching across different input-scale routes."""
+    exact = signature.get("exact")
+    if not isinstance(exact, dict):
+        return {}
+    out = dict(exact)
+    # Same output target can be reached via different requested scales (e.g. 960x540@x4 vs 1920x1080@x2).
+    # Reuse the same cache lane by ignoring scale-only route differences.
+    out.pop("scale", None)
+    return out
+
+
 def _resolve_uploaded_path(uploaded_file: Any) -> str:
     if uploaded_file is None:
         return ""
@@ -282,17 +294,16 @@ def _build_autotune_signature(
 def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     if not isinstance(candidate, dict) or not isinstance(expected, dict):
         return False
-    if str(candidate.get("exact_hash") or "") != str(expected.get("exact_hash") or ""):
-        return False
+    cand_hash = str(candidate.get("exact_hash") or "")
+    exp_hash = str(expected.get("exact_hash") or "")
+    if cand_hash != exp_hash:
+        cand_exact = _exact_payload_for_cache_lookup(candidate)
+        exp_exact = _exact_payload_for_cache_lookup(expected)
+        if (not cand_exact) or (not exp_exact) or cand_exact != exp_exact:
+            return False
     if not _within_ratio(
         float(candidate.get("target_pixels", 0) or 0),
         float(expected.get("target_pixels", 0) or 0),
-        tolerance=0.05,
-    ):
-        return False
-    if not _within_ratio(
-        float(candidate.get("effective_input_pixels", 0) or 0),
-        float(expected.get("effective_input_pixels", 0) or 0),
         tolerance=0.05,
     ):
         return False

@@ -68,6 +68,9 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Same output target can be reached via different requested scales (e.g. 960x540@x4 vs 1920x1080@x2).
     # Reuse the same cache lane by ignoring scale-only route differences.
     out.pop("scale", None)
+    # Route controls can differ while the resolved effective/target dimensions are identical.
+    # Cache matching should prioritize actual processed resolution (tracked separately in signature dims).
+    out.pop("max_target_resolution", None)
     # Reserve target is dynamic and evaluated from historical VRAM usage;
     # changing it should not invalidate cache matching.
     out.pop("save_vram_gb", None)
@@ -798,9 +801,13 @@ def flashvsr_auto_tune_action(
         if not gpu_ids and str(global_gpu_device).isdigit():
             gpu_ids = [int(global_gpu_device)]
         gpu_snapshot = _query_gpu_memory_snapshot_gb()
+        selected_gpu_ids = list(gpu_ids)
+        if (not selected_gpu_ids) and gpu_snapshot:
+            selected_gpu_ids = [int(sorted(gpu_snapshot.keys())[0])]
+
         total_vram_gb = 0.0
-        if gpu_ids and gpu_snapshot:
-            total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in gpu_ids if g in gpu_snapshot)
+        if selected_gpu_ids and gpu_snapshot:
+            total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in selected_gpu_ids if g in gpu_snapshot)
         if total_vram_gb <= 0:
             try:
                 from shared.gpu_utils import get_gpu_info
@@ -809,10 +816,14 @@ def flashvsr_auto_tune_action(
             except Exception:
                 gpus = []
             if gpus:
-                if gpu_ids:
-                    by_id = {int(g.id): g for g in gpus}
-                    total_vram_gb = sum(float(by_id[g].total_memory_gb) for g in gpu_ids if g in by_id)
-                else:
+                if not selected_gpu_ids:
+                    try:
+                        selected_gpu_ids = [int(gpus[0].id)]
+                    except Exception:
+                        selected_gpu_ids = [0]
+                by_id = {int(g.id): g for g in gpus}
+                total_vram_gb = sum(float(by_id[g].total_memory_gb) for g in selected_gpu_ids if g in by_id)
+                if total_vram_gb <= 0 and (not gpu_ids):
                     total_vram_gb = float(gpus[0].total_memory_gb)
         if total_vram_gb <= 0:
             _append_log("Could not detect total VRAM for selected GPU.")
@@ -821,8 +832,7 @@ def flashvsr_auto_tune_action(
 
         telemetry_gpu_ids: List[int] = []
         if gpu_snapshot:
-            preferred_ids = list(gpu_ids) if gpu_ids else sorted(gpu_snapshot.keys())
-            telemetry_gpu_ids = [idx for idx in preferred_ids if idx in gpu_snapshot]
+            telemetry_gpu_ids = [idx for idx in selected_gpu_ids if idx in gpu_snapshot]
         if not telemetry_gpu_ids:
             _append_log(
                 "Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi "

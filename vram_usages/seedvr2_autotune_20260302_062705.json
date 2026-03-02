@@ -1,0 +1,80 @@
+{
+  "model": "seedvr2",
+  "created_at": "2026-03-02 06:27:05",
+  "updated_at": "2026-03-02 06:27:05",
+  "status": "running",
+  "finalized": false,
+  "frontier_verified": false,
+  "signature": {
+    "exact": {
+      "autotune_model": "seedvr2",
+      "dit_model": "seedvr2_ema_7b_sharp_fp16.safetensors",
+      "attention_mode": "flash_attn_2",
+      "compile_dit": false,
+      "compile_vae": false,
+      "compile_backend": "inductor",
+      "compile_mode": "default",
+      "compile_fullgraph": false,
+      "compile_dynamic": false,
+      "compile_dynamo_cache_size_limit": 64,
+      "compile_dynamo_recompile_limit": 128,
+      "cache_dit": false,
+      "cache_vae": false,
+      "dit_offload_device": "cpu",
+      "vae_offload_device": "cpu",
+      "tensor_offload_device": "cpu",
+      "swap_io_components": false,
+      "uniform_batch_size": false,
+      "vae_encode_tiled": true,
+      "vae_decode_tiled": true,
+      "vae_encode_tile_size": 1024,
+      "vae_encode_tile_overlap": 128,
+      "vae_decode_tile_size": 1024,
+      "vae_decode_tile_overlap": 128,
+      "upscale_factor": 2.0,
+      "max_resolution": 3840,
+      "pre_downscale_then_upscale": true,
+      "global_gpu_device": "0",
+      "save_vram_gb": 2.0
+    },
+    "exact_hash": "9c1dd52993c99fe95a79bef0cd0a4d72572231ba",
+    "target_pixels": 3145728,
+    "effective_input_pixels": 786432,
+    "target_width": 2048,
+    "target_height": 1536,
+    "effective_input_width": 1024,
+    "effective_input_height": 768,
+    "gpu_total_vram_gb": 31.8427734375
+  },
+  "input": {
+    "path": "G:\\SECourses_Premium_Upscaler_Pro_V1\\SECourses_Premium_Upscaler_Pro\\test\\1024x768.mp4",
+    "width": 1024,
+    "height": 768,
+    "effective_input_width": 1024,
+    "effective_input_height": 768
+  },
+  "target": {
+    "width": 2048,
+    "height": 1536,
+    "pixels": 3145728
+  },
+  "gpu": {
+    "selected_device": "0",
+    "selected_ids": [
+      0
+    ],
+    "total_vram_gb": 31.8427734375,
+    "min_free_target_gb": 2.0
+  },
+  "demo_clip": {
+    "input_kind": "video",
+    "fps": 30.0,
+    "width": 1024,
+    "height": 768,
+    "source_frames": 450,
+    "written_frames": 201,
+    "path": "G:\\SECourses_Premium_Upscaler_Pro_V1\\SECourses_Premium_Upscaler_Pro\\temp\\seedvr2_autotune\\20260302_062705\\seedvr2_autotune_demo_201f.mp4"
+  },
+  "tests": [],
+  "best_config": {}
+}

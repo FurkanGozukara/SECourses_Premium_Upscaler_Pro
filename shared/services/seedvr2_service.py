@@ -1056,14 +1056,57 @@ def _looks_like_oom(log_text: str) -> bool:
 
 
 def _detect_oom_phase(log_text: str) -> str:
-    """Best-effort phase classification for OOM events."""
-    lc = str(log_text or "").lower()
-    if "phase 1" in lc or "encoding batch" in lc or "vae encoding" in lc:
-        return "phase1_encode"
-    if "phase 2" in lc or "upscaling batch" in lc or "dit upscaling" in lc:
-        return "phase2_upscale"
-    if "phase 3" in lc or "decoding batch" in lc or "vae decoding" in lc:
-        return "phase3_decode"
+    """
+    Best-effort phase classification for OOM events.
+
+    Important: do not classify by "any phase token in whole log", because logs
+    often contain earlier phase markers. We classify from the phase context at
+    the actual OOM line (or the nearest preceding progress phase).
+    """
+    text = str(log_text or "")
+    if not text:
+        return "unknown"
+    oom_tokens = (
+        "out of memory",
+        "cuda out of memory",
+        "torch.cuda.outofmemoryerror",
+        "c10::error",
+        "allocation on device",
+        "failed to allocate memory",
+    )
+
+    def _phase_from_line(lc_line: str) -> str:
+        if "phase 1" in lc_line or "encoding batch" in lc_line or "vae encoding" in lc_line:
+            return "phase1_encode"
+        if "phase 2" in lc_line or "upscaling batch" in lc_line or "dit upscaling" in lc_line:
+            return "phase2_upscale"
+        if "phase 3" in lc_line or "decoding batch" in lc_line or "vae decoding" in lc_line:
+            return "phase3_decode"
+        return "unknown"
+
+    current_phase = "unknown"
+    saw_oom = False
+    for raw_line in text.splitlines():
+        lc_line = str(raw_line or "").strip().lower()
+        if not lc_line:
+            continue
+        phase_hint = _phase_from_line(lc_line)
+        if phase_hint != "unknown":
+            current_phase = phase_hint
+
+        if any(tok in lc_line for tok in oom_tokens):
+            saw_oom = True
+            # Prefer phase hints on the OOM line itself.
+            line_phase = _phase_from_line(lc_line)
+            if line_phase != "unknown":
+                return line_phase
+            # Fall back to nearest preceding phase context.
+            if current_phase != "unknown":
+                return current_phase
+
+    # If OOM is detected but no reliable phase context was found.
+    if saw_oom:
+        return "unknown"
     return "unknown"
 
 
@@ -1164,6 +1207,9 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Same output target can be reached via different upscale routes (e.g. 960x540@x4 vs 1920x1080@x2).
     # Reuse the same cache lane by ignoring route-only scale differences.
     out.pop("upscale_factor", None)
+    # Route controls can differ while the resolved effective/target dimensions are identical.
+    # Cache matching should prioritize actual processed resolution (tracked separately in signature dims).
+    out.pop("max_resolution", None)
     # Reserve target is dynamic and evaluated from historical VRAM usage;
     # changing it should not invalidate cache matching.
     out.pop("save_vram_gb", None)
@@ -3574,16 +3620,24 @@ def build_seedvr2_callbacks(
             if not gpu_ids and str(global_gpu_device).isdigit():
                 gpu_ids = [int(global_gpu_device)]
             gpu_snapshot = _query_gpu_memory_snapshot_gb()
+            selected_gpu_ids = list(gpu_ids)
+            if (not selected_gpu_ids) and gpu_snapshot:
+                selected_gpu_ids = [int(sorted(gpu_snapshot.keys())[0])]
+
             total_vram_gb = 0.0
-            if gpu_ids and gpu_snapshot:
-                total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in gpu_ids if g in gpu_snapshot)
+            if selected_gpu_ids and gpu_snapshot:
+                total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in selected_gpu_ids if g in gpu_snapshot)
             if total_vram_gb <= 0:
                 gpus = get_gpu_info()
                 if gpus:
-                    if gpu_ids:
-                        by_id = {int(g.id): g for g in gpus}
-                        total_vram_gb = sum(float(by_id[g].total_memory_gb) for g in gpu_ids if g in by_id)
-                    else:
+                    if not selected_gpu_ids:
+                        try:
+                            selected_gpu_ids = [int(gpus[0].id)]
+                        except Exception:
+                            selected_gpu_ids = [0]
+                    by_id = {int(g.id): g for g in gpus}
+                    total_vram_gb = sum(float(by_id[g].total_memory_gb) for g in selected_gpu_ids if g in by_id)
+                    if total_vram_gb <= 0 and (not gpu_ids):
                         total_vram_gb = float(gpus[0].total_memory_gb)
             if total_vram_gb <= 0:
                 _append_log("Could not detect total VRAM for selected GPU.")
@@ -3592,8 +3646,7 @@ def build_seedvr2_callbacks(
 
             telemetry_gpu_ids: List[int] = []
             if gpu_snapshot:
-                preferred_ids = list(gpu_ids) if gpu_ids else sorted(gpu_snapshot.keys())
-                telemetry_gpu_ids = [idx for idx in preferred_ids if idx in gpu_snapshot]
+                telemetry_gpu_ids = [idx for idx in selected_gpu_ids if idx in gpu_snapshot]
             if not telemetry_gpu_ids:
                 _append_log(
                     "Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi "
@@ -4053,6 +4106,17 @@ def build_seedvr2_callbacks(
                 selected_peak_gb = max_used_phase2_gb if peak_source == "phase2" else max_used_gb
                 free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
 
+                oom = bool(_looks_like_oom(result.log))
+                oom_phase = _detect_oom_phase(result.log) if oom else ""
+                if oom and oom_phase == "unknown":
+                    phase_from_progress = str(phase_state.get("phase") or "").strip().lower()
+                    if phase_from_progress == "phase1":
+                        oom_phase = "phase1_encode"
+                    elif phase_from_progress == "phase2":
+                        oom_phase = "phase2_upscale"
+                    elif phase_from_progress == "phase3":
+                        oom_phase = "phase3_decode"
+
                 outcome = {
                     "batch_size": int(test_batch),
                     "blocks_to_swap": int(test_blocks),
@@ -4061,8 +4125,8 @@ def build_seedvr2_callbacks(
                     "vae_encode_tile_size": int(probe_settings.get("vae_encode_tile_size") or 0),
                     "vae_decode_tile_size": int(probe_settings.get("vae_decode_tile_size") or 0),
                     "returncode": int(result.returncode),
-                    "oom": bool(_looks_like_oom(result.log)),
-                    "oom_phase": _detect_oom_phase(result.log) if _looks_like_oom(result.log) else "",
+                    "oom": bool(oom),
+                    "oom_phase": str(oom_phase),
                     "max_vram_used_gb": round(selected_peak_gb, 3),
                     "peak_source": str(peak_source),
                     "phase2_peak_vram_used_gb": round(max_used_phase2_gb, 3),
@@ -4110,6 +4174,7 @@ def build_seedvr2_callbacks(
                         result, outcome = yield from _run_probe_once(batch_candidate, int(working_settings["blocks_to_swap"]))
                         passed = (
                             outcome["returncode"] == 0
+                            and bool(outcome.get("telemetry_ok", False))
                             and (not outcome["oom"])
                             and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
                         )
@@ -4220,6 +4285,7 @@ def build_seedvr2_callbacks(
                             result, outcome = yield from _run_probe_once(AUTOTUNE_TARGET_FRAMES, blocks_candidate)
                             passed = (
                                 outcome["returncode"] == 0
+                                and bool(outcome.get("telemetry_ok", False))
                                 and (not outcome["oom"])
                                 and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
                             )

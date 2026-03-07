@@ -38,6 +38,7 @@ AUTOTUNE_FRAME_CHUNK_SEQUENCE = (450, 350, 250, 150, 100, 64, 48, 32)
 AUTOTUNE_PHASE2_MIN_SAMPLES_FOR_EARLY_STOP = 4
 AUTOTUNE_PHASE2_MIN_SECONDS_FOR_EARLY_STOP = 0.60
 AUTOTUNE_PHASE2_MIN_ITER_FOR_GATE = 3
+AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
 
 
 def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VRAM_GB) -> float:
@@ -308,6 +309,28 @@ def _build_autotune_signature(
 
 
 def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    if not _autotune_signature_settings_match(candidate, expected, vram_tolerance=0.10):
+        return False
+    pixel_diff, _aspect_diff, _dim_diff = _autotune_signature_resolution_distance(candidate, expected)
+    return pixel_diff <= 0.05
+
+
+def _ratio_diff(lhs: Any, rhs: Any) -> float:
+    try:
+        lhs_f = float(lhs)
+        rhs_f = float(rhs)
+    except Exception:
+        return 1e9
+    base = max(abs(rhs_f), 1e-9)
+    return abs(lhs_f - rhs_f) / base
+
+
+def _autotune_signature_settings_match(
+    candidate: Dict[str, Any],
+    expected: Dict[str, Any],
+    *,
+    vram_tolerance: float = 0.10,
+) -> bool:
     if not isinstance(candidate, dict) or not isinstance(expected, dict):
         return False
     cand_hash = str(candidate.get("exact_hash") or "")
@@ -317,17 +340,48 @@ def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, A
         exp_exact = _exact_payload_for_cache_lookup(expected)
         if (not cand_exact) or (not exp_exact) or cand_exact != exp_exact:
             return False
-    if not _within_ratio(
-        float(candidate.get("target_pixels", 0) or 0),
-        float(expected.get("target_pixels", 0) or 0),
-        tolerance=0.05,
-    ):
-        return False
     cand_vram = float(candidate.get("gpu_total_vram_gb", 0) or 0)
     exp_vram = float(expected.get("gpu_total_vram_gb", 0) or 0)
-    if cand_vram > 0 and exp_vram > 0 and (not _within_ratio(cand_vram, exp_vram, tolerance=0.05)):
-        return False
+    if cand_vram > 0 and exp_vram > 0:
+        if _ratio_diff(cand_vram, exp_vram) > max(0.01, float(vram_tolerance)):
+            return False
     return True
+
+
+def _autotune_signature_resolution_distance(candidate: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[float, float, float]:
+    cand_px = float(candidate.get("target_pixels", 0) or 0)
+    exp_px = float(expected.get("target_pixels", 0) or 0)
+    pixel_diff = _ratio_diff(cand_px, exp_px) if cand_px > 0 and exp_px > 0 else 1e9
+
+    try:
+        cand_w = int(candidate.get("target_width", 0) or 0)
+        cand_h = int(candidate.get("target_height", 0) or 0)
+        exp_w = int(expected.get("target_width", 0) or 0)
+        exp_h = int(expected.get("target_height", 0) or 0)
+    except Exception:
+        return (pixel_diff, 1e9, 1e9)
+
+    if cand_w <= 0 or cand_h <= 0 or exp_w <= 0 or exp_h <= 0:
+        return (pixel_diff, 1e9, 1e9)
+
+    cand_ar = float(cand_w) / float(cand_h)
+    exp_ar = float(exp_w) / float(exp_h)
+    aspect_diff = _ratio_diff(cand_ar, exp_ar)
+    dim_diff = _ratio_diff(cand_w, exp_w) + _ratio_diff(cand_h, exp_h)
+    return (pixel_diff, aspect_diff, dim_diff)
+
+
+def _autotune_payload_status_rank(payload: Dict[str, Any]) -> int:
+    status_raw = str(payload.get("status") or "").strip().lower()
+    finalized = bool(payload.get("finalized", False))
+    frontier = bool(payload.get("frontier_verified", False))
+    if finalized and frontier and status_raw in {"completed", "threshold_reached"}:
+        return 0
+    if finalized and status_raw in {"completed", "threshold_reached"}:
+        return 1
+    if status_raw in {"completed", "threshold_reached"}:
+        return 2
+    return 3
 
 
 def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -435,6 +489,7 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
     except Exception:
         return None
 
+    scored_matches: List[Dict[str, Any]] = []
     for path in candidates:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -456,10 +511,38 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         if not _has_strict_phase2_validation(payload):
             # Ignore stale cache logs produced before strict DiT-phase validation.
             continue
-        if _autotune_signature_matches(payload.get("signature", {}), expected_signature):
-            payload["_log_path"] = str(path)
-            return payload
-    return None
+        sig_blob = payload.get("signature")
+        if not _autotune_signature_settings_match(sig_blob, expected_signature, vram_tolerance=0.10):
+            continue
+        pixel_diff, aspect_diff, dim_diff = _autotune_signature_resolution_distance(sig_blob, expected_signature)
+        scored_matches.append(
+            {
+                "payload": payload,
+                "path": path,
+                "pixel_diff": float(pixel_diff),
+                "aspect_diff": float(aspect_diff),
+                "dim_diff": float(dim_diff),
+                "status_rank": int(_autotune_payload_status_rank(payload)),
+                "mtime": float(path.stat().st_mtime),
+            }
+        )
+
+    if not scored_matches:
+        return None
+
+    scored_matches.sort(
+        key=lambda row: (
+            row["pixel_diff"],
+            row["aspect_diff"],
+            row["dim_diff"],
+            row["status_rank"],
+            -row["mtime"],
+        )
+    )
+    best_row = scored_matches[0]
+    out = dict(best_row["payload"])
+    out["_log_path"] = str(best_row["path"])
+    return out
 
 
 def _write_autotune_log(
@@ -885,6 +968,7 @@ def flashvsr_auto_tune_action(
         except Exception:
             candidate_logs = []
 
+        scored_history_logs: List[Dict[str, Any]] = []
         for log_path in candidate_logs:
             try:
                 payload = json.loads(log_path.read_text(encoding="utf-8"))
@@ -898,7 +982,61 @@ def flashvsr_auto_tune_action(
                 continue
             if (not model_id) and (not is_flash_file):
                 continue
-            if not _autotune_signature_matches(payload.get("signature", {}), signature):
+            sig_blob = payload.get("signature")
+            if not _autotune_signature_settings_match(sig_blob, signature, vram_tolerance=0.10):
+                continue
+            pixel_diff, aspect_diff, dim_diff = _autotune_signature_resolution_distance(sig_blob, signature)
+            scored_history_logs.append(
+                {
+                    "path": log_path,
+                    "payload": payload,
+                    "pixel_diff": float(pixel_diff),
+                    "aspect_diff": float(aspect_diff),
+                    "dim_diff": float(dim_diff),
+                    "status_rank": int(_autotune_payload_status_rank(payload)),
+                    "mtime": float(log_path.stat().st_mtime),
+                    "target_w": int((sig_blob or {}).get("target_width") or 0),
+                    "target_h": int((sig_blob or {}).get("target_height") or 0),
+                }
+            )
+
+        selected_history_logs: List[Dict[str, Any]] = []
+        if scored_history_logs:
+            scored_history_logs.sort(
+                key=lambda row: (
+                    row["pixel_diff"],
+                    row["aspect_diff"],
+                    row["dim_diff"],
+                    row["status_rank"],
+                    -row["mtime"],
+                )
+            )
+            closest_any = scored_history_logs[0]
+            selected_history_logs = [
+                row
+                for row in scored_history_logs
+                if float(row.get("pixel_diff", 1e9)) <= float(AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE)
+            ][:12]
+            _append_log(
+                f"History scan: read {len(candidate_logs)} log(s), "
+                f"settings-compatible {len(scored_history_logs)}, "
+                f"within <= {AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE * 100:.1f}% pixel delta: {len(selected_history_logs)}."
+            )
+            _append_log(
+                f"Closest historical target {closest_any['target_w']}x{closest_any['target_h']} "
+                f"(Δpixels={float(closest_any['pixel_diff']) * 100.0:.2f}%, "
+                f"Δaspect={float(closest_any['aspect_diff']) * 100.0:.2f}%)."
+            )
+            if not selected_history_logs:
+                _append_log(
+                    f"No historical autotune log is within {AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE * 100:.1f}% pixel delta. "
+                    "Running fresh autotune tests."
+                )
+
+        for row in sorted(selected_history_logs, key=lambda item: float(item.get("mtime", 0.0))):
+            log_path = Path(str(row.get("path") or ""))
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
                 continue
             history_sources.append(str(log_path))
             status_raw = str(payload.get("status") or "").strip().lower()

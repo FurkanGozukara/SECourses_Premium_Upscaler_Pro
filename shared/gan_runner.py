@@ -527,7 +527,11 @@ def _run_gan_video(
             return GanResult(1, None, "No frames extracted from video")
 
         if on_progress:
-            on_progress(f"FRAME_PROGRESS 0/{total_frames} frames completed (0%)")
+            on_progress(f"FRAME_PROGRESS 0/{total_frames} | 0.0% | elapsed 0s | ETA unknown")
+            try:
+                print(f"FRAME_PROGRESS 0/{total_frames} | 0.0% | elapsed 0s | ETA unknown", flush=True)
+            except Exception:
+                pass
 
         # Batch process frames
         try:
@@ -537,6 +541,35 @@ def _run_gan_video(
         batch_size = max(1, batch_size)
         processed_count = 0
         last_reported_pct = -1
+        progress_started_ts = time.time()
+        ema_frame_sec: Optional[float] = None
+
+        def _emit_frame_progress(done: int, total: int) -> None:
+            nonlocal ema_frame_sec
+            safe_total = max(1, int(total))
+            safe_done = max(0, min(int(done), safe_total))
+            elapsed = max(1e-6, time.time() - progress_started_ts)
+            if safe_done > 0:
+                frame_sec = elapsed / float(safe_done)
+                if ema_frame_sec is None:
+                    ema_frame_sec = frame_sec
+                else:
+                    ema_frame_sec = (ema_frame_sec * 0.7) + (frame_sec * 0.3)
+            eta_text = "ETA unknown"
+            if ema_frame_sec is not None and safe_done > 0 and safe_done < safe_total:
+                eta_s = max(0.0, float(safe_total - safe_done) * float(ema_frame_sec))
+                finish_local = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_s))
+                eta_text = f"ETA {int(eta_s)}s (finish ~{finish_local})"
+            elif safe_done >= safe_total:
+                eta_text = "ETA 0s"
+            pct = (float(safe_done) / float(safe_total)) * 100.0
+            line = f"FRAME_PROGRESS {safe_done}/{safe_total} | {pct:.1f}% | elapsed {int(elapsed)}s | {eta_text}"
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+            if on_progress:
+                on_progress(line)
 
         # Real batching path: load Spandrel model once and run N frames per forward pass.
         # Fallback to legacy per-frame inference if unavailable or if a batch fails.
@@ -645,9 +678,7 @@ def _run_gan_video(
                             progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
                             if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
                                 last_reported_pct = progress_pct
-                                on_progress(
-                                    f"FRAME_PROGRESS {processed_count}/{total_frames} frames completed ({progress_pct}%)"
-                                )
+                                _emit_frame_progress(processed_count, total_frames)
                         batch_done = True
                 except Exception as e:
                     batch_done = False
@@ -675,9 +706,7 @@ def _run_gan_video(
                 progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
                 if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
                     last_reported_pct = progress_pct
-                    on_progress(
-                        f"FRAME_PROGRESS {processed_count}/{total_frames} frames completed ({progress_pct}%)"
-                    )
+                    _emit_frame_progress(processed_count, total_frames)
 
                 if result.returncode != 0 and on_progress:
                     on_progress(f"Warning: Frame {frame_path.name} failed")

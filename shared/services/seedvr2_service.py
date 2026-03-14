@@ -5738,6 +5738,7 @@ def build_seedvr2_callbacks(
             chunk_duration_by_index: Dict[int, float] = {}
             chunk_duration_total = 0.0
             chunk_duration_loaded = False
+            run_start_time = time.time()
 
             def _try_load_chunk_duration_weights() -> None:
                 """
@@ -6092,13 +6093,25 @@ def build_seedvr2_callbacks(
                         else:
                             overall_fraction_for_text = max(0.0, min(1.0, last_progress_value))
 
+                        elapsed_total_s = max(0.0, float(time.time() - run_start_time))
+                        eta_suffix = ""
+                        if overall_fraction_for_text > 0.001 and overall_fraction_for_text < 0.999:
+                            eta_s = max(
+                                0.0,
+                                (elapsed_total_s / max(1e-6, overall_fraction_for_text)) - elapsed_total_s,
+                            )
+                            finish_local = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_s))
+                            eta_suffix = f" | ETA {int(eta_s)}s (finish ~{finish_local})"
+                        elif overall_fraction_for_text >= 0.999:
+                            eta_suffix = " | ETA 0s"
+
                         percent_done = int(overall_fraction_for_text * 100.0)
                         completed_shown = min(max(0, completed_chunk_count), total_chunks_estimate)
                         current_shown = active_chunk_idx if active_chunk_idx > 0 else max(1, completed_shown)
                         if total_chunks_estimate > 1:
                             status_text = (
                                 f"Processing... {completed_shown}/{total_chunks_estimate} chunks completed "
-                                f"| overall {percent_done}%"
+                                f"| overall {percent_done}%{eta_suffix}"
                             )
                             if stage_summary_short:
                                 status_text = f"{status_text} | {stage_summary_short}"
@@ -6113,11 +6126,11 @@ def build_seedvr2_callbacks(
                                 )
                         else:
                             if stage_summary_short:
-                                status_text = f"Processing... {stage_summary_short} (overall {percent_done}%)"
-                                indicator_title = f"Processing... ({stage_summary_short}, overall {percent_done}% done)"
+                                status_text = f"Processing... {stage_summary_short} (overall {percent_done}%{eta_suffix})"
+                                indicator_title = f"Processing... ({stage_summary_short}, overall {percent_done}% done{eta_suffix})"
                             else:
-                                status_text = f"Processing... {percent_done}%"
-                                indicator_title = f"Processing... ({percent_done}% done)"
+                                status_text = f"Processing... {percent_done}%{eta_suffix}"
+                                indicator_title = f"Processing... ({percent_done}% done{eta_suffix})"
 
                         if oom_visible:
                             status_text = "Out of VRAM (GPU) - see banner above"
@@ -6128,11 +6141,13 @@ def build_seedvr2_callbacks(
                                 f"Chunk mode: {chunk_mode_label}",
                                 f"Chunks completed: {completed_shown}/{total_chunks_estimate}",
                                 f"Current chunk: {current_shown}/{total_chunks_estimate}",
+                                f"Elapsed: {int(elapsed_total_s)}s{eta_suffix}",
                             ]
                         else:
                             chunk_status_lines = [
                                 f"Chunk mode: {chunk_mode_label}",
                                 f"Chunk {current_shown}/{max(1, total_chunks_estimate)}",
+                                f"Elapsed: {int(elapsed_total_s)}s{eta_suffix}",
                             ]
                         if stage_summary_line:
                             chunk_status_lines.append(stage_summary_line)

@@ -2145,6 +2145,41 @@ class Runner:
         proc: Optional[subprocess.Popen] = None
         log_lines: List[str] = []
         start_time = time.time()  # Track execution time
+        ratio_re = re.compile(
+            r"\b(?:(?:frame|frames?|step|steps?|batch|batches?)\s*)?(\d+)\s*/\s*(\d+)\b",
+            flags=re.IGNORECASE,
+        )
+        last_ratio_done = 0
+        last_ratio_total = 0
+        ema_step_sec: Optional[float] = None
+
+        def _emit_eta_progress(done: int, total: int) -> None:
+            nonlocal ema_step_sec
+            safe_total = max(1, int(total))
+            safe_done = max(0, min(int(done), safe_total))
+            elapsed = max(1e-6, time.time() - start_time)
+            if safe_done > 0:
+                step_sec = elapsed / float(safe_done)
+                if ema_step_sec is None:
+                    ema_step_sec = step_sec
+                else:
+                    ema_step_sec = (ema_step_sec * 0.7) + (step_sec * 0.3)
+            eta_text = "ETA unknown"
+            if ema_step_sec is not None and safe_done > 0 and safe_done < safe_total:
+                eta_s = max(0.0, float(safe_total - safe_done) * float(ema_step_sec))
+                finish_local = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_s))
+                eta_text = f"ETA {int(eta_s)}s (finish ~{finish_local})"
+            elif safe_done >= safe_total:
+                eta_text = "ETA 0s"
+            pct = (float(safe_done) / float(safe_total)) * 100.0
+            eta_line = f"FRAME_PROGRESS {safe_done}/{safe_total} | {pct:.1f}% | elapsed {int(elapsed)}s | {eta_text}"
+            log_lines.append(eta_line)
+            try:
+                print(eta_line, flush=True)
+            except Exception:
+                pass
+            if on_progress:
+                on_progress(eta_line + "\n")
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -2161,7 +2196,30 @@ class Runner:
 
             assert proc.stdout is not None
             for line in proc.stdout:
-                log_lines.append(line.rstrip())
+                raw_line = line.rstrip()
+                log_lines.append(raw_line)
+                try:
+                    print(raw_line, flush=True)
+                except Exception:
+                    pass
+
+                ratio_match = ratio_re.search(raw_line)
+                if ratio_match:
+                    try:
+                        done_val = int(ratio_match.group(1))
+                        total_val = int(ratio_match.group(2))
+                        if total_val > 0:
+                            should_emit = (
+                                done_val != last_ratio_done
+                                or total_val != last_ratio_total
+                                or done_val == total_val
+                            )
+                            if should_emit:
+                                last_ratio_done = done_val
+                                last_ratio_total = total_val
+                                _emit_eta_progress(done_val, total_val)
+                    except Exception:
+                        pass
                 if on_progress:
                     on_progress(line)
                 with self._lock:

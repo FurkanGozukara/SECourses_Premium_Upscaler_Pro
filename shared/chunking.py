@@ -2418,6 +2418,7 @@ def chunk_and_process(
             reset_cancel()
     except Exception:
         pass
+    run_start_ts = time.time()
 
     input_path = normalize_path(settings["input_path"])
     # When inputs are preprocessed (e.g., downscaled) we still want to preserve the original audio.
@@ -2556,6 +2557,193 @@ def chunk_and_process(
             on_progress=on_progress,
         )
         on_progress(f"Split into {len(chunk_paths)} chunks\n")
+
+    split_stage_weight = 0.10 if input_type != "directory" else 0.04
+    merge_stage_weight = 0.06 if output_format != "png" else 0.03
+    process_stage_weight = max(0.0, 1.0 - split_stage_weight - merge_stage_weight)
+    split_stage_progress = 1.0
+    merge_stage_progress = 0.0
+
+    def _safe_chunk_work_units(chunk_path: Path) -> float:
+        try:
+            p = Path(chunk_path)
+            if p.is_dir():
+                frame_count = 0
+                try:
+                    for item in p.iterdir():
+                        if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}:
+                            frame_count += 1
+                except Exception:
+                    frame_count = 0
+                return float(max(1, frame_count))
+            duration = float(get_media_duration_seconds(str(p)) or 0.0)
+            if duration > 0:
+                fps = float(get_media_fps(str(p)) or get_media_fps(input_path) or 30.0)
+                return float(max(1.0, duration * max(1.0, fps)))
+        except Exception:
+            pass
+        return 1.0
+
+    chunk_work_units: List[float] = [max(1.0, _safe_chunk_work_units(Path(c))) for c in chunk_paths]
+    total_chunk_units = float(sum(chunk_work_units)) if chunk_work_units else 1.0
+    completed_chunk_units = 0.0
+    current_chunk_index = 0
+    current_chunk_inner_fraction = 0.0
+
+    last_overall_emit_ts = 0.0
+    last_rate_sample_ts = run_start_ts
+    last_rate_sample_progress = 0.0
+    ema_progress_rate: Optional[float] = None
+    last_emitted_fraction = -1.0
+    inline_frame_progress_active = False
+    inline_frame_progress_width = 0
+
+    frame_progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+    pct_progress_re = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%")
+    ratio_hint_re = re.compile(
+        r"\b(?:processed|processing|frame|frames|step|steps|batch|batches)\b[^0-9]{0,20}(\d+)\s*/\s*(\d+)",
+        flags=re.IGNORECASE,
+    )
+
+    def _format_elapsed(seconds: float) -> str:
+        sec = max(0, int(round(float(seconds or 0.0))))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        if h > 0:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m > 0:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def _emit_progress_line(line: str) -> None:
+        nonlocal inline_frame_progress_active, inline_frame_progress_width
+        payload = str(line or "").rstrip("\r\n")
+        if not payload:
+            return
+        try:
+            if payload.startswith("FRAME_PROGRESS "):
+                padded = payload
+                if inline_frame_progress_width > len(payload):
+                    padded = payload + (" " * (inline_frame_progress_width - len(payload)))
+                print(f"\r{padded}", end="", flush=True)
+                inline_frame_progress_active = True
+                inline_frame_progress_width = len(payload)
+            else:
+                if inline_frame_progress_active:
+                    print("", flush=True)
+                    inline_frame_progress_active = False
+                    inline_frame_progress_width = 0
+                print(payload, flush=True)
+        except Exception:
+            pass
+        try:
+            on_progress(payload + "\n")
+        except Exception:
+            pass
+
+    def _parse_chunk_inner_fraction(message: str) -> Optional[float]:
+        text = str(message or "").strip()
+        if not text:
+            return None
+        if text.startswith("FRAME_PROGRESS "):
+            body = text[len("FRAME_PROGRESS ") :].strip()
+            m = frame_progress_re.search(body)
+            if m:
+                cur = int(m.group(1))
+                total = max(1, int(m.group(2)))
+                return max(0.0, min(1.0, float(cur) / float(total)))
+            p = pct_progress_re.search(body)
+            if p:
+                return max(0.0, min(1.0, float(p.group(1)) / 100.0))
+            return None
+        m = ratio_hint_re.search(text)
+        if m:
+            cur = int(m.group(1))
+            total = max(1, int(m.group(2)))
+            return max(0.0, min(1.0, float(cur) / float(total)))
+        p = pct_progress_re.search(text)
+        if p and any(tok in text.lower() for tok in ("progress", "processing", "processed", "frame", "batch", "step")):
+            return max(0.0, min(1.0, float(p.group(1)) / 100.0))
+        return None
+
+    def _overall_process_fraction() -> float:
+        nonlocal completed_chunk_units, current_chunk_index, current_chunk_inner_fraction
+        if total_chunk_units <= 0:
+            return 0.0
+        current_units = 0.0
+        if 1 <= int(current_chunk_index) <= len(chunk_work_units):
+            current_units = float(chunk_work_units[int(current_chunk_index) - 1]) * max(
+                0.0, min(1.0, float(current_chunk_inner_fraction))
+            )
+        frac = (float(completed_chunk_units) + current_units) / float(total_chunk_units)
+        return max(0.0, min(1.0, frac))
+
+    def _overall_fraction() -> float:
+        frac = (
+            float(split_stage_weight) * max(0.0, min(1.0, float(split_stage_progress)))
+            + float(process_stage_weight) * _overall_process_fraction()
+            + float(merge_stage_weight) * max(0.0, min(1.0, float(merge_stage_progress)))
+        )
+        return max(0.0, min(1.0, frac))
+
+    def _format_eta(eta_seconds: Optional[float]) -> str:
+        if eta_seconds is None:
+            return "ETA unknown"
+        if eta_seconds <= 0:
+            return "ETA 0s"
+        finish_ts = time.time() + float(eta_seconds)
+        finish_local = time.strftime("%H:%M:%S", time.localtime(finish_ts))
+        return f"ETA {_format_elapsed(eta_seconds)} (finish ~{finish_local})"
+
+    def _estimate_eta_from_progress(progress_fraction: float) -> Optional[float]:
+        nonlocal last_rate_sample_ts, last_rate_sample_progress, ema_progress_rate
+        p = max(0.0, min(1.0, float(progress_fraction)))
+        if p <= 1e-6:
+            return None
+        now = time.time()
+        elapsed = max(1e-6, now - run_start_ts)
+        inst_rate = p / elapsed
+
+        dt = max(0.0, now - float(last_rate_sample_ts))
+        dp = max(0.0, p - float(last_rate_sample_progress))
+        if dt >= 0.25 and dp >= 0:
+            sample_rate = dp / dt if dt > 0 else inst_rate
+            if sample_rate > 0:
+                if ema_progress_rate is None:
+                    ema_progress_rate = sample_rate
+                else:
+                    ema_progress_rate = (ema_progress_rate * 0.7) + (sample_rate * 0.3)
+            last_rate_sample_ts = now
+            last_rate_sample_progress = p
+
+        rate = max(inst_rate, float(ema_progress_rate or 0.0))
+        if rate <= 1e-9:
+            return None
+        return max(0.0, (1.0 - p) / rate)
+
+    def _emit_overall_progress(stage_label: str = "", force: bool = False) -> None:
+        nonlocal last_overall_emit_ts, last_emitted_fraction
+        now = time.time()
+        frac = _overall_fraction()
+        if not force:
+            if (now - last_overall_emit_ts) < 0.45 and abs(frac - last_emitted_fraction) < 0.004:
+                return
+        elapsed = max(0.0, now - run_start_ts)
+        eta_seconds = _estimate_eta_from_progress(frac)
+        done = max(0, min(100, int(round(frac * 100.0))))
+        line = (
+            f"FRAME_PROGRESS {done}/100 | {frac * 100.0:.1f}% | "
+            f"elapsed {_format_elapsed(elapsed)} | {_format_eta(eta_seconds)}"
+        )
+        stage_clean = str(stage_label or "").strip()
+        if stage_clean:
+            line += f" | {stage_clean}"
+        _emit_progress_line(line)
+        last_overall_emit_ts = now
+        last_emitted_fraction = frac
+
+    _emit_overall_progress("Chunk split complete; starting processing", force=True)
 
     output_chunks: List[Path] = []
     chunk_logs: List[dict] = []
@@ -2952,6 +3140,16 @@ def chunk_and_process(
             f"(backend output codec may vary by runtime; requested codec={expected_codec_name or 'auto'}, "
             f"10bit={expected_use_10bit}).\n"
         )
+    elif model_type == "rtx":
+        # RTX Super Resolution currently writes MP4 via OpenCV's mp4v path in the runner.
+        # Enforcing strict equality against requested/source codec (often h264) can produce
+        # false codec-drift failures even when chunk output is valid and mergeable.
+        strict_codec_validation = False
+        _emit_diag(
+            "[codec] strict validation disabled for RTX Super Resolution "
+            f"(runner output codec may differ by OpenCV runtime; requested codec={expected_codec_name or 'auto'}, "
+            f"10bit={expected_use_10bit}).\n"
+        )
     if output_format != "png" and expected_codec_name and strict_codec_validation:
         _emit_diag(
             f"[codec] expected output codec={expected_codec_name}, 10bit={expected_use_10bit}\n"
@@ -3054,7 +3252,15 @@ def chunk_and_process(
                 "resumed": True,
             })
         output_chunks = validated_existing_chunks.copy()
+        if chunk_work_units:
+            completed_chunk_units = float(sum(chunk_work_units[: len(validated_existing_chunks)]))
+        current_chunk_index = 0
+        current_chunk_inner_fraction = 0.0
         on_progress(f"✅ Loaded {len(existing_chunks)} completed chunks from previous run - skipping to chunk {start_chunk_idx + 1}\n")
+        _emit_overall_progress(
+            f"Resumed {len(validated_existing_chunks)}/{len(chunk_paths)} chunks",
+            force=True,
+        )
         for i, chunk_path in enumerate(validated_existing_chunks, 1):
             _notify_progress(
                 i / max(1, len(chunk_paths)),
@@ -3066,6 +3272,9 @@ def chunk_and_process(
             )
 
     for idx, chunk in enumerate(chunk_paths[start_chunk_idx:], start_chunk_idx + 1):
+        current_chunk_index = int(idx)
+        current_chunk_inner_fraction = 0.0
+        _emit_overall_progress(f"Processing chunk {idx}/{len(chunk_paths)}", force=True)
         # Respect external cancellation
         try:
             if getattr(runner, "is_canceled", lambda: False)():
@@ -3077,6 +3286,10 @@ def chunk_and_process(
                 )
                 if partial:
                     return partial
+                _emit_overall_progress(
+                    f"Canceled before chunk {idx}/{len(chunk_paths)} started",
+                    force=True,
+                )
                 return 1, "Canceled before processing current chunk", "", len(chunk_paths)
         except Exception:
             pass
@@ -3117,30 +3330,57 @@ def chunk_and_process(
                             on_progress(f"Adjusting SeedVR2 batch_size {user_bs}->{adj} for short chunk ({frame_count} frames)\n")
                         except Exception:
                             pass
+
+        def _chunk_progress_proxy(message: str) -> None:
+            nonlocal current_chunk_inner_fraction
+            text = str(message or "")
+            stripped = text.strip()
+            if not stripped:
+                return
+            parsed_fraction = _parse_chunk_inner_fraction(stripped)
+            if parsed_fraction is not None:
+                current_chunk_inner_fraction = max(
+                    float(current_chunk_inner_fraction),
+                    max(0.0, min(1.0, float(parsed_fraction))),
+                )
+                _emit_overall_progress(
+                    f"Processing chunk {idx}/{len(chunk_paths)}",
+                    force=False,
+                )
+            # Replace chunk-local FRAME_PROGRESS with overall progress to keep UI/CMD consistent.
+            if stripped.startswith("FRAME_PROGRESS "):
+                return
+            try:
+                if text.endswith("\n"):
+                    on_progress(text)
+                else:
+                    on_progress(text + "\n")
+            except Exception:
+                pass
         
         # Use provided processing function or select based on model type
         if process_func:
             if custom_process_accepts_kw_on_progress:
-                res = process_func(chunk_settings, on_progress=on_progress)
+                res = process_func(chunk_settings, on_progress=_chunk_progress_proxy)
             elif custom_process_accepts_pos_on_progress:
-                res = process_func(chunk_settings, on_progress)
+                res = process_func(chunk_settings, _chunk_progress_proxy)
             else:
                 res = process_func(chunk_settings)
         elif model_type == "seedvr2":
-            res = runner.run_seedvr2(chunk_settings, on_progress=None, preview_only=False)
+            res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
         elif model_type == "gan":
             # Forward GAN progress so frame-level runtime status can be shown in the UI.
-            res = runner.run_gan(chunk_settings, on_progress=on_progress)
+            res = runner.run_gan(chunk_settings, on_progress=_chunk_progress_proxy)
         elif model_type == "rife":
-            res = runner.run_rife(chunk_settings, on_progress=None)
+            res = runner.run_rife(chunk_settings, on_progress=_chunk_progress_proxy)
         elif model_type == "flashvsr":
             if hasattr(runner, "run_flashvsr"):
-                res = runner.run_flashvsr(chunk_settings, on_progress=None)
+                res = runner.run_flashvsr(chunk_settings, on_progress=_chunk_progress_proxy)
             else:
                 raise AttributeError("chunk_and_process: model_type='flashvsr' requires runner.run_flashvsr() or a custom process_func")
         else:
             # Fallback to seedvr2 for backward compatibility
-            res = runner.run_seedvr2(chunk_settings, on_progress=None, preview_only=False)
+            res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
 
         if res.returncode != 0 or getattr(runner, "is_canceled", lambda: False)():
             on_progress(f"Chunk {idx} failed with code {res.returncode}\n")
@@ -3162,6 +3402,10 @@ def chunk_and_process(
                 returncode=partial_returncode,
                 canceled=is_canceled_now,
                 reason="canceled" if is_canceled_now else "stopped early",
+            )
+            _emit_overall_progress(
+                f"{'Canceled' if is_canceled_now else 'Failed'} at chunk {idx}/{len(chunk_paths)}",
+                force=True,
             )
             if partial:
                 return partial
@@ -3270,6 +3514,14 @@ def chunk_and_process(
             output_format=str(output_format),
             phase="completed",
         )
+        current_chunk_inner_fraction = 1.0
+        _emit_overall_progress(f"Completed chunk {idx}/{len(chunk_paths)}", force=True)
+        if idx - 1 < len(chunk_work_units):
+            completed_chunk_units = min(
+                float(total_chunk_units),
+                float(completed_chunk_units) + float(chunk_work_units[idx - 1]),
+            )
+        current_chunk_inner_fraction = 0.0
         chunk_logs.append(
             {
                 "chunk_index": idx,
@@ -3331,6 +3583,8 @@ def chunk_and_process(
             )
         except Exception:
             pass
+        merge_stage_progress = 1.0
+        _emit_overall_progress("Chunk processing complete", force=True)
         return 0, log_blob, str(target_dir), len(chunk_paths)
 
     if explicit_final_path is not None:
@@ -3348,10 +3602,14 @@ def chunk_and_process(
         )
         final_path = collision_safe_path(Path(final_path))
     
+    merge_stage_progress = 0.05
+    _emit_overall_progress("Preparing chunk merge", force=True)
     merge_chunks = _resolve_merge_chunks(expected_count=len(chunk_paths))
     if not merge_chunks:
+        _emit_overall_progress("Merge failed: no mergeable chunks", force=True)
         return 1, "Concat failed: no mergeable chunk outputs were found", str(final_path), len(chunk_paths)
     if len(merge_chunks) < len(chunk_paths):
+        _emit_overall_progress("Merge failed: missing chunk outputs", force=True)
         return (
             1,
             f"Concat failed: discovered {len(merge_chunks)}/{len(chunk_paths)} chunk outputs; refusing best-effort merge.",
@@ -3379,6 +3637,8 @@ def chunk_and_process(
     # Use blending concat if overlap specified.
     merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
     overlap_frames_for_blend = int(chunk_overlap * merge_fps_hint) if chunk_overlap > 0 else 0
+    merge_stage_progress = 0.30
+    _emit_overall_progress("Merging processed chunks", force=True)
     ok = concat_videos_with_blending(
         merge_chunks,
         final_path,
@@ -3389,7 +3649,10 @@ def chunk_and_process(
     )
     
     if not ok:
+        _emit_overall_progress("Merge failed", force=True)
         return 1, "Concat failed", str(final_path), len(chunk_paths)
+    merge_stage_progress = 0.70
+    _emit_overall_progress("Chunk merge complete, applying audio", force=True)
     on_progress(f"Chunks concatenated with blending to {final_path}\n")
     final_codec_ok, _final_probe_path = _ensure_expected_chunk_codec(
         0,
@@ -3429,12 +3692,15 @@ def chunk_and_process(
         Path(final_path),
     )
     if not final_codec_ok:
+        _emit_overall_progress("Final output validation failed", force=True)
         return (
             1,
             "Final output codec drift detected after audio mux.",
             str(final_path),
             len(chunk_paths),
         )
+    merge_stage_progress = 1.0
+    _emit_overall_progress("Chunked processing complete", force=True)
     if per_chunk_cleanup:
         _cleanup_chunk_dirs(preserve_thumbs=True)
     # Write chunk metadata

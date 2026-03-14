@@ -493,6 +493,10 @@ def run_flashvsr(
             parts.append(f"Processing: {iter_idx}/{iter_total} ({iter_pct:.1f}%)")
             if speed_s is not None and float(speed_s) > 0:
                 parts.append(f"{float(speed_s):.2f}s/iter")
+                remaining_iters = max(0, int(iter_total) - int(iter_idx))
+                eta_s = max(0.0, float(remaining_iters) * float(speed_s))
+                finish_local = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_s))
+                parts.append(f"ETA {int(eta_s)}s (finish ~{finish_local})")
             return " | ".join(parts), True
 
         return raw, False

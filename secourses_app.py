@@ -62,13 +62,14 @@ from ui.face_tab import face_tab
 from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
+from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V3.5 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V4.0 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -1035,7 +1036,7 @@ def main(argv=None):
     }
     /* Main navigation tabs (Gradio Tabs.svelte): always visible in two rows */
     #secourses-main-tabs {
-      --main-tab-col-count: 5;
+      --main-tab-col-count: 6;
       --main-tab-gap: 6px;
       --main-tab-min-height: 46px;
       --main-tab-row-slack: 16px;
@@ -1089,7 +1090,7 @@ def main(argv=None):
       min-height: var(--main-tab-min-height);
       height: auto;
       margin: 0;
-      padding: 6px 8px;
+      padding: 6px 4px;
       line-height: 1.24;
       white-space: normal;
       text-align: center;
@@ -1151,6 +1152,7 @@ def main(argv=None):
 
     @media (max-width: 768px) {
       #secourses-main-tabs {
+        --main-tab-col-count: 4;
         --main-tab-gap: 5px;
         --main-tab-min-height: 42px;
         --main-tab-row-slack: 12px;
@@ -1160,7 +1162,7 @@ def main(argv=None):
       }
       #secourses-main-tabs .tab-container button,
       #secourses-main-tabs .overflow-menu .overflow-dropdown button {
-        padding: 5px 6px;
+        padding: 5px 4px;
         font-size: 12px;
       }
       .action-btn button,
@@ -1499,6 +1501,7 @@ def main(argv=None):
                 "gan_settings": startup_preset.get("gan", {}),
                 "rife_settings": startup_preset.get("rife", {}),
                 "flashvsr_settings": startup_preset.get("flashvsr", {}),
+                "rtx_settings": startup_preset.get("rtx", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
                 "output_settings": startup_preset.get("output", {}),
@@ -1855,6 +1858,7 @@ def main(argv=None):
         tab_sync_rife = gr.State(value="")
         tab_sync_gan = gr.State(value="")
         tab_sync_flashvsr = gr.State(value="")
+        tab_sync_rtx = gr.State(value="")
         tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
 
@@ -1920,6 +1924,26 @@ def main(argv=None):
                 fn=_make_tab_sync("flashvsr"),
                 inputs=[shared_state, tab_sync_flashvsr],
                 outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🚀 RTX Super Resolution", render_children=True) as tab_rtx:
+                rtx_ui = rtx_super_resolution_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir,
+                )
+            tab_rtx.select(
+                fn=_make_tab_sync("rtx"),
+                inputs=[shared_state, tab_sync_rtx],
+                outputs=rtx_ui["inputs_list"] + [rtx_ui["preset_dropdown"], rtx_ui["preset_status"], tab_sync_rtx],
                 queue=False,
                 show_progress="hidden",
                 trigger_mode="always_last",

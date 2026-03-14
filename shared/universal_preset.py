@@ -26,6 +26,10 @@ from shared.services.flashvsr_service import (
     flashvsr_defaults,
     canonical_flashvsr_scale,
 )
+from shared.services.rtx_super_resolution_service import (
+    RTX_ORDER,
+    rtx_super_resolution_defaults,
+)
 from shared.services.face_service import FACE_ORDER, face_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
@@ -106,6 +110,11 @@ TAB_CONFIGS = {
     "flashvsr": {
         "order": FLASHVSR_ORDER,
         "defaults_fn": flashvsr_defaults,
+        "needs_model_arg": False,
+    },
+    "rtx": {
+        "order": RTX_ORDER,
+        "defaults_fn": rtx_super_resolution_defaults,
         "needs_model_arg": False,
     },
     "face": {
@@ -408,6 +417,9 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
     
     # FlashVSR
     defaults["flashvsr"] = flashvsr_defaults()
+
+    # RTX Super Resolution
+    defaults["rtx"] = rtx_super_resolution_defaults()
     
     # Face
     defaults["face"] = face_defaults(models_list)
@@ -472,6 +484,7 @@ def create_universal_preset(
     gan_values: List[Any] = None,
     rife_values: List[Any] = None,
     flashvsr_values: List[Any] = None,
+    rtx_values: List[Any] = None,
     face_values: List[Any] = None,
     resolution_values: List[Any] = None,
     output_values: List[Any] = None,
@@ -522,6 +535,11 @@ def create_universal_preset(
         preset["flashvsr"] = values_to_dict("flashvsr", flashvsr_values)
     else:
         preset["flashvsr"] = defaults["flashvsr"]
+
+    if rtx_values is not None:
+        preset["rtx"] = values_to_dict("rtx", rtx_values)
+    else:
+        preset["rtx"] = defaults["rtx"]
     
     if face_values is not None:
         preset["face"] = values_to_dict("face", face_values)
@@ -632,6 +650,7 @@ def update_shared_state_from_preset(
     seed_controls["gan_settings"] = preset.get("gan", {})
     seed_controls["rife_settings"] = preset.get("rife", {})
     seed_controls["flashvsr_settings"] = preset.get("flashvsr", {})
+    seed_controls["rtx_settings"] = preset.get("rtx", {})
     seed_controls["face_settings"] = preset.get("face", {})
     seed_controls["resolution_settings"] = preset.get("resolution", {})
     seed_controls["output_settings"] = preset.get("output", {})
@@ -730,6 +749,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "gan": seed_controls.get("gan_settings", {}),
         "rife": seed_controls.get("rife_settings", {}),
         "flashvsr": seed_controls.get("flashvsr_settings", {}),
+        "rtx": seed_controls.get("rtx_settings", {}),
         "face": seed_controls.get("face_settings", {}),
         "resolution": seed_controls.get("resolution_settings", {}),
         "output": seed_controls.get("output_settings", {}),

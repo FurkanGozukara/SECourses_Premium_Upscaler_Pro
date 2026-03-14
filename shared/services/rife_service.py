@@ -1206,27 +1206,128 @@ def build_rife_callbacks(
                 settings["per_chunk_cleanup"] = per_chunk_cleanup
                 settings["frame_accurate_split"] = frame_accurate_split
                 
-                def chunk_progress_cb(progress_val, desc=""):
-                    yield (f" Chunking: {desc}", f"Processing chunks... {desc}", gr.update(value=desc, visible=True), None, gr.update(value=None), gr.update(value="", visible=False), state)
-                
-                # Run chunked RIFE processing
-                rc, clog, final_output, chunk_count = chunk_and_process(
-                    runner=runner,
-                    settings=settings,
-                    scene_threshold=scene_threshold,
-                    min_scene_len=min_scene_len,
-                    work_dir=Path(settings.get("_run_dir") or output_dir),
-                    on_progress=lambda msg: None,
-                    chunk_seconds=0.0 if auto_chunk else chunk_size_sec,
-                    chunk_overlap=0.0 if auto_chunk else chunk_overlap_sec,
-                    per_chunk_cleanup=per_chunk_cleanup,
-                    allow_partial=True,
-                    global_output_dir=str(Path(settings.get("_run_dir") or output_dir)),
-                    resume_from_partial=resume_requested,
-                    progress_tracker=chunk_progress_cb,
-                    process_func=None,
-                    model_type="rife",  # Route to runner.run_rife
+                progress_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+                chunk_result: Dict[str, Any] = {}
+
+                def _chunk_progress_cb(_progress_val, desc=""):
+                    if desc:
+                        progress_queue.put(("progress", str(desc)))
+
+                def _chunk_on_progress(msg):
+                    line = str(msg or "").strip()
+                    if not line:
+                        return
+                    progress_queue.put(("progress", line))
+
+                def _chunk_worker():
+                    try:
+                        rc_local, clog_local, final_output_local, chunk_count_local = chunk_and_process(
+                            runner=runner,
+                            settings=settings,
+                            scene_threshold=scene_threshold,
+                            min_scene_len=min_scene_len,
+                            work_dir=Path(settings.get("_run_dir") or output_dir),
+                            on_progress=_chunk_on_progress,
+                            chunk_seconds=0.0 if auto_chunk else chunk_size_sec,
+                            chunk_overlap=0.0 if auto_chunk else chunk_overlap_sec,
+                            per_chunk_cleanup=per_chunk_cleanup,
+                            allow_partial=True,
+                            global_output_dir=str(Path(settings.get("_run_dir") or output_dir)),
+                            resume_from_partial=resume_requested,
+                            progress_tracker=_chunk_progress_cb,
+                            process_func=None,
+                            model_type="rife",  # Route to runner.run_rife
+                        )
+                        chunk_result["payload"] = (
+                            rc_local,
+                            clog_local,
+                            final_output_local,
+                            chunk_count_local,
+                        )
+                    except Exception as worker_exc:
+                        chunk_result["error"] = str(worker_exc)
+
+                worker = threading.Thread(target=_chunk_worker, daemon=True)
+                worker.start()
+
+                live_logs: List[str] = []
+                live_detail = init_desc
+                last_update = time.time()
+                frame_marker = "FRAME_PROGRESS "
+                while worker.is_alive() or not progress_queue.empty():
+                    try:
+                        update_type, data = progress_queue.get(timeout=0.15)
+                        if update_type != "progress":
+                            continue
+                        line = str(data or "").strip()
+                        if not line:
+                            continue
+                        if line.startswith(frame_marker):
+                            detail = line[len(frame_marker):].strip()
+                            live_detail = detail or live_detail
+                            compact = f"{frame_marker}{detail}"
+                            if live_logs and str(live_logs[-1]).startswith(frame_marker):
+                                live_logs[-1] = compact
+                            else:
+                                live_logs.append(compact)
+                        else:
+                            live_logs.append(line)
+                            live_detail = line
+                    except queue.Empty:
+                        pass
+
+                    now_ts = time.time()
+                    if now_ts - last_update >= 0.5:
+                        last_update = now_ts
+                        yield (
+                            " RUNNING: RIFE chunked processing...",
+                            "\n".join(live_logs[-400:]),
+                            gr.update(value=live_detail or "Processing chunks...", visible=True),
+                            None,
+                            gr.update(value=None),
+                            gr.update(value="", visible=False),
+                            state,
+                        )
+                    time.sleep(0.05)
+
+                worker.join()
+                if chunk_result.get("error"):
+                    err = str(chunk_result.get("error") or "Chunked processing failed")
+                    if maybe_set_vram_oom_alert(state, model_label="RIFE", text=err, settings=settings):
+                        state["operation_status"] = "error"
+                        show_vram_oom_modal(state, title="Out of VRAM (GPU)  RIFE", duration=None)
+                        yield (
+                            " Out of VRAM (GPU)  see banner above",
+                            err,
+                            gr.update(value="", visible=False),
+                            None,
+                            gr.update(value=None),
+                            gr.update(value="", visible=False),
+                            state,
+                        )
+                    else:
+                        yield (
+                            " RIFE chunking failed",
+                            err,
+                            gr.update(value="", visible=False),
+                            None,
+                            gr.update(value=None),
+                            gr.update(value="", visible=False),
+                            state,
+                        )
+                    return
+
+                rc, clog, final_output, chunk_count = chunk_result.get(
+                    "payload",
+                    (1, "", None, 0),
                 )
+                merged_chunk_logs = "\n".join(live_logs[-400:]).strip()
+                if clog:
+                    merged_chunk_logs = (
+                        f"{merged_chunk_logs}\n{clog}".strip()
+                        if merged_chunk_logs
+                        else str(clog)
+                    )
                 
                 status = " RIFE chunked processing complete" if rc == 0 else f" RIFE chunking failed (code {rc})"
                 if rc != 0 and maybe_set_vram_oom_alert(state, model_label="RIFE", text=clog, settings=settings):
@@ -1253,7 +1354,7 @@ def build_rife_callbacks(
                 
                 meta_md = f"Chunking ({'Auto scenes' if auto_chunk else 'Static'}): {chunk_count} chunks processed\nOutput: {final_output}"
                 
-                yield (status, clog, gr.update(value="", visible=False), final_output if final_output and Path(final_output).suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv') else None, image_slider_update, video_comp_html_update, state)
+                yield (status, merged_chunk_logs, gr.update(value="", visible=False), final_output if final_output and Path(final_output).suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv') else None, image_slider_update, video_comp_html_update, state)
                 return
 
             # Check for batch processing

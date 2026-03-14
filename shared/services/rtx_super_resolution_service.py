@@ -127,6 +127,7 @@ def rtx_super_resolution_defaults() -> Dict[str, Any]:
         "max_resolution": 3840,
         "pre_downscale_then_upscale": True,
         "non_blocking_inference": True,
+        "disable_auto_scene_detection_split": True,
         "cuda_stream_ptr": 0,
         "output_format": "auto",
         "face_restore_after_upscale": False,
@@ -149,6 +150,7 @@ RTX_ORDER: List[str] = [
     "max_resolution",
     "pre_downscale_then_upscale",
     "non_blocking_inference",
+    "disable_auto_scene_detection_split",
     "cuda_stream_ptr",
     "output_format",
     "face_restore_after_upscale",
@@ -321,6 +323,7 @@ def build_rtx_super_resolution_callbacks(
         s["max_resolution"] = max(0, _to_int(s.get("max_resolution"), 0))
         s["pre_downscale_then_upscale"] = _to_bool(s.get("pre_downscale_then_upscale"), True)
         s["non_blocking_inference"] = _to_bool(s.get("non_blocking_inference"), True)
+        s["disable_auto_scene_detection_split"] = _to_bool(s.get("disable_auto_scene_detection_split"), True)
         s["cuda_stream_ptr"] = _to_int(s.get("cuda_stream_ptr"), 0)
 
         s["image_output_format"] = str(
@@ -489,13 +492,22 @@ def build_rtx_super_resolution_callbacks(
             )
             face_strength = float(global_settings_local.get("face_strength", 0.5))
 
+            disable_scene_split = bool(runtime_settings.get("disable_auto_scene_detection_split", True))
             auto_chunk = bool(seed_controls_local.get("auto_chunk", True))
             chunk_size_sec = float(seed_controls_local.get("chunk_size_sec", 0) or 0)
+            if disable_scene_split:
+                auto_chunk = False
+                chunk_size_sec = 0.0
             chunk_overlap_sec = 0.0 if auto_chunk else float(seed_controls_local.get("chunk_overlap_sec", 0) or 0)
             scene_threshold = float(seed_controls_local.get("scene_threshold", 27.0))
             min_scene_len = float(seed_controls_local.get("min_scene_len", 1.0))
             frame_accurate_split = bool(seed_controls_local.get("frame_accurate_split", True))
             per_chunk_cleanup = bool(seed_controls_local.get("per_chunk_cleanup", False))
+
+            if disable_scene_split:
+                _emit_progress_line(
+                    "[RTX] Override is active: Resolution tab scene detection/split is disabled for this run."
+                )
 
             native_chunk_frames = max(0, _to_int(runtime_settings.get("streaming_chunk_size_frames"), 0))
             input_kind = detect_input_type(input_path_local)
@@ -1314,6 +1326,7 @@ def build_rtx_super_resolution_callbacks(
         max_resolution,
         pre_downscale_then_upscale,
         non_blocking_inference,
+        disable_auto_scene_detection_split,
         cuda_stream_ptr,
         state,
     ):
@@ -1332,6 +1345,7 @@ def build_rtx_super_resolution_callbacks(
             rtx_settings["max_resolution"] = int(_to_int(max_resolution, 3840))
             rtx_settings["pre_downscale_then_upscale"] = bool(_to_bool(pre_downscale_then_upscale, True))
             rtx_settings["non_blocking_inference"] = bool(_to_bool(non_blocking_inference, True))
+            rtx_settings["disable_auto_scene_detection_split"] = bool(_to_bool(disable_auto_scene_detection_split, True))
             rtx_settings["cuda_stream_ptr"] = int(_to_int(cuda_stream_ptr, 0))
             seed_controls["rtx_settings"] = rtx_settings
             seed_controls["preset_dirty"] = True
@@ -1398,6 +1412,7 @@ def build_rtx_super_resolution_callbacks(
                 "max_resolution": _to_int(max_resolution, 0),
                 "pre_downscale_then_upscale": _to_bool(pre_downscale_then_upscale, True),
                 "non_blocking_inference": _to_bool(non_blocking_inference, True),
+                "disable_auto_scene_detection_split": _to_bool(disable_auto_scene_detection_split, True),
                 "cuda_stream_ptr": _to_int(cuda_stream_ptr, 0),
                 "output_format": "png",
                 "global_output_dir": str(Path(global_settings.get("temp_dir", temp_dir)) / "rtx_autotune"),

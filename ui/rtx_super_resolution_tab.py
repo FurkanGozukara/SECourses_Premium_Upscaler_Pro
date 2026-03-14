@@ -41,6 +41,35 @@ def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> Optional[floa
     return val
 
 
+def _rtx_scene_override_enabled(
+    state: Dict[str, Any] | None,
+    override_flag: Optional[bool] = None,
+) -> bool:
+    if override_flag is not None:
+        return bool(override_flag)
+    if not isinstance(state, dict):
+        return True
+    seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+    rtx_settings = seed_controls.get("rtx_settings", {}) if isinstance(seed_controls, dict) else {}
+    if isinstance(rtx_settings, dict):
+        if "disable_auto_scene_detection_split" in rtx_settings:
+            return bool(rtx_settings.get("disable_auto_scene_detection_split", True))
+    return True
+
+
+def _effective_rtx_scene_flags(
+    state: Dict[str, Any] | None,
+    override_flag: Optional[bool] = None,
+) -> tuple[bool, bool, bool]:
+    seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+    auto_chunk = bool(seed_controls.get("auto_chunk", True))
+    auto_detect_scenes = bool(seed_controls.get("auto_detect_scenes", True))
+    override_enabled = _rtx_scene_override_enabled(state, override_flag=override_flag)
+    if override_enabled:
+        return False, False, True
+    return auto_chunk, auto_detect_scenes, False
+
+
 def _build_dimensions_info(path_val: str, use_global: bool, local_scale_x: float, max_edge: int, pre_downscale: bool, quality_preset: str, state: Dict[str, Any] | None) -> str:
     normalized = normalize_path(path_val) if path_val else ""
     if not normalized:
@@ -315,6 +344,7 @@ def _build_rtx_sizing_report(
     max_edge: int,
     pre_downscale: bool,
     quality_preset: str,
+    disable_auto_scene_detection_split: bool,
     state: Dict[str, Any] | None,
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> tuple[gr.update, Dict[str, Any]]:
@@ -573,11 +603,13 @@ def _build_rtx_sizing_report(
             pass
 
         _emit_progress(62, "Preparing chunk analysis...")
-        auto_chunk = bool(seed_controls.get("auto_chunk", True))
+        auto_chunk, auto_detect_scenes, override_scene_split = _effective_rtx_scene_flags(
+            state_obj,
+            override_flag=disable_auto_scene_detection_split,
+        )
         if auto_chunk:
             scene_threshold = float(seed_controls.get("scene_threshold", 27.0) or 27.0)
             min_scene_len = float(seed_controls.get("min_scene_len", 1.0) or 1.0)
-            auto_detect_scenes = bool(seed_controls.get("auto_detect_scenes", True))
             scan = seed_controls.get("rtx_last_scene_scan") or {}
             scan_path = normalize_path(scan.get("input_path")) if scan.get("input_path") else None
             cached_valid = (
@@ -664,21 +696,28 @@ def _build_rtx_sizing_report(
             else:
                 chunk_rows.append(_stat_row("Auto Chunk Status", "Scene scan failed."))
         else:
-            _emit_progress(74, "Static chunking mode selected.")
+            if override_scene_split:
+                _emit_progress(74, "RTX override disables global scene detection/splitting.")
+                chunk_rows.append(_stat_row("Chunk Mode", "Disabled by RTX override"))
+                chunk_rows.append(_stat_row("Auto Chunk Status", "Resolution tab scene detection/split is ignored for RTX."))
+                chunk_rows.append(_stat_row("Chunking", "Global auto/static chunking disabled for RTX runs."))
+            else:
+                _emit_progress(74, "Static chunking mode selected.")
             chunk_size = float(seed_controls.get("chunk_size_sec", 0) or 0)
             chunk_overlap = float(seed_controls.get("chunk_overlap_sec", 0) or 0)
-            chunk_rows.append(_stat_row("Chunk Mode", "Static"))
-            if chunk_size <= 0:
-                chunk_rows.append(_stat_row("Chunking", "Disabled (chunk size = 0)"))
-            elif chunk_overlap >= chunk_size:
-                chunk_rows.append(_stat_row("Chunking", "Invalid settings: overlap must be smaller than chunk size."))
-            else:
-                if duration_sec and duration_sec > 0:
-                    est_chunks = math.ceil(float(duration_sec) / max(0.001, chunk_size - chunk_overlap))
-                    chunk_rows.append(_stat_row("Estimated Chunks", f"~{_format_int(est_chunks)}"))
-                    chunk_rows.append(_stat_row("Window", f"{chunk_size:g}s with {chunk_overlap:g}s overlap"))
-                if fps_val and fps_val > 0:
-                    chunk_rows.append(_stat_row("Approx Frames / Chunk", _format_int(int(round(float(chunk_size) * float(fps_val))))))
+            if not override_scene_split:
+                chunk_rows.append(_stat_row("Chunk Mode", "Static"))
+                if chunk_size <= 0:
+                    chunk_rows.append(_stat_row("Chunking", "Disabled (chunk size = 0)"))
+                elif chunk_overlap >= chunk_size:
+                    chunk_rows.append(_stat_row("Chunking", "Invalid settings: overlap must be smaller than chunk size."))
+                else:
+                    if duration_sec and duration_sec > 0:
+                        est_chunks = math.ceil(float(duration_sec) / max(0.001, chunk_size - chunk_overlap))
+                        chunk_rows.append(_stat_row("Estimated Chunks", f"~{_format_int(est_chunks)}"))
+                        chunk_rows.append(_stat_row("Window", f"{chunk_size:g}s with {chunk_overlap:g}s overlap"))
+                    if fps_val and fps_val > 0:
+                        chunk_rows.append(_stat_row("Approx Frames / Chunk", _format_int(int(round(float(chunk_size) * float(fps_val))))))
     else:
         _emit_progress(74, "Input is not a video; scene detection skipped.")
         chunk_rows.append(_stat_row("Chunk Stats", "Chunk frame stats are available for video inputs."))
@@ -713,16 +752,25 @@ def _build_rtx_sizing_report(
     return gr.update(value=html_block, visible=True), state_obj
 
 
-def _processing_banner_html(state, progress_pct: Optional[int] = None, progress_note: str = "") -> str:
-    seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-    auto_chunk = bool(seed_controls.get("auto_chunk", True))
-    auto_detect_scenes = bool(seed_controls.get("auto_detect_scenes", True))
+def _processing_banner_html(
+    state,
+    progress_pct: Optional[int] = None,
+    progress_note: str = "",
+    override_scene_split: Optional[bool] = None,
+) -> str:
+    auto_chunk, auto_detect_scenes, override_active = _effective_rtx_scene_flags(
+        state if isinstance(state, dict) else {},
+        override_flag=override_scene_split,
+    )
     if auto_chunk and auto_detect_scenes:
         title = "Analyzing input (resolution + scene detection)"
         sub = (
             "PySceneDetect scans the video to find scene cuts; on long videos this can take a while. "
             "Disable <strong>Auto Detect Scenes</strong> in the Resolution tab to speed this up."
         )
+    elif override_active:
+        title = "Analyzing input (RTX override active)"
+        sub = "Resolution tab scene detection and split are disabled for RTX."
     else:
         title = "Analyzing input"
         sub = "Reading media metadata and calculating target sizing."
@@ -949,6 +997,12 @@ def rtx_super_resolution_tab(
                         value=bool(_value("non_blocking_inference", True)),
                         scale=2,
                     )
+                    disable_auto_scene_detection_split = gr.Checkbox(
+                        label="Disable Auto Scene Detection/Split (RTX Override)",
+                        value=bool(_value("disable_auto_scene_detection_split", True)),
+                        info="When enabled, RTX ignores Resolution tab scene detection/chunk split settings for this run.",
+                        scale=2,
+                    )
                     cuda_stream_ptr = gr.Number(
                         label="CUDA Stream Pointer (0 = default)",
                         value=int(_value("cuda_stream_ptr", 0) or 0),
@@ -1000,7 +1054,7 @@ def rtx_super_resolution_tab(
     inputs_list = [
         input_path, output_override, batch_enable, batch_input, batch_output,
         quality_preset, use_resolution_tab, upscale_factor, max_resolution,
-        pre_downscale_then_upscale, non_blocking_inference, cuda_stream_ptr,
+        pre_downscale_then_upscale, non_blocking_inference, disable_auto_scene_detection_split, cuda_stream_ptr,
         output_format, face_restore_after_upscale, resume_run_dir,
         auto_transfer_output_to_input, streaming_chunk_size_frames, resume_partial_chunks,
     ]
@@ -1025,7 +1079,7 @@ def rtx_super_resolution_tab(
         except Exception as e:
             return gr.update(value=f"ERROR: **Detection Error**\n\n{str(e)}", visible=True)
 
-    def _build_sizing_update(path_val, use_global, scale_x, max_edge, pre_down, quality, state):
+    def _build_sizing_update(path_val, use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state):
         upd, _ = _build_rtx_sizing_report(
             str(path_val or ""),
             bool(use_global),
@@ -1033,18 +1087,22 @@ def rtx_super_resolution_tab(
             int(max_edge or 0),
             bool(pre_down),
             str(quality or "HIGHBITRATE_ULTRA"),
+            bool(disable_scene_split),
             state if isinstance(state, dict) else None,
             on_progress=None,
         )
         return upd
 
-    def _iter_sizing_progress(path_val, use_global, scale_x, max_edge, pre_down, quality, state):
+    def _iter_sizing_progress(path_val, use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state):
         result_box: Dict[str, Any] = {}
         error_box: Dict[str, Exception] = {}
         progress_box: "queue.Queue[tuple[int, str]]" = queue.Queue()
         state_obj = state if isinstance(state, dict) else {}
-        seed_controls_local = state_obj.get("seed_controls", {}) if isinstance(state_obj, dict) else {}
-        scene_mode = bool(seed_controls_local.get("auto_chunk", True)) and bool(seed_controls_local.get("auto_detect_scenes", True))
+        auto_chunk_local, auto_detect_local, _override_active = _effective_rtx_scene_flags(
+            state_obj,
+            override_flag=bool(disable_scene_split),
+        )
+        scene_mode = bool(auto_chunk_local) and bool(auto_detect_local)
         cap_pct = 96 if scene_mode else 92
         speed = 5.0 if scene_mode else 12.0
         poll_sec = 0.12
@@ -1066,6 +1124,7 @@ def rtx_super_resolution_tab(
                     int(max_edge or 0),
                     bool(pre_down),
                     str(quality or "HIGHBITRATE_ULTRA"),
+                    bool(disable_scene_split),
                     state_obj,
                     on_progress=_push_progress,
                 )
@@ -1090,7 +1149,15 @@ def rtx_super_resolution_tab(
                     last_note = note or _analysis_progress_note(scene_mode, last_pct)
                     yield (
                         "progress",
-                        gr.update(value=_processing_banner_html(state_obj, last_pct, last_note), visible=True),
+                        gr.update(
+                            value=_processing_banner_html(
+                                state_obj,
+                                last_pct,
+                                last_note,
+                                override_scene_split=bool(disable_scene_split),
+                            ),
+                            visible=True,
+                        ),
                         state_obj,
                     )
             elapsed = max(0.0, time.monotonic() - started)
@@ -1101,7 +1168,15 @@ def rtx_super_resolution_tab(
                 last_note = _analysis_progress_note(scene_mode, fallback_pct)
                 yield (
                     "progress",
-                    gr.update(value=_processing_banner_html(state_obj, fallback_pct, last_note), visible=True),
+                    gr.update(
+                        value=_processing_banner_html(
+                            state_obj,
+                            fallback_pct,
+                            last_note,
+                            override_scene_split=bool(disable_scene_split),
+                        ),
+                        visible=True,
+                    ),
                     state_obj,
                 )
             time.sleep(poll_sec)
@@ -1114,7 +1189,7 @@ def rtx_super_resolution_tab(
         final_upd, final_state = result_box.get("value", (gr.update(value="", visible=False), state_obj))
         yield ("done", final_upd, final_state)
 
-    def cache_input(val, use_global, scale_x, max_edge, pre_down, quality, state):
+    def cache_input(val, use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state):
         state = state if isinstance(state, dict) else {}
         state.setdefault("seed_controls", {})
         state["seed_controls"]["last_input_path"] = val if val else ""
@@ -1127,6 +1202,7 @@ def rtx_super_resolution_tab(
             max_edge,
             pre_down,
             quality,
+            disable_scene_split,
             state,
         ):
             if event_type == "progress":
@@ -1152,7 +1228,16 @@ def rtx_super_resolution_tab(
 
     input_file.upload(
         fn=cache_input,
-        inputs=[input_file, use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, quality_preset, shared_state],
+        inputs=[
+            input_file,
+            use_resolution_tab,
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            quality_preset,
+            disable_auto_scene_detection_split,
+            shared_state,
+        ],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
@@ -1171,7 +1256,7 @@ def rtx_super_resolution_tab(
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
-    def update_from_path(val, use_global, scale_x, max_edge, pre_down, quality, state):
+    def update_from_path(val, use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state):
         state = state if isinstance(state, dict) else {}
         state.setdefault("seed_controls", {})
         state["seed_controls"]["last_input_path"] = val if val else ""
@@ -1184,6 +1269,7 @@ def rtx_super_resolution_tab(
             max_edge,
             pre_down,
             quality,
+            disable_scene_split,
             state,
         ):
             if event_type == "progress":
@@ -1207,17 +1293,35 @@ def rtx_super_resolution_tab(
 
     input_path.submit(
         fn=update_from_path,
-        inputs=[input_path, use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, quality_preset, shared_state],
+        inputs=[
+            input_path,
+            use_resolution_tab,
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            quality_preset,
+            disable_auto_scene_detection_split,
+            shared_state,
+        ],
         outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
-    def refresh_sizing(scale_x, max_edge, pre_down, use_global, quality, path_val, state):
-        return _build_sizing_update(path_val or "", use_global, scale_x, max_edge, pre_down, quality, state)
+    def refresh_sizing(scale_x, max_edge, pre_down, use_global, quality, disable_scene_split, path_val, state):
+        return _build_sizing_update(path_val or "", use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state)
 
-    for comp in [pre_downscale_then_upscale, use_resolution_tab, quality_preset, output_format]:
+    for comp in [pre_downscale_then_upscale, use_resolution_tab, quality_preset, output_format, disable_auto_scene_detection_split]:
         comp.change(
             fn=refresh_sizing,
-            inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, quality_preset, input_path, shared_state],
+            inputs=[
+                upscale_factor,
+                max_resolution,
+                pre_downscale_then_upscale,
+                use_resolution_tab,
+                quality_preset,
+                disable_auto_scene_detection_split,
+                input_path,
+                shared_state,
+            ],
             outputs=[sizing_info],
             trigger_mode="always_last",
         )
@@ -1231,7 +1335,16 @@ def rtx_super_resolution_tab(
 
     upscale_factor.release(
         fn=refresh_sizing,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, quality_preset, input_path, shared_state],
+        inputs=[
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            use_resolution_tab,
+            quality_preset,
+            disable_auto_scene_detection_split,
+            input_path,
+            shared_state,
+        ],
         outputs=[sizing_info],
         preprocess=False,
         trigger_mode="always_last",
@@ -1239,7 +1352,16 @@ def rtx_super_resolution_tab(
 
     max_resolution.change(
         fn=refresh_sizing,
-        inputs=[upscale_factor, max_resolution, pre_downscale_then_upscale, use_resolution_tab, quality_preset, input_path, shared_state],
+        inputs=[
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            use_resolution_tab,
+            quality_preset,
+            disable_auto_scene_detection_split,
+            input_path,
+            shared_state,
+        ],
         outputs=[sizing_info],
         trigger_mode="always_last",
     )
@@ -1324,7 +1446,17 @@ def rtx_super_resolution_tab(
         except Exception:
             return ""
 
-    def _apply_output_to_input(output_path_val, use_global, scale_x, max_edge, pre_down, quality, state, message: str):
+    def _apply_output_to_input(
+        output_path_val,
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        quality,
+        disable_scene_split,
+        state,
+        message: str,
+    ):
         state = state if isinstance(state, dict) else {}
         state.setdefault("seed_controls", {})
         state["seed_controls"]["last_input_path"] = output_path_val if output_path_val else ""
@@ -1336,21 +1468,40 @@ def rtx_super_resolution_tab(
             int(max_edge or 0),
             bool(pre_down),
             str(quality or "HIGHBITRATE_ULTRA"),
+            bool(disable_scene_split),
             state,
             on_progress=None,
         )
         img_prev, vid_prev = preview_updates(output_path_val)
         return output_path_val or "", gr.update(value=message, visible=True), img_prev, vid_prev, det, info, state
 
-    def copy_latest_output_to_input(use_global, scale_x, max_edge, pre_down, quality, state):
+    def copy_latest_output_to_input(use_global, scale_x, max_edge, pre_down, quality, disable_scene_split, state):
         outp = _resolve_latest_output(state)
         if not outp:
             return gr.skip(), gr.update(value="No generated RTX output found to transfer.", visible=True), gr.skip(), gr.skip(), gr.skip(), gr.skip(), state
-        return _apply_output_to_input(outp, use_global, scale_x, max_edge, pre_down, quality, state, "Output path copied into input.")
+        return _apply_output_to_input(
+            outp,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            quality,
+            disable_scene_split,
+            state,
+            "Output path copied into input.",
+        )
 
     copy_output_into_input_btn.click(
         fn=copy_latest_output_to_input,
-        inputs=[use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale, quality_preset, shared_state],
+        inputs=[
+            use_resolution_tab,
+            upscale_factor,
+            max_resolution,
+            pre_downscale_then_upscale,
+            quality_preset,
+            disable_auto_scene_detection_split,
+            shared_state,
+        ],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
@@ -1435,7 +1586,17 @@ def rtx_super_resolution_tab(
     def capture_latest_output_signature(state):
         return _output_path_signature(_resolve_latest_output(state))
 
-    def auto_transfer_latest_output_to_input(use_global, scale_x, max_edge, pre_down, quality, auto_enabled, previous_signature, state):
+    def auto_transfer_latest_output_to_input(
+        use_global,
+        scale_x,
+        max_edge,
+        pre_down,
+        quality,
+        disable_scene_split,
+        auto_enabled,
+        previous_signature,
+        state,
+    ):
         state = state if isinstance(state, dict) else {}
         if not bool(auto_enabled):
             return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), state
@@ -1445,7 +1606,17 @@ def rtx_super_resolution_tab(
         sig = _output_path_signature(outp)
         if previous_signature and sig and str(previous_signature) == str(sig):
             return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), state
-        return _apply_output_to_input(outp, use_global, scale_x, max_edge, pre_down, quality, state, "Auto-transferred latest output into input.")
+        return _apply_output_to_input(
+            outp,
+            use_global,
+            scale_x,
+            max_edge,
+            pre_down,
+            quality,
+            disable_scene_split,
+            state,
+            "Auto-transferred latest output into input.",
+        )
 
     upscale_btn.click(
         fn=capture_latest_output_signature,
@@ -1482,7 +1653,7 @@ def rtx_super_resolution_tab(
         fn=auto_transfer_latest_output_to_input,
         inputs=[
             use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale,
-            quality_preset, auto_transfer_output_to_input, rtx_pre_run_output_signature, shared_state,
+            quality_preset, disable_auto_scene_detection_split, auto_transfer_output_to_input, rtx_pre_run_output_signature, shared_state,
         ],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
@@ -1492,7 +1663,7 @@ def rtx_super_resolution_tab(
         inputs=[
             input_file, input_path, quality_preset, use_resolution_tab, upscale_factor,
             max_resolution, pre_downscale_then_upscale, non_blocking_inference,
-            cuda_stream_ptr, shared_state,
+            disable_auto_scene_detection_split, cuda_stream_ptr, shared_state,
         ],
         outputs=[quality_preset, auto_tune_status, shared_state],
     ).then(fn=lambda: gr.update(visible=True), outputs=[auto_tune_status])
@@ -1538,7 +1709,17 @@ def rtx_super_resolution_tab(
             blob = str(payload)
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
-    def _sync_upscale_and_sizing_if_needed(use_global, local_x, max_edge, pre_down, quality, path_val, state, previous_signature: str = ""):
+    def _sync_upscale_and_sizing_if_needed(
+        use_global,
+        local_x,
+        max_edge,
+        pre_down,
+        quality,
+        disable_scene_split,
+        path_val,
+        state,
+        previous_signature: str = "",
+    ):
         signature = _sync_signature(
             {
                 "use_global": bool(use_global),
@@ -1546,6 +1727,7 @@ def rtx_super_resolution_tab(
                 "max_edge": max_edge,
                 "pre_down": bool(pre_down),
                 "quality": quality,
+                "disable_scene_split": bool(disable_scene_split),
                 "path_val": path_val,
                 "shared_scale": resolve_shared_upscale_factor(state if bool(use_global) else None),
                 "resolution_settings": ((state or {}).get("seed_controls", {}) or {}).get("resolution_settings", {}),
@@ -1554,14 +1736,23 @@ def rtx_super_resolution_tab(
         if signature == str(previous_signature or ""):
             return gr.skip(), gr.skip(), previous_signature
         slider_upd = _sync_upscale_ui(use_global, local_x, state)
-        sizing_upd = _build_sizing_update(path_val or "", use_global, local_x, max_edge, pre_down, quality, state)
+        sizing_upd = _build_sizing_update(
+            path_val or "",
+            use_global,
+            local_x,
+            max_edge,
+            pre_down,
+            quality,
+            disable_scene_split,
+            state,
+        )
         return slider_upd, sizing_upd, signature
 
     shared_state.change(
         fn=_sync_upscale_and_sizing_if_needed,
         inputs=[
             use_resolution_tab, upscale_factor, max_resolution, pre_downscale_then_upscale,
-            quality_preset, input_path, shared_state, rtx_sync_signature,
+            quality_preset, disable_auto_scene_detection_split, input_path, shared_state, rtx_sync_signature,
         ],
         outputs=[upscale_factor, sizing_info, rtx_sync_signature],
         queue=False,

@@ -850,11 +850,19 @@ def seedvr2_tab(
             )
 
             # Batch processing controls - MOVED HERE: right column above Last Processed Chunk as requested
-            with gr.Accordion(" Batch Processing", open=False):
-                batch_enable = gr.Checkbox(
-                    label="Enable Batch Processing (use directory input)",
-                    value=values[5]
-                )
+            with gr.Accordion(" Batch Processing", open=True):
+                with gr.Row():
+                    batch_enable = gr.Checkbox(
+                        label="Enable Batch Processing (use directory input)",
+                        value=values[5],
+                        scale=2,
+                    )
+                    keep_only_output_files = gr.Checkbox(
+                        label="Keep only output files",
+                        value=bool(merged_defaults.get("keep_only_output_files", False)),
+                        info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
+                        scale=2,
+                    )
                 batch_input = gr.Textbox(
                     label="Batch Input Folder",
                     value=values[6],
@@ -1018,7 +1026,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 54, len(inputs_list) must also = 54
+    # Current count: len(SEEDVR2_ORDER) = 55, len(inputs_list) must also = 55
     # ============================================================================
     
     inputs_list = [
@@ -1047,6 +1055,8 @@ def seedvr2_tab(
         auto_transfer_output_to_input,
         # Auto Tune free VRAM target (GB)
         save_vram_gb,
+        # Batch cleanup behavior
+        keep_only_output_files,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

@@ -50,6 +50,7 @@ from shared.output_run_manager import (
     ensure_image_input_artifact,
     finalize_run_context,
 )
+from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
@@ -310,6 +311,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "save_metadata": True,
         "face_restore_after_upscale": False,
         "batch_enable": False,
+        "keep_only_output_files": False,
         "batch_input_path": "",
         "batch_output_path": "",
         "resume_run_dir": "",
@@ -367,6 +369,7 @@ FLASHVSR_ORDER: List[str] = [
     "pre_downscale_then_upscale",
     "resume_run_dir",
     "save_vram_gb",
+    "keep_only_output_files",
 ]
 
 
@@ -476,6 +479,10 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
 
     cfg["models_dir"] = str(cfg.get("models_dir", defaults.get("models_dir", "")) or "").strip()
     cfg["batch_enable"] = _to_bool(cfg.get("batch_enable"), _to_bool(defaults.get("batch_enable", False), False))
+    cfg["keep_only_output_files"] = _to_bool(
+        cfg.get("keep_only_output_files"),
+        _to_bool(defaults.get("keep_only_output_files", False), False),
+    )
     cfg["use_resolution_tab"] = _to_bool(
         cfg.get("use_resolution_tab"),
         _to_bool(defaults.get("use_resolution_tab", True), True),
@@ -1295,14 +1302,80 @@ def build_flashvsr_callbacks(
                     return
 
                 in_dir = Path(batch_in)
-                items: List[Path] = [
-                    p
-                    for p in sorted(in_dir.iterdir())
-                    if (p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS) or p.is_dir()
-                ]
+                batch_root = resolve_batch_output_dir(
+                    batch_input_path=str(in_dir),
+                    batch_output_path=settings.get("batch_output_path"),
+                    fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
+                    default_subdir_name="upscaled_files",
+                )
+                settings["batch_output_path"] = str(batch_root)
+                try:
+                    batch_root.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+
+                def _is_within(path: Path, parent: Path) -> bool:
+                    try:
+                        path.resolve().relative_to(parent.resolve())
+                        return True
+                    except Exception:
+                        return False
+
+                excluded_subtree: Optional[Path] = None
+                try:
+                    if _is_within(batch_root, in_dir) and batch_root.resolve() != in_dir.resolve():
+                        excluded_subtree = batch_root.resolve()
+                except Exception:
+                    excluded_subtree = None
+
+                media_file_exts = VIDEO_EXTENSIONS.union(IMAGE_EXTENSIONS)
+                items: List[Path] = []
+                try:
+                    for p in sorted(in_dir.iterdir()):
+                        try:
+                            if excluded_subtree and _is_within(p, excluded_subtree):
+                                continue
+                            if p.is_file() and p.suffix.lower() in media_file_exts:
+                                items.append(p)
+                                continue
+                            if p.is_dir():
+                                has_images = any(
+                                    f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+                                    for f in p.iterdir()
+                                )
+                                if has_images:
+                                    items.append(p)
+                        except Exception:
+                            continue
+                except Exception:
+                    items = []
+
+                # If no top-level items found, allow processing the folder itself when it
+                # is a frame directory.
                 if not items:
-                    # If the batch folder itself is a frame directory, treat it as a single job.
-                    items = [in_dir]
+                    try:
+                        root_images = [
+                            p for p in sorted(in_dir.iterdir())
+                            if p.is_file()
+                            and p.suffix.lower() in IMAGE_EXTENSIONS
+                            and (not excluded_subtree or not _is_within(p, excluded_subtree))
+                        ]
+                    except Exception:
+                        root_images = []
+                    if root_images:
+                        items = [in_dir]
+                if not items:
+                    vid_upd, img_upd = _media_updates(None)
+                    yield (
+                        "❌ No media files found in batch input folder",
+                        "Supported batch inputs: videos, image files, or frame-sequence subfolders.",
+                        vid_upd,
+                        img_upd,
+                        gr.update(visible=False),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
 
                 # Universal chunking (Resolution tab) applies to FlashVSR+ batch runs too.
                 auto_chunk = bool(seed_controls.get("auto_chunk", True))
@@ -1320,17 +1393,6 @@ def build_flashvsr_callbacks(
                 last_output_path: Optional[str] = None
                 last_chunk_run_dir: Optional[Path] = None
                 total_items = max(1, len(items))
-                batch_root = resolve_batch_output_dir(
-                    batch_input_path=str(in_dir),
-                    batch_output_path=settings.get("batch_output_path"),
-                    fallback_output_dir=Path(global_settings.get("output_dir", output_dir)),
-                    default_subdir_name="upscaled_files",
-                )
-                settings["batch_output_path"] = str(batch_root)
-                try:
-                    batch_root.mkdir(parents=True, exist_ok=True)
-                except Exception:
-                    pass
 
                 def _batch_live_payload(status_text: str, preview_out: Optional[str] = None):
                     seed_controls["flashvsr_batch_outputs"] = list(outputs)
@@ -1619,6 +1681,20 @@ def build_flashvsr_callbacks(
                         f"Batch progress {idx}/{total_items}: {succeeded} succeeded, {with_issues} with issues",
                         preview_out=last_output_path,
                     )
+
+                if bool(settings.get("keep_only_output_files", False)):
+                    try:
+                        cleanup_result = keep_only_batch_outputs(
+                            batch_root,
+                            outputs,
+                            on_log=lambda msg: logs.append(str(msg)),
+                        )
+                        flattened_outputs = cleanup_result.get("final_outputs")
+                        if isinstance(flattened_outputs, list) and flattened_outputs:
+                            outputs = [str(p) for p in flattened_outputs if str(p).strip()]
+                            last_output_path = outputs[-1] if outputs else last_output_path
+                    except Exception as cleanup_err:
+                        logs.append(f"Keep-only cleanup warning: {cleanup_err}")
 
                 if progress:
                     progress(1.0, desc=f"Batch complete ({len(outputs)}/{len(items)} succeeded)")

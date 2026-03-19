@@ -1044,15 +1044,26 @@ def rtx_super_resolution_tab(
 
             batch_gallery = gr.Gallery(label="Batch Results", visible=False, columns=4, rows=2, height="auto", object_fit="contain", buttons=["download"])
 
-            with gr.Accordion("Batch Processing", open=False):
-                batch_enable = gr.Checkbox(label="Enable Batch Processing", value=bool(_value("batch_enable", False)))
+            with gr.Accordion("Batch Processing", open=True):
+                with gr.Row():
+                    batch_enable = gr.Checkbox(
+                        label="Enable Batch Processing",
+                        value=bool(_value("batch_enable", False)),
+                        scale=2,
+                    )
+                    keep_only_output_files = gr.Checkbox(
+                        label="Keep only output files",
+                        value=bool(_value("keep_only_output_files", False)),
+                        info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
+                        scale=2,
+                    )
                 batch_input = gr.Textbox(label="Batch Input Folder", value=_value("batch_input_path", ""))
                 batch_output = gr.Textbox(label="Batch Output Folder", value=_value("batch_output_path", ""))
 
             log_box = gr.Textbox(label="Run Log", value="", lines=14, buttons=["copy"])
 
     inputs_list = [
-        input_path, output_override, batch_enable, batch_input, batch_output,
+        input_path, output_override, batch_enable, keep_only_output_files, batch_input, batch_output,
         quality_preset, use_resolution_tab, upscale_factor, max_resolution,
         pre_downscale_then_upscale, non_blocking_inference, disable_auto_scene_detection_split, cuda_stream_ptr,
         output_format, face_restore_after_upscale, resume_run_dir,

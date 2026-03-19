@@ -29,6 +29,7 @@ from shared.output_run_manager import (
     ensure_image_input_artifact,
     finalize_run_context,
 )
+from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.realesrgan_runner import run_realesrgan
 from shared.gan_runner import run_gan_upscale, GanResult, get_gan_model_metadata
 from shared.ffmpeg_utils import scale_video
@@ -45,6 +46,19 @@ from shared.preview_utils import prepare_preview_input
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
 GAN_META_CACHE: Dict[str, Dict[str, Any]] = {}
 PREFERRED_GAN_DEFAULT_MODEL = "4x-UltraSharpV2.safetensors"
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _normalize_key(name: str) -> str:
@@ -187,6 +201,7 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "input_path": "",
         "output_override": "",
         "batch_enable": False,
+        "keep_only_output_files": False,
         "batch_input_path": "",
         "batch_output_path": "",
         "model": default_model,
@@ -252,6 +267,8 @@ GAN_ORDER: List[str] = [
     "resume_run_dir",
     # Auto-copy latest output into input after upscale completes.
     "auto_transfer_output_to_input",
+    # Batch-only postprocessing: remove non-output artifacts after completion.
+    "keep_only_output_files",
 ]
 
 
@@ -791,6 +808,19 @@ def build_gan_callbacks(
                 # Don't fail batch on metadata error
                 if progress_q:
                     progress_q.put(f"WARNING: Failed to write batch metadata: {e}\n")
+
+            if _as_bool(settings.get("keep_only_output_files"), False):
+                try:
+                    cleanup_result = keep_only_batch_outputs(
+                        Path(current_output_dir),
+                        outputs,
+                        on_log=lambda msg: logs.append(str(msg)),
+                    )
+                    flattened_outputs = cleanup_result.get("final_outputs")
+                    if isinstance(flattened_outputs, list) and flattened_outputs:
+                        outputs = [str(p) for p in flattened_outputs if str(p).strip()]
+                except Exception as cleanup_err:
+                    logs.append(f"Keep-only cleanup warning: {cleanup_err}")
             
             try:
                 seed_controls["gan_batch_outputs"] = list(outputs)

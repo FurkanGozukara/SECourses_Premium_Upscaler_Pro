@@ -910,12 +910,20 @@ def flashvsr_tab(
                     elem_classes=["action-btn", "action-btn-clear"],
                 )
 
-            with gr.Accordion(" Batch Processing", open=False):
-                batch_enable = gr.Checkbox(
-                    label="Enable Batch",
-                    value=bool(_value("batch_enable", False)),
-                    info="Process multiple files"
-                )
+            with gr.Accordion(" Batch Processing", open=True):
+                with gr.Row():
+                    batch_enable = gr.Checkbox(
+                        label="Enable Batch",
+                        value=bool(_value("batch_enable", False)),
+                        info="Process multiple files",
+                        scale=2,
+                    )
+                    keep_only_output_files = gr.Checkbox(
+                        label="Keep only output files",
+                        value=bool(_value("keep_only_output_files", False)),
+                        info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
+                        scale=2,
+                    )
                 batch_input = gr.Textbox(
                     label="Batch Input Folder",
                     value=_value("batch_input_path", ""),
@@ -967,6 +975,7 @@ def flashvsr_tab(
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir,
         save_vram_gb,
+        keep_only_output_files,
     ]
 
     # Development validation: inputs_list must stay aligned with FLASHVSR_ORDER

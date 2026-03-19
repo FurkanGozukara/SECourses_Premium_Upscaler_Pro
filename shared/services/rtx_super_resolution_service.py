@@ -39,6 +39,7 @@ from shared.output_run_manager import (
     prepare_single_video_run,
     resolve_resume_input_from_run_dir,
 )
+from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -119,6 +120,7 @@ def rtx_super_resolution_defaults() -> Dict[str, Any]:
         "input_path": "",
         "output_override": "",
         "batch_enable": False,
+        "keep_only_output_files": False,
         "batch_input_path": "",
         "batch_output_path": "",
         "quality_preset": "HIGHBITRATE_ULTRA",
@@ -142,6 +144,7 @@ RTX_ORDER: List[str] = [
     "input_path",
     "output_override",
     "batch_enable",
+    "keep_only_output_files",
     "batch_input_path",
     "batch_output_path",
     "quality_preset",
@@ -698,9 +701,13 @@ def build_rtx_super_resolution_callbacks(
                         _emit_progress_line(f"Comparison video failed: {comp_vid_err}")
 
                 status = (
-                    f"SUCCESS: RTX chunked upscale complete ({int(chunk_count)} chunks)"
-                    if int(rc) == 0
-                    else f"WARNING: RTX chunked upscale failed (code {int(rc)})"
+                    "CANCELED: RTX chunked processing canceled"
+                    if cancel_event.is_set()
+                    else (
+                        f"SUCCESS: RTX chunked upscale complete ({int(chunk_count)} chunks)"
+                        if int(rc) == 0
+                        else f"WARNING: RTX chunked upscale failed (code {int(rc)})"
+                    )
                 )
                 if int(rc) != 0 and maybe_set_vram_oom_alert(state, model_label="RTX Super Resolution", text=clog, settings=chunk_settings):
                     status = "OOM: Out of VRAM (GPU) - see banner above"
@@ -807,6 +814,8 @@ def build_rtx_super_resolution_callbacks(
 
             def _process_job(job: BatchJob) -> bool:
                 if cancel_event.is_set():
+                    job.status = "cancelled"
+                    job.error_message = "Cancelled by user"
                     return False
                 try:
                     item_path = Path(job.input_path)
@@ -859,18 +868,40 @@ def build_rtx_super_resolution_callbacks(
 
             processor = BatchProcessor(max_workers=1)
             batch_result = processor.process_batch(jobs=jobs, processor_func=_process_job, max_concurrent=1)
+            if bool(_to_bool(settings_local.get("keep_only_output_files"), False)):
+                try:
+                    cleanup_result = keep_only_batch_outputs(
+                        batch_root,
+                        outputs,
+                        on_log=lambda msg: logs.append(str(msg)),
+                    )
+                    flattened_outputs = cleanup_result.get("final_outputs")
+                    if isinstance(flattened_outputs, list) and flattened_outputs:
+                        outputs = [str(p) for p in flattened_outputs if str(p).strip()]
+                except Exception as cleanup_err:
+                    logs.append(f"Keep-only cleanup warning: {cleanup_err}")
             if outputs:
                 _update_last_output_state(seed_controls_local, outputs[-1])
             seed_controls_local["rtx_batch_outputs"] = list(outputs)
             state["seed_controls"] = seed_controls_local
 
+            if cancel_event.is_set():
+                status_text = (
+                    f"CANCELED: RTX batch canceled "
+                    f"({len(outputs)}/{batch_result.total_files} completed before cancel)"
+                )
+            else:
+                status_text = (
+                    f"SUCCESS: Batch complete: {batch_result.completed_files}/{batch_result.total_files} "
+                    f"processed ({batch_result.failed_files} failed)"
+                )
             result_holder["payload"] = (
-                f"SUCCESS: Batch complete: {batch_result.completed_files}/{batch_result.total_files} processed ({batch_result.failed_files} failed)",
+                status_text,
                 "\n\n".join(logs),
                 outputs[-1] if outputs else None,
                 last_html,
                 last_slider,
-                0 if batch_result.failed_files == 0 else 1,
+                0 if (batch_result.failed_files == 0 and not cancel_event.is_set()) else 1,
             )
 
         try:
@@ -1243,8 +1274,11 @@ def build_rtx_super_resolution_callbacks(
                 show_vram_oom_modal(state, title="Out of VRAM (GPU) - RTX Super Resolution", duration=None)
 
             if progress:
-                if int(rc) == 0 and "error" not in str(status).lower():
+                status_lc = str(status).lower()
+                if int(rc) == 0 and "error" not in status_lc:
                     progress(1.0, desc="RTX Super Resolution complete")
+                elif "cancel" in status_lc:
+                    progress(0, desc="Canceled")
                 else:
                     progress(0, desc="Failed")
 

@@ -387,6 +387,7 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
             "input_path": "",
             "output_override": "",
             "batch_enable": False,
+            "keep_only_output_files": False,
             "batch_input_path": "",
             "batch_output_path": "",
             "model": "",

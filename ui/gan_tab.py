@@ -238,12 +238,20 @@ def gan_tab(
                 input_detection_result = gr.Markdown("", visible=False)
                 sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
 
-            with gr.Accordion("Batch Processing", open=False):
-                batch_enable = gr.Checkbox(
-                    label="Enable Batch Processing",
-                    value=bool(_value("batch_enable", False)),
-                    info="Process multiple files from directory"
-                )
+            with gr.Accordion("Batch Processing", open=True):
+                with gr.Row():
+                    batch_enable = gr.Checkbox(
+                        label="Enable Batch Processing",
+                        value=bool(_value("batch_enable", False)),
+                        info="Process multiple files from directory",
+                        scale=2,
+                    )
+                    keep_only_output_files = gr.Checkbox(
+                        label="Keep only output files",
+                        value=bool(_value("keep_only_output_files", False)),
+                        info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
+                        scale=2,
+                    )
                 with gr.Row():
                     batch_input = gr.Textbox(
                         label="Batch Input Folder",
@@ -575,7 +583,7 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 22 components (model-specific controls + vNext sizing + resume path)
+    # Current count: 23 components (model-specific controls + vNext sizing + resume path + batch cleanup)
     # ============================================================================
     
     inputs_list = [
@@ -589,6 +597,8 @@ def gan_tab(
         resume_run_dir,
         # Auto-copy output into input after run
         auto_transfer_output_to_input,
+        # Batch cleanup behavior
+        keep_only_output_files,
     ]
     
     # Development validation

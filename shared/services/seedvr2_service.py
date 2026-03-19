@@ -45,6 +45,7 @@ from shared.output_run_manager import (
     ensure_image_input_artifact,
     finalize_run_context,
 )
+from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
 from shared.face_restore import restore_image, restore_video
 from shared.models.seedvr2_meta import get_seedvr2_model_names, model_meta_map
@@ -361,6 +362,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "model_dir": model_dir_path,
         "dit_model": target_model,
         "batch_enable": False,
+        "keep_only_output_files": False,
         "batch_input_path": "",
         "batch_output_path": "",
         # PySceneDetect chunking removed - now configured in Resolution tab
@@ -651,6 +653,8 @@ SEEDVR2_ORDER: List[str] = [
     "auto_transfer_output_to_input",
     # Auto Tune free VRAM target (GB).
     "save_vram_gb",
+    # Batch-only postprocessing: remove non-output artifacts after completion.
+    "keep_only_output_files",
 ]
 
 
@@ -735,6 +739,10 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
     cfg["auto_transfer_output_to_input"] = _coerce_bool(
         cfg.get("auto_transfer_output_to_input", defaults.get("auto_transfer_output_to_input", False)),
         default=bool(defaults.get("auto_transfer_output_to_input", False)),
+    )
+    cfg["keep_only_output_files"] = _coerce_bool(
+        cfg.get("keep_only_output_files", defaults.get("keep_only_output_files", False)),
+        default=bool(defaults.get("keep_only_output_files", False)),
     )
     try:
         save_vram_raw = float(cfg.get("save_vram_gb", defaults.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB)))
@@ -5452,25 +5460,6 @@ def build_seedvr2_callbacks(
                     if job.status == "completed" and job.output_path and Path(job.output_path).exists():
                         batch_outputs.append(str(job.output_path))
 
-                # Persist last SeedVR2 outputs for copy/auto-transfer convenience.
-                try:
-                    seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
-                    if not isinstance(seed_controls, dict):
-                        seed_controls = {}
-                    seed_controls["seedvr2_batch_outputs"] = list(batch_outputs)
-                    if batch_outputs:
-                        last_batch_out = Path(batch_outputs[-1])
-                        seed_controls["seedvr2_last_output_path"] = str(last_batch_out)
-                        seed_controls["last_output_dir"] = str(
-                            last_batch_out.parent if last_batch_out.is_file() else last_batch_out
-                        )
-                        seed_controls["last_output_path"] = str(last_batch_out) if last_batch_out.is_file() else None
-                    else:
-                        seed_controls["seedvr2_last_output_path"] = ""
-                    state["seed_controls"] = seed_controls
-                except Exception:
-                    pass
-
                 summary_msg = f"Batch complete: {completed}/{len(jobs)} succeeded"
                 if skipped > 0:
                     summary_msg += f", {skipped} skipped"
@@ -5534,12 +5523,47 @@ def build_seedvr2_callbacks(
                     # Don't fail batch on metadata error
                     pass
 
+                cleanup_notes: List[str] = []
+                if bool(settings.get("keep_only_output_files", False)):
+                    try:
+                        cleanup_result = keep_only_batch_outputs(
+                            batch_output_folder,
+                            batch_outputs,
+                            on_log=cleanup_notes.append,
+                        )
+                        flattened_outputs = cleanup_result.get("final_outputs")
+                        if isinstance(flattened_outputs, list) and flattened_outputs:
+                            batch_outputs = [str(p) for p in flattened_outputs if str(p).strip()]
+                    except Exception as cleanup_err:
+                        cleanup_notes.append(f"Keep-only cleanup warning: {cleanup_err}")
+
+                # Persist last SeedVR2 outputs for copy/auto-transfer convenience.
+                try:
+                    seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+                    if not isinstance(seed_controls, dict):
+                        seed_controls = {}
+                    seed_controls["seedvr2_batch_outputs"] = list(batch_outputs)
+                    if batch_outputs:
+                        last_batch_out = Path(batch_outputs[-1])
+                        seed_controls["seedvr2_last_output_path"] = str(last_batch_out)
+                        seed_controls["last_output_dir"] = str(
+                            last_batch_out.parent if last_batch_out.is_file() else last_batch_out
+                        )
+                        seed_controls["last_output_path"] = str(last_batch_out) if last_batch_out.is_file() else None
+                    else:
+                        seed_controls["seedvr2_last_output_path"] = ""
+                    state["seed_controls"] = seed_controls
+                except Exception:
+                    pass
+
                 # Update gr.Progress to 100%
                 if progress:
                     progress(1.0, desc="Batch complete!")
 
                 # Compact failure summary for the log box
                 log_lines = [f"{summary_msg}"]
+                if cleanup_notes:
+                    log_lines.extend(cleanup_notes)
                 if skipped:
                     log_lines.append("Skipped files were left unchanged (enable overwrite to reprocess existing outputs).")
                 if failed:

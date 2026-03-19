@@ -267,7 +267,8 @@ def seedvr2_tab(
                     "tests increasing batch sizes with `Blocks to Swap = 36`, keeps your `Save VRAM (GB)` target free "
                     "(default `2.0GB`), then optionally "
                     "reduces block swap for higher quality if headroom remains. Results are cached in `vram_usages` "
-                    "for faster reuse. Cache reuse requires matching SeedVR2 settings/model plus similar output size "
+                    "for faster reuse. Cache reuse requires matching SeedVR2 settings/model, the active torch.compile lane "
+                    "(enabled vs disabled), plus similar output size "
                     "(about +/-5% total pixels), similar effective input pixels (+/-5%), and similar total GPU VRAM "
                     "(+/-5%). You can cancel anytime and keep the best-so-far config."
                 )

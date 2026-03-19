@@ -1193,6 +1193,7 @@ def _build_autotune_signature(
         "global_gpu_device": str(global_gpu_device or ""),
         "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb),
     }
+    exact_payload = _normalize_autotune_compile_exact_payload(exact_payload)
     exact_blob = json.dumps(exact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return {
         "exact": exact_payload,
@@ -1207,12 +1208,37 @@ def _build_autotune_signature(
     }
 
 
+def _normalize_autotune_compile_exact_payload(exact: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize compile-related cache keys so eager and compiled autotune history
+    stay in separate lanes without fragmenting eager history by inactive knobs.
+    """
+    if not isinstance(exact, dict):
+        return {}
+
+    out = dict(exact)
+    compile_enabled = bool(out.get("compile_dit", False) or out.get("compile_vae", False))
+    out["compile_lane"] = "compiled" if compile_enabled else "eager"
+
+    if not compile_enabled:
+        out["compile_dit"] = False
+        out["compile_vae"] = False
+        out.pop("compile_backend", None)
+        out.pop("compile_mode", None)
+        out.pop("compile_fullgraph", None)
+        out.pop("compile_dynamic", None)
+        out.pop("compile_dynamo_cache_size_limit", None)
+        out.pop("compile_dynamo_recompile_limit", None)
+
+    return out
+
+
 def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize signature.exact for cache matching across different input-scale routes."""
     exact = signature.get("exact")
     if not isinstance(exact, dict):
         return {}
-    out = dict(exact)
+    out = _normalize_autotune_compile_exact_payload(exact)
     # Same output target can be reached via different upscale routes (e.g. 960x540@x4 vs 1920x1080@x2).
     # Reuse the same cache lane by ignoring route-only scale differences.
     out.pop("upscale_factor", None)

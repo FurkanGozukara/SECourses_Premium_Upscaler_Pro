@@ -343,7 +343,7 @@ def _extract_single_image_from_video(
         out_frame = np.median(stack, axis=0).astype(np.uint8)
 
     ext = ".jpg" if fmt == "jpg" else f".{fmt}"
-    out_path = collision_safe_path(video_path.with_name(f"{video_path.stem}_image{ext}"))
+    out_path = collision_safe_path(video_path.with_suffix(ext))
     imwrite_params: List[int] = []
     if fmt == "jpg":
         imwrite_params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]

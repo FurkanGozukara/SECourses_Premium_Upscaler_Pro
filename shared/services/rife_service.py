@@ -904,12 +904,14 @@ def build_rife_callbacks(
 
             uploaded_input_path, uploaded_name = _extract_path_and_name(uploaded_file)
             configured_input_path, configured_name = _extract_path_and_name(settings.get("input_path"))
+            batch_input_path_configured, batch_input_name = _extract_path_and_name(settings.get("batch_input_path"))
             folder_input_path, folder_name = _extract_path_and_name(
                 img_folder if isinstance(img_folder, (str, Path, dict)) else ""
             )
 
+            batch_mode = bool(settings.get("batch_enable"))
             resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
-            resume_mode = bool(resume_run_dir_raw and (not settings.get("batch_enable")) and (not preview_only))
+            resume_mode = bool(resume_run_dir_raw and (not batch_mode) and (not preview_only))
 
             if resume_mode:
                 resume_run_dir = Path(normalize_path(resume_run_dir_raw))
@@ -943,16 +945,37 @@ def build_rife_callbacks(
                 input_path = normalize_path(str(recovered_input))
                 original_filename = recovered_name or Path(input_path).name
             else:
-                input_path = uploaded_input_path or configured_input_path or folder_input_path
-                original_filename = (
-                    uploaded_name
-                    or configured_name
-                    or folder_name
-                    or (Path(input_path).name if input_path else None)
-                )
+                if batch_mode:
+                    input_path = (
+                        batch_input_path_configured
+                        or uploaded_input_path
+                        or configured_input_path
+                        or folder_input_path
+                    )
+                    original_filename = (
+                        batch_input_name
+                        or uploaded_name
+                        or configured_name
+                        or folder_name
+                        or (Path(input_path).name if input_path else None)
+                    )
+                else:
+                    input_path = uploaded_input_path or configured_input_path or folder_input_path
+                    original_filename = (
+                        uploaded_name
+                        or configured_name
+                        or folder_name
+                        or (Path(input_path).name if input_path else None)
+                    )
 
             if not input_path or not Path(input_path).exists():
-                yield (" Input missing or not found", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
+                missing_status = " Batch input missing or not found" if batch_mode else " Input missing or not found"
+                missing_log = (
+                    "Set 'Batch Input Folder' to a valid folder or video file."
+                    if batch_mode
+                    else ""
+                )
+                yield (missing_status, missing_log, gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                 return
 
             input_type_runtime = detect_input_type(input_path)
@@ -1016,6 +1039,7 @@ def build_rife_callbacks(
                     settings["scale"] = effective_scale
 
             # Apply Output tab format preferences when RIFE tab format is not explicitly set.
+            # Sequence export toggle is authoritative and must not be disabled by a video container choice.
             cached_fmt = str(seed_controls.get("output_format_val") or "").strip().lower()
             png_seq_enabled = bool(
                 seed_controls.get(
@@ -1023,13 +1047,16 @@ def build_rife_callbacks(
                     output_settings.get("png_sequence_enabled", False),
                 )
             )
+            sequence_requested = bool(settings.get("png_output", False))
             if settings.get("output_format") in (None, "auto"):
-                if cached_fmt in ("mp4", "png"):
-                    settings["output_format"] = cached_fmt
-                elif png_seq_enabled:
+                if sequence_requested or png_seq_enabled:
                     settings["output_format"] = "png"
+                elif cached_fmt in ("mp4", "png"):
+                    settings["output_format"] = cached_fmt
             output_format_pref = str(settings.get("output_format") or "").strip().lower()
-            if output_format_pref == "png":
+            if sequence_requested:
+                settings["png_output"] = True
+            elif output_format_pref == "png":
                 settings["png_output"] = True
             elif output_format_pref in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"}:
                 settings["png_output"] = False
@@ -1419,8 +1446,33 @@ def build_rife_callbacks(
                 rife_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
                 batch_files = []
                 if batch_input_path.is_dir():
-                    for ext in rife_exts:
-                        batch_files.extend(batch_input_path.glob(f"**/*{ext}"))
+                    artifact_dir_names = {"input_chunks", "processed_chunks", "thumbs", "__gan_out"}
+                    try:
+                        batch_output_resolved = batch_output_folder.resolve()
+                    except Exception:
+                        batch_output_resolved = batch_output_folder
+
+                    for candidate in batch_input_path.rglob("*"):
+                        if not candidate.is_file():
+                            continue
+                        if candidate.suffix.lower() not in rife_exts:
+                            continue
+                        if any(part in artifact_dir_names for part in candidate.parts):
+                            continue
+                        try:
+                            candidate_resolved = candidate.resolve()
+                        except Exception:
+                            candidate_resolved = candidate
+                        try:
+                            if candidate_resolved.is_relative_to(batch_output_resolved):
+                                continue
+                        except Exception:
+                            try:
+                                if str(candidate_resolved).startswith(str(batch_output_resolved)):
+                                    continue
+                            except Exception:
+                                pass
+                        batch_files.append(candidate)
                 elif batch_input_path.suffix.lower() in rife_exts:
                     batch_files = [batch_input_path]
 
@@ -1428,10 +1480,33 @@ def build_rife_callbacks(
                     yield (" No supported video files found in batch input", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                     return
 
+                batch_events: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+
+                def _batch_progress_cb(progress) -> None:
+                    try:
+                        processed = int(progress.completed_files + progress.failed_files + progress.skipped_files)
+                        total = int(progress.total_files or len(jobs) or 0)
+                        current_file = Path(progress.current_file).name if progress.current_file else ""
+                        batch_events.put((
+                            "state",
+                            {
+                                "processed": processed,
+                                "completed": int(progress.completed_files),
+                                "failed": int(progress.failed_files),
+                                "skipped": int(progress.skipped_files),
+                                "total": total,
+                                "current_file": current_file,
+                                "eta": float(progress.estimated_time_remaining) if progress.estimated_time_remaining is not None else None,
+                            },
+                        ))
+                    except Exception:
+                        pass
+
                 # Create batch processor
                 batch_processor = BatchProcessor(
                     output_dir=str(batch_output_folder),
                     max_workers=1,  # Sequential processing for memory management
+                    progress_callback=_batch_progress_cb,
                     telemetry_enabled=global_settings.get("telemetry", True),
                 )
 
@@ -1445,6 +1520,8 @@ def build_rife_callbacks(
                             "global_settings": global_settings,
                             "face_apply": bool(global_settings.get("face_global", False)),
                             "face_strength": float(global_settings.get("face_strength", 0.5)),
+                            "batch_index": len(jobs) + 1,
+                            "batch_total": len(batch_files),
                         }
                     )
                     jobs.append(job)
@@ -1454,7 +1531,15 @@ def build_rife_callbacks(
                     try:
                         # Process single file with current settings
                         single_settings = job.metadata["settings"].copy()
+                        batch_index = int(job.metadata.get("batch_index", 1) or 1)
+                        batch_total = int(job.metadata.get("batch_total", len(jobs)) or len(jobs) or 1)
+                        job_name = Path(job.input_path).name
+                        batch_events.put(("log", f"[{batch_index}/{batch_total}] Starting {job_name}"))
                         single_settings["input_path"] = job.input_path
+                        input_type_job = detect_input_type(job.input_path)
+                        single_settings["img_mode"] = input_type_job in {"directory", "image"}
+                        if bool(single_settings.get("png_output", False)):
+                            single_settings["output_format"] = "png"
                         single_settings["batch_enable"] = False  # Disable batch for individual processing
                         single_settings["output_override"] = None  # Will be set per-item for batch
                         single_settings["_original_filename"] = Path(job.input_path).name
@@ -1606,11 +1691,19 @@ def build_rife_callbacks(
                                 job.error_message = str(e)
                                 return False
 
-                        result = runner.run_rife(single_settings, on_progress=None)
+                        result = runner.run_rife(
+                            single_settings,
+                            on_progress=lambda msg, job_idx=batch_index, job_total=batch_total, name=job_name: (
+                                batch_events.put(("log", f"[{job_idx}/{job_total}] {name}: {str(msg).strip()}"))
+                                if str(msg or "").strip()
+                                else None
+                            ),
+                        )
 
                         if result.output_path and Path(result.output_path).exists():
                             job.output_path = result.output_path
                             ok = True
+                            batch_events.put(("log", f"[{batch_index}/{batch_total}] Completed {job_name}"))
 
                             # Apply face restoration if enabled
                             if job.metadata["face_apply"] and Path(job.output_path).exists():
@@ -1660,19 +1753,122 @@ def build_rife_callbacks(
                                     pass
                         else:
                             job.error_message = result.log
+                            batch_events.put(("log", f"[{batch_index}/{batch_total}] Failed {job_name}"))
                             ok = False
 
                         return ok
                     except Exception as e:
                         job.error_message = str(e)
+                        try:
+                            batch_events.put(("log", f"[{job.metadata.get('batch_index', '?')}/{job.metadata.get('batch_total', '?')}] Error {Path(job.input_path).name}: {str(e)}"))
+                        except Exception:
+                            pass
                         return False
 
-                # Run batch processing
-                batch_result = batch_processor.process_batch(
-                    jobs=jobs,
-                    processor_func=process_single_rife_job,
-                    max_concurrent=1,
+                yield (
+                    f" Starting RIFE batch processing ({len(jobs)} files)...",
+                    f"Batch input: {batch_input_path}\nBatch output: {batch_output_folder}\nDiscovered files: {len(jobs)}",
+                    gr.update(value=f"Batch processing {len(jobs)} file(s)...", visible=True),
+                    None,
+                    gr.update(value=None),
+                    gr.update(value="", visible=False),
+                    state,
                 )
+
+                batch_result_holder: Dict[str, Any] = {}
+
+                def _batch_worker():
+                    try:
+                        batch_result_holder["result"] = batch_processor.process_batch(
+                            jobs=jobs,
+                            processor_func=process_single_rife_job,
+                            max_concurrent=1,
+                        )
+                    except Exception as batch_exc:
+                        batch_result_holder["error"] = str(batch_exc)
+
+                batch_worker = threading.Thread(target=_batch_worker, daemon=True)
+                batch_worker.start()
+
+                live_logs = [
+                    f"Batch input: {batch_input_path}",
+                    f"Batch output: {batch_output_folder}",
+                    f"Discovered files: {len(jobs)}",
+                ]
+                live_detail = f"Batch processing {len(jobs)} file(s)..."
+                last_batch_update = 0.0
+
+                while batch_worker.is_alive() or not batch_events.empty():
+                    try:
+                        event_type, payload = batch_events.get(timeout=0.15)
+                        if event_type == "state":
+                            processed = int(payload.get("processed", 0) or 0)
+                            total = max(1, int(payload.get("total", len(jobs)) or len(jobs) or 1))
+                            completed_count = int(payload.get("completed", 0) or 0)
+                            failed_count = int(payload.get("failed", 0) or 0)
+                            skipped_count = int(payload.get("skipped", 0) or 0)
+                            current_name = str(payload.get("current_file") or "").strip()
+                            pct = (processed / total) * 100.0
+                            eta_val = payload.get("eta")
+                            eta_text = f" | ETA {int(eta_val)}s" if isinstance(eta_val, (int, float)) and eta_val >= 0 else ""
+                            current_text = f" | Current: {current_name}" if current_name else ""
+                            live_detail = (
+                                f"Batch {processed}/{total} ({pct:.1f}%)"
+                                f" | completed {completed_count}, failed {failed_count}, skipped {skipped_count}"
+                                f"{current_text}{eta_text}"
+                            )
+                            if live_logs and str(live_logs[-1]).startswith("BATCH_PROGRESS "):
+                                live_logs[-1] = f"BATCH_PROGRESS {live_detail}"
+                            else:
+                                live_logs.append(f"BATCH_PROGRESS {live_detail}")
+                        elif event_type == "log":
+                            line = str(payload or "").strip()
+                            if line:
+                                live_logs.append(line)
+                                live_detail = line
+                    except queue.Empty:
+                        pass
+
+                    now_ts = time.time()
+                    if now_ts - last_batch_update >= 0.5:
+                        last_batch_update = now_ts
+                        yield (
+                            " RUNNING: RIFE batch processing...",
+                            "\n".join(live_logs[-400:]),
+                            gr.update(value=live_detail, visible=True),
+                            None,
+                            gr.update(value=None),
+                            gr.update(value="", visible=False),
+                            state,
+                        )
+                    time.sleep(0.05)
+
+                batch_worker.join()
+                if batch_result_holder.get("error"):
+                    err = str(batch_result_holder.get("error") or "Batch processing failed")
+                    yield (
+                        " RIFE batch processing failed",
+                        err,
+                        gr.update(value="", visible=False),
+                        None,
+                        gr.update(value=None),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
+
+                batch_result = batch_result_holder.get("result")
+                if batch_result is None:
+                    yield (
+                        " RIFE batch processing failed",
+                        "Batch processor did not return a result.",
+                        gr.update(value="", visible=False),
+                        None,
+                        gr.update(value=None),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
 
                 # Summarize results
                 completed = int(batch_result.completed_files)

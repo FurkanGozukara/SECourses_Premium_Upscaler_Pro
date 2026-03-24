@@ -297,8 +297,9 @@ def rife_output_path(
         target = Path(normalize_path(override))
         if target.suffix == "":
             if png_output:
-                ensure_dir(target)
-                return collision_safe_path(target)
+                final_dir = collision_safe_dir(target)
+                ensure_dir(final_dir)
+                return final_dir
             target = target.with_suffix(".mp4")
         ensure_dir(target.parent)
         return collision_safe_path(target)

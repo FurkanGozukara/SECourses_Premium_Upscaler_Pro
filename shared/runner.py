@@ -39,6 +39,48 @@ def _normalize_rife_sequence_format(raw: Any) -> str:
     return "jpg" if fmt in {"jpg", "jpeg"} else "png"
 
 
+def _clear_rife_sequence_staging(staging_dir: Path) -> None:
+    if not staging_dir.exists():
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        return
+    for child in staging_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _sync_rife_sequence_staging(staging_dir: Path, output_dir: Path) -> int:
+    if not staging_dir.exists():
+        return 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for src in staging_dir.iterdir():
+        if not src.is_file():
+            continue
+        dest = output_dir / src.name
+        try:
+            src_stat = src.stat()
+            should_copy = (
+                (not dest.exists())
+                or src_stat.st_size != dest.stat().st_size
+                or src_stat.st_mtime_ns > dest.stat().st_mtime_ns
+            )
+        except Exception:
+            should_copy = not dest.exists()
+        if not should_copy:
+            continue
+        try:
+            shutil.copy2(src, dest)
+            copied += 1
+        except Exception:
+            pass
+    return copied
+
+
 def _finalize_rife_sequence_output(
     output_dir: Path,
     settings: Dict[str, Any],
@@ -61,7 +103,36 @@ def _finalize_rife_sequence_output(
         p for p in output_dir.iterdir()
         if p.is_file() and p.suffix.lower() == ".png"
     )
+    jpg_paths = sorted(
+        p for p in output_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}
+    )
+
+    metadata_path = output_dir / ".png_settings.json"
+    def _write_sequence_meta() -> None:
+        try:
+            import json
+
+            meta: Dict[str, Any] = {}
+            if metadata_path.exists():
+                with metadata_path.open("r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        meta = loaded
+            meta.setdefault("padding", int(settings.get("png_padding", 6) or 6))
+            meta.setdefault("keep_basename", bool(settings.get("png_keep_basename", False)))
+            meta.setdefault("base_name", output_dir.name)
+            meta["format"] = "jpg"
+            meta["quality"] = quality
+            with metadata_path.open("w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
+
     if not frame_paths:
+        if jpg_paths:
+            _write_sequence_meta()
+            return output_dir, None
         return output_dir, None
 
     try:
@@ -87,25 +158,7 @@ def _finalize_rife_sequence_output(
             tmp_dst.replace(final_dst)
             src.unlink(missing_ok=True)
 
-        metadata_path = output_dir / ".png_settings.json"
-        try:
-            import json
-
-            meta: Dict[str, Any] = {}
-            if metadata_path.exists():
-                with metadata_path.open("r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    if isinstance(loaded, dict):
-                        meta = loaded
-            meta.setdefault("padding", int(settings.get("png_padding", 6) or 6))
-            meta.setdefault("keep_basename", bool(settings.get("png_keep_basename", False)))
-            meta.setdefault("base_name", output_dir.name)
-            meta["format"] = "jpg"
-            meta["quality"] = quality
-            with metadata_path.open("w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-        except Exception:
-            pass
+        _write_sequence_meta()
 
         message = f"Converted PNG sequence to JPG ({len(frame_paths)} frames, quality {quality})."
         if on_progress:
@@ -2161,12 +2214,15 @@ class Runner:
                 effective_input = input_path
 
         output_format_pref = str(settings.get("output_format") or "").strip().lower()
-        if output_format_pref == "png":
+        sequence_requested = bool(settings.get("png_output"))
+        if sequence_requested:
+            png_output = True
+        elif output_format_pref == "png":
             png_output = True
         elif output_format_pref in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"}:
             png_output = False
         else:
-            png_output = bool(settings.get("png_output"))
+            png_output = sequence_requested
         settings["png_output"] = bool(png_output)
         output_override = settings.get("output_override") or None
         predicted_output = rife_output_path(
@@ -2229,6 +2285,9 @@ class Runner:
 
         env = os.environ.copy()
         env.setdefault("PYTHONWARNINGS", "ignore")
+        legacy_alloc_conf = env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        if legacy_alloc_conf and not env.get("PYTORCH_ALLOC_CONF"):
+            env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
         cuda_device = str(settings.get("cuda_device", "") or "").strip().lower()
         if cuda_device.startswith("cuda:"):
             cuda_device = cuda_device.split(":", 1)[1].strip()
@@ -2256,6 +2315,9 @@ class Runner:
         last_ratio_done = 0
         last_ratio_total = 0
         ema_step_sec: Optional[float] = None
+        sequence_staging_dir: Optional[Path] = None
+        sequence_sync_stop: Optional[threading.Event] = None
+        sequence_sync_thread: Optional[threading.Thread] = None
 
         def _emit_eta_progress(done: int, total: int) -> None:
             nonlocal ema_step_sec
@@ -2284,6 +2346,24 @@ class Runner:
                 pass
             if on_progress:
                 on_progress(eta_line + "\n")
+        if png_output:
+            sequence_staging_dir = self.base_dir / "RIFE" / "vid_out"
+            _clear_rife_sequence_staging(sequence_staging_dir)
+            predicted_output.mkdir(parents=True, exist_ok=True)
+            sequence_sync_stop = threading.Event()
+
+            def _sequence_sync_worker() -> None:
+                while not sequence_sync_stop.is_set():
+                    _sync_rife_sequence_staging(sequence_staging_dir, predicted_output)
+                    sequence_sync_stop.wait(0.5)
+                _sync_rife_sequence_staging(sequence_staging_dir, predicted_output)
+
+            sequence_sync_thread = threading.Thread(
+                target=_sequence_sync_worker,
+                name="rife-sequence-sync",
+                daemon=True,
+            )
+            sequence_sync_thread.start()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -2333,6 +2413,12 @@ class Runner:
         finally:
             with self._lock:
                 self._active_process = None
+            if sequence_sync_stop is not None:
+                sequence_sync_stop.set()
+            if sequence_sync_thread is not None:
+                sequence_sync_thread.join(timeout=5.0)
+            if png_output and sequence_staging_dir is not None:
+                _sync_rife_sequence_staging(sequence_staging_dir, predicted_output)
 
         output_path = str(predicted_output)
         if png_output:
@@ -2344,6 +2430,8 @@ class Runner:
             output_path = str(finalized_path)
             if finalize_note:
                 log_lines.append(finalize_note)
+            if sequence_staging_dir is not None:
+                _clear_rife_sequence_staging(sequence_staging_dir)
         if settings.get("fps_override") and predicted_output.suffix.lower() == ".mp4":
             adjusted = ffmpeg_set_fps(predicted_output, settings["fps_override"])
             output_path = str(adjusted)
@@ -2635,6 +2723,15 @@ class Runner:
         # Output options
         if settings.get("png_output"):
             cmd.append("--png")
+            sequence_format = _normalize_rife_sequence_format(settings.get("sequence_format", "png"))
+            cmd.extend(["--sequence-format", sequence_format])
+            if sequence_format == "jpg":
+                try:
+                    sequence_quality = int(float(settings.get("sequence_quality", 95) or 95))
+                except Exception:
+                    sequence_quality = 95
+                sequence_quality = max(1, min(100, sequence_quality))
+                cmd.extend(["--jpg-quality", str(sequence_quality)])
         if settings.get("montage"):
             cmd.append("--montage")
         if settings.get("no_audio"):

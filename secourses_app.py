@@ -13,6 +13,11 @@ from typing import Any, Dict
 # - Default to disabled unless the launcher/user explicitly enables it.
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
+# Migrate deprecated allocator env var so subprocesses and in-app torch startup stay quiet.
+legacy_alloc_conf = os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+if legacy_alloc_conf and not os.environ.get("PYTORCH_ALLOC_CONF"):
+    os.environ["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
+
 # Upstream dependency warning (not emitted by this repo's direct code):
 # suppress only this known PyTorch deprecation message to keep startup logs clean.
 warnings.filterwarnings(

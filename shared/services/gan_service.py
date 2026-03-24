@@ -5,6 +5,7 @@ import threading
 import time
 import html
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Callable, Tuple
 import gradio as gr
 
@@ -20,7 +21,6 @@ from shared.path_utils import (
     resolve_batch_output_dir,
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
-from shared.face_restore import restore_image, restore_video
 from shared.logging_utils import RunLogger
 from shared.output_run_manager import (
     prepare_single_video_run,
@@ -30,8 +30,6 @@ from shared.output_run_manager import (
     finalize_run_context,
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
-from shared.realesrgan_runner import run_realesrgan
-from shared.gan_runner import run_gan_upscale, GanResult, get_gan_model_metadata
 from shared.ffmpeg_utils import scale_video
 from shared.comparison_unified import create_unified_comparison, create_video_comparison_slider
 from shared.video_comparison_slider import create_video_comparison_html
@@ -46,6 +44,41 @@ from shared.preview_utils import prepare_preview_input
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
 GAN_META_CACHE: Dict[str, Dict[str, Any]] = {}
 PREFERRED_GAN_DEFAULT_MODEL = "4x-UltraSharpV2.safetensors"
+
+
+def restore_image(*args, **kwargs):
+    """Lazy-import face restoration so the Gradio process stays backend-light."""
+    from shared.face_restore import restore_image as _restore_image_impl
+
+    return _restore_image_impl(*args, **kwargs)
+
+
+def restore_video(*args, **kwargs):
+    """Lazy-import face restoration so the Gradio process stays backend-light."""
+    from shared.face_restore import restore_video as _restore_video_impl
+
+    return _restore_video_impl(*args, **kwargs)
+
+
+def run_realesrgan(*args, **kwargs):
+    """Lazy-import RealESRGAN runner only when a GAN job starts."""
+    from shared.realesrgan_runner import run_realesrgan as _run_realesrgan_impl
+
+    return _run_realesrgan_impl(*args, **kwargs)
+
+
+def run_gan_upscale(*args, **kwargs):
+    """Lazy-import GAN runner only when a GAN job starts."""
+    from shared.gan_runner import run_gan_upscale as _run_gan_upscale_impl
+
+    return _run_gan_upscale_impl(*args, **kwargs)
+
+
+def get_gan_model_metadata(*args, **kwargs):
+    """Lazy-import GAN metadata helpers so startup avoids cv2/numpy imports."""
+    from shared.gan_runner import get_gan_model_metadata as _get_gan_model_metadata_impl
+
+    return _get_gan_model_metadata_impl(*args, **kwargs)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -106,14 +139,57 @@ def _load_gan_catalog(base_dir: Path):
                 data = json.load(f)
             name = data.get("name") or jf.stem
             scale = data.get("scale") or _parse_scale_from_name(name)
-            GAN_META_CACHE[_normalize_key(name)] = {"name": name, "scale": scale}
+            GAN_META_CACHE[_normalize_key(name)] = {
+                "name": name,
+                "scale": scale,
+                "architecture": data.get("architecture", "unknown"),
+                "description": data.get("description", ""),
+                "author": data.get("author", "unknown"),
+                "tags": data.get("tags", []) or [],
+            }
         except Exception:
             continue
 
 
+def get_gan_model_metadata_lightweight(filename: str, base_dir: Path):
+    """
+    UI-safe model metadata lookup.
+
+    Uses catalog JSON / filename heuristics only, and intentionally avoids importing
+    shared.gan_runner so Gradio startup never pulls in spandrel/torch.
+    """
+    name = str(filename or "").strip()
+    scale = _parse_scale_from_name(name)
+    architecture = "unknown"
+    description = ""
+    author = "unknown"
+    tags: List[str] = []
+
+    try:
+        _load_gan_catalog(base_dir)
+        cached = GAN_META_CACHE.get(_normalize_key(name), {})
+        if cached:
+            scale = int(cached.get("scale") or scale)
+            architecture = str(cached.get("architecture") or architecture)
+            description = str(cached.get("description") or description)
+            author = str(cached.get("author") or author)
+            raw_tags = cached.get("tags") or []
+            tags = [str(tag) for tag in raw_tags if str(tag).strip()]
+    except Exception:
+        pass
+
+    return SimpleNamespace(
+        name=name,
+        scale=int(scale or 4),
+        architecture=architecture,
+        description=description,
+        author=author,
+        tags=tags,
+    )
+
+
 def _get_gan_meta(filename: str, base_dir: Path) -> Dict[str, Any]:
     """Legacy metadata function - now uses comprehensive registry"""
-    from shared.gan_runner import get_gan_model_metadata
     metadata = get_gan_model_metadata(filename, base_dir)
     return {
         "scale": metadata.scale,
@@ -184,11 +260,7 @@ def _scan_gan_models(base_dir: Path) -> List[str]:
                     models.add(f.name)
         except Exception:
             continue
-    
-    # Trigger cache reload for metadata
-    from shared.gan_runner import reload_gan_models_cache
-    reload_gan_models_cache(base_dir)
-    
+
     return sorted(models)
 
 

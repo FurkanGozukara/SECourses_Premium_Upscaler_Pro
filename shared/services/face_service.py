@@ -12,13 +12,44 @@ from shared.path_utils import (
     VIDEO_EXTENSIONS,
     resolve_batch_output_dir,
 )
-from shared.face_restore import restore_image, restore_video
+
+
+def _face_backend_available(module_name: str) -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def get_available_backends_lightweight() -> List[str]:
+    """Avoid importing face_restore/cv2/numpy during Gradio startup."""
+    backends: List[str] = []
+    if _face_backend_available("gfpgan"):
+        backends.append("gfpgan")
+    if _face_backend_available("codeformer"):
+        backends.append("codeformer")
+    return backends
+
+
+def restore_image(*args, **kwargs):
+    """Lazy-import face restoration only when standalone face processing runs."""
+    from shared.face_restore import restore_image as _restore_image_impl
+
+    return _restore_image_impl(*args, **kwargs)
+
+
+def restore_video(*args, **kwargs):
+    """Lazy-import face restoration only when standalone face processing runs."""
+    from shared.face_restore import restore_video as _restore_video_impl
+
+    return _restore_video_impl(*args, **kwargs)
 
 
 def face_defaults(models: List[str]) -> Dict[str, Any]:
     """Get default face restoration settings"""
-    from shared.face_restore import get_available_backends
-    available = get_available_backends()
+    available = get_available_backends_lightweight()
     default_backend = available[0] if available else "auto"
     
     return {

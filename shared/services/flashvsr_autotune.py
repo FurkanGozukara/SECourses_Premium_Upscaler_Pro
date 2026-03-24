@@ -154,11 +154,11 @@ def _sample_peak_vram_gb(
     total_vram_hint_gb: float = 0.0,
 ) -> None:
     """
-    Track peak VRAM and optionally stop probe early once phase2 has enough samples.
+    Track peak VRAM and optionally stop probe early when the whole-run peak
+    already violates the configured free-VRAM target.
 
     Probe cancellation is triggered by:
-    - crossing the configured free-VRAM threshold, or
-    - collecting enough phase2 samples (~0.6s+) for fast pass/fail inference.
+    - crossing the configured free-VRAM threshold.
     """
     peak_used = 0.0
     peak_phase2 = 0.0
@@ -166,7 +166,6 @@ def _sample_peak_vram_gb(
     telemetry_ok = False
     samples = 0
     phase2_samples = 0
-    phase2_started_at: Optional[float] = None
 
     while not stop_event.is_set():
         snap = _query_gpu_memory_snapshot_gb()
@@ -183,8 +182,6 @@ def _sample_peak_vram_gb(
                 if cur_phase == "phase2":
                     peak_phase2 = max(peak_phase2, used_sum)
                     phase2_samples += 1
-                    if phase2_started_at is None:
-                        phase2_started_at = time.time()
 
                 if total_sum > 0:
                     total_seen = total_sum
@@ -200,23 +197,13 @@ def _sample_peak_vram_gb(
                 if probe_cancel_event is not None and (not probe_cancel_event.is_set()) and phase2_samples > 0:
                     total_for_eval = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                     free_est = (
-                        max(0.0, total_for_eval - peak_phase2)
+                        max(0.0, total_for_eval - peak_used)
                         if total_for_eval > 0
-                        else max(0.0, float(total_vram_hint_gb) - peak_phase2)
+                        else max(0.0, float(total_vram_hint_gb) - peak_used)
                     )
-                    phase2_gate_ready = bool((phase_state or {}).get("phase2_gate_ready", False))
 
                     if min_free_target_gb is not None and free_est < float(min_free_target_gb):
                         result_box["early_stop_reason"] = "threshold_reached"
-                        probe_cancel_event.set()
-                    elif (
-                        phase2_gate_ready
-                        and
-                        phase2_started_at is not None
-                        and phase2_samples >= int(AUTOTUNE_PHASE2_MIN_SAMPLES_FOR_EARLY_STOP)
-                        and (time.time() - phase2_started_at) >= float(AUTOTUNE_PHASE2_MIN_SECONDS_FOR_EARLY_STOP)
-                    ):
-                        result_box["early_stop_reason"] = "enough_phase2_samples"
                         probe_cancel_event.set()
 
         stop_event.wait(max(0.05, float(interval_sec)))
@@ -242,6 +229,19 @@ def _looks_like_oom(log_text: str) -> bool:
         "cannot recover",
     )
     return any(tok in lc for tok in tokens)
+
+
+def _resolve_autotune_eval_peak_gb(item: Dict[str, Any]) -> float:
+    """Use the safest available peak reading for VRAM pass/fail decisions."""
+    peaks: List[float] = []
+    for key in ("whole_run_peak_vram_used_gb", "max_vram_used_gb", "phase2_peak_vram_used_gb"):
+        try:
+            value = float(item.get(key, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            peaks.append(value)
+    return float(max(peaks)) if peaks else 0.0
 
 
 def _detect_flashvsr_oom_phase(log_text: str) -> str:
@@ -1059,10 +1059,9 @@ def flashvsr_auto_tune_action(
                 item["tiled_dit"] = bool(item.get("tiled_dit", True))
                 item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                 item["oom"] = bool(item.get("oom", False))
-                try:
-                    peak_used = float(item.get("max_vram_used_gb", 0.0) or 0.0)
-                except Exception:
-                    peak_used = 0.0
+                peak_used = _resolve_autotune_eval_peak_gb(item)
+                item["max_vram_used_gb"] = float(peak_used)
+                item["peak_source"] = "whole_run" if float(item.get("whole_run_peak_vram_used_gb", 0.0) or 0.0) > 0 else str(item.get("peak_source") or "legacy")
                 try:
                     historical_total = float(item.get("total_vram_gb", 0.0) or 0.0)
                 except Exception:
@@ -1455,14 +1454,14 @@ def flashvsr_auto_tune_action(
             early_stop_reason = str(sampler_box.get("early_stop_reason") or "")
             phase2_gate_ready = bool(phase_state.get("phase2_gate_ready", False))
             total_for_eval = measured_total if measured_total > 0 else float(total_vram_gb)
-            peak_source = "phase2" if (phase2_samples > 0 and max_used_phase2_gb > 0) else "whole_run"
-            selected_peak_gb = max_used_phase2_gb if peak_source == "phase2" else max_used_gb
+            peak_source = "whole_run"
+            selected_peak_gb = float(max_used_gb)
             free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
 
             canceled_by_user = _cancel_requested()
             oom = bool(_looks_like_oom(result.log))
             oom_phase = _detect_flashvsr_oom_phase(result.log) if oom else ""
-            fast_probe_stop = bool(early_stop_reason in {"threshold_reached", "enough_phase2_samples"})
+            fast_probe_stop = bool(early_stop_reason == "threshold_reached")
             return_ok = bool(result.returncode == 0) or (fast_probe_stop and (not canceled_by_user) and (not oom))
             passed = bool(
                 telemetry_ok

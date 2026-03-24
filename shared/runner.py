@@ -1089,6 +1089,31 @@ class Runner:
     # Command builder
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _normalize_compile_dynamic_setting(value: Any, default: str = "none") -> str:
+        """Normalize compile_dynamic to one of: 'none', 'false', 'true'."""
+        default_text = str(default or "none").strip().lower()
+        if default_text in {"", "auto", "default"}:
+            default_text = "none"
+        if default_text not in {"none", "false", "true"}:
+            default_text = "none"
+
+        if value is None:
+            return default_text
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return "true" if bool(value) else "false"
+
+        text = str(value).strip().lower()
+        if text in {"", "none", "auto", "default"}:
+            return "none"
+        if text in {"true", "1", "yes", "on"}:
+            return "true"
+        if text in {"false", "0", "no", "off"}:
+            return "false"
+        return default_text
+
+    @staticmethod
     def _strip_torch_compile_flags(command: List[str]) -> List[str]:
         """
         Remove torch.compile-related CLI args from a command list.
@@ -1102,7 +1127,6 @@ class Runner:
             "--compile_dit",
             "--compile_vae",
             "--compile_fullgraph",
-            "--compile_dynamic",
         }
         flags_with_value = {
             "--compile_backend",
@@ -1117,6 +1141,12 @@ class Runner:
             token = command[i]
             if token in flags_no_value:
                 i += 1
+                continue
+            if token == "--compile_dynamic":
+                if i + 1 < len(command) and str(command[i + 1]).strip().lower() in {"none", "false", "true"}:
+                    i += 2
+                else:
+                    i += 1
                 continue
             if token in flags_with_value:
                 i += 2  # Skip flag + its value
@@ -1765,10 +1795,14 @@ class Runner:
             cmd.extend(["--compile_mode", settings["compile_mode"]])
         if settings.get("compile_fullgraph"):
             cmd.append("--compile_fullgraph")
-        if settings.get("compile_dynamic"):
-            cmd.append("--compile_dynamic")
+        cmd.extend([
+            "--compile_dynamic",
+            self._normalize_compile_dynamic_setting(settings.get("compile_dynamic"), default="none"),
+        ])
         _add_int("--compile_dynamo_cache_size_limit", "compile_dynamo_cache_size_limit")
         _add_int("--compile_dynamo_recompile_limit", "compile_dynamo_recompile_limit")
+        if bool(settings.get("split_phase_subprocesses", True)):
+            cmd.append("--split_phase_subprocesses")
 
         # Caching
         if settings.get("cache_dit"):
@@ -1889,32 +1923,7 @@ class Runner:
             The previous implementation incorrectly skipped the next token for
             boolean flags like --compile_dit, which could delete unrelated args.
             """
-            flags_no_value = {
-                "--compile_dit",
-                "--compile_vae",
-                "--compile_fullgraph",
-                "--compile_dynamic",
-            }
-            flags_with_value = {
-                "--compile_backend",
-                "--compile_mode",
-                "--compile_dynamo_cache_size_limit",
-                "--compile_dynamo_recompile_limit",
-            }
-
-            out: List[str] = []
-            i = 0
-            while i < len(command):
-                token = command[i]
-                if token in flags_no_value:
-                    i += 1
-                    continue
-                if token in flags_with_value:
-                    i += 2  # Skip flag + its value
-                    continue
-                out.append(token)
-                i += 1
-            return out
+            return Runner._strip_torch_compile_flags(command)
 
         if platform.system() != "Windows":
             return cmd

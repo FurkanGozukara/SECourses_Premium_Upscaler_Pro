@@ -17,7 +17,6 @@ import gradio as gr
 from shared.preset_manager import PresetManager
 from shared.runner import Runner
 from shared.path_utils import normalize_path, ffmpeg_set_fps, get_media_dimensions, resolve_batch_output_dir
-from shared.face_restore import restore_video
 from shared.logging_utils import RunLogger
 from shared.models.rife_meta import get_rife_metadata, get_rife_default_model
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
@@ -27,6 +26,13 @@ from shared.output_run_manager import prepare_single_video_run, resolve_resume_i
 from shared.video_codec_options import build_ffmpeg_video_encode_args
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.global_rife import global_rife_enabled
+
+
+def restore_video(*args, **kwargs):
+    """Lazy-import face restoration so the Gradio process stays backend-light."""
+    from shared.face_restore import restore_video as _restore_video_impl
+
+    return _restore_video_impl(*args, **kwargs)
 
 
 # Defaults and ordering --------------------------------------------------------

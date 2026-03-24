@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 
-from .chunking import detect_scenes
 from .input_detector import detect_input
 from .path_utils import (
     VIDEO_EXTENSIONS,
@@ -26,6 +25,13 @@ from .path_utils import (
     normalize_path,
 )
 from .resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
+
+
+def detect_scenes(*args, **kwargs):
+    """Lazy-import scene detection so fixed-scale UI cards stay OpenCV-free at startup."""
+    from .chunking import detect_scenes as _detect_scenes_impl
+
+    return _detect_scenes_impl(*args, **kwargs)
 
 
 def _safe(text: Any) -> str:

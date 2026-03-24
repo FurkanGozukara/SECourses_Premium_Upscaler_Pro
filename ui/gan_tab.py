@@ -11,7 +11,7 @@ from typing import Dict, Any
 import html
 
 from shared.services.gan_service import (
-    build_gan_callbacks, GAN_ORDER, PREFERRED_GAN_DEFAULT_MODEL
+    build_gan_callbacks, GAN_ORDER, PREFERRED_GAN_DEFAULT_MODEL, get_gan_model_metadata_lightweight
 )
 from shared.video_comparison_slider import create_video_comparison_html, get_video_comparison_js_on_load
 
@@ -116,8 +116,6 @@ def gan_tab(
         preferred_lookup = {str(m).lower(): str(m) for m in gan_model_choices}
         gan_model_value = preferred_lookup.get(PREFERRED_GAN_DEFAULT_MODEL.lower(), gan_model_choices[0])
 
-    from shared.gan_runner import get_gan_model_metadata
-
     model_meta_cache: Dict[str, Any] = {}
 
     def _get_model_meta(model_name: str):
@@ -126,7 +124,7 @@ def gan_tab(
             return None
         if key not in model_meta_cache:
             try:
-                model_meta_cache[key] = get_gan_model_metadata(key, base_dir)
+                model_meta_cache[key] = get_gan_model_metadata_lightweight(key, base_dir)
             except Exception:
                 model_meta_cache[key] = None
         return model_meta_cache[key]
@@ -646,8 +644,7 @@ def gan_tab(
         state,
     ) -> gr.update:
         try:
-            from shared.gan_runner import get_gan_model_metadata
-            meta = get_gan_model_metadata(model_name, base_dir)
+            meta = get_gan_model_metadata_lightweight(model_name, base_dir)
             model_scale = int(meta.scale or 4)
         except Exception:
             model_scale = 4

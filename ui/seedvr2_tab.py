@@ -537,6 +537,20 @@ def seedvr2_tab(
             if compile_mode_value not in ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]:
                 compile_mode_value = "default"
             
+            compile_dynamic_raw = values[40] if len(values) > 40 else "none"
+            if isinstance(compile_dynamic_raw, bool):
+                compile_dynamic_value = "true" if compile_dynamic_raw else "false"
+            else:
+                compile_dynamic_text = str(compile_dynamic_raw or "").strip().lower()
+                if compile_dynamic_text in {"", "none", "auto", "default"}:
+                    compile_dynamic_value = "none"
+                elif compile_dynamic_text in {"true", "1", "yes", "on"}:
+                    compile_dynamic_value = "true"
+                elif compile_dynamic_text in {"false", "0", "no", "off"}:
+                    compile_dynamic_value = "false"
+                else:
+                    compile_dynamic_value = "none"
+
             # Compile Mode / Fullgraph / Dynamic in same row (requested)
             with gr.Row():
                 compile_mode = gr.Dropdown(
@@ -554,10 +568,11 @@ def seedvr2_tab(
                     interactive=compile_available,
                     scale=1,
                 )
-                compile_dynamic = gr.Checkbox(
+                compile_dynamic = gr.Dropdown(
                     label="Compile Dynamic Shapes",
-                    value=values[40] if compile_available else False,
-                    info="Support varying input shapes with compilation. Slower compilation but more flexible. Enable if processing mixed resolutions.",
+                    choices=["none", "false", "true"],
+                    value=compile_dynamic_value if compile_available else "none",
+                    info="PyTorch dynamic mode. 'none' uses PyTorch auto behavior and is recommended. 'false' forces exact-shape specialization. 'true' compiles dynamic kernels up front.",
                     interactive=compile_available,
                     scale=1,
                 )
@@ -597,6 +612,16 @@ def seedvr2_tab(
             
             # Cache warning for multi-GPU
             cache_warning = gr.Markdown("", visible=False)
+
+            split_phase_subprocesses = gr.Checkbox(
+                label="Split Encode / Upscale / Decode Into Subprocesses",
+                value=bool(
+                    values[SEEDVR2_ORDER.index("split_phase_subprocesses")]
+                    if "split_phase_subprocesses" in SEEDVR2_ORDER and len(values) > SEEDVR2_ORDER.index("split_phase_subprocesses")
+                    else merged_defaults.get("split_phase_subprocesses", True)
+                ),
+                info="Run VAE encode, DiT upscale, and VAE decode/postprocess in separate child processes for much cleaner phase-boundary VRAM release. Slower, and disables model-cache benefits. Recommended ON.",
+            )
 
             gr.Markdown("---")
             gr.Markdown(
@@ -1027,7 +1052,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 55, len(inputs_list) must also = 55
+    # Current count: len(SEEDVR2_ORDER) = 56, len(inputs_list) must also = 56
     # ============================================================================
     
     inputs_list = [
@@ -1058,6 +1083,8 @@ def seedvr2_tab(
         save_vram_gb,
         # Batch cleanup behavior
         keep_only_output_files,
+        # Split heavy phases into isolated subprocesses
+        split_phase_subprocesses,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

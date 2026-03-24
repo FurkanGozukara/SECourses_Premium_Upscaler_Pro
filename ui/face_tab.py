@@ -7,7 +7,7 @@ import gradio as gr
 from typing import Dict, Any
 
 from shared.services.face_service import (
-    build_face_callbacks, FACE_ORDER
+    build_face_callbacks, FACE_ORDER, get_available_backends_lightweight
 )
 from shared.models.seedvr2_meta import get_seedvr2_model_names
 from ui.media_preview import preview_updates
@@ -264,8 +264,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
             gr.Markdown("#### Face Restoration Model")
             
             # Get available backends
-            from shared.face_restore import get_available_backends
-            available_backends = get_available_backends()
+            available_backends = get_available_backends_lightweight()
             
             if not available_backends:
                 gr.Markdown("""

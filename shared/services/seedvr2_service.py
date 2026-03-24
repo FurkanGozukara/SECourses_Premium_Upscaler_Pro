@@ -37,7 +37,6 @@ from shared.path_utils import (
     resolve_batch_output_dir,
 )
 from shared.resolution_calculator import estimate_seedvr2_upscale_plan_from_dims
-from shared.chunking import chunk_and_process, check_resume_available
 from shared.output_run_manager import (
     prepare_single_video_run,
     downscaled_video_path,
@@ -47,7 +46,6 @@ from shared.output_run_manager import (
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
-from shared.face_restore import restore_image, restore_video
 from shared.models.seedvr2_meta import get_seedvr2_model_names, model_meta_map
 from shared.logging_utils import RunLogger
 from shared.comparison_unified import create_unified_comparison, build_comparison_selector
@@ -71,6 +69,34 @@ from shared.error_handling import (
 SEEDVR2_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
 SEEDVR2_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 I32_INDEX_LIMIT = 2_147_483_647
+
+
+def chunk_and_process(*args, **kwargs):
+    """Lazy-import chunking helpers so Gradio startup stays free of OpenCV/numpy."""
+    from shared.chunking import chunk_and_process as _chunk_and_process_impl
+
+    return _chunk_and_process_impl(*args, **kwargs)
+
+
+def check_resume_available(*args, **kwargs):
+    """Lazy-import chunking helpers so Gradio startup stays free of OpenCV/numpy."""
+    from shared.chunking import check_resume_available as _check_resume_available_impl
+
+    return _check_resume_available_impl(*args, **kwargs)
+
+
+def restore_image(*args, **kwargs):
+    """Lazy-import face restoration only when a face post-process actually runs."""
+    from shared.face_restore import restore_image as _restore_image_impl
+
+    return _restore_image_impl(*args, **kwargs)
+
+
+def restore_video(*args, **kwargs):
+    """Lazy-import face restoration only when a face post-process actually runs."""
+    from shared.face_restore import restore_video as _restore_video_impl
+
+    return _restore_video_impl(*args, **kwargs)
 
 
 def _largest_4n_plus_1_leq(n: int) -> int:
@@ -99,6 +125,31 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
         if text in {"0", "false", "no", "off", ""}:
             return False
     return bool(default)
+
+
+def _normalize_compile_dynamic_setting(value: Any, default: str = "none") -> str:
+    """Normalize compile_dynamic to one of: 'none', 'false', 'true'."""
+    default_text = str(default or "none").strip().lower()
+    if default_text in {"", "auto", "default"}:
+        default_text = "none"
+    if default_text not in {"none", "false", "true"}:
+        default_text = "none"
+
+    if value is None:
+        return default_text
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return "true" if bool(value) else "false"
+
+    text = str(value).strip().lower()
+    if text in {"", "none", "auto", "default"}:
+        return "none"
+    if text in {"true", "1", "yes", "on"}:
+        return "true"
+    if text in {"false", "0", "no", "off"}:
+        return "false"
+    return default_text
 
 
 def _estimate_seedvr2_output_dims(in_w: int, in_h: int, resolution_short: int, max_edge: int = 0) -> Tuple[int, int]:
@@ -377,7 +428,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         # then upscale with the full factor to reach the capped target (useful for fixed-scale models).
         "pre_downscale_then_upscale": True,
         "batch_size": default_batch_size,  # Apply model-specific default
-        "uniform_batch_size": False,
+        "uniform_batch_size": True,
         "seed": 42,
         "auto_transfer_output_to_input": False,
         "save_vram_gb": 2.0,
@@ -410,11 +461,12 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "compile_backend": "inductor",
         "compile_mode": "default",
         "compile_fullgraph": False,
-        "compile_dynamic": False,
+        "compile_dynamic": "none",
         "compile_dynamo_cache_size_limit": 64,
         "compile_dynamo_recompile_limit": 128,
         "cache_dit": False,
         "cache_vae": False,
+        "split_phase_subprocesses": True,
         "debug": False,
         "resume_chunking": False,
         "resume_run_dir": "",
@@ -655,6 +707,8 @@ SEEDVR2_ORDER: List[str] = [
     "save_vram_gb",
     # Batch-only postprocessing: remove non-output artifacts after completion.
     "keep_only_output_files",
+    # Isolate encode/upscale/decode into fresh child processes.
+    "split_phase_subprocesses",
 ]
 
 
@@ -743,6 +797,14 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
     cfg["keep_only_output_files"] = _coerce_bool(
         cfg.get("keep_only_output_files", defaults.get("keep_only_output_files", False)),
         default=bool(defaults.get("keep_only_output_files", False)),
+    )
+    cfg["split_phase_subprocesses"] = _coerce_bool(
+        cfg.get("split_phase_subprocesses", defaults.get("split_phase_subprocesses", True)),
+        default=bool(defaults.get("split_phase_subprocesses", True)),
+    )
+    cfg["compile_dynamic"] = _normalize_compile_dynamic_setting(
+        cfg.get("compile_dynamic", defaults.get("compile_dynamic", "none")),
+        default=_normalize_compile_dynamic_setting(defaults.get("compile_dynamic", "none"), default="none"),
     )
     try:
         save_vram_raw = float(cfg.get("save_vram_gb", defaults.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB)))
@@ -1050,6 +1112,19 @@ def _sample_peak_vram_gb(
     result_box["telemetry_ok"] = bool(telemetry_ok)
 
 
+def _resolve_autotune_eval_peak_gb(item: Dict[str, Any]) -> float:
+    """Use the safest available peak reading for VRAM pass/fail decisions."""
+    peaks: List[float] = []
+    for key in ("whole_run_peak_vram_used_gb", "max_vram_used_gb", "phase2_peak_vram_used_gb"):
+        try:
+            value = float(item.get(key, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            peaks.append(value)
+    return float(max(peaks)) if peaks else 0.0
+
+
 def _looks_like_oom(log_text: str) -> bool:
     """Heuristic OOM detector from CLI/subprocess logs."""
     lc = str(log_text or "").lower()
@@ -1171,11 +1246,12 @@ def _build_autotune_signature(
         "compile_backend": str(settings.get("compile_backend") or "inductor"),
         "compile_mode": str(settings.get("compile_mode") or "default"),
         "compile_fullgraph": bool(settings.get("compile_fullgraph", False)),
-        "compile_dynamic": bool(settings.get("compile_dynamic", False)),
+        "compile_dynamic": _normalize_compile_dynamic_setting(settings.get("compile_dynamic", "none"), default="none"),
         "compile_dynamo_cache_size_limit": int(settings.get("compile_dynamo_cache_size_limit") or 64),
         "compile_dynamo_recompile_limit": int(settings.get("compile_dynamo_recompile_limit") or 128),
         "cache_dit": bool(settings.get("cache_dit", False)),
         "cache_vae": bool(settings.get("cache_vae", False)),
+        "split_phase_subprocesses": bool(settings.get("split_phase_subprocesses", True)),
         "dit_offload_device": str(settings.get("dit_offload_device") or "none"),
         "vae_offload_device": str(settings.get("vae_offload_device") or "none"),
         "tensor_offload_device": str(settings.get("tensor_offload_device") or "cpu"),
@@ -1217,6 +1293,7 @@ def _normalize_autotune_compile_exact_payload(exact: Dict[str, Any]) -> Dict[str
         return {}
 
     out = dict(exact)
+    out["compile_dynamic"] = _normalize_compile_dynamic_setting(out.get("compile_dynamic", "none"), default="none")
     compile_enabled = bool(out.get("compile_dit", False) or out.get("compile_vae", False))
     out["compile_lane"] = "compiled" if compile_enabled else "eager"
 
@@ -3910,10 +3987,9 @@ def build_seedvr2_callbacks(
                     item["vae_decode_tiled"] = bool(item.get("vae_decode_tiled", False))
                     item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                     item["oom"] = bool(item.get("oom", False))
-                    try:
-                        peak_used = float(item.get("max_vram_used_gb", 0.0) or 0.0)
-                    except Exception:
-                        peak_used = 0.0
+                    peak_used = _resolve_autotune_eval_peak_gb(item)
+                    item["max_vram_used_gb"] = float(peak_used)
+                    item["peak_source"] = "whole_run" if float(item.get("whole_run_peak_vram_used_gb", 0.0) or 0.0) > 0 else str(item.get("peak_source") or "legacy")
                     try:
                         historical_total = float(item.get("total_vram_gb", 0.0) or 0.0)
                     except Exception:
@@ -4272,8 +4348,8 @@ def build_seedvr2_callbacks(
                     total_for_eval = measured_total
                 else:
                     total_for_eval = float(total_vram_gb)
-                peak_source = "phase2" if (phase2_samples > 0 and max_used_phase2_gb > 0) else "whole_run"
-                selected_peak_gb = max_used_phase2_gb if peak_source == "phase2" else max_used_gb
+                peak_source = "whole_run"
+                selected_peak_gb = float(max_used_gb)
                 free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
 
                 oom = bool(_looks_like_oom(result.log))

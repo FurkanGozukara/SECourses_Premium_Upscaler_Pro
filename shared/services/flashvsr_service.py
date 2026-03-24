@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import gradio as gr
 
 from shared.preset_manager import PresetManager
-from shared.flashvsr_runner import run_flashvsr, FlashVSRResult
 from shared.path_utils import (
     normalize_path,
     collision_safe_path,
@@ -59,6 +58,13 @@ from shared.preview_utils import prepare_preview_input
 
 # Cancel event for FlashVSR+ processing
 _flashvsr_cancel_event = threading.Event()
+
+
+def run_flashvsr(*args, **kwargs):
+    """Lazy-import FlashVSR runner so the Gradio process stays backend-light."""
+    from shared.flashvsr_runner import run_flashvsr as _run_flashvsr_impl
+
+    return _run_flashvsr_impl(*args, **kwargs)
 
 
 def _save_preprocessed_artifact(pre_path: Path, output_path_str: str) -> Optional[str]:

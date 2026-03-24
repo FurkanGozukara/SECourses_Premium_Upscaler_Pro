@@ -1,0 +1,76 @@
+{
+  "model": "seedvr2",
+  "created_at": "2026-03-20 02:34:16",
+  "updated_at": "2026-03-20 02:34:16",
+  "status": "running",
+  "finalized": false,
+  "frontier_verified": false,
+  "signature": {
+    "exact": {
+      "autotune_model": "seedvr2",
+      "dit_model": "seedvr2_ema_7b_sharp_fp16.safetensors",
+      "attention_mode": "flash_attn_2",
+      "compile_dit": false,
+      "compile_vae": false,
+      "cache_dit": false,
+      "cache_vae": false,
+      "split_phase_subprocesses": true,
+      "dit_offload_device": "cpu",
+      "vae_offload_device": "cpu",
+      "tensor_offload_device": "cpu",
+      "swap_io_components": false,
+      "uniform_batch_size": true,
+      "vae_encode_tiled": true,
+      "vae_decode_tiled": true,
+      "vae_encode_tile_size": 1024,
+      "vae_encode_tile_overlap": 128,
+      "vae_decode_tile_size": 1024,
+      "vae_decode_tile_overlap": 128,
+      "upscale_factor": 4.0,
+      "max_resolution": 1920,
+      "pre_downscale_then_upscale": true,
+      "global_gpu_device": "0",
+      "save_vram_gb": 2.0,
+      "compile_lane": "eager"
+    },
+    "exact_hash": "f5f671d7f283a234fab7ffd5bffef5f2b435f26e",
+    "target_pixels": 2488320,
+    "effective_input_pixels": 155520,
+    "target_width": 1296,
+    "target_height": 1920,
+    "effective_input_width": 324,
+    "effective_input_height": 480,
+    "gpu_total_vram_gb": 31.8427734375
+  },
+  "input": {
+    "path": "G:\\SECourses_Premium_Upscaler_Pro_V1\\SECourses_Premium_Upscaler_Pro\\temp\\gradio\\13132a390d06d8708228fdc537d64195e9f884e4c9f8782cd786fc4a4993cd24\\grok_fish_flames_buzz.mp4",
+    "width": 464,
+    "height": 688,
+    "effective_input_width": 324,
+    "effective_input_height": 480
+  },
+  "target": {
+    "width": 1296,
+    "height": 1920,
+    "pixels": 2488320
+  },
+  "gpu": {
+    "selected_device": "0",
+    "selected_ids": [
+      0
+    ],
+    "total_vram_gb": 31.8427734375,
+    "min_free_target_gb": 2.0
+  },
+  "demo_clip": {
+    "input_kind": "video",
+    "fps": 30.0,
+    "width": 324,
+    "height": 480,
+    "source_frames": 145,
+    "written_frames": 201,
+    "path": "G:\\SECourses_Premium_Upscaler_Pro_V1\\SECourses_Premium_Upscaler_Pro\\temp\\seedvr2_autotune\\20260320_023416\\seedvr2_autotune_demo_201f.mp4"
+  },
+  "tests": [],
+  "best_config": {}
+}

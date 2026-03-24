@@ -16,7 +16,13 @@ import gradio as gr
 
 from shared.preset_manager import PresetManager
 from shared.runner import Runner
-from shared.path_utils import normalize_path, ffmpeg_set_fps, get_media_dimensions, resolve_batch_output_dir
+from shared.path_utils import (
+    normalize_path,
+    ffmpeg_set_fps,
+    get_media_dimensions,
+    resolve_batch_output_dir,
+    detect_input_type,
+)
 from shared.logging_utils import RunLogger
 from shared.models.rife_meta import get_rife_metadata, get_rife_default_model
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
@@ -74,6 +80,8 @@ def rife_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         # Kept as string to align with UI dropdown choices ("fp16"/"fp32").
         "fp16_mode": default_precision,
         "png_output": False,
+        "sequence_format": "png",
+        "sequence_quality": 95,
         "no_audio": False,
         "show_ffmpeg": False,
         "montage": False,
@@ -117,6 +125,8 @@ RIFE_ORDER: List[str] = [
     "uhd_mode",
     "fp16_mode",
     "png_output",
+    "sequence_format",
+    "sequence_quality",
     "no_audio",
     "show_ffmpeg",
     "montage",
@@ -612,6 +622,11 @@ def _rife_dict_from_args(args: List[Any]) -> Dict[str, Any]:
     return dict(zip(RIFE_ORDER, args))
 
 
+def _normalize_sequence_format(raw: Any) -> str:
+    fmt = str(raw or "png").strip().lower()
+    return "jpg" if fmt in {"jpg", "jpeg"} else "png"
+
+
 def _enforce_rife_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
     """
     Apply RIFE-specific validation rules using metadata registry.
@@ -676,6 +691,17 @@ def _enforce_rife_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> D
         text = str(precision_raw).strip().lower()
         cfg["fp16_mode"] = "fp16" if text in ("fp16", "true", "1", "yes", "on") else "fp32"
 
+    cfg["sequence_format"] = _normalize_sequence_format(
+        cfg.get("sequence_format", defaults.get("sequence_format", "png"))
+    )
+    try:
+        sequence_quality = int(
+            float(cfg.get("sequence_quality", defaults.get("sequence_quality", 95)) or 95)
+        )
+    except (ValueError, TypeError):
+        sequence_quality = 95
+    cfg["sequence_quality"] = max(1, min(100, sequence_quality))
+
     # Normalize FPS multiplier into xN format accepted by the UI dropdown.
     fps_raw = str(cfg.get("fps_multiplier", "x2")).strip().lower()
     if fps_raw.startswith("x"):
@@ -688,6 +714,10 @@ def _enforce_rife_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> D
     cfg["fps_multiplier"] = f"x{fps_val}"
     
     return cfg
+
+
+def _sequence_dir_suffix(settings: Dict[str, Any]) -> str:
+    return _normalize_sequence_format(settings.get("sequence_format", "png"))
 
 
 def _apply_rife_preset(
@@ -925,16 +955,17 @@ def build_rife_callbacks(
                 yield (" Input missing or not found", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                 return
 
-            # Validate input type based on mode
+            input_type_runtime = detect_input_type(input_path)
+            settings["img_mode"] = input_type_runtime in {"directory", "image"}
+
+            # Validate input type based on detected mode
             if settings.get("img_mode"):
-                # In --img mode, require a frames folder or images
-                if Path(input_path).is_file() and Path(input_path).suffix.lower() in (".mp4", ".mov", ".mkv", ".avi"):
-                    yield (" --img mode expects frames folder or images, not a video file.", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
+                if input_type_runtime == "video":
+                    yield (" Image-sequence input expects frames/images, not a video file.", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                     return
             else:
-                # In video mode, require a video file
                 if Path(input_path).is_dir():
-                    yield (" Video mode expects a video file. Enable --img for frame folders.", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
+                    yield (" RIFE auto-detect found a folder input. Use a video file here, or keep the folder to process it as an image sequence automatically.", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                     return
 
             settings["input_path"] = input_path
@@ -1067,8 +1098,7 @@ def build_rife_callbacks(
             settings["frame_accurate_split"] = frame_accurate_split
             
             # Determine if PySceneDetect chunking should be used
-            from shared.path_utils import detect_input_type as detect_type
-            input_type_check = detect_type(input_path)
+            input_type_check = input_type_runtime
 
             # NEW: Per-run output folder for single video runs (0001/0002/...) to avoid collisions and
             # to keep chunk artifacts user-visible.
@@ -1103,7 +1133,9 @@ def build_rife_callbacks(
                     base_stem = Path(settings.get("_original_filename") or input_path).stem
                     png_output = bool(settings.get("png_output", False))
                     if png_output:
-                        settings["output_override"] = str(run_dir / f"{base_stem}_png")
+                        settings["output_override"] = str(
+                            run_dir / f"{base_stem}_{_sequence_dir_suffix(settings)}"
+                        )
                     else:
                         out_ext = str(settings.get("output_format") or "mp4")
                         if out_ext == "auto":
@@ -1130,12 +1162,12 @@ def build_rife_callbacks(
                         base_stem = Path(settings.get("_original_filename") or input_path).stem
                         png_output = bool(settings.get("png_output", False))
                         if png_output:
-                            # PNG sequence output: force an output DIRECTORY inside the run folder.
+                            # Image-sequence output: force an output DIRECTORY inside the run folder.
                             # If user provided a file override, reuse its stem as the directory name.
                             if explicit_final:
                                 default_final = run_dir / Path(explicit_final).stem
                             else:
-                                default_final = run_dir / f"{base_stem}_png"
+                                default_final = run_dir / f"{base_stem}_{_sequence_dir_suffix(settings)}"
                             settings["output_override"] = str(default_final)
                         else:
                             out_ext = str(settings.get("output_format") or "mp4")
@@ -1152,7 +1184,7 @@ def build_rife_callbacks(
                 input_type_check == "video" and
                 not settings.get("batch_enable", False) and
                 not settings.get("img_mode", False) and  # Don't chunk image sequences
-                not bool(settings.get("png_output", False))  # PNG export uses directory outputs; keep flow simple
+                not bool(settings.get("png_output", False))  # Sequence export uses directory outputs; keep flow simple
             )
             resume_requested = bool(settings.get("_resume_run_requested") or str(settings.get("resume_run_dir") or "").strip())
             if resume_requested and not should_use_chunking:
@@ -1441,7 +1473,10 @@ def build_rife_callbacks(
                         item_out_dir = batch_item_dir(batch_output_folder, Path(job.input_path).name)
                         png_output_job = bool(single_settings.get("png_output", False))
                         if png_output_job:
-                            predicted_final = item_out_dir / f"{Path(job.input_path).stem}_png"
+                            predicted_final = (
+                                item_out_dir
+                                / f"{Path(job.input_path).stem}_{_sequence_dir_suffix(single_settings)}"
+                            )
                         else:
                             predicted_final = item_out_dir / f"{Path(job.input_path).stem}.{out_ext.lstrip('.')}"
 

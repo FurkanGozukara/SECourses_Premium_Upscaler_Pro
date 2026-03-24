@@ -1845,9 +1845,49 @@ def concat_videos(
 
     # Stream-copy path (fast, no extra generation loss) only for homogeneous streams.
     if stream_copy_safe:
-        # Preferred path for H.264/H.265: convert each MP4 segment to MPEG-TS (Annex B),
-        # then concat-copy back to MP4. This avoids timestamp/PPS issues seen with direct
-        # MP4 stream-copy concat and keeps video bit-exact (no re-encode).
+        # Use a tight duration check for copy-based merges. A relaxed threshold can accept
+        # timestamp-compressed outputs that play in tolerant media players but decode poorly
+        # in stricter NLEs such as Resolve.
+        copy_merge_min_ratio = 0.999
+
+        # Prefer direct concat demuxer + copy first. For MP4 chunk sets this preserves the
+        # original MP4 timing more reliably than the TS bridge when chunk streams already
+        # match cleanly.
+        output_path.unlink(missing_ok=True)
+        cmd_copy = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(txt),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        proc_copy = _run_ffmpeg(cmd_copy)
+        if proc_copy.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=copy_merge_min_ratio):
+            if on_progress:
+                on_progress(
+                    f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
+                )
+            return True
+        if on_progress:
+            tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
+            on_progress("WARN: Direct stream-copy concat failed validation; trying TS fallback.\n")
+            if tail:
+                on_progress(f"ffmpeg: {tail}\n")
+
+        # Secondary path for H.264/H.265: convert each MP4 segment to MPEG-TS (Annex B),
+        # then concat-copy back to MP4. Keep this as a fallback for chunk sets where direct
+        # MP4 concat-copy is rejected by ffmpeg or produces incompatible bitstream metadata.
         codec_keys = [_probe_video_codec_key_with_retry(p, attempts=4, delay_sec=0.15) for p in stable_chunks]
         common_codec: Optional[str] = None
         if codec_keys and all(k == codec_keys[0] and k for k in codec_keys):
@@ -1909,7 +1949,7 @@ def concat_videos(
                         str(output_path),
                     ]
                     proc_ts_concat = _run_ffmpeg(cmd_ts_concat)
-                    if proc_ts_concat.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
+                    if proc_ts_concat.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=copy_merge_min_ratio):
                         if on_progress:
                             on_progress(
                                 f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
@@ -1917,42 +1957,9 @@ def concat_videos(
                         return True
                     if on_progress:
                         tail = (proc_ts_concat.stderr or proc_ts_concat.stdout or "").strip()[-400:]
-                        on_progress("WARN: TS stream-copy concat failed; trying generic copy merge.\n")
+                        on_progress("WARN: TS stream-copy concat failed validation; trying robust fallback.\n")
                         if tail:
                             on_progress(f"ffmpeg: {tail}\n")
-
-        # Secondary copy path: direct concat demuxer + stream copy.
-        output_path.unlink(missing_ok=True)
-        cmd_copy = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(txt),
-            "-map",
-            "0:v:0",
-            "-c:v",
-            "copy",
-            "-an",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        proc_copy = _run_ffmpeg(cmd_copy)
-        if proc_copy.returncode == 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
-            if on_progress:
-                on_progress(
-                    f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
-                )
-            return True
-        if on_progress:
-            tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
-            on_progress("WARN: Direct stream-copy concat failed validation; trying robust fallback.\n")
-            if tail:
-                on_progress(f"ffmpeg: {tail}\n")
 
     # Robust fallback path for mixed-timestamp chunks or failed stream-copy concat.
     if _try_framepipe_reencode_concat(stream_copy_reason or "stream-copy merge failed"):

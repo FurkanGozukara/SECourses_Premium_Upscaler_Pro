@@ -215,6 +215,14 @@ def _normalize_rife_settings(data: Dict[str, Any]) -> Dict[str, Any]:
         fps_int = 2
     fps_int = 1 if fps_int <= 1 else (2 if fps_int <= 2 else (4 if fps_int <= 4 else 8))
     cfg["fps_multiplier"] = f"x{fps_int}"
+
+    seq_fmt = str(cfg.get("sequence_format", "png") or "png").strip().lower()
+    cfg["sequence_format"] = "jpg" if seq_fmt in {"jpg", "jpeg"} else "png"
+    try:
+        seq_quality = int(float(cfg.get("sequence_quality", 95) or 95))
+    except Exception:
+        seq_quality = 95
+    cfg["sequence_quality"] = max(1, min(100, seq_quality))
     return cfg
 
 

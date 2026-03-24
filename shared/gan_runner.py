@@ -1174,7 +1174,7 @@ def _run_with_realesrgan_image(
                 if proc.returncode == 0 and temp_downscaled.exists():
                     effective_input = temp_downscaled
                     if on_progress:
-                        on_progress(f"âœ“ Downscaled input to {result_calc.input_resize_width}x{result_calc.input_resize_height}\n")
+                        on_progress(f"INFO: Downscaled input to {result_calc.input_resize_width}x{result_calc.input_resize_height}\n")
 
         # Prepare settings for Real-ESRGAN
         realesrgan_settings = {

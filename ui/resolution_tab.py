@@ -178,7 +178,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                     scale=20,
                 )
                 calc_input_browse_btn = gr.Button(
-                    "📂",
+                    "Browse",
                     size="lg",
                     elem_id="open_folder_small",
                     scale=1,
@@ -321,7 +321,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         
         # Check for disk space warnings in the info
         info_lower = str(info or "").lower()
-        if "disk space" in info_lower and ("warning" in info_lower or "⚠" in str(info) or "âš" in str(info)):
+        if "disk space" in info_lower and "warning" in info_lower:
             disk_warning = "WARNING: Insufficient disk space detected!"
             return gr.update(value=info, visible=True), updated_state, gr.update(value=disk_warning, visible=True)
         
@@ -350,9 +350,9 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         if input_path:
             return (
                 gr.update(value=input_path),
-                gr.update(value=f"✅ Using input from {tab_label} tab: {input_path}", visible=True),
+                gr.update(value=f"SUCCESS: Using input from {tab_label} tab: {input_path}", visible=True),
             )
-        return gr.update(), gr.update(value=f"⚠️ No input set in {tab_label} tab yet", visible=True)
+        return gr.update(), gr.update(value=f"WARNING: No input set in {tab_label} tab yet", visible=True)
 
     use_seedvr2_input_btn.click(
         fn=lambda state: use_tab_input(state, "seedvr2_settings", "SeedVR2"),

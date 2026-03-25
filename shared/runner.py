@@ -25,6 +25,7 @@ from .path_utils import (
 )
 from .model_manager import get_model_manager, ModelType
 from .command_logger import get_command_logger
+from .video_codec_options import build_ffmpeg_video_encode_args
 
 
 class RunResult:
@@ -2215,24 +2216,46 @@ class Runner:
 
         output_format_pref = str(settings.get("output_format") or "").strip().lower()
         sequence_requested = bool(settings.get("png_output"))
+        img_input_mode = bool(settings.get("img_mode"))
         if sequence_requested:
-            png_output = True
+            wants_sequence_output = True
         elif output_format_pref == "png":
-            png_output = True
+            wants_sequence_output = True
         elif output_format_pref in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"}:
-            png_output = False
+            wants_sequence_output = False
         else:
-            png_output = sequence_requested
-        settings["png_output"] = bool(png_output)
+            wants_sequence_output = sequence_requested
+        settings["png_output"] = bool(wants_sequence_output)
         output_override = settings.get("output_override") or None
-        predicted_output = rife_output_path(
-            effective_input,  # Use trimmed input for output naming
-            png_output,
-            output_override,
-            global_output_dir=str(self.output_dir),
-            png_padding=settings.get("png_padding"),
-            png_keep_basename=settings.get("png_keep_basename", False),
-        )
+        package_sequence_to_video = bool(img_input_mode and not wants_sequence_output)
+        cli_png_output = bool(wants_sequence_output or img_input_mode)
+        final_video_output: Optional[Path] = None
+        if package_sequence_to_video:
+            final_video_output = rife_output_path(
+                effective_input,
+                False,
+                output_override,
+                global_output_dir=str(self.output_dir),
+                png_padding=settings.get("png_padding"),
+                png_keep_basename=settings.get("png_keep_basename", False),
+            )
+            predicted_output = rife_output_path(
+                effective_input,
+                True,
+                str(final_video_output.parent / f"_{final_video_output.stem}_rife_frames"),
+                global_output_dir=str(final_video_output.parent),
+                png_padding=settings.get("png_padding"),
+                png_keep_basename=settings.get("png_keep_basename", False),
+            )
+        else:
+            predicted_output = rife_output_path(
+                effective_input,  # Use trimmed input for output naming
+                cli_png_output,
+                output_override,
+                global_output_dir=str(self.output_dir),
+                png_padding=settings.get("png_padding"),
+                png_keep_basename=settings.get("png_keep_basename", False),
+            )
 
         cmd = self._build_rife_cmd(
             cli_path,
@@ -2263,7 +2286,7 @@ class Runner:
             finally:
                 sys.argv = [sys.executable]
             output_path = str(predicted_output)
-            if png_output:
+            if cli_png_output:
                 finalized_path, finalize_note = _finalize_rife_sequence_output(
                     predicted_output,
                     settings,
@@ -2272,12 +2295,29 @@ class Runner:
                 output_path = str(finalized_path)
                 if finalize_note:
                     buf.write(f"{finalize_note}\n")
+            if package_sequence_to_video and final_video_output is not None:
+                packaged_path, package_note = self._package_rife_sequence_to_video(
+                    Path(output_path),
+                    final_video_output,
+                    settings,
+                    on_progress=on_progress,
+                )
+                if package_note:
+                    buf.write(f"{package_note}\n")
+                if packaged_path is None:
+                    rc = rc or 1
+                else:
+                    try:
+                        shutil.rmtree(Path(output_path), ignore_errors=True)
+                    except Exception:
+                        pass
+                    output_path = str(packaged_path)
             meta_payload = {
                 "returncode": rc,
                 "output": output_path,
                 "args": settings,
             }
-            if png_output:
+            if Path(output_path).exists() and Path(output_path).is_dir():
                 write_png_metadata(Path(output_path), meta_payload)
             else:
                 emit_metadata(Path(output_path), meta_payload)
@@ -2346,7 +2386,7 @@ class Runner:
                 pass
             if on_progress:
                 on_progress(eta_line + "\n")
-        if png_output:
+        if cli_png_output:
             sequence_staging_dir = self.base_dir / "RIFE" / "vid_out"
             _clear_rife_sequence_staging(sequence_staging_dir)
             predicted_output.mkdir(parents=True, exist_ok=True)
@@ -2417,26 +2457,51 @@ class Runner:
                 sequence_sync_stop.set()
             if sequence_sync_thread is not None:
                 sequence_sync_thread.join(timeout=5.0)
-            if png_output and sequence_staging_dir is not None:
+            if cli_png_output and sequence_staging_dir is not None:
                 _sync_rife_sequence_staging(sequence_staging_dir, predicted_output)
 
         output_path = str(predicted_output)
-        if png_output:
+        sequence_output_path: Optional[Path] = None
+        if cli_png_output:
             finalized_path, finalize_note = _finalize_rife_sequence_output(
                 predicted_output,
                 settings,
                 on_progress=on_progress,
             )
+            sequence_output_path = finalized_path
             output_path = str(finalized_path)
             if finalize_note:
                 log_lines.append(finalize_note)
             if sequence_staging_dir is not None:
                 _clear_rife_sequence_staging(sequence_staging_dir)
-        if settings.get("fps_override") and predicted_output.suffix.lower() == ".mp4":
-            adjusted = ffmpeg_set_fps(predicted_output, settings["fps_override"])
-            output_path = str(adjusted)
 
         returncode_val = proc.returncode if proc else -1
+        if returncode_val == 0 and package_sequence_to_video and sequence_output_path is not None and final_video_output is not None:
+            packaged_path, package_note = self._package_rife_sequence_to_video(
+                sequence_output_path,
+                final_video_output,
+                settings,
+                on_progress=on_progress,
+            )
+            if package_note:
+                log_lines.append(package_note)
+            if packaged_path is None:
+                returncode_val = 1
+            else:
+                try:
+                    shutil.rmtree(sequence_output_path, ignore_errors=True)
+                except Exception:
+                    pass
+                output_path = str(packaged_path)
+
+        if (
+            returncode_val == 0
+            and (not package_sequence_to_video)
+            and settings.get("fps_override")
+            and Path(output_path).suffix.lower() == ".mp4"
+        ):
+            adjusted = ffmpeg_set_fps(Path(output_path), settings["fps_override"])
+            output_path = str(adjusted)
         execution_time = time.time() - start_time
         
         meta_payload = {
@@ -2457,7 +2522,7 @@ class Runner:
             try:
                 # Emit for all runs (success, failure, cancellation)
                 metadata_target = Path(output_path) if Path(output_path).exists() or Path(output_path).parent.exists() else self.output_dir
-                if png_output:
+                if Path(output_path).exists() and Path(output_path).is_dir():
                     write_png_metadata(metadata_target if metadata_target.is_dir() else metadata_target.parent, meta_payload)
                 else:
                     emit_metadata(metadata_target, meta_payload)
@@ -2477,7 +2542,9 @@ class Runner:
                 additional_info={
                     "mode": "subprocess",
                     "cancelled": self._canceled,
-                    "png_output": png_output,
+                    "png_output": wants_sequence_output,
+                    "cli_png_output": cli_png_output,
+                    "sequence_packaged_to_video": package_sequence_to_video,
                     "trimmed_input": str(trimmed_video) if trimmed_video else None
                 }
             )
@@ -2561,6 +2628,148 @@ class Runner:
             "prores_ks": "prores_ks",
         }
         return codec_map.get(text, "libx264")
+
+    @staticmethod
+    def _rife_video_codec_key(codec_raw: Any) -> str:
+        codec_name = Runner._normalize_rife_video_codec(codec_raw)
+        codec_map = {
+            "libx264": "h264",
+            "libx265": "h265",
+            "libvpx-vp9": "vp9",
+            "libsvtav1": "av1",
+            "prores_ks": "prores",
+        }
+        return codec_map.get(codec_name, "h264")
+
+    @staticmethod
+    def _infer_rife_sequence_pattern(frame_dir: Path) -> Tuple[Optional[str], Optional[int]]:
+        try:
+            frame_paths = sorted(
+                p for p in Path(frame_dir).iterdir()
+                if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            )
+        except Exception:
+            return None, None
+
+        if not frame_paths:
+            return None, None
+
+        first = frame_paths[0]
+        match = re.match(r"^(.*?)(\d+)$", first.stem)
+        if not match:
+            return None, None
+
+        prefix, digits = match.groups()
+        return f"{prefix}%0{len(digits)}d{first.suffix.lower()}", int(digits)
+
+    def _package_rife_sequence_to_video(
+        self,
+        sequence_dir: Path,
+        output_path: Path,
+        settings: Dict[str, Any],
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[Optional[Path], Optional[str]]:
+        sequence_dir = Path(sequence_dir)
+        output_path = Path(output_path)
+
+        if not sequence_dir.exists() or not sequence_dir.is_dir():
+            return None, f"Sequence output directory not found: {sequence_dir}"
+
+        pattern_name, start_number = self._infer_rife_sequence_pattern(sequence_dir)
+        if not pattern_name or start_number is None:
+            return None, f"Could not detect numbered frames in: {sequence_dir}"
+
+        try:
+            output_fps = float(settings.get("fps_override") or 0.0)
+        except Exception:
+            output_fps = 0.0
+
+        if output_fps <= 0:
+            try:
+                fps_mult = int(settings.get("fps_multiplier", 2) or 2)
+            except Exception:
+                fps_mult = 2
+            fps_mult = max(1, fps_mult)
+            output_fps = 30.0 * float(fps_mult)
+            if on_progress:
+                on_progress(
+                    f"INFO: Image-sequence input has no source FPS metadata; packaging video at "
+                    f"{output_fps:.2f}fps (30fps base x{fps_mult}).\n"
+                )
+
+        codec_key = self._rife_video_codec_key(settings.get("video_codec", "h264"))
+        try:
+            quality_val = int(float(settings.get("video_quality", settings.get("output_quality", 23)) or 23))
+        except Exception:
+            quality_val = 23
+        quality_val = max(0, min(63, quality_val))
+
+        video_preset = str(settings.get("video_preset", "slow") or "slow").strip().lower() or "slow"
+        pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower() or "yuv420p"
+        use_10bit = bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False))
+        if codec_key == "h265" and use_10bit and "10le" not in pixel_format:
+            pixel_format = "yuv420p10le"
+
+        h265_tune = str(settings.get("h265_tune", "none") or "none").strip().lower() or "none"
+        try:
+            av1_film_grain = int(float(settings.get("av1_film_grain", 8) or 8))
+        except Exception:
+            av1_film_grain = 8
+        av1_film_grain = max(0, min(50, av1_film_grain))
+        av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
+
+        codec_args = build_ffmpeg_video_encode_args(
+            codec=codec_key,
+            quality=quality_val,
+            pixel_format=pixel_format,
+            preset=video_preset,
+            audio_codec="none",
+            audio_bitrate=None,
+            h265_tune=h265_tune,
+            av1_film_grain=av1_film_grain,
+            av1_film_grain_denoise=av1_film_grain_denoise,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_pattern = str(sequence_dir / pattern_name)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            f"{float(output_fps):.6f}",
+            "-start_number",
+            str(int(start_number)),
+            "-i",
+            frame_pattern,
+            *codec_args,
+        ]
+        if output_path.suffix.lower() == ".mp4":
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(output_path))
+
+        if on_progress:
+            on_progress(f"Packaging image sequence to video: {output_path.name}\n")
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception as exc:
+            return None, f"Failed to package image sequence to video: {exc}"
+
+        if proc.returncode != 0 or not output_path.exists():
+            detail = (proc.stdout or "").strip()
+            if len(detail) > 1000:
+                detail = detail[-1000:]
+            return None, (
+                f"Failed to package image sequence to video: "
+                f"{detail or f'ffmpeg exited with code {proc.returncode}'}"
+            )
+
+        return output_path, None
 
     def _resolve_rife_bundle_dir(self, candidate_dir: Path) -> Optional[Path]:
         """

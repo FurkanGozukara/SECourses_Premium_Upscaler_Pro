@@ -291,15 +291,19 @@ def rife_output_path(
     """
     Collision-safe output for RIFE, reusing the shared SeedVR2-style helper:
     - If override is provided, use it (file or dir) as-is.
+    - In sequence mode, file-style overrides are normalized to a directory
+      using the file stem (e.g. output.mp4 -> output/).
     - Otherwise mirror generate_output_path semantics with optional global override.
     """
     if override:
         target = Path(normalize_path(override))
+        if png_output:
+            if target.suffix != "":
+                target = target.with_suffix("")
+            final_dir = collision_safe_dir(target)
+            ensure_dir(final_dir)
+            return final_dir
         if target.suffix == "":
-            if png_output:
-                final_dir = collision_safe_dir(target)
-                ensure_dir(final_dir)
-                return final_dir
             target = target.with_suffix(".mp4")
         ensure_dir(target.parent)
         return collision_safe_path(target)

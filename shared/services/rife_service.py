@@ -1130,12 +1130,11 @@ def build_rife_callbacks(
             # NEW: Per-run output folder for single video runs (0001/0002/...) to avoid collisions and
             # to keep chunk artifacts user-visible.
             if (
-                input_type_check == "video"
+                input_type_check in {"video", "directory"}
                 and not settings.get("batch_enable", False)
-                and not settings.get("img_mode", False)
             ):
                 resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
-                if resume_run_dir_raw:
+                if input_type_check == "video" and resume_run_dir_raw:
                     resume_run_dir = Path(normalize_path(resume_run_dir_raw))
                     if not (resume_run_dir.exists() and resume_run_dir.is_dir()):
                         yield (
@@ -2081,13 +2080,18 @@ def build_rife_callbacks(
             except Exception:
                 pass
 
-            comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                settings.get("_original_input_path_before_preprocess") or settings.get("input_path"),
-                final_output_path,
-                seed_controls,
-                label_output="RIFE",
-                on_progress=None,
-            )
+            final_output_obj = Path(final_output_path) if final_output_path else None
+            final_output_is_file = bool(final_output_obj and final_output_obj.exists() and final_output_obj.is_file())
+            comp_vid_path = None
+            comp_vid_err = None
+            if final_output_is_file:
+                comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
+                    settings.get("_original_input_path_before_preprocess") or settings.get("input_path"),
+                    final_output_path,
+                    seed_controls,
+                    label_output="RIFE",
+                    on_progress=None,
+                )
             comp_vid_note = ""
             if comp_vid_path:
                 comp_vid_note = f"\nComparison Video: {comp_vid_path}"
@@ -2137,11 +2141,11 @@ def build_rife_callbacks(
             image_slider_update = gr.update(value=None)
             video_comparison_html_update = gr.update(value="", visible=False)
             
-            if final_output_path and Path(final_output_path).exists():
+            if final_output_is_file:
                 original_input = settings["input_path"]
                 
                 # Video comparison with custom HTML slider
-                if Path(final_output_path).suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv'):
+                if final_output_obj.suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv'):
                     if Path(original_input).exists():
                         from shared.video_comparison_slider import create_video_comparison_html
                         
@@ -2154,7 +2158,7 @@ def build_rife_callbacks(
                         video_comparison_html_update = gr.update(value=video_comp_html_value, visible=True)
                 
                 # Image comparison with ImageSlider (for single-frame outputs or image mode)
-                elif Path(final_output_path).suffix.lower() in ('.png', '.jpg', '.jpeg'):
+                elif final_output_obj.suffix.lower() in ('.png', '.jpg', '.jpeg'):
                     if Path(original_input).exists():
                         image_slider_update = gr.update(
                             value=(original_input, final_output_path),
@@ -2168,7 +2172,7 @@ def build_rife_callbacks(
                 status,
                 result.log if should_run_rife and "result" in locals() else "",
                 gr.update(value="", visible=False),  # progress_indicator (clear on completion)
-                final_output_path if final_output_path and Path(final_output_path).suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv') else None,
+                final_output_path if final_output_is_file and final_output_obj.suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv') else None,
                 image_slider_update,
                 video_comparison_html_update,
                 state

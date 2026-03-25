@@ -636,7 +636,7 @@ def seedvr2_tab(
                 label="Input Video or Frames Folder Path",
                 value=values[0],
                 placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
-                info="Enter path to either a video file (mp4, avi, mov, etc.) or folder containing image frames (jpg, png, tiff, etc.). Automatically detected - works on Windows and Linux."
+                info="Enter a video file path or a folder containing image frames. With Batch Processing OFF, a folder is treated as one ordered frame-sequence clip using Windows-style logical sorting on Windows and Linux. Use Batch Processing for per-file folder batches."
             )
 
             # Model directory override (optional). SeedVR2 Model selection is above Batch Size.
@@ -852,7 +852,7 @@ def seedvr2_tab(
                     label="Output Format",
                     choices=["auto", "mp4", "png"],
                     value=output_format_value,
-                    info="'auto' chooses based on input type. 'mp4' for video output. 'png' exports frame sequence. Note: MP4 drops alpha channels.",
+                    info="'auto' chooses based on input type. Direct video or frames-folder clip inputs default to mp4; 'png' exports a frame sequence. Note: MP4 drops alpha channels.",
                     scale=1,
                 )
 
@@ -879,8 +879,9 @@ def seedvr2_tab(
             with gr.Accordion(" Batch Processing", open=True):
                 with gr.Row():
                     batch_enable = gr.Checkbox(
-                        label="Enable Batch Processing (use directory input)",
+                        label="Enable Batch Processing (per-file folder batch)",
                         value=values[5],
+                        info="Use Batch Input Folder for per-file batch processing. Leave this OFF when the direct input path is a single frames folder that should be treated as one clip.",
                         scale=2,
                     )
                     keep_only_output_files = gr.Checkbox(
@@ -893,7 +894,7 @@ def seedvr2_tab(
                     label="Batch Input Folder",
                     value=values[6],
                     placeholder="Folder containing videos or frames",
-                    info="Process multiple files in batch mode"
+                    info="Per-file folder batch mode. Each supported file is processed separately, unlike the direct input path frame-sequence mode."
                 )
                 batch_output = gr.Textbox(
                     label="Batch Output Folder Override",
@@ -2490,6 +2491,7 @@ def seedvr2_tab(
                     info_parts.append(f"&nbsp;&nbsp; Missing: {len(input_info.missing_frames)}")
             elif input_info.input_type == "directory":
                 info_parts.append(f"&nbsp;&nbsp; Files: {input_info.total_files}")
+                info_parts.append("&nbsp;&nbsp; Direct input treats this as one ordered frame-sequence clip when Batch Processing is OFF")
             elif input_info.input_type in ["video", "image"]:
                 info_parts.append(f"&nbsp;&nbsp; Format: **{input_info.format.upper()}**")
             

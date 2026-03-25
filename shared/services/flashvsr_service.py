@@ -27,6 +27,8 @@ from shared.path_utils import (
     detect_input_type,
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    list_directory_entries_sorted,
+    list_files_sorted,
     resolve_batch_output_dir,
 )
 from shared.logging_utils import RunLogger
@@ -962,7 +964,7 @@ def build_flashvsr_callbacks(
                         temp_root = Path(global_settings.get("temp_dir", temp_dir))
                         temp_root.mkdir(parents=True, exist_ok=True)
                         src_dir = Path(src_input_path)
-                        img_files = [p for p in sorted(src_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+                        img_files = list_files_sorted(src_dir, IMAGE_EXTENSIONS)
                         if not img_files:
                             return
 
@@ -1162,7 +1164,7 @@ def build_flashvsr_callbacks(
                         temp_root = Path(global_settings.get("temp_dir", temp_dir))
                         temp_root.mkdir(parents=True, exist_ok=True)
                         src_dir = Path(src_input_path)
-                        img_files = [p for p in sorted(src_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+                        img_files = list_files_sorted(src_dir, IMAGE_EXTENSIONS)
                         if img_files:
                             pre_dir = collision_safe_dir(
                                 temp_root / f"{src_dir.name}_pre{int(plan.preprocess_width)}x{int(plan.preprocess_height)}"
@@ -1337,7 +1339,12 @@ def build_flashvsr_callbacks(
                 media_file_exts = VIDEO_EXTENSIONS.union(IMAGE_EXTENSIONS)
                 items: List[Path] = []
                 try:
-                    for p in sorted(in_dir.iterdir()):
+                    for p in list_directory_entries_sorted(
+                        in_dir,
+                        include_files=True,
+                        include_dirs=True,
+                        extensions=media_file_exts,
+                    ):
                         try:
                             if excluded_subtree and _is_within(p, excluded_subtree):
                                 continue
@@ -1361,10 +1368,8 @@ def build_flashvsr_callbacks(
                 if not items:
                     try:
                         root_images = [
-                            p for p in sorted(in_dir.iterdir())
-                            if p.is_file()
-                            and p.suffix.lower() in IMAGE_EXTENSIONS
-                            and (not excluded_subtree or not _is_within(p, excluded_subtree))
+                            p for p in list_files_sorted(in_dir, IMAGE_EXTENSIONS)
+                            if not excluded_subtree or not _is_within(p, excluded_subtree)
                         ]
                     except Exception:
                         root_images = []

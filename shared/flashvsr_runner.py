@@ -27,6 +27,7 @@ from .path_utils import (
     detect_input_type,
     get_media_dimensions,
     get_media_fps,
+    list_files_sorted,
     normalize_path,
     resolve_output_location,
 )
@@ -386,11 +387,7 @@ def _prepare_cli_input(
         return str(temp_video), tmp_root, None
 
     if kind == "directory":
-        image_paths = [
-            p
-            for p in sorted(Path(input_path).iterdir())
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-        ]
+        image_paths = list_files_sorted(input_path, IMAGE_EXTENSIONS)
         if not image_paths:
             shutil.rmtree(tmp_root, ignore_errors=True)
             return None, None, f"Input directory has no supported image files: {input_path}"

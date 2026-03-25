@@ -34,7 +34,9 @@ from shared.path_utils import (
     get_media_duration_seconds,
     get_media_fps,
     detect_input_type,
+    list_files_sorted,
     resolve_batch_output_dir,
+    sort_windows_names,
 )
 from shared.resolution_calculator import estimate_seedvr2_upscale_plan_from_dims
 from shared.output_run_manager import (
@@ -971,17 +973,8 @@ def _resolve_input_path(file_upload: Optional[str], manual_path: str, batch_enab
 def _list_media_files(folder: str, video_exts: set, image_exts: set) -> List[str]:
     """List media files in a folder."""
     try:
-        p = Path(normalize_path(folder))
-        if not p.exists() or not p.is_dir():
-            return []
-        items = []
-        for f in sorted(p.iterdir()):
-            if not f.is_file():
-                continue
-            ext = f.suffix.lower()
-            if ext in video_exts or ext in image_exts:
-                items.append(str(f))
-        return items
+        allowed_exts = set(video_exts).union(image_exts)
+        return [str(f) for f in list_files_sorted(folder, allowed_exts)]
     except Exception:
         return []
 
@@ -1985,8 +1978,37 @@ def _process_single_file(
                                     pre_out = None
                         except Exception:
                             pre_out = None
+                    elif in_type == "directory" and bool(settings.get("directory_as_sequence")):
+                        try:
+                            import cv2  # type: ignore
 
-                    # Directories (batch folders / frame folders) are handled per-item in batch mode.
+                            frame_files = list_files_sorted(in_path, SEEDVR2_IMAGE_EXTS)
+                            if not frame_files:
+                                raise ValueError(f"No supported image frames found in directory: {in_path}")
+
+                            pre_dir = collision_safe_dir(
+                                pre_root / f"{Path(in_path).name}_pre{plan.preprocess_width}x{plan.preprocess_height}"
+                            )
+                            pre_dir.mkdir(parents=True, exist_ok=True)
+
+                            for frame_file in frame_files:
+                                img = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
+                                if img is None:
+                                    raise ValueError(f"Cannot open frame for preprocessing: {frame_file}")
+                                resized = cv2.resize(
+                                    img,
+                                    (int(plan.preprocess_width), int(plan.preprocess_height)),
+                                    interpolation=cv2.INTER_LANCZOS4,
+                                )
+                                out_frame = pre_dir / frame_file.name
+                                cv2.imwrite(str(out_frame), resized)
+                                if not out_frame.exists():
+                                    raise ValueError(f"Failed to write preprocessed frame: {out_frame}")
+
+                            pre_out = pre_dir
+                        except Exception:
+                            pre_out = None
+
                     if pre_out:
                         settings["_original_input_path_before_preprocess"] = settings["input_path"]
                         settings["_preprocessed_input_path"] = str(pre_out)
@@ -2001,7 +2023,14 @@ def _process_single_file(
         # very large per-batch tensors (frames * H * W * C). Clamp batch_size
         # to a safe 4n+1 value based on estimated output dimensions.
         try:
-            if (not preview_only) and detect_input_type(settings["input_path"]) == "video":
+            input_kind_for_guard = detect_input_type(settings["input_path"])
+            if (not preview_only) and (
+                input_kind_for_guard == "video"
+                or (
+                    input_kind_for_guard == "directory"
+                    and bool(settings.get("directory_as_sequence"))
+                )
+            ):
                 color_mode = str(settings.get("color_correction", "lab") or "").strip().lower()
                 if color_mode == "lab":
                     dims_for_guard = get_media_dimensions(settings["input_path"])
@@ -2216,15 +2245,11 @@ def _process_single_file(
                         if target_path.is_file():
                             gallery_item = str(target_path)
                         elif target_path.is_dir():
-                            video_candidates: List[Path] = []
-                            for ext in sorted(SEEDVR2_VIDEO_EXTS):
-                                video_candidates.extend(sorted(target_path.glob(f"*{ext}")))
+                            video_candidates = list_files_sorted(target_path, SEEDVR2_VIDEO_EXTS)
                             if video_candidates:
                                 gallery_item = str(video_candidates[0])
                             else:
-                                image_candidates: List[Path] = []
-                                for ext in sorted(SEEDVR2_IMAGE_EXTS):
-                                    image_candidates.extend(sorted(target_path.glob(f"*{ext}")))
+                                image_candidates = list_files_sorted(target_path, SEEDVR2_IMAGE_EXTS)
                                 if image_candidates:
                                     gallery_item = str(image_candidates[0])
 
@@ -4782,6 +4807,23 @@ def build_seedvr2_callbacks(
                     shutil.copy2(src, preview_path)
                 return str(preview_path)
 
+            def _resolve_previewable_image_path(image_path: Optional[str]) -> Optional[str]:
+                """
+                Resolve a directory-based PNG sequence to its first frame for UI preview/comparison.
+                """
+                try:
+                    if not image_path:
+                        return None
+                    candidate = Path(str(image_path))
+                    if candidate.is_dir():
+                        image_files = list_files_sorted(candidate, SEEDVR2_IMAGE_EXTS)
+                        return str(image_files[0]) if image_files else None
+                    if candidate.exists() and candidate.suffix.lower() in image_exts:
+                        return str(candidate)
+                except Exception:
+                    pass
+                return None
+
             def _media_updates(video_path: Optional[str], image_path: Optional[str]) -> tuple[Any, Any]:
                 """
                 Return (output_video_update, output_image_update) for the merged output panel.
@@ -4791,9 +4833,9 @@ def build_seedvr2_callbacks(
                         if Path(video_path).suffix.lower() in video_exts:
                             preview_path = _prepare_output_video_preview_copy(video_path)
                             return gr.update(value=preview_path, visible=True), gr.update(value=None, visible=False)
-                    if image_path and not Path(image_path).is_dir():
-                        if Path(image_path).suffix.lower() in image_exts:
-                            return gr.update(value=None, visible=False), gr.update(value=image_path, visible=True)
+                    preview_image_path = _resolve_previewable_image_path(image_path)
+                    if preview_image_path:
+                        return gr.update(value=None, visible=False), gr.update(value=preview_image_path, visible=True)
                 except Exception:
                     pass
                 return gr.update(value=None, visible=False), gr.update(value=None, visible=False)
@@ -4991,6 +5033,12 @@ def build_seedvr2_callbacks(
                     state  # shared_state
                 )
                 return
+
+            input_kind = detect_input_type(settings["input_path"])
+            settings["directory_as_sequence"] = bool(
+                (not settings.get("batch_enable"))
+                and input_kind == "directory"
+            )
 
             # Expand "all" to device list if specified
             cuda_device_raw = settings.get("cuda_device", "")
@@ -5435,7 +5483,7 @@ def build_seedvr2_callbacks(
 
                 # Create batch jobs
                 jobs: List[BatchJob] = []
-                for input_file in sorted(set(batch_files)):
+                for input_file in sort_windows_names(set(batch_files), key=lambda p: p.name):
                     # For image-only batches, disable per-file telemetry (we will write one consolidated metadata file).
                     job_global_settings = global_settings.copy()
                     if is_image_only_batch:
@@ -5702,10 +5750,10 @@ def build_seedvr2_callbacks(
             # Start processing with progress tracking
             effective_output_dir = Path(global_settings.get("output_dir", output_dir))
 
-            # Per-run output folder for single video/image runs (0001/0002/...) to avoid collisions
-            # and to keep all artifacts in one user-visible location.
+            # Per-run output folder for single video/image/frame-sequence runs (0001/0002/...)
+            # to avoid collisions and to keep all artifacts in one user-visible location.
             input_kind_single = detect_input_type(settings["input_path"])
-            if (not preview_only) and input_kind_single in {"video", "image"}:
+            if (not preview_only) and input_kind_single in {"video", "image", "directory"}:
                 resume_run_dir_raw = str(settings.get("resume_run_dir") or "").strip()
                 if resume_run_dir_raw:
                     resume_run_dir = Path(normalize_path(resume_run_dir_raw))
@@ -5766,6 +5814,11 @@ def build_seedvr2_callbacks(
                         # Output override now targets the run folder (or an explicit file inside it)
                         settings["_user_output_override_raw"] = settings.get("output_override") or ""
                         settings["output_override"] = str(explicit_final) if explicit_final else str(effective_output_dir)
+                        if input_kind_single == "directory" and bool(settings.get("directory_as_sequence")):
+                            prepare_log_msg = (
+                                "Preparing ordered frame-sequence folder input "
+                                "(Batch Processing OFF: folder is treated as one clip)."
+                            )
                     except Exception:
                         # Fail open: fall back to global output dir if run folder creation fails.
                         seed_controls["last_run_dir"] = str(effective_output_dir)
@@ -6363,18 +6416,19 @@ def build_seedvr2_callbacks(
             # Create comparison based on mode from Output tab
             comparison_mode = seed_controls.get("comparison_mode_val", "native")
             original_path_for_compare = settings.get("_original_input_path_before_preprocess") or settings.get("input_path")
+            display_output_image = _resolve_previewable_image_path(output_image)
             comparison_html = ""
             
             if comparison_mode == "native":
                 # Use gradio's native ImageSlider for images
-                if output_image and Path(output_image).exists():
+                if display_output_image and Path(display_output_image).exists():
                     comparison_html = ""
                     # Check for pinned reference
                     pinned_ref = seed_controls.get("pinned_reference_path")
                     pin_enabled = seed_controls.get("pin_reference_val", False)
                     
                     image_slider_update = gr.update(
-                        value=(pinned_ref if (pin_enabled and pinned_ref) else original_path_for_compare, output_image),
+                        value=(pinned_ref if (pin_enabled and pinned_ref) else original_path_for_compare, display_output_image),
                         visible=True
                     )
                 else:
@@ -6384,7 +6438,7 @@ def build_seedvr2_callbacks(
                     
                     comparison_html, image_slider_update = create_comparison_selector(
                         input_path=original_path_for_compare,
-                        output_path=output_video or output_image,
+                        output_path=output_video or display_output_image,
                         comparison_mode="slider",
                         pinned_reference_path=pinned_ref,
                         pin_enabled=pin_enabled
@@ -6396,7 +6450,7 @@ def build_seedvr2_callbacks(
                 
                 comparison_html, image_slider_update = create_comparison_selector(
                     input_path=original_path_for_compare,
-                    output_path=output_video or output_image,
+                    output_path=output_video or display_output_image,
                     comparison_mode=comparison_mode,
                     pinned_reference_path=pinned_ref,
                     pin_enabled=pin_enabled
@@ -6439,9 +6493,9 @@ def build_seedvr2_callbacks(
                 print(f"[ERROR] Traceback: {traceback.format_exc()}", flush=True)
             
             # If no HTML comparison, use ImageSlider for images
-            if not comparison_html and output_image and not output_video:
+            if not comparison_html and display_output_image and not output_video:
                 image_slider_update = gr.update(
-                    value=(original_path_for_compare, output_image),
+                    value=(original_path_for_compare, display_output_image),
                     visible=True
                 )
             elif not image_slider_update:

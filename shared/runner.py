@@ -414,7 +414,10 @@ class Runner:
             effective_output_format = "png"
         elif format_for_cli is None:
             itype = detect_input_type(input_path)
-            effective_output_format = "png" if itype in ("image", "directory") else "mp4"
+            if settings.get("directory_as_sequence") and itype == "directory":
+                effective_output_format = "mp4"
+            else:
+                effective_output_format = "png" if itype in ("image", "directory") else "mp4"
         else:
             effective_output_format = format_for_cli
 
@@ -455,6 +458,9 @@ class Runner:
                 png_keep_basename=settings.get("png_keep_basename", False),
                 original_filename=settings.get("_original_filename"),  # Preserve user's filename
             )
+
+        if settings.get("directory_as_sequence") and effective_output_format == "png" and predicted_output:
+            cli_output_arg = str(predicted_output)
 
         # IMPORTANT: If we predicted a FILE output (e.g., .mp4 or single-image .png),
         # pass that exact path to the CLI so the real output matches our collision-safe
@@ -1863,6 +1869,8 @@ class Runner:
 
         if output_format:
             cmd.extend(["--output_format", output_format])
+        if settings.get("directory_as_sequence"):
+            cmd.append("--directory_as_sequence")
 
         if settings.get("model_dir"):
             cmd.extend(["--model_dir", settings["model_dir"]])

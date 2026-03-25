@@ -3,11 +3,106 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
+
+T = TypeVar("T")
+_NATURAL_SORT_SPLIT_RE = re.compile(r"(\d+)")
 
 # Supported extensions match SeedVR2 CLI
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def filename_natural_sort_key(value: Any) -> Tuple[Tuple[int, object], ...]:
+    """
+    Build a case-insensitive natural-sort key from a filename or path.
+    """
+    try:
+        name = Path(str(value or "")).name
+    except Exception:
+        name = str(value or "")
+    parts = _NATURAL_SORT_SPLIT_RE.split(name.casefold())
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part != ""
+    )
+
+
+def sort_windows_names(values: Iterable[T], key: Optional[Callable[[T], Any]] = None) -> List[T]:
+    """
+    Sort items by one deterministic Windows-style logical filename ordering.
+
+    This intentionally uses the same pure-Python comparison on every platform
+    so Linux and Windows process the same folder in the same order.
+    """
+    items = list(values or [])
+    if len(items) <= 1:
+        return items
+
+    key_fn = key or (lambda item: item)
+
+    def _logical_key(item: T):
+        display_value = key_fn(item)
+        display_text = str(display_value or "")
+        item_text = str(item or "")
+        return (
+            filename_natural_sort_key(display_text),
+            display_text.casefold(),
+            item_text.casefold(),
+            item_text,
+        )
+
+    return sorted(items, key=_logical_key)
+
+
+def list_directory_entries_sorted(
+    folder: Any,
+    *,
+    include_files: bool = True,
+    include_dirs: bool = False,
+    extensions: Optional[set[str]] = None,
+) -> List[Path]:
+    """
+    Return direct children of a directory using Windows-style name ordering.
+
+    `extensions` only applies to files. Directories are included or excluded
+    only by `include_dirs`.
+    """
+    try:
+        folder_path = Path(normalize_path(str(folder)))
+    except Exception:
+        return []
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        return []
+
+    allowed_exts = {str(ext).lower() for ext in extensions} if extensions else None
+    entries: List[Path] = []
+    try:
+        for item in folder_path.iterdir():
+            if item.is_file():
+                if not include_files:
+                    continue
+                if allowed_exts is not None and item.suffix.lower() not in allowed_exts:
+                    continue
+                entries.append(item)
+            elif include_dirs and item.is_dir():
+                entries.append(item)
+    except Exception:
+        return []
+
+    return sort_windows_names(entries, key=lambda path: path.name)
+
+
+def list_files_sorted(folder: Any, extensions: Optional[set[str]] = None) -> List[Path]:
+    """Return direct child files in Windows-style name order."""
+    return list_directory_entries_sorted(
+        folder,
+        include_files=True,
+        include_dirs=False,
+        extensions=extensions,
+    )
 
 
 def normalize_path(path: Optional[str]) -> Optional[str]:
@@ -41,7 +136,7 @@ def get_media_dimensions(path: str) -> Optional[Tuple[int, int]]:
             # Directory input (frame sequence): pick a representative file.
             # Prefer images, then videos.
             for ext_set in (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS):
-                items = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in ext_set]
+                items = list_files_sorted(p, ext_set)
                 if items:
                     return get_media_dimensions(str(items[0]))
             return None
@@ -468,6 +563,17 @@ def generate_output_path(
     if input_type is None:
         input_type = detect_input_type(input_path)
 
+    if output_dir:
+        requested_output = Path(normalize_path(output_dir))
+        if requested_output.suffix:
+            suffix = requested_output.suffix.lower()
+            if output_format == "mp4" and suffix in VIDEO_EXTENSIONS:
+                ensure_dir(requested_output.parent)
+                return collision_safe_path(requested_output)
+            if output_format == "png" and input_type == "image" and suffix in IMAGE_EXTENSIONS:
+                ensure_dir(requested_output.parent)
+                return collision_safe_path(requested_output)
+
     # Determine base directory; suffix is applied for single runs.
     if output_dir:
         base_dir = Path(normalize_path(output_dir))
@@ -495,7 +601,14 @@ def generate_output_path(
             # NOTE: png_padding is stored as metadata in the directory for CLI usage
             # The actual frame files are created by SeedVR2 CLI with pattern: {base}_{idx:0Nd}.png
             # where N comes from png_padding (default 6 to match CLI hardcoded value)
-            target_dir = base_dir / f"{input_name}{file_suffix}"
+            if output_dir:
+                requested_dir = Path(normalize_path(output_dir))
+                if requested_dir.suffix == "" and requested_dir.name.casefold() == input_name.casefold():
+                    target_dir = requested_dir
+                else:
+                    target_dir = base_dir / f"{input_name}{file_suffix}"
+            else:
+                target_dir = base_dir / f"{input_name}{file_suffix}"
             ensure_dir(target_dir.parent)
             target_dir = collision_safe_dir(target_dir)
             ensure_dir(target_dir)

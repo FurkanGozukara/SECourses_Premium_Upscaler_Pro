@@ -18,18 +18,14 @@ from .path_utils import (
     collision_safe_dir,
     collision_safe_path,
     detect_input_type,
+    list_files_sorted,
     normalize_path,
 )
 
 
 def _first_file_with_exts(folder: Path, exts: set[str]) -> Optional[Path]:
-    try:
-        for item in sorted(folder.iterdir()):
-            if item.is_file() and item.suffix.lower() in exts:
-                return item
-    except Exception:
-        return None
-    return None
+    files = list_files_sorted(folder, exts)
+    return files[0] if files else None
 
 
 def _extract_first_frame(video_path: Path, temp_root: Path, prefix: str) -> Optional[Path]:
@@ -132,4 +128,3 @@ def prepare_preview_input(
         return str(folder), f"Preview input prepared from first frame ({preview_image.name})."
 
     return str(preview_image), f"Preview input prepared from first frame ({preview_image.name})."
-

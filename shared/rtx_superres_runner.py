@@ -19,6 +19,7 @@ from shared.path_utils import (
     detect_input_type,
     get_media_dimensions,
     get_media_fps,
+    list_files_sorted,
     normalize_path,
     resolve_output_location,
 )
@@ -91,14 +92,7 @@ def _format_finish_eta(eta_seconds: Optional[float]) -> str:
 
 
 def _sorted_image_files(folder: Path) -> List[Path]:
-    files = []
-    try:
-        for item in sorted(folder.iterdir()):
-            if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS:
-                files.append(item)
-    except Exception:
-        return []
-    return files
+    return list_files_sorted(folder, IMAGE_EXTENSIONS)
 
 
 def _make_image_output_path(

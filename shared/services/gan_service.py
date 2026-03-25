@@ -18,7 +18,9 @@ from shared.path_utils import (
     get_media_dimensions,
     detect_input_type,
     IMAGE_EXTENSIONS,
+    list_files_sorted,
     resolve_batch_output_dir,
+    sort_windows_names,
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.logging_utils import RunLogger
@@ -573,7 +575,7 @@ def build_gan_callbacks(
                 # Directory of frames: pre-downscale each image into a temp directory.
                 try:
                     src_dir = Path(s["input_path"])
-                    img_files = [p for p in sorted(src_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+                    img_files = list_files_sorted(src_dir, IMAGE_EXTENSIONS)
                     if not img_files:
                         return s
 
@@ -1751,15 +1753,21 @@ def build_gan_callbacks(
             if settings.get("batch_enable"):
                 folder = Path(settings["input_path"])
                 # Check if this is a frame folder (contains only images, treated as a sequence)
-                image_files = [p for p in sorted(folder.iterdir()) if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")]
-                video_files = [p for p in sorted(folder.iterdir()) if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".mkv", ".avi")]
+                image_files = list_files_sorted(
+                    folder,
+                    {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"},
+                )
+                video_files = list_files_sorted(
+                    folder,
+                    {".mp4", ".mov", ".mkv", ".avi"},
+                )
 
                 if image_files and len(image_files) > 1 and not video_files:
                     # Treat as frame folder - process as single unit
                     items = [folder]
                 else:
                     # Regular batch processing - individual files
-                    items = image_files + video_files
+                    items = sort_windows_names(image_files + video_files, key=lambda p: p.name)
 
                 if not items:
                     yield (

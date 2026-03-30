@@ -70,7 +70,6 @@ from shared.error_handling import (
 # Constants --------------------------------------------------------------------
 SEEDVR2_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
 SEEDVR2_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
-I32_INDEX_LIMIT = 2_147_483_647
 
 
 def chunk_and_process(*args, **kwargs):
@@ -99,17 +98,6 @@ def restore_video(*args, **kwargs):
     from shared.face_restore import restore_video as _restore_video_impl
 
     return _restore_video_impl(*args, **kwargs)
-
-
-def _largest_4n_plus_1_leq(n: int) -> int:
-    """Largest value <= n that satisfies 4k+1 (minimum 1)."""
-    try:
-        n_i = int(n)
-    except Exception:
-        return 1
-    if n_i <= 1:
-        return 1
-    return int(((n_i - 1) // 4) * 4 + 1)
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -152,33 +140,6 @@ def _normalize_compile_dynamic_setting(value: Any, default: str = "none") -> str
     if text in {"false", "0", "no", "off"}:
         return "false"
     return default_text
-
-
-def _estimate_seedvr2_output_dims(in_w: int, in_h: int, resolution_short: int, max_edge: int = 0) -> Tuple[int, int]:
-    """
-    Mirror the SeedVR2 CLI sizing logic sufficiently for batch-safety checks.
-    """
-    w = max(1, int(in_w or 1))
-    h = max(1, int(in_h or 1))
-    res = max(16, int(resolution_short or 16))
-    m_edge = max(0, int(max_edge or 0))
-
-    if w <= h:
-        out_w = res
-        out_h = int(res * h / max(1, w))
-    else:
-        out_h = res
-        out_w = int(res * w / max(1, h))
-
-    if m_edge > 0 and max(out_w, out_h) > m_edge:
-        s = float(m_edge) / float(max(out_w, out_h))
-        out_w = int(round(out_w * s))
-        out_h = int(round(out_h * s))
-
-    # CLI eventually saves even dimensions after alignment/trimming.
-    out_w = max(2, int(out_w) - (int(out_w) % 2))
-    out_h = max(2, int(out_h) - (int(out_h) % 2))
-    return out_w, out_h
 
 
 def _is_path_within(path: Path, parent: Path) -> bool:
@@ -2018,51 +1979,6 @@ def _process_single_file(
         except Exception as e:
             if progress_cb:
                 progress_cb(f"Preprocess sizing skipped: {str(e)[:120]}\n")
-
-        # Guardrail: LAB color-correction can hit PyTorch 32-bit index limits for
-        # very large per-batch tensors (frames * H * W * C). Clamp batch_size
-        # to a safe 4n+1 value based on estimated output dimensions.
-        try:
-            input_kind_for_guard = detect_input_type(settings["input_path"])
-            if (not preview_only) and (
-                input_kind_for_guard == "video"
-                or (
-                    input_kind_for_guard == "directory"
-                    and bool(settings.get("directory_as_sequence"))
-                )
-            ):
-                color_mode = str(settings.get("color_correction", "lab") or "").strip().lower()
-                if color_mode == "lab":
-                    dims_for_guard = get_media_dimensions(settings["input_path"])
-                    if dims_for_guard:
-                        in_w, in_h = int(dims_for_guard[0]), int(dims_for_guard[1])
-                        out_w, out_h = _estimate_seedvr2_output_dims(
-                            in_w,
-                            in_h,
-                            int(settings.get("resolution", 1080) or 1080),
-                            int(settings.get("max_resolution", 0) or 0),
-                        )
-                        elems_per_frame = int(out_w) * int(out_h) * 3  # RGB
-                        if elems_per_frame > 0:
-                            max_safe_frames = max(1, int((I32_INDEX_LIMIT - 1) // elems_per_frame))
-                            safe_bs = _largest_4n_plus_1_leq(max_safe_frames)
-                            current_bs = int(settings.get("batch_size", 5) or 5)
-                            if current_bs > safe_bs:
-                                settings["batch_size"] = safe_bs
-                                guard_msg = (
-                                    f"Adjusting batch_size {current_bs}->{safe_bs} to avoid 32-bit index overflow "
-                                    f"in LAB color correction ({out_w}x{out_h} output)."
-                                )
-                                local_logs.append(guard_msg)
-                                if progress_cb:
-                                    progress_cb(f"⚠️ {guard_msg}\n")
-        except Exception:
-            # Never block processing due to guardrail estimation issues.
-            pass
-
-        # Model loading check
-        model_manager = get_model_manager()
-        dit_model = settings.get("dit_model", "")
         # Model loading check
         model_manager = get_model_manager()
         dit_model = settings.get("dit_model", "")

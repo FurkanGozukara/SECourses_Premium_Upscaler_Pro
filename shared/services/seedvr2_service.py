@@ -391,7 +391,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         # then upscale with the full factor to reach the capped target (useful for fixed-scale models).
         "pre_downscale_then_upscale": True,
         "batch_size": default_batch_size,  # Apply model-specific default
-        "uniform_batch_size": True,
+        "uniform_batch_size": False,
         "seed": 42,
         "auto_transfer_output_to_input": False,
         "save_vram_gb": 2.0,
@@ -2371,14 +2371,19 @@ def _process_single_file(
             restored = restore_video(
                 output_video,
                 strength=face_strength,
-                on_progress=lambda x: progress_cb(x) if progress_cb else None
+                on_progress=lambda x: progress_cb(x) if progress_cb else None,
+                gpu_device=settings.get("cuda_device"),
             )
             if restored:
                 local_logs.append(f"Face-restored video saved to {restored} (strength {face_strength})")
                 output_video = restored
 
         if face_apply and output_image and Path(output_image).exists():
-            restored_img = restore_image(output_image, strength=face_strength)
+            restored_img = restore_image(
+                output_image,
+                strength=face_strength,
+                gpu_device=settings.get("cuda_device"),
+            )
             if restored_img:
                 local_logs.append(f"Face-restored image saved to {restored_img} (strength {face_strength})")
                 output_image = restored_img

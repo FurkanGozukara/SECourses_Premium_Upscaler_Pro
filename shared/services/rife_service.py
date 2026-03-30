@@ -1619,7 +1619,8 @@ def build_rife_callbacks(
                                     restored = restore_video(
                                         job.output_path,
                                         strength=job.metadata["face_strength"],
-                                        on_progress=None
+                                        on_progress=None,
+                                        gpu_device=single_settings.get("cuda_device"),
                                     )
                                     if restored:
                                         job.output_path = restored
@@ -1709,7 +1710,8 @@ def build_rife_callbacks(
                                 restored = restore_video(
                                     job.output_path,
                                     strength=job.metadata["face_strength"],
-                                    on_progress=None
+                                    on_progress=None,
+                                    gpu_device=single_settings.get("cuda_device"),
                                 )
                                 if restored:
                                     job.output_path = restored
@@ -2032,7 +2034,8 @@ def build_rife_callbacks(
                 pre_face_output = str(final_output_path)
                 face_strength = float(global_settings.get("face_strength", 0.5))
                 restored = restore_video(final_output_path, strength=face_strength,
-                                       on_progress=lambda x: progress_callback(f"Face restoration: {x}"))
+                                       on_progress=lambda x: progress_callback(f"Face restoration: {x}"),
+                                       gpu_device=settings.get("cuda_device"))
                 if restored:
                     final_output_path = restored
                     # Prefer audio from the pre-face output only if it actually contains audio;

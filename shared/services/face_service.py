@@ -12,6 +12,7 @@ from shared.path_utils import (
     VIDEO_EXTENSIONS,
     resolve_batch_output_dir,
 )
+from shared.gpu_utils import get_global_gpu_override
 
 
 def _face_backend_available(module_name: str) -> bool:
@@ -287,7 +288,12 @@ def build_face_callbacks(
             else dict(_global_settings)
         )
         state = state or {}
+        seed_controls = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+        if not isinstance(seed_controls, dict):
+            seed_controls = {}
         settings = _face_dict_from_args(list(args))
+        global_gpu_device = get_global_gpu_override(seed_controls, global_settings)
+        face_gpu_device = "" if global_gpu_device == "cpu" else global_gpu_device
 
         logs: List[str] = []
 
@@ -367,11 +373,25 @@ def build_face_callbacks(
                 out_path = _build_output_path(batch_out_dir, fp)
                 try:
                     if itype == "image":
-                        restored = restore_image(str(fp), strength=strength, backend=backend, use_gpu=use_gpu, output_path=str(out_path))
+                        restored = restore_image(
+                            str(fp),
+                            strength=strength,
+                            backend=backend,
+                            use_gpu=use_gpu,
+                            output_path=str(out_path),
+                            gpu_device=face_gpu_device,
+                        )
                         last_img = restored or None
                         output_paths.append(str(restored or out_path))
                     elif itype == "video":
-                        restored = restore_video(str(fp), strength=strength, backend=backend, use_gpu=use_gpu, output_path=str(out_path))
+                        restored = restore_video(
+                            str(fp),
+                            strength=strength,
+                            backend=backend,
+                            use_gpu=use_gpu,
+                            output_path=str(out_path),
+                            gpu_device=face_gpu_device,
+                        )
                         last_vid = restored or None
                         output_paths.append(str(restored or out_path))
                     else:
@@ -443,10 +463,24 @@ def build_face_callbacks(
         out_img: Optional[str] = None
         out_vid: Optional[str] = None
         if itype == "image":
-            restored = restore_image(resolved, strength=strength, backend=backend, use_gpu=use_gpu, output_path=str(out_path))
+            restored = restore_image(
+                resolved,
+                strength=strength,
+                backend=backend,
+                use_gpu=use_gpu,
+                output_path=str(out_path),
+                gpu_device=face_gpu_device,
+            )
             out_img = restored or str(out_path)
         elif itype == "video":
-            restored = restore_video(resolved, strength=strength, backend=backend, use_gpu=use_gpu, output_path=str(out_path))
+            restored = restore_video(
+                resolved,
+                strength=strength,
+                backend=backend,
+                use_gpu=use_gpu,
+                output_path=str(out_path),
+                gpu_device=face_gpu_device,
+            )
             out_vid = restored or str(out_path)
         else:
             return (

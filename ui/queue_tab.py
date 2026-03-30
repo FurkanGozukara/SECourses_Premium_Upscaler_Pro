@@ -12,16 +12,32 @@ import gradio as gr
 from shared.processing_queue import get_processing_queue_manager
 
 
+def _render_active_table(active_items: List[dict]) -> str:
+    if not active_items:
+        return "Active jobs: **None**"
+    lines = [
+        "| Job ID | Tab | Action | Resources | Running | Submitted |",
+        "|---|---|---|---|---:|---|",
+    ]
+    for item in active_items:
+        lines.append(
+            f"| `{item['job_id']}` | {item['tab_name']} | {item['action_name']} | "
+            f"{item.get('resource_label', 'Auto GPU')} | {item['wait_seconds_text']} | {item['submitted_at_text']} |"
+        )
+    return "\n".join(lines)
+
+
 def _render_waiting_table(waiting_items: List[dict]) -> str:
     if not waiting_items:
         return "No waiting jobs."
     lines = [
-        "| Job ID | Tab | Action | Waiting | Submitted |",
-        "|---|---|---|---:|---|",
+        "| Job ID | Tab | Action | Resources | Lane Pos | Waiting | Submitted |",
+        "|---|---|---|---|---:|---:|---|",
     ]
     for item in waiting_items:
         lines.append(
             f"| `{item['job_id']}` | {item['tab_name']} | {item['action_name']} | "
+            f"{item.get('resource_label', 'Auto GPU')} | {item.get('position', 0) or '?'} | "
             f"{item['wait_seconds_text']} | {item['submitted_at_text']} |"
         )
     return "\n".join(lines)
@@ -39,8 +55,8 @@ def queue_tab(queue_tab_component) -> None:
     gr.Markdown("### Processing Queue")
     gr.Markdown("Monitor waiting jobs and remove queued items before they start.")
 
-    queue_summary = gr.Markdown("Waiting jobs: **0**")
-    active_job = gr.Markdown("Active job: **None**")
+    queue_summary = gr.Markdown("Active jobs: **0** | Waiting jobs: **0**")
+    active_job = gr.Markdown("Active jobs: **None**")
     waiting_jobs = gr.Markdown("No waiting jobs.")
 
     waiting_selector = gr.Dropdown(
@@ -63,35 +79,35 @@ def queue_tab(queue_tab_component) -> None:
     def refresh_queue(selected_ids, previous_signature: str = ""):
         selected_ids = list(selected_ids or [])
         snapshot = queue_manager.snapshot()
+        active_items = list(snapshot.get("active_jobs", []))
+        active_count = int(snapshot.get("active_count", len(active_items)))
         waiting_items = list(snapshot.get("waiting", []))
         waiting_count = int(snapshot.get("waiting_count", 0))
-        active = snapshot.get("active")
 
-        if active:
-            active_text = (
-                f"Active job: **`{active['job_id']}`** | {active['tab_name']} | "
-                f"{active['action_name']} | running {active['wait_seconds_text']}"
-            )
-        else:
-            active_text = "Active job: **None**"
-
-        summary_text = f"Waiting jobs: **{waiting_count}**"
+        active_text = _render_active_table(active_items)
+        summary_text = f"Active jobs: **{active_count}** | Waiting jobs: **{waiting_count}**"
         waiting_table = _render_waiting_table(waiting_items)
 
         choices = [
             (
-                f"{item['job_id']} | {item['tab_name']} | {item['action_name']} | {item['wait_seconds_text']}",
+                (
+                    f"{item['job_id']} | {item['tab_name']} | {item['action_name']} | "
+                    f"{item.get('resource_label', 'Auto GPU')} | lane {item.get('position', 0) or '?'} | "
+                    f"{item['wait_seconds_text']}"
+                ),
                 item["job_id"],
             )
             for item in waiting_items
         ]
         waiting_ids = {item["job_id"] for item in waiting_items}
         valid_selected = [job_id for job_id in selected_ids if job_id in waiting_ids]
-        time_bucket = int(time.time() // 10) if (waiting_count > 0 or active) else 0
+        active_ids = [item["job_id"] for item in active_items]
+        time_bucket = int(time.time() // 10) if (waiting_count > 0 or active_count > 0) else 0
         signature = "|".join(
             [
+                str(active_count),
                 str(waiting_count),
-                str(active.get("job_id") if isinstance(active, dict) else ""),
+                ",".join(active_ids),
                 ",".join(sorted(waiting_ids)),
                 ",".join(valid_selected),
                 str(time_bucket),

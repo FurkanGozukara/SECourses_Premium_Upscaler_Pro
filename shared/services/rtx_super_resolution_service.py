@@ -364,9 +364,14 @@ def build_rtx_super_resolution_callbacks(
                     str(path_obj),
                     strength=float(face_strength),
                     on_progress=(lambda m: progress_cb(m) if (progress_cb and m) else None),
+                    gpu_device=settings_local.get("device"),
                 )
             else:
-                restored = restore_image(str(path_obj), strength=float(face_strength))
+                restored = restore_image(
+                    str(path_obj),
+                    strength=float(face_strength),
+                    gpu_device=settings_local.get("device"),
+                )
             if restored and Path(restored).exists():
                 return str(restored)
         except Exception:

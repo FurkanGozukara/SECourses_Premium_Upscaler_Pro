@@ -1575,11 +1575,16 @@ def build_flashvsr_callbacks(
                                         outp,
                                         strength=face_strength,
                                         on_progress=lambda x: logs.append(x) if x else None,
+                                        gpu_device=settings.get("device"),
                                     )
                                     if restored and Path(restored).exists():
                                         outp = restored
                                 else:
-                                    restored_img = restore_image(outp, strength=face_strength)
+                                    restored_img = restore_image(
+                                        outp,
+                                        strength=face_strength,
+                                        gpu_device=settings.get("device"),
+                                    )
                                     if restored_img and Path(restored_img).exists():
                                         outp = restored_img
                             except Exception:
@@ -2381,14 +2386,19 @@ def build_flashvsr_callbacks(
                     restored = restore_video(
                         output_path,
                         strength=face_strength,
-                        on_progress=lambda x: log_buffer.append(x) if x else None
+                        on_progress=lambda x: log_buffer.append(x) if x else None,
+                        gpu_device=settings.get("device"),
                     )
                     if restored and Path(restored).exists():
                         output_path = restored
                         log_buffer.append(f"✅ Face restoration complete: {restored}")
                 else:
                     # Image restoration
-                    restored_img = restore_image(output_path, strength=face_strength)
+                    restored_img = restore_image(
+                        output_path,
+                        strength=face_strength,
+                        gpu_device=settings.get("device"),
+                    )
                     if restored_img and Path(restored_img).exists():
                         output_path = restored_img
                         log_buffer.append(f"✅ Face restoration complete: {restored_img}")

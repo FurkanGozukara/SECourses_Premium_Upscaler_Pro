@@ -1464,6 +1464,7 @@ def build_gan_callbacks(
                                 outp,
                                 strength=face_strength,
                                 on_progress=progress_cb if progress_cb else None,
+                                gpu_device=chunk_settings.get("cuda_device") or chunk_settings.get("gpu_device"),
                             )
                             if restored:
                                 outp = restored

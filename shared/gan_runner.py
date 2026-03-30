@@ -451,7 +451,11 @@ def _run_gan_image(
         if settings.get("face_restore") and result.returncode == 0 and result.output_path:
             if on_progress:
                 on_progress("Applying face restoration...\n")
-            restored = restore_image(result.output_path, strength=settings.get("face_strength", 0.5))
+            restored = restore_image(
+                result.output_path,
+                strength=settings.get("face_strength", 0.5),
+                gpu_device=_resolve_cuda_device_id(settings),
+            )
             if restored:
                 result.output_path = restored
 
@@ -666,7 +670,11 @@ def _run_gan_video(
                             out_img.save(out_path, format="PNG")
 
                             if settings.get("face_restore"):
-                                restored = restore_image(str(out_path), strength=settings.get("face_strength", 0.5))
+                                restored = restore_image(
+                                    str(out_path),
+                                    strength=settings.get("face_strength", 0.5),
+                                    gpu_device=_resolve_cuda_device_id(settings),
+                                )
                                 if restored:
                                     try:
                                         if Path(restored).resolve() != out_path.resolve():
@@ -992,7 +1000,12 @@ def _run_gan_video(
         if settings.get("face_restore") and Path(output_path).exists():
             if on_progress:
                 on_progress("Applying face restoration to video")
-            restored = restore_video(output_path, strength=settings.get("face_strength", 0.5), on_progress=on_progress)
+            restored = restore_video(
+                output_path,
+                strength=settings.get("face_strength", 0.5),
+                on_progress=on_progress,
+                gpu_device=_resolve_cuda_device_id(settings),
+            )
             if restored:
                 output_path = restored
         output_path = str(

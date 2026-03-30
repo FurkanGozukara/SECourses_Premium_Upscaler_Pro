@@ -869,13 +869,15 @@ class GanRunner:
                             result.output_path,
                             face_strength,
                             temp_dir=settings.get("temp_dir"),
-                            on_progress=log
+                            on_progress=log,
+                            gpu_device=settings.get("gpu_device"),
                         )
                     else:
                         result.output_path = restore_image(
                             result.output_path,
                             face_strength,
-                            on_progress=log
+                            on_progress=log,
+                            gpu_device=settings.get("gpu_device"),
                         )
                     
                     log("✓ Face restoration complete")

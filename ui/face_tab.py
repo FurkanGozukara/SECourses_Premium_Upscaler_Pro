@@ -16,7 +16,7 @@ from ui.universal_preset_section import (
     wire_universal_preset_events,
 )
 from shared.universal_preset import dict_to_values
-from shared.processing_queue import get_processing_queue_manager
+from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
     snapshot_queue_state,
     snapshot_global_settings,
@@ -563,7 +563,13 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
         queued_state = snapshot_queue_state(live_state)
         queued_global_settings = snapshot_global_settings(global_settings)
         queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
-        ticket = queue_manager.submit("Face", "Restore")
+        queue_resource_keys, queue_resource_label = resolve_queue_gpu_resources(queued_state, queued_global_settings)
+        ticket = queue_manager.submit(
+            "Face",
+            "Restore",
+            resource_keys=queue_resource_keys,
+            resource_label=queue_resource_label,
+        )
         acquired_slot = queue_manager.is_active(ticket.job_id)
 
         try:

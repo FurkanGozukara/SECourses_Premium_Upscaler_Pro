@@ -152,7 +152,12 @@ def run_realesrgan(
             if fps_override and isinstance(out_path, Path) and out_path.suffix.lower() == ".mp4":
                 out_path = ffmpeg_set_fps(out_path, fps_override)
             if apply_face and out_path and Path(out_path).exists():
-                restored = restore_video(out_path, strength=face_strength, on_progress=None)
+                restored = restore_video(
+                    out_path,
+                    strength=face_strength,
+                    on_progress=None,
+                    gpu_device=str(gpu_id) if gpu_id is not None else None,
+                )
                 if restored:
                     out_path = Path(restored)
             if output_format == "mp4":
@@ -177,7 +182,11 @@ def run_realesrgan(
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(candidates[0], out_path)
             if apply_face and out_path.exists():
-                restored = restore_image(str(out_path), strength=face_strength)
+                restored = restore_image(
+                    str(out_path),
+                    strength=face_strength,
+                    gpu_device=str(gpu_id) if gpu_id is not None else None,
+                )
                 if restored:
                     out_path = Path(restored)
             return RealESRGANResult(0, str(out_path), log)

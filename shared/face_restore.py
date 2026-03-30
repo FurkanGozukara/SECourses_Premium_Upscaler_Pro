@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -38,11 +38,14 @@ GFPGAN_AVAILABLE = _check_gfpgan()
 CODEFORMER_AVAILABLE = _check_codeformer()
 
 
-def _resolve_global_cuda_device_token() -> str:
-    """Read global GPU selection from environment for in-process face restoration."""
-    token = str(os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "") or "").strip().lower()
+def _resolve_global_cuda_device_token(gpu_device: Any = None) -> str:
+    """Resolve a face-restoration GPU token from an explicit override or app env."""
+    source = gpu_device if gpu_device is not None else os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "")
+    token = str(source or "").strip().lower()
     if token.startswith("cuda:"):
         token = token.split(":", 1)[1].strip()
+    if "," in token:
+        token = token.split(",", 1)[0].strip()
     return token
 
 
@@ -63,6 +66,7 @@ def restore_image(
     on_progress: Optional[Callable[[str], None]] = None,
     use_gpu: Optional[bool] = None,
     output_path: Optional[str] = None,
+    gpu_device: Any = None,
 ) -> Optional[str]:
     """
     Restore faces in an image using GFPGAN or CodeFormer.
@@ -93,7 +97,14 @@ def restore_image(
             return image_path  # Return original if no backend available
     
     if backend == "gfpgan":
-        return _restore_with_gfpgan(image_path, strength, on_progress, use_gpu=use_gpu, output_path=output_path)
+        return _restore_with_gfpgan(
+            image_path,
+            strength,
+            on_progress,
+            use_gpu=use_gpu,
+            output_path=output_path,
+            gpu_device=gpu_device,
+        )
     elif backend == "codeformer":
         return _restore_with_codeformer(image_path, strength, on_progress, output_path=output_path)
     else:
@@ -110,6 +121,7 @@ def restore_video(
     use_gpu: Optional[bool] = None,
     output_path: Optional[str] = None,
     preserve_audio: bool = True,
+    gpu_device: Any = None,
 ) -> Optional[str]:
     """
     Restore faces in a video frame-by-frame.
@@ -186,6 +198,7 @@ def restore_video(
                 on_progress=None,  # Don't spam progress for each frame
                 use_gpu=use_gpu,
                 output_path=None,
+                gpu_device=gpu_device,
             )
             
             if restored_frame and restored_frame != str(frame_path):
@@ -305,6 +318,7 @@ def _restore_with_gfpgan(
     on_progress: Optional[Callable[[str], None]] = None,
     use_gpu: Optional[bool] = None,
     output_path: Optional[str] = None,
+    gpu_device: Any = None,
 ) -> Optional[str]:
     """Restore image using GFPGAN"""
     try:
@@ -315,7 +329,7 @@ def _restore_with_gfpgan(
             on_progress("Loading GFPGAN model...\n")
         
         # Determine device (honors app-wide global GPU selector).
-        global_token = _resolve_global_cuda_device_token()
+        global_token = _resolve_global_cuda_device_token(gpu_device)
         if use_gpu is False or global_token in {"cpu", "none", "off"}:
             device = torch.device("cpu")
         elif torch.cuda.is_available():

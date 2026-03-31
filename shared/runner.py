@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -26,6 +27,7 @@ from .path_utils import (
 from .model_manager import get_model_manager, ModelType
 from .command_logger import get_command_logger
 from .video_codec_options import build_ffmpeg_video_encode_args
+from .processing_queue import queue_resource_keys_for_gpu_selection
 
 
 class RunResult:
@@ -187,9 +189,9 @@ class Runner:
         self.output_dir = Path(output_dir)
         self._lock = threading.Lock()
         self._active_process: Optional[subprocess.Popen] = None
-        # Guard against overlapping SeedVR2 subprocess runs. One active SeedVR2
-        # run at a time keeps cancellation/process tracking deterministic.
-        self._seedvr2_inflight = False
+        # Track concurrent SeedVR2 runs by their GPU resource sets so different
+        # GPUs can run simultaneously while overlapping device selections still block.
+        self._seedvr2_inflight_resources: Counter[Tuple[str, ...]] = Counter()
         self._active_mode = "subprocess"
         self._log_lines: List[str] = []
         self._canceled = False
@@ -235,6 +237,24 @@ class Runner:
         with self._lock:
             self._canceled = False
 
+    @staticmethod
+    def _seedvr2_resource_sets_conflict(left: Tuple[str, ...], right: Tuple[str, ...]) -> bool:
+        left_keys = {str(item).strip().lower() for item in (left or ()) if str(item).strip()}
+        right_keys = {str(item).strip().lower() for item in (right or ()) if str(item).strip()}
+        if not left_keys or not right_keys:
+            return False
+
+        if "cpu" in left_keys and "cpu" in right_keys:
+            return True
+
+        left_gpu = {key for key in left_keys if key.startswith("gpu:")}
+        right_gpu = {key for key in right_keys if key.startswith("gpu:")}
+        if not left_gpu or not right_gpu:
+            return False
+        if "gpu:auto" in left_gpu or "gpu:auto" in right_gpu:
+            return True
+        return bool(left_gpu & right_gpu)
+
     # ------------------------------------------------------------------ #
     # Cancellation
     # ------------------------------------------------------------------ #
@@ -253,7 +273,7 @@ class Runner:
             if not proc:
                 # A SeedVR2 run may be in pre-launch setup (vcvars/env prep) before
                 # Popen is assigned. Mark cancel requested so launch can be aborted.
-                if self._seedvr2_inflight:
+                if self._seedvr2_inflight_resources:
                     self._canceled = True
                     return True
                 # No active process to cancel. Ensure stale cancel state does not
@@ -647,9 +667,15 @@ class Runner:
         ENHANCED: Now prints all subprocess output to console (CMD) for user visibility,
         in addition to sending it to the on_progress callback for UI updates.
         """
-        # Guard against overlapping SeedVR2 runs (e.g., preview + upscale clicked together).
+        run_resources = queue_resource_keys_for_gpu_selection(settings.get("cuda_device"))
+
+        # Guard against overlapping SeedVR2 runs on the same GPU resource set.
         with self._lock:
-            if self._seedvr2_inflight:
+            has_conflict = any(
+                self._seedvr2_resource_sets_conflict(run_resources, inflight_resources)
+                for inflight_resources in self._seedvr2_inflight_resources
+            )
+            if has_conflict:
                 busy_msg = (
                     "Another SeedVR2 run is already active. "
                     "Wait for it to finish or cancel it before starting a new run."
@@ -657,7 +683,7 @@ class Runner:
                 if on_progress:
                     on_progress(f"{busy_msg}\n")
                 return RunResult(1, None, busy_msg)
-            self._seedvr2_inflight = True
+            self._seedvr2_inflight_resources[run_resources] += 1
             self._canceled = False
 
         # Helper function to log to both console AND callback
@@ -923,7 +949,10 @@ class Runner:
         finally:
             with self._lock:
                 self._active_process = None
-                self._seedvr2_inflight = False
+                if self._seedvr2_inflight_resources.get(run_resources, 0) > 1:
+                    self._seedvr2_inflight_resources[run_resources] -= 1
+                else:
+                    self._seedvr2_inflight_resources.pop(run_resources, None)
             
             # Also clear CUDA cache on error/cancellation
             try:

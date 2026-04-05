@@ -23,6 +23,7 @@ from shared.path_utils import (
     normalize_path,
 )
 from shared.services.rtx_super_resolution_service import RTX_ORDER, build_rtx_super_resolution_callbacks
+from shared.video_fps_utils import build_output_fps_summary
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
@@ -568,39 +569,18 @@ def _build_rtx_sizing_report(
         output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
         if not isinstance(output_settings, dict):
             output_settings = {}
-        try:
-            fps_override = float(seed_controls.get("fps_override_val", output_settings.get("fps_override", 0)) or 0)
-        except Exception:
-            fps_override = 0.0
-        base_output_fps = fps_override if fps_override > 0 else (float(fps_val) if fps_val and fps_val > 0 else None)
-        if base_output_fps and base_output_fps > 0:
-            sizing_rows.append(_stat_row("Output FPS (Base)", f"{float(base_output_fps):.3f}".rstrip("0").rstrip(".")))
-
-        try:
-            from shared.global_rife import global_rife_enabled
-
-            if global_rife_enabled(seed_controls):
-                mult_raw = str(
-                    seed_controls.get("global_rife_multiplier_val", output_settings.get("global_rife_multiplier", "x2")) or "x2"
-                ).strip().lower()
-                if mult_raw.startswith("x"):
-                    mult_raw = mult_raw[1:]
-                try:
-                    mult_val = int(float(mult_raw))
-                except Exception:
-                    mult_val = 2
-                mult_val = 2 if mult_val <= 2 else (4 if mult_val <= 4 else 8)
-                if base_output_fps and base_output_fps > 0:
-                    sizing_rows.append(
-                        _stat_row(
-                            f"Output FPS (+Global RIFE {mult_val}x)",
-                            f"{float(base_output_fps * mult_val):.3f}".rstrip("0").rstrip("."),
-                        )
-                    )
-                else:
-                    sizing_rows.append(_stat_row(f"Output FPS (+Global RIFE {mult_val}x)", "Unavailable (input FPS unknown)"))
-        except Exception:
-            pass
+        fps_summary = build_output_fps_summary(
+            input_fps=fps_val,
+            seed_controls=seed_controls,
+            output_settings=output_settings,
+        )
+        input_rows.append(
+            _stat_row(
+                str(fps_summary.get("label") or "Output FPS"),
+                str(fps_summary.get("value") or "Unavailable"),
+                str(fps_summary.get("value_class") or ""),
+            )
+        )
 
         _emit_progress(62, "Preparing chunk analysis...")
         auto_chunk, auto_detect_scenes, override_scene_split = _effective_rtx_scene_flags(

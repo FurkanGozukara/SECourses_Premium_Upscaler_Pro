@@ -25,6 +25,7 @@ from .path_utils import (
     normalize_path,
 )
 from .resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
+from .video_fps_utils import build_output_fps_summary
 
 
 def detect_scenes(*args, **kwargs):
@@ -417,7 +418,7 @@ def build_fixed_scale_analysis_update(
     if out_short < input_short:
         mode_line = f"Downscaling vs original input ({out_short}px < {input_short}px short side)"
         mode_class = "is-down"
-        notes.append("Tip: increase Upscale x and/or Max Resolution to avoid downscaling.")
+        notes.append("Tip: raise Upscale x and/or Max Resolution to avoid downscaling.")
     elif out_short > input_short:
         mode_line = f"Upscaling vs original input ({out_short}px > {input_short}px short side)"
         mode_class = "is-up"
@@ -482,6 +483,19 @@ def build_fixed_scale_analysis_update(
             input_rows.append(_stat_row("Total Frames", f"{_format_int(total_frames)} ({frame_src_label})"))
         else:
             input_rows.append(_stat_row("Total Frames", "Unavailable"))
+
+        fps_summary = build_output_fps_summary(
+            input_fps=fps_val,
+            seed_controls=seed_controls,
+            output_settings=seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {},
+        )
+        input_rows.append(
+            _stat_row(
+                str(fps_summary.get("label") or "Output FPS"),
+                str(fps_summary.get("value") or "Unavailable"),
+                str(fps_summary.get("value_class") or ""),
+            )
+        )
     elif input_kind == "frame_sequence":
         input_rows.append(_stat_row("Frames", f"{_format_int(input_info.frame_count)}"))
         if input_info.frame_start or input_info.frame_end:

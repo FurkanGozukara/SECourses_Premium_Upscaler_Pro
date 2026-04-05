@@ -14,7 +14,6 @@ from shared.path_utils import (
     normalize_path,
     collision_safe_dir,
     collision_safe_path,
-    ffmpeg_set_fps,
     get_media_dimensions,
     detect_input_type,
     IMAGE_EXTENSIONS,
@@ -41,6 +40,7 @@ from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
+from shared.video_fps_utils import apply_video_fps_override_preprocess
 
 
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
@@ -487,6 +487,18 @@ def build_gan_callbacks(
             - For fixed-scale models (2x/4x), pre-downscale the input so that one model pass
               reaches the capped target (mandatory to avoid post-downscale).
             """
+            fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
+                s,
+                fps_key="fps_override",
+                run_dir=Path(s.get("_run_dir") or current_output_dir_local),
+                input_key="input_path",
+                effective_input_key=None,
+            )
+            if fps_pre_msg:
+                s["_fps_override_preprocess_note"] = str(fps_pre_msg)
+            if not fps_pre_ok:
+                raise RuntimeError(fps_pre_msg or "FPS override preprocess failed")
+
             # Get model scale factor
             model_scale = s.get("scale", 4)
             if model_scale <= 1:  # Not a scaling model
@@ -547,8 +559,11 @@ def build_gan_callbacks(
                     audio_copy_first=True,
                 )
                 if ok and Path(pre_out).exists():
-                    s["_original_input_path_before_preprocess"] = s["input_path"]
+                    s["_original_input_path_before_preprocess"] = (
+                        s.get("_original_input_path_before_preprocess") or s["input_path"]
+                    )
                     s["_preprocessed_input_path"] = str(pre_out)
+                    s["_effective_input_path"] = str(pre_out)
                     s["input_path"] = str(pre_out)
                     s["resolution_adjusted"] = True
             elif in_type == "image":
@@ -565,8 +580,11 @@ def build_gan_callbacks(
                         )
                         cv2.imwrite(str(tmp_path), adjusted)
                         if tmp_path.exists():
-                            s["_original_input_path_before_preprocess"] = s["input_path"]
+                            s["_original_input_path_before_preprocess"] = (
+                                s.get("_original_input_path_before_preprocess") or s["input_path"]
+                            )
                             s["_preprocessed_input_path"] = str(tmp_path)
+                            s["_effective_input_path"] = str(tmp_path)
                             s["input_path"] = str(tmp_path)
                             s["resolution_adjusted"] = True
                 except Exception:
@@ -594,8 +612,11 @@ def build_gan_callbacks(
                         cv2.imwrite(str(tmp_dir / f.name), adjusted)
 
                     if any(tmp_dir.iterdir()):
-                        s["_original_input_path_before_preprocess"] = s["input_path"]
+                        s["_original_input_path_before_preprocess"] = (
+                            s.get("_original_input_path_before_preprocess") or s["input_path"]
+                        )
                         s["_preprocessed_input_path"] = str(tmp_dir)
+                        s["_effective_input_path"] = str(tmp_dir)
                         s["input_path"] = str(tmp_dir)
                         s["resolution_adjusted"] = True
                 except Exception:
@@ -1360,6 +1381,8 @@ def build_gan_callbacks(
                     f"GPU: {runtime_settings.get('cuda_device') or 'auto/CPU'} (single GPU enforced)",
                     f"Input: {runtime_settings['input_path']}",
                 ]
+                if runtime_settings.get("_fps_override_preprocess_note"):
+                    header_log.append(str(runtime_settings.get("_fps_override_preprocess_note")))
                 if progress_cb:
                     for line in header_log:
                         progress_cb(line)

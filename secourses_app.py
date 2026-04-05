@@ -74,7 +74,8 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V4.6 – https://www.patreon.com/posts/150202809"
+FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V4.7 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -613,6 +614,10 @@ def main(argv=None):
       font-weight: 800;
     }
     .resolution-info .resolution-stat-val.is-down {
+      color: #fb7185;
+      font-weight: 800;
+    }
+    .resolution-info .resolution-stat-val.is-override {
       color: #fb7185;
       font-weight: 800;
     }
@@ -2208,6 +2213,7 @@ def main(argv=None):
         "theme": modern_theme,
         "css": CUSTOM_CSS,
         "head": CUSTOM_HEAD + theme_bootstrap_head,
+        "favicon_path": str(FAVICON_PATH),
     }
     if launch_cli_args.server_name:
         launch_kwargs["server_name"] = launch_cli_args.server_name

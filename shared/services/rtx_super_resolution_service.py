@@ -52,6 +52,7 @@ from shared.preset_manager import PresetManager
 from shared.preview_utils import prepare_preview_input
 from shared.global_rife import maybe_apply_global_rife
 from shared.rtx_superres_runner import run_rtx_superres
+from shared.video_fps_utils import apply_video_fps_override_preprocess
 
 
 RTX_QUALITY_PRESETS: List[str] = [
@@ -494,6 +495,46 @@ def build_rtx_super_resolution_callbacks(
             input_path_local = str(runtime_settings.get("input_path") or "")
             run_output_root = Path(runtime_settings.get("_run_dir") or global_settings_local.get("output_dir", output_dir))
             run_output_root.mkdir(parents=True, exist_ok=True)
+            comparison_input_path = str(
+                runtime_settings.get("_original_input_path_before_preprocess") or input_path_local
+            )
+
+            try:
+                fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
+                    runtime_settings,
+                    fps_key="fps",
+                    run_dir=run_output_root,
+                    on_progress=(lambda x: _emit_progress_line(x) if x else None),
+                    input_key="input_path",
+                    effective_input_key="_effective_input_path",
+                )
+                if fps_pre_msg:
+                    _emit_progress_line(fps_pre_msg)
+                if not fps_pre_ok:
+                    return (
+                        "FPS override preprocess failed",
+                        str(fps_pre_msg or "FPS override preprocess failed"),
+                        None,
+                        "",
+                        gr.update(value=None),
+                        1,
+                    )
+            except Exception as exc:
+                return (
+                    "FPS override preprocess failed",
+                    f"FPS override preprocess failed: {exc}",
+                    None,
+                    "",
+                    gr.update(value=None),
+                    1,
+                )
+
+            input_path_local = str(
+                runtime_settings.get("_effective_input_path") or runtime_settings.get("input_path") or ""
+            )
+            comparison_input_path = str(
+                runtime_settings.get("_original_input_path_before_preprocess") or comparison_input_path
+            )
 
             face_apply = bool(runtime_settings.get("face_restore_after_upscale", False)) or bool(
                 global_settings_local.get("face_global", False)
@@ -694,7 +735,7 @@ def build_rtx_super_resolution_callbacks(
                         _emit_progress_line(rife_msg)
 
                     comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                        runtime_settings.get("_original_input_path_before_preprocess") or input_path_local,
+                        comparison_input_path,
                         output_path_local,
                         seed_controls_local,
                         label_output="RTX Super Resolution",
@@ -724,7 +765,7 @@ def build_rtx_super_resolution_callbacks(
                     returncode_val=int(rc),
                 )
                 _finalize_context(status, output_path_local, int(rc))
-                slider_upd, html_upd = _create_comparison_updates(input_path_local, output_path_local)
+                slider_upd, html_upd = _create_comparison_updates(comparison_input_path, output_path_local)
                 return status, clog, output_path_local, html_upd, slider_upd, int(rc)
 
             # Non-chunk path
@@ -773,7 +814,7 @@ def build_rtx_super_resolution_callbacks(
                 elif rife_msg:
                     _emit_progress_line(rife_msg)
                 comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                    runtime_settings.get("_original_input_path_before_preprocess") or input_path_local,
+                    comparison_input_path,
                     output_path_local,
                     seed_controls_local,
                     label_output="RTX Super Resolution",
@@ -794,7 +835,7 @@ def build_rtx_super_resolution_callbacks(
                 returncode_val=int(res.returncode),
             )
             _finalize_context(status, output_path_local, int(res.returncode))
-            slider_upd, html_upd = _create_comparison_updates(input_path_local, output_path_local)
+            slider_upd, html_upd = _create_comparison_updates(comparison_input_path, output_path_local)
             return status, res.log, output_path_local, html_upd, slider_upd, int(res.returncode)
 
         def _worker_single(prepped_settings: Dict[str, Any], seed_controls_local: Dict[str, Any]):

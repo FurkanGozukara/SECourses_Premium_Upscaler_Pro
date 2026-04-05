@@ -29,7 +29,6 @@ from shared.path_utils import (
     normalize_path,
     collision_safe_path,
     collision_safe_dir,
-    ffmpeg_set_fps,
     get_media_dimensions,
     get_media_duration_seconds,
     get_media_fps,
@@ -66,6 +65,7 @@ from shared.error_handling import (
     safe_execute,
     logger as error_logger,
 )
+from shared.video_fps_utils import apply_video_fps_override_preprocess, build_output_fps_summary
 
 # Constants --------------------------------------------------------------------
 SEEDVR2_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
@@ -1846,6 +1846,42 @@ def _process_single_file(
         # -----------------------------------------------------------------
         #  Upscale-x sizing (compute SeedVR2 CLI params + optional pre-downscale)
         # -----------------------------------------------------------------
+        try:
+            fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
+                settings,
+                fps_key="fps_override",
+                run_dir=Path(settings.get("_run_dir") or output_dir),
+                on_progress=(lambda x: progress_cb(x) if progress_cb else None),
+                input_key="input_path",
+                effective_input_key=None,
+            )
+            if fps_pre_msg:
+                local_logs.append(fps_pre_msg)
+                if progress_cb:
+                    progress_cb(f"{fps_pre_msg}\n")
+            if not fps_pre_ok:
+                return (
+                    "FPS override preprocess failed",
+                    "\n".join(local_logs),
+                    None,
+                    None,
+                    "FPS override preprocess failed",
+                    fps_pre_msg,
+                    fps_pre_msg,
+                )
+        except Exception as e:
+            fps_err = f"FPS override preprocess failed: {str(e)}"
+            local_logs.append(fps_err)
+            return (
+                "FPS override preprocess failed",
+                "\n".join(local_logs),
+                None,
+                None,
+                "FPS override preprocess failed",
+                fps_err,
+                fps_err,
+            )
+
         # Single-image outputs: keep artifacts inside the per-run output folder.
         try:
             if (not preview_only) and detect_input_type(settings["input_path"]) == "image":
@@ -1971,8 +2007,11 @@ def _process_single_file(
                             pre_out = None
 
                     if pre_out:
-                        settings["_original_input_path_before_preprocess"] = settings["input_path"]
+                        settings["_original_input_path_before_preprocess"] = (
+                            settings.get("_original_input_path_before_preprocess") or settings["input_path"]
+                        )
                         settings["_preprocessed_input_path"] = str(pre_out)
+                        settings["_effective_input_path"] = str(pre_out)
                         settings["input_path"] = str(pre_out)
                         if progress_cb:
                             progress_cb(f"Preprocess complete: {pre_out.name}\n")
@@ -2401,16 +2440,6 @@ def _process_single_file(
                     f"(quality {int(settings.get('image_output_quality', 95) or 95)}): {converted_image}"
                 )
                 output_image = converted_image
-
-        # Apply FPS override from global Output settings.
-        fps_val = settings.get("fps_override", 0) or seed_controls.get("fps_override_val", 0)
-        if fps_val and fps_val > 0 and output_video and Path(output_video).exists():
-            try:
-                adjusted = ffmpeg_set_fps(Path(output_video), float(fps_val))
-                output_video = str(adjusted)
-                local_logs.append(f"FPS overridden to {fps_val}: {adjusted}")
-            except Exception as e:
-                local_logs.append(f"FPS override failed: {str(e)}")
 
         # Audio replacement is controlled by user-selected Output settings.
         # Do not force hidden fallback codecs here.
@@ -3240,7 +3269,7 @@ def build_seedvr2_callbacks(
         if out_short < input_short:
             mode_line = f"Downscaling vs original input ({out_short}px < {input_short}px short side)"
             mode_class = "is-down"
-            notes.append("Tip: set Upscale x >= 1.0 and/or increase Max Resolution to avoid downscaling.")
+            notes.append("Tip: raise Upscale x and/or Max Resolution to avoid downscaling.")
         elif out_short > input_short:
             mode_line = f"Upscaling vs original input ({out_short}px > {input_short}px short side)"
             mode_class = "is-up"
@@ -3358,52 +3387,21 @@ def build_seedvr2_callbacks(
             else:
                 input_rows.append(_stat_row("Total Frames", "Unavailable"))
 
-            # FPS forecast shown in the Sizing card (base + Global RIFE when enabled).
             output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
             if not isinstance(output_settings, dict):
                 output_settings = {}
-
-            def _fmt_fps(v: Optional[float]) -> Optional[str]:
-                try:
-                    if v is None:
-                        return None
-                    fv = float(v)
-                    if fv <= 0:
-                        return None
-                    return f"{fv:.3f}".rstrip("0").rstrip(".")
-                except Exception:
-                    return None
-
-            try:
-                fps_override = float(seed_controls.get("fps_override_val", output_settings.get("fps_override", 0)) or 0)
-            except Exception:
-                fps_override = 0.0
-
-            base_output_fps: Optional[float] = fps_override if fps_override > 0 else (float(fps_val) if fps_val and fps_val > 0 else None)
-            base_fps_text = _fmt_fps(base_output_fps)
-            if base_fps_text:
-                sizing_rows.append(_stat_row("Output FPS (Base)", base_fps_text))
-
-            global_rife_on = global_rife_enabled(seed_controls)
-            if global_rife_on:
-                mult_raw = str(
-                    seed_controls.get("global_rife_multiplier_val", output_settings.get("global_rife_multiplier", "x2")) or "x2"
-                ).strip().lower()
-                if mult_raw.startswith("x"):
-                    mult_raw = mult_raw[1:]
-                try:
-                    mult_val = int(float(mult_raw))
-                except Exception:
-                    mult_val = 2
-                mult_val = 2 if mult_val <= 2 else (4 if mult_val <= 4 else 8)
-
-                if base_output_fps and base_output_fps > 0:
-                    rife_output_fps = base_output_fps * float(mult_val)
-                    rife_fps_text = _fmt_fps(rife_output_fps)
-                    if rife_fps_text:
-                        sizing_rows.append(_stat_row(f"Output FPS (+Global RIFE {mult_val}x)", rife_fps_text))
-                else:
-                    sizing_rows.append(_stat_row(f"Output FPS (+Global RIFE {mult_val}x)", "Unavailable (input FPS unknown)"))
+            fps_summary = build_output_fps_summary(
+                input_fps=fps_val,
+                seed_controls=seed_controls,
+                output_settings=output_settings,
+            )
+            input_rows.append(
+                _stat_row(
+                    str(fps_summary.get("label") or "Output FPS"),
+                    str(fps_summary.get("value") or "Unavailable"),
+                    str(fps_summary.get("value_class") or ""),
+                )
+            )
 
             # Chunking info (Resolution tab global settings)
             _emit_progress(62, "Preparing chunk analysis...")

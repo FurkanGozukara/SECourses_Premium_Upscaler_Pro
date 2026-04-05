@@ -9,7 +9,6 @@ from .path_utils import (
     collision_safe_dir,
     collision_safe_path,
     detect_input_type,
-    ffmpeg_set_fps,
     get_media_fps,
     normalize_path,
     resolve_output_location,
@@ -85,12 +84,22 @@ def _run_realesrgan_video(
     upscaled_pattern = f"frame_%0{png_padding}d_out.png"
     
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "30", "-i", str(frames_up / upscaled_pattern), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(float(source_fps)),
+            "-i",
+            str(frames_up / upscaled_pattern),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(out_path),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    if source_fps and out_path.exists():
-        out_path = ffmpeg_set_fps(out_path, source_fps)
     return 0, log, out_path if out_path.exists() else None, frames_up
 
 
@@ -111,7 +120,6 @@ def run_realesrgan(
     model_name = Path(model_name).stem
     model_path = settings.get("model_path")
     outscale = int(settings.get("scale") or 4)
-    fps_override = float(settings.get("fps_override") or 0)
     output_format = settings.get("output_format") or "auto"
     input_type = detect_input_type(str(input_path))
     if output_format == "auto":
@@ -149,8 +157,6 @@ def run_realesrgan(
                 target_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(frames_up, target_dir, dirs_exist_ok=True)
                 out_path = target_dir
-            if fps_override and isinstance(out_path, Path) and out_path.suffix.lower() == ".mp4":
-                out_path = ffmpeg_set_fps(out_path, fps_override)
             if apply_face and out_path and Path(out_path).exists():
                 restored = restore_video(
                     out_path,

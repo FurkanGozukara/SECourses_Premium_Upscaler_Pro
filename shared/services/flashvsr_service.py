@@ -57,6 +57,7 @@ from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
+from shared.video_fps_utils import apply_video_fps_override_preprocess
 
 # Cancel event for FlashVSR+ processing
 _flashvsr_cancel_event = threading.Event()
@@ -896,7 +897,9 @@ def build_flashvsr_callbacks(
                             audio_copy_first=True,
                         )
                         if ok and Path(pre_out).exists():
-                            cfg["_original_input_path_before_preprocess"] = src_input_path
+                            cfg["_original_input_path_before_preprocess"] = (
+                                cfg.get("_original_input_path_before_preprocess") or src_input_path
+                            )
                             cfg["_preprocessed_input_path"] = str(pre_out)
                             cfg["_effective_input_path"] = str(pre_out)
                             cfg["_preprocess_note"] = (
@@ -950,7 +953,9 @@ def build_flashvsr_callbacks(
                                 saved = False
 
                         if saved and pre_file.exists():
-                            cfg["_original_input_path_before_preprocess"] = src_input_path
+                            cfg["_original_input_path_before_preprocess"] = (
+                                cfg.get("_original_input_path_before_preprocess") or src_input_path
+                            )
                             cfg["_preprocessed_input_path"] = str(pre_file)
                             cfg["_effective_input_path"] = str(pre_file)
                             cfg["_preprocess_note"] = (
@@ -1004,7 +1009,9 @@ def build_flashvsr_callbacks(
                                 return
 
                         if any(pre_dir.iterdir()):
-                            cfg["_original_input_path_before_preprocess"] = src_input_path
+                            cfg["_original_input_path_before_preprocess"] = (
+                                cfg.get("_original_input_path_before_preprocess") or src_input_path
+                            )
                             cfg["_preprocessed_input_path"] = str(pre_dir)
                             cfg["_effective_input_path"] = str(pre_dir)
                             cfg["_preprocess_note"] = (
@@ -1053,7 +1060,9 @@ def build_flashvsr_callbacks(
                     fallback_done = False
 
                     def _mark_applied(preprocessed_path: str) -> None:
-                        cfg["_original_input_path_before_preprocess"] = src_input_path
+                        cfg["_original_input_path_before_preprocess"] = (
+                            cfg.get("_original_input_path_before_preprocess") or src_input_path
+                        )
                         cfg["_preprocessed_input_path"] = str(preprocessed_path)
                         cfg["_effective_input_path"] = str(preprocessed_path)
                         cfg["_preprocess_note"] = (
@@ -1492,8 +1501,26 @@ def build_flashvsr_callbacks(
                     # Explicit output file path inside the per-item folder.
                     item_settings["output_override"] = str(predicted_output_file)
 
-                    _apply_vnext_preprocess(item_settings, item_path)
-                    _enforce_preprocess_requirements(item_settings, item_path)
+                    fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
+                        item_settings,
+                        fps_key="fps",
+                        run_dir=Path(run_paths.run_dir),
+                        input_key="input_path",
+                        effective_input_key="_effective_input_path",
+                    )
+                    if fps_pre_msg:
+                        logs.append(str(fps_pre_msg))
+                    if not fps_pre_ok:
+                        logs.append(
+                            f"âŒ [{idx}/{len(items)}] {Path(item_path).name} failed: "
+                            f"{fps_pre_msg or 'FPS override preprocess failed'}"
+                        )
+                        yield _batch_live_payload(f"Batch {idx}/{len(items)}: FPS preprocess failed for {item_name}")
+                        continue
+
+                    effective_preprocess_source = normalize_path(item_settings.get("_effective_input_path") or item_path)
+                    _apply_vnext_preprocess(item_settings, effective_preprocess_source)
+                    _enforce_preprocess_requirements(item_settings, effective_preprocess_source)
                     if item_settings.get("_preprocess_required_but_missing"):
                         logs.append(
                             f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed: "
@@ -1907,8 +1934,33 @@ def build_flashvsr_callbacks(
             
             # Output root for artifacts + preprocessing
             settings["global_output_dir"] = str(Path(settings.get("_run_dir") or output_dir))
-            _apply_vnext_preprocess(settings, input_path)
-            _enforce_preprocess_requirements(settings, input_path)
+            fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
+                settings,
+                fps_key="fps",
+                run_dir=Path(settings.get("_run_dir") or output_dir),
+                input_key="input_path",
+                effective_input_key="_effective_input_path",
+                on_progress=(lambda x: progress_queue.put(str(x).strip()) if str(x).strip() else None),
+            )
+            if fps_pre_msg:
+                log_hint = str(fps_pre_msg).strip()
+                if log_hint:
+                    progress_queue.put(log_hint)
+            if not fps_pre_ok:
+                vid_upd, img_upd = _media_updates(None)
+                yield (
+                    "FPS override preprocess failed",
+                    str(fps_pre_msg or "Could not preprocess input video FPS."),
+                    vid_upd,
+                    img_upd,
+                    gr.update(visible=False),
+                    gr.update(value="", visible=False),
+                    state,
+                )
+                return
+            effective_preprocess_source = normalize_path(settings.get("_effective_input_path") or input_path)
+            _apply_vnext_preprocess(settings, effective_preprocess_source)
+            _enforce_preprocess_requirements(settings, effective_preprocess_source)
             if settings.get("_preprocess_required_but_missing"):
                 vid_upd, img_upd = _media_updates(None)
                 yield (

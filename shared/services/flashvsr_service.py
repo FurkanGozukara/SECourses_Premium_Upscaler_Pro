@@ -21,6 +21,7 @@ from shared.path_utils import (
     normalize_path,
     collision_safe_path,
     collision_safe_dir,
+    sanitize_filename,
     get_media_dimensions,
     get_media_duration_seconds,
     get_media_fps,
@@ -148,6 +149,83 @@ def _apply_image_output_preferences(
             pass
 
         return str(dst)
+    except Exception:
+        return image_path
+
+
+def _move_or_convert_image_output(
+    image_path: Optional[str],
+    desired_path: Optional[Path],
+    image_output_quality: Any = 95,
+) -> Optional[str]:
+    """
+    Move an image result to an exact requested filename.
+
+    Used by FlashVSR batch-image processing so the public output folder contains
+    only image files named like the inputs, even though FlashVSR internally
+    produces a temporary MP4 before extracting an image.
+    """
+    if not image_path or desired_path is None:
+        return image_path
+
+    try:
+        src = Path(str(image_path))
+        dest = Path(desired_path)
+        if (not src.exists()) or src.is_dir():
+            return image_path
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if src.resolve() == dest.resolve():
+                return str(dest)
+        except Exception:
+            if str(src) == str(dest):
+                return str(dest)
+
+        if dest.exists():
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        try:
+            quality = int(float(image_output_quality or 95))
+        except Exception:
+            quality = 95
+        quality = max(1, min(100, quality))
+
+        src_ext = src.suffix.lower()
+        dest_ext = dest.suffix.lower()
+        if src_ext == dest_ext:
+            shutil.move(str(src), str(dest))
+            return str(dest)
+
+        from PIL import Image
+
+        with Image.open(src) as img:
+            if dest_ext in {".jpg", ".jpeg"}:
+                img = img.convert("RGB")
+                img.save(dest, format="JPEG", quality=quality)
+            elif dest_ext == ".webp":
+                img.save(dest, format="WEBP", quality=quality)
+            elif dest_ext == ".png":
+                img.save(dest, format="PNG")
+            elif dest_ext in {".tif", ".tiff"}:
+                img.save(dest, format="TIFF")
+            elif dest_ext == ".bmp":
+                if img.mode not in {"RGB", "L"}:
+                    img = img.convert("RGB")
+                img.save(dest, format="BMP")
+            else:
+                img.save(dest)
+
+        try:
+            src.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return str(dest)
     except Exception:
         return image_path
 
@@ -1431,6 +1509,22 @@ def build_flashvsr_callbacks(
                         state,
                     )
 
+                def _cleanup_batch_image_work_dir(cfg: Dict[str, Any]) -> None:
+                    image_work_dir_raw = cfg.get("_flashvsr_batch_image_work_dir") if isinstance(cfg, dict) else None
+                    if not image_work_dir_raw:
+                        return
+                    try:
+                        work_dir = Path(str(image_work_dir_raw))
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                        work_parent = work_dir.parent
+                        if work_parent.name == ".flashvsr_image_work":
+                            try:
+                                work_parent.rmdir()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
                 if progress:
                     progress(0, desc=f"Batch: {len(items)} item(s) queued")
                 logs.append(f"Batch queued: {len(items)} item(s). Output: {batch_root}")
@@ -1465,21 +1559,74 @@ def build_flashvsr_callbacks(
                     item_settings["input_path"] = item_path
                     item_settings["_effective_input_path"] = item_path
                     item_settings["_original_filename"] = Path(item_path).name
-                    item_out_dir = batch_item_dir(batch_root, Path(item_path).name)
+                    item_input = Path(item_path)
+                    item_kind = detect_input_type(item_path)
+                    is_batch_image_item = item_kind == "image"
 
-                    base_no_ext = Path(item_path).stem
-                    predicted_output_file = item_out_dir / f"{base_no_ext}.mp4"
+                    if is_batch_image_item:
+                        safe_name = sanitize_filename(item_input.name) or item_input.name
+                        desired_output_file = batch_root / safe_name
 
-                    from shared.output_run_manager import prepare_batch_video_run_dir
+                        if desired_output_file.exists() and not overwrite_existing:
+                            outputs.append(str(desired_output_file))
+                            last_output_path = str(desired_output_file)
+                            logs.append(f"[{idx}/{len(items)}] {item_input.name} skipped (output exists)")
+                            yield _batch_live_payload(f"Batch {idx}/{len(items)}: skipped {item_name}")
+                            continue
+                        if desired_output_file.exists() and overwrite_existing:
+                            try:
+                                desired_output_file.unlink(missing_ok=True)
+                            except Exception:
+                                pass
 
-                    run_paths = prepare_batch_video_run_dir(
-                        batch_root,
-                        Path(item_path).name,
-                        input_path=str(item_path),
-                        model_label="FlashVSR+",
-                        mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
-                        overwrite_existing=overwrite_existing,
-                    )
+                        safe_stem = sanitize_filename(item_input.stem) or "image"
+                        image_work_dir = batch_root / ".flashvsr_image_work" / safe_stem
+                        try:
+                            if image_work_dir.exists():
+                                shutil.rmtree(image_work_dir, ignore_errors=True)
+                            image_work_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            logs.append(f"[{idx}/{len(items)}] {item_input.name} failed (could not create image work folder)")
+                            yield _batch_live_payload(f"Batch {idx}/{len(items)}: could not prepare output for {item_name}")
+                            continue
+
+                        item_out_dir = image_work_dir
+                        predicted_output_file = image_work_dir / f"{safe_stem}.mp4"
+                        processed_chunks_dir = image_work_dir / "processed_chunks"
+                        try:
+                            processed_chunks_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            pass
+
+                        item_settings["global_output_dir"] = str(image_work_dir)
+                        item_settings["_run_dir"] = str(image_work_dir)
+                        item_settings["_processed_chunks_dir"] = str(processed_chunks_dir)
+                        item_settings["output_override"] = str(predicted_output_file)
+                        item_settings["_flashvsr_batch_image_desired_output"] = str(desired_output_file)
+                        item_settings["_flashvsr_batch_image_work_dir"] = str(image_work_dir)
+                        item_settings["save_metadata"] = False
+                        from types import SimpleNamespace
+
+                        run_paths = SimpleNamespace(
+                            run_dir=image_work_dir,
+                            processed_chunks_dir=processed_chunks_dir,
+                        )
+                    else:
+                        item_out_dir = batch_item_dir(batch_root, item_input.name)
+
+                        base_no_ext = item_input.stem
+                        predicted_output_file = item_out_dir / f"{base_no_ext}.mp4"
+
+                        from shared.output_run_manager import prepare_batch_video_run_dir
+
+                        run_paths = prepare_batch_video_run_dir(
+                            batch_root,
+                            item_input.name,
+                            input_path=str(item_input),
+                            model_label="FlashVSR+",
+                            mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
+                            overwrite_existing=overwrite_existing,
+                        )
                     if not run_paths:
                         if not overwrite_existing:
                             logs.append(
@@ -1515,6 +1662,7 @@ def build_flashvsr_callbacks(
                             f"âŒ [{idx}/{len(items)}] {Path(item_path).name} failed: "
                             f"{fps_pre_msg or 'FPS override preprocess failed'}"
                         )
+                        _cleanup_batch_image_work_dir(item_settings)
                         yield _batch_live_payload(f"Batch {idx}/{len(items)}: FPS preprocess failed for {item_name}")
                         continue
 
@@ -1526,6 +1674,7 @@ def build_flashvsr_callbacks(
                             f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed: "
                             f"{item_settings.get('_preprocess_error_note') or 'required pre-downscale failed'}"
                         )
+                        _cleanup_batch_image_work_dir(item_settings)
                         yield _batch_live_payload(f"Batch {idx}/{len(items)}: preprocessing issue for {item_name}")
                         continue
 
@@ -1617,8 +1766,18 @@ def build_flashvsr_callbacks(
                             except Exception:
                                 pass
 
+                        batch_image_desired = item_settings.get("_flashvsr_batch_image_desired_output")
+                        if batch_image_desired and Path(outp).suffix.lower() in image_exts:
+                            moved = _move_or_convert_image_output(
+                                outp,
+                                Path(str(batch_image_desired)),
+                                settings.get("image_output_quality", 95),
+                            )
+                            if moved and Path(moved).exists():
+                                outp = moved
+
                         # Apply global image output format/quality preferences.
-                        if Path(outp).suffix.lower() in image_exts:
+                        if (not batch_image_desired) and Path(outp).suffix.lower() in image_exts:
                             converted = _apply_image_output_preferences(
                                 outp,
                                 settings.get("image_output_format", "png"),
@@ -1717,6 +1876,8 @@ def build_flashvsr_callbacks(
                             )
                         except Exception:
                             pass
+
+                    _cleanup_batch_image_work_dir(item_settings)
 
                     succeeded = len(outputs)
                     with_issues = max(0, idx - succeeded)

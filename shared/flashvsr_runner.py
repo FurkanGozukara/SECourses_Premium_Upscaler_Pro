@@ -1046,6 +1046,12 @@ def run_flashvsr(
                     result.output_path = str(img_path)
                 elif img_err:
                     log(f"[FlashVSR] Single-image export skipped: {img_err}")
+                    try:
+                        Path(output_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    result.returncode = 1
+                    result.output_path = None
         else:
             log("No output file generated")
             result = FlashVSRResult(

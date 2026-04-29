@@ -75,7 +75,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V4.8 – https://www.patreon.com/posts/150202809"
+APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V4.81 – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #

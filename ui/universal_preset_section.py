@@ -32,6 +32,16 @@ from shared.universal_preset import (
 )
 
 
+def _auto_sync_triggers_for_component(comp: gr.components.Component) -> List[Tuple[str, Callable]]:
+    """Return all user-change events that should refresh universal preset state."""
+    triggers: List[Tuple[str, Callable]] = []
+    for event_name in ("release", "input", "change"):
+        trigger = getattr(comp, event_name, None)
+        if callable(trigger):
+            triggers.append((event_name, trigger))
+    return triggers
+
+
 def create_universal_preset_callbacks(
     preset_manager: PresetManager,
     tab_name: str,
@@ -457,14 +467,10 @@ def wire_universal_preset_events(
 
         triggers = []
         for comp in inputs_list:
-            # Use a single best trigger per component to reduce fan-out:
-            # release (sliders) -> input (text-like) -> change (fallback).
-            if hasattr(comp, "release"):
-                triggers.append(comp.release)
-            elif hasattr(comp, "input"):
-                triggers.append(comp.input)
-            elif hasattr(comp, "change"):
-                triggers.append(comp.change)
+            # Listen to every relevant user-change event. Some Gradio components
+            # expose both input/change, but browser selection updates are not
+            # guaranteed to arrive through only one of them across versions.
+            triggers.extend(trigger for _event_name, trigger in _auto_sync_triggers_for_component(comp))
 
         # Prefer gr.on() for a single endpoint; fall back to per-component wiring if needed.
         if hasattr(gr, "on") and triggers:
@@ -480,26 +486,8 @@ def wire_universal_preset_events(
         else:
             # Fallback: register one event per component (heavier, but compatible).
             for comp in inputs_list:
-                if hasattr(comp, "release"):
-                    comp.release(
-                        fn=_sync_wrapper,
-                        inputs=inputs_list + [shared_state],
-                        outputs=[shared_state],
-                        queue=False,
-                        show_progress="hidden",
-                        trigger_mode="always_last",
-                    )
-                elif hasattr(comp, "input"):
-                    comp.input(
-                        fn=_sync_wrapper,
-                        inputs=inputs_list + [shared_state],
-                        outputs=[shared_state],
-                        queue=False,
-                        show_progress="hidden",
-                        trigger_mode="always_last",
-                    )
-                elif hasattr(comp, "change"):
-                    comp.change(
+                for _event_name, trigger in _auto_sync_triggers_for_component(comp):
+                    trigger(
                         fn=_sync_wrapper,
                         inputs=inputs_list + [shared_state],
                         outputs=[shared_state],

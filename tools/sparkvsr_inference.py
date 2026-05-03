@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import os
@@ -37,6 +38,15 @@ decord.bridge.set_bridge("torch")
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+
+def release_torch_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -193,27 +203,29 @@ def remove_padding_and_extra_frames(video: torch.Tensor, pad_f: int, pad_h: int,
 
 
 def make_temporal_chunks(frame_count: int, chunk_len: int, overlap_t: int = 8) -> List[Tuple[int, int]]:
-    if int(chunk_len or 0) <= 0:
-        return [(0, int(frame_count))]
+    frame_count = int(frame_count)
+    if int(chunk_len or 0) <= 0 or frame_count <= int(chunk_len or 0):
+        return [(0, frame_count)]
     chunk = int(chunk_len)
     overlap = int(overlap_t or 0)
     effective_stride = chunk - overlap
     if effective_stride <= 0:
         raise ValueError("chunk_len must be greater than overlap_t")
-    chunk_starts = list(range(0, frame_count - overlap, effective_stride))
-    if not chunk_starts:
-        chunk_starts = [0]
-    if chunk_starts[-1] + chunk < frame_count:
-        chunk_starts.append(max(0, frame_count - chunk))
-    time_chunks = [(s, min(s + chunk, frame_count)) for s in chunk_starts]
-    if len(time_chunks) >= 2 and time_chunks[-1][1] - time_chunks[-1][0] < chunk:
-        last = time_chunks.pop()
-        prev_start, _ = time_chunks[-1]
-        time_chunks[-1] = (prev_start, last[1])
-    return time_chunks
+    starts = [0]
+    while starts[-1] + chunk < frame_count:
+        next_start = starts[-1] + effective_stride
+        if next_start + chunk >= frame_count:
+            if next_start < frame_count and next_start != starts[-1]:
+                starts.append(next_start)
+            break
+        starts.append(next_start)
+    starts = sorted(set(max(0, min(int(s), max(0, frame_count - 1))) for s in starts))
+    return [(s, min(s + chunk, frame_count)) for s in starts]
 
 
 def make_spatial_tiles(height: int, width: int, tile_size_hw: Tuple[int, int], overlap_hw: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
+    height = int(height)
+    width = int(width)
     tile_h, tile_w = int(tile_size_hw[0]), int(tile_size_hw[1])
     overlap_h, overlap_w = int(overlap_hw[0]), int(overlap_hw[1])
     if tile_h <= 0 or tile_w <= 0:
@@ -223,27 +235,27 @@ def make_spatial_tiles(height: int, width: int, tile_size_hw: Tuple[int, int], o
     if stride_h <= 0 or stride_w <= 0:
         raise ValueError("Tile size must be greater than overlap")
 
-    h_tiles = list(range(0, max(1, height - overlap_h), stride_h))
-    if not h_tiles or h_tiles[-1] + tile_h < height:
-        h_tiles.append(max(0, height - tile_h))
-    if len(h_tiles) >= 2 and h_tiles[-1] + tile_h > height:
-        h_tiles.pop()
+    def tile_starts(length: int, tile: int, stride: int) -> List[int]:
+        if length <= tile:
+            return [0]
+        starts = [0]
+        while starts[-1] + tile < length:
+            next_start = starts[-1] + stride
+            if next_start + tile >= length:
+                if next_start < length and next_start != starts[-1]:
+                    starts.append(next_start)
+                break
+            starts.append(next_start)
+        return sorted(set(max(0, min(int(s), max(0, length - 1))) for s in starts))
 
-    w_tiles = list(range(0, max(1, width - overlap_w), stride_w))
-    if not w_tiles or w_tiles[-1] + tile_w < width:
-        w_tiles.append(max(0, width - tile_w))
-    if len(w_tiles) >= 2 and w_tiles[-1] + tile_w > width:
-        w_tiles.pop()
+    h_tiles = tile_starts(height, tile_h, stride_h)
+    w_tiles = tile_starts(width, tile_w, stride_w)
 
     tiles: List[Tuple[int, int, int, int]] = []
     for h_start in h_tiles:
         h_end = min(h_start + tile_h, height)
-        if h_end + stride_h > height:
-            h_end = height
         for w_start in w_tiles:
             w_end = min(w_start + tile_w, width)
-            if w_end + stride_w > width:
-                w_end = width
             tiles.append((h_start, h_end, w_start, w_end))
     return tiles
 
@@ -467,11 +479,26 @@ def process_video_ref_i2v(
     latent_generate = pipe.scheduler.get_velocity(predicted_noise_slice, lq_sample, timesteps)
     if patch_size_t is not None and ncopy > 0:
         latent_generate = latent_generate[:, :, ncopy:, :, :]
+    predicted_noise = None
+    predicted_noise_slice = None
+    lq_sample = None
+    latents = None
+    input_latent = None
+    full_ref_latent = None
+    lq_latent = None
+    latent_dist = None
+    prompt_embedding = None
+    rotary_emb = None
+    timesteps = None
+    ofs = None
+    release_torch_memory()
 
     mark(0.88, "decoding output video tile")
     video_generate = pipe.vae.decode(latent_generate / pipe.vae.config.scaling_factor).sample
+    latent_generate = None
+    release_torch_memory()
     mark(1.0, "tile complete")
-    return (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
+    return video_generate.mul_(0.5).add_(0.5).clamp_(0.0, 1.0)
 
 
 def parse_ref_indices(text: Optional[str]) -> Optional[List[int]]:
@@ -987,6 +1014,10 @@ def main() -> int:
                     region["valid_h_start"] : region["valid_h_end"],
                     region["valid_w_start"] : region["valid_w_end"],
                 ]
+                del generated
+                del video_chunk
+                del current_ref_frames
+                release_torch_memory()
                 emit_progress(
                     video_pct(0.18 + (step_idx / total_steps) * 0.68),
                     "tile",

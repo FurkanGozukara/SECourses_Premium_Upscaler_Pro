@@ -387,7 +387,7 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "ref_indices": "0",
         "ref_guidance_scale": 1.0,
         "ref_source_path": "",
-        "auto_reference_prepass": False,
+        "auto_reference_prepass": True,
         "auto_reference_upscaler": "SeedVR2",
         "ref_pisa_cache_dir": "",
         "pisa_python_executable": "",
@@ -568,7 +568,7 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["ref_guidance_scale"] = max(0.0, min(100.0, _to_float(cfg.get("ref_guidance_scale"), 1.0)))
     cfg["auto_reference_prepass"] = _to_bool(
         cfg.get("auto_reference_prepass"),
-        _to_bool(defaults.get("auto_reference_prepass", False), False),
+        _to_bool(defaults.get("auto_reference_prepass", True), True),
     )
     auto_ref_upscaler = str(
         cfg.get("auto_reference_upscaler", defaults.get("auto_reference_upscaler", "SeedVR2")) or "SeedVR2"
@@ -1182,58 +1182,23 @@ def build_sparkvsr_callbacks(
         global_settings_snapshot: Dict[str, Any] | None = None,
         _global_settings: Dict[str, Any] = global_settings,
     ):
-        state = state or {"seed_controls": {}}
-        settings = _enforce_sparkvsr_guardrails({**defaults, **_sparkvsr_dict_from_args(list(args))}, defaults)
-        try:
-            from shared.gpu_utils import get_gpu_info
+        from shared.services.sparkvsr_autotune import sparkvsr_auto_tune_action
 
-            gpus = get_gpu_info()
-            vram_gb = float(gpus[0].total_memory_gb) if gpus else 0.0
-        except Exception:
-            vram_gb = 0.0
-
-        if vram_gb and vram_gb < 12:
-            tile_h = tile_w = 256
-            chunk_len = 17
-        elif vram_gb and vram_gb < 20:
-            tile_h = tile_w = 512
-            chunk_len = 33
-        else:
-            tile_h = tile_w = 0
-            chunk_len = 0
-
-        # Keep SparkVSR's official temporal overlap default unless chunking is disabled.
-        if chunk_len <= 0:
-            overlap_t = 8
-        else:
-            overlap_t = min(8, max(0, chunk_len - 1))
-
-        settings["tile_height"] = tile_h
-        settings["tile_width"] = tile_w
-        settings["chunk_len"] = chunk_len
-        settings["overlap_t"] = overlap_t
-        settings["vae_tiling"] = True
-        seed_controls = state.setdefault("seed_controls", {})
-        seed_controls["sparkvsr_settings"] = settings
-
-        summary = (
-            f"SparkVSR memory profile applied: tile={tile_h}x{tile_w} "
-            f"({'disabled' if tile_h == 0 else 'enabled'}), chunk_len={chunk_len}, "
-            f"overlap_t={overlap_t}, VAE tiling=ON."
-        )
-        if progress:
-            progress(1.0, desc="SparkVSR settings optimized")
-        yield (
-            "SparkVSR memory profile applied",
-            summary,
-            gr.update(value="", visible=False),
-            gr.update(value=tile_h),
-            gr.update(value=tile_w),
-            gr.update(value=chunk_len),
-            gr.update(value=overlap_t),
-            gr.update(value=True),
-            gr.update(value=summary, visible=True),
-            state,
+        yield from sparkvsr_auto_tune_action(
+            uploaded_file=uploaded_file,
+            args=tuple(args),
+            state=state,
+            progress=progress,
+            global_settings_snapshot=global_settings_snapshot,
+            global_settings_fallback=_global_settings,
+            defaults=defaults,
+            sparkvsr_order=SPARKVSR_ORDER,
+            parse_args_fn=_sparkvsr_dict_from_args,
+            guardrail_fn=_enforce_sparkvsr_guardrails,
+            canonical_scale_fn=canonical_sparkvsr_scale,
+            base_dir=base_dir,
+            temp_dir=temp_dir,
+            cancel_event=_sparkvsr_cancel_event,
         )
         return
 

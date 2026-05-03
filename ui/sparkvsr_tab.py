@@ -488,8 +488,8 @@ def sparkvsr_tab(
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
                 gr.Markdown(
                     (
-                        "**Auto Tune:** Applies a conservative SparkVSR memory profile based on detected GPU VRAM: "
-                        "spatial tiling and shorter temporal chunks on low-VRAM GPUs, full-frame processing when headroom is available."
+                        "**Auto Tune:** Runs a short SparkVSR probe clip, measures live GPU VRAM, and applies the highest-quality "
+                        "spatial tile / temporal chunk settings that keep the selected free-VRAM headroom."
                     )
                 )
 
@@ -648,7 +648,7 @@ def sparkvsr_tab(
                 with gr.Row():
                     auto_reference_prepass = gr.Checkbox(
                         label="Auto Upscale First Frame per Chunk",
-                        value=bool(_value("auto_reference_prepass", False)),
+                        value=bool(_value("auto_reference_prepass", True)),
                         info=(
                             "Before SparkVSR processes a chunk, upscale that chunk's first frame locally and use it "
                             "as the sr_image reference for that chunk."
@@ -2095,6 +2095,8 @@ def sparkvsr_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             safe_state,
         )
 
@@ -2112,6 +2114,8 @@ def sparkvsr_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             safe_state,
         )
 
@@ -2123,6 +2127,8 @@ def sparkvsr_tab(
             gr.update(value=title),
             gr.update(value=subtitle),
             _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -2398,6 +2404,8 @@ def sparkvsr_tab(
             progress_indicator,
             tile_height,
             tile_width,
+            overlap_height,
+            overlap_width,
             chunk_len,
             overlap_t,
             vae_tiling,

@@ -69,6 +69,13 @@ def run_sparkvsr(*args, **kwargs):
     return _run_sparkvsr_impl(*args, **kwargs)
 
 
+def run_flashvsr(*args, **kwargs):
+    """Lazy-import FlashVSR+ runner only when the optional reference prepass needs it."""
+    from shared.flashvsr_runner import run_flashvsr as _run_flashvsr_impl
+
+    return _run_flashvsr_impl(*args, **kwargs)
+
+
 def _save_preprocessed_artifact(pre_path: Path, output_path_str: str) -> Optional[str]:
     """
     Save the preprocessed (downscaled) input next to outputs for inspection.
@@ -380,6 +387,8 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "ref_indices": "0",
         "ref_guidance_scale": 1.0,
         "ref_source_path": "",
+        "auto_reference_prepass": False,
+        "auto_reference_upscaler": "SeedVR2",
         "ref_pisa_cache_dir": "",
         "pisa_python_executable": "",
         "pisa_script_path": "",
@@ -440,6 +449,8 @@ SPARKVSR_ORDER: List[str] = [
     "ref_indices",
     "ref_guidance_scale",
     "ref_source_path",
+    "auto_reference_prepass",
+    "auto_reference_upscaler",
     "ref_pisa_cache_dir",
     "pisa_python_executable",
     "pisa_script_path",
@@ -555,6 +566,19 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["ref_mode"] = ref_mode if ref_mode in set(SPARKVSR_REF_MODE_OPTIONS) else "no_ref"
     cfg["ref_indices"] = str(cfg.get("ref_indices", defaults.get("ref_indices", "0")) or "").strip()
     cfg["ref_guidance_scale"] = max(0.0, min(100.0, _to_float(cfg.get("ref_guidance_scale"), 1.0)))
+    cfg["auto_reference_prepass"] = _to_bool(
+        cfg.get("auto_reference_prepass"),
+        _to_bool(defaults.get("auto_reference_prepass", False), False),
+    )
+    auto_ref_upscaler = str(
+        cfg.get("auto_reference_upscaler", defaults.get("auto_reference_upscaler", "SeedVR2")) or "SeedVR2"
+    ).strip()
+    auto_ref_lc = auto_ref_upscaler.lower().replace(" ", "")
+    if auto_ref_lc in {"seedvr2", "seed"}:
+        auto_ref_upscaler = "SeedVR2"
+    elif auto_ref_lc in {"flashvsr", "flashvsr+", "flash"}:
+        auto_ref_upscaler = "FlashVSR+"
+    cfg["auto_reference_upscaler"] = auto_ref_upscaler or "SeedVR2"
     for key in (
         "ref_source_path",
         "ref_pisa_cache_dir",
@@ -644,6 +668,455 @@ def build_sparkvsr_callbacks(
 ):
     """Build SparkVSR callback functions for the UI."""
     defaults = sparkvsr_defaults()
+
+    def _auto_ref_log(on_progress: Optional[Callable[[str], None]], message: str) -> None:
+        text = f"[SparkVSR reference prepass] {str(message).strip()}"
+        if not text.strip():
+            return
+        try:
+            print(text, flush=True)
+        except Exception:
+            pass
+        if on_progress:
+            try:
+                on_progress(text + "\n")
+            except Exception:
+                pass
+
+    def _normalize_auto_ref_key(value: Any) -> Tuple[str, str]:
+        raw = str(value or "SeedVR2").strip()
+        compact = raw.lower().replace(" ", "")
+        if compact in {"seedvr2", "seed"}:
+            return "seedvr2", ""
+        if compact in {"flashvsr", "flashvsr+", "flash"}:
+            return "flashvsr", ""
+        if raw.lower().startswith("gan::"):
+            return "gan", raw.split("::", 1)[1].strip()
+        if raw.lower().startswith("gan:"):
+            return "gan", raw.split(":", 1)[1].strip()
+        if raw.lower().endswith((".pth", ".safetensors")):
+            return "gan", raw
+        return "seedvr2", ""
+
+    def _copy_or_extract_first_frame(src_input: str, dst_path: Path, on_progress=None) -> Optional[Path]:
+        try:
+            src = Path(normalize_path(src_input))
+            dst = Path(dst_path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not src.exists():
+                _auto_ref_log(on_progress, f"source missing for first-frame extraction: {src}")
+                return None
+
+            kind = detect_input_type(str(src))
+            if kind == "image":
+                try:
+                    from PIL import Image
+
+                    with Image.open(src) as im:
+                        im.convert("RGB").save(dst, format="PNG")
+                except Exception:
+                    shutil.copy2(src, dst)
+                return dst if dst.exists() else None
+
+            if kind == "directory":
+                frames = list_files_sorted(src, IMAGE_EXTENSIONS)
+                if not frames:
+                    _auto_ref_log(on_progress, f"frame directory has no supported images: {src}")
+                    return None
+                return _copy_or_extract_first_frame(str(frames[0]), dst, on_progress=on_progress)
+
+            if kind == "video":
+                from shared.frame_utils import extract_first_frame
+
+                ok, frame_path, err = extract_first_frame(str(src), str(dst), format="png")
+                if ok and frame_path and Path(frame_path).exists():
+                    return Path(frame_path)
+                _auto_ref_log(on_progress, f"failed to extract first frame from {src.name}: {err}")
+                return None
+
+            _auto_ref_log(on_progress, f"unsupported source type for first-frame reference: {src}")
+            return None
+        except Exception as exc:
+            _auto_ref_log(on_progress, f"first-frame extraction failed: {exc}")
+            return None
+
+    def _finalize_reference_image(candidate_path: Optional[str], dst_path: Path, on_progress=None) -> Optional[Path]:
+        if not candidate_path:
+            return None
+        try:
+            src = Path(normalize_path(candidate_path))
+            dst = Path(dst_path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not src.exists():
+                return None
+
+            kind = detect_input_type(str(src))
+            if kind == "video":
+                from shared.frame_utils import extract_first_frame
+
+                ok, frame_path, err = extract_first_frame(str(src), str(dst), format="png")
+                if ok and frame_path and Path(frame_path).exists():
+                    return Path(frame_path)
+                _auto_ref_log(on_progress, f"could not extract reference image from video output: {err}")
+                return None
+
+            if kind == "directory":
+                frames = list_files_sorted(src, IMAGE_EXTENSIONS)
+                if not frames:
+                    return None
+                return _finalize_reference_image(str(frames[0]), dst, on_progress=on_progress)
+
+            if kind == "image":
+                try:
+                    if src.resolve() == dst.resolve():
+                        return dst
+                except Exception:
+                    if str(src) == str(dst):
+                        return dst
+                try:
+                    from PIL import Image
+
+                    with Image.open(src) as im:
+                        im.convert("RGB").save(dst, format="PNG")
+                except Exception:
+                    shutil.copy2(src, dst)
+                return dst if dst.exists() else None
+
+            return None
+        except Exception as exc:
+            _auto_ref_log(on_progress, f"reference image finalization failed: {exc}")
+            return None
+
+    def _merge_tab_settings(seed_controls: Dict[str, Any], key: str, base_defaults: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = dict(base_defaults or {})
+        tab_settings = seed_controls.get(key, {}) if isinstance(seed_controls, dict) else {}
+        if isinstance(tab_settings, dict):
+            for k, v in tab_settings.items():
+                if v is not None:
+                    cfg[k] = v
+        return cfg
+
+    def _selected_gpu_for_reference(seed_controls: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+        try:
+            return str(get_global_gpu_override(seed_controls, snapshot) or "").strip()
+        except Exception:
+            return ""
+
+    def _run_seedvr2_reference(
+        *,
+        frame_path: Path,
+        desired_ref_path: Path,
+        work_dir: Path,
+        seed_controls: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        on_progress=None,
+    ) -> Optional[Path]:
+        try:
+            from shared.services.seedvr2_service import (
+                seedvr2_defaults,
+                _enforce_seedvr2_guardrails,
+                _process_single_file,
+            )
+
+            seed_defaults = seedvr2_defaults(base_dir=base_dir)
+            seed_cfg = _merge_tab_settings(seed_controls, "seedvr2_settings", seed_defaults)
+            prepass_overrides = {
+                "input_path": str(frame_path),
+                "_effective_input_path": str(frame_path),
+                "_original_filename": frame_path.name,
+                "_run_dir": str(work_dir),
+                "global_output_dir": str(work_dir),
+                "output_override": str(desired_ref_path),
+                "output_format": "png",
+                "batch_enable": False,
+                "batch_input_path": "",
+                "batch_output_path": "",
+                "resume_run_dir": "",
+                "auto_transfer_output_to_input": False,
+                "keep_only_output_files": False,
+                "save_metadata": False,
+                "load_cap": 1,
+                "skip_first_frames": 0,
+            }
+            seed_cfg.update(prepass_overrides)
+            if seed_controls.get("upscale_factor_val") is not None and bool(seed_cfg.get("use_resolution_tab", True)):
+                try:
+                    seed_cfg["upscale_factor"] = float(
+                        seed_controls.get("upscale_factor_val") or seed_cfg.get("upscale_factor") or 4.0
+                    )
+                except Exception:
+                    pass
+            if "ratio_downscale" in seed_controls:
+                seed_cfg["pre_downscale_then_upscale"] = bool(seed_controls.get("ratio_downscale", True))
+            gpu = _selected_gpu_for_reference(seed_controls, snapshot)
+            if gpu:
+                seed_cfg["cuda_device"] = "" if gpu == "cpu" else gpu
+
+            seed_cfg = _enforce_seedvr2_guardrails(
+                seed_cfg,
+                seed_defaults,
+                state={"seed_controls": seed_controls},
+                silent_migration=True,
+            )
+            seed_cfg.update(prepass_overrides)
+            if gpu:
+                seed_cfg["cuda_device"] = "" if gpu == "cpu" else gpu
+
+            face_ref = bool(seed_cfg.get("face_restore_after_upscale", False)) or bool(snapshot.get("face_global", False))
+            status, logs, _vid, out_img, *_rest = _process_single_file(
+                runner,
+                seed_cfg,
+                snapshot,
+                seed_controls,
+                face_ref,
+                float(snapshot.get("face_strength", 0.5) or 0.5),
+                run_logger,
+                work_dir,
+                preview_only=False,
+                progress_cb=on_progress,
+            )
+            final = _finalize_reference_image(out_img, desired_ref_path, on_progress=on_progress)
+            if final and final.exists():
+                return final
+            _auto_ref_log(on_progress, f"SeedVR2 reference failed: {status}. {str(logs)[-240:]}")
+            return None
+        except Exception as exc:
+            _auto_ref_log(on_progress, f"SeedVR2 reference generation failed: {exc}")
+            return None
+
+    def _run_gan_reference(
+        *,
+        frame_path: Path,
+        desired_ref_path: Path,
+        work_dir: Path,
+        seed_controls: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        gan_model: str,
+        on_progress=None,
+    ) -> Optional[Path]:
+        try:
+            from shared.services.gan_service import gan_defaults, PREFERRED_GAN_DEFAULT_MODEL
+
+            gan_cfg = _merge_tab_settings(seed_controls, "gan_settings", gan_defaults(base_dir))
+            model_name = str(gan_model or gan_cfg.get("model") or "").strip()
+            if not model_name:
+                models: List[str] = []
+                for folder_name in ("models", "Image_Upscale_Models"):
+                    folder = base_dir / folder_name
+                    if folder.exists():
+                        models.extend(
+                            sorted(
+                                f.name for f in folder.iterdir()
+                                if f.is_file() and f.suffix.lower() in {".pth", ".safetensors"}
+                            )
+                        )
+                preferred = {m.lower(): m for m in models}.get(PREFERRED_GAN_DEFAULT_MODEL.lower())
+                model_name = preferred or (models[0] if models else "")
+            if not model_name:
+                _auto_ref_log(on_progress, "GAN reference requested, but no GAN model is available.")
+                return None
+
+            gan_cfg.update(
+                {
+                    "input_path": str(frame_path),
+                    "_effective_input_path": str(frame_path),
+                    "_original_filename": frame_path.name,
+                    "_run_dir": str(work_dir),
+                    "global_output_dir": str(work_dir),
+                    "output_override": str(desired_ref_path),
+                    "output_format": "png",
+                    "model": model_name,
+                    "batch_enable": False,
+                    "batch_input_path": "",
+                    "batch_output_path": "",
+                    "auto_transfer_output_to_input": False,
+                    "keep_only_output_files": False,
+                    "save_metadata": False,
+                }
+            )
+            if seed_controls.get("upscale_factor_val") is not None and bool(gan_cfg.get("use_resolution_tab", True)):
+                try:
+                    gan_cfg["upscale_factor"] = float(
+                        seed_controls.get("upscale_factor_val") or gan_cfg.get("upscale_factor") or 4.0
+                    )
+                except Exception:
+                    pass
+            gpu = _selected_gpu_for_reference(seed_controls, snapshot)
+            if gpu:
+                gan_cfg["gpu_acceleration"] = gpu != "cpu"
+                gan_cfg["gpu_device"] = "" if gpu == "cpu" else gpu
+            gan_cfg["face_restore"] = bool(gan_cfg.get("face_restore_after_upscale", False)) or bool(snapshot.get("face_global", False))
+            gan_cfg["face_strength"] = float(snapshot.get("face_strength", 0.5) or 0.5)
+
+            result = runner.run_gan(gan_cfg, on_progress=on_progress)
+            if result.returncode == 0 and result.output_path:
+                final = _finalize_reference_image(result.output_path, desired_ref_path, on_progress=on_progress)
+                if final and final.exists():
+                    return final
+            _auto_ref_log(
+                on_progress,
+                f"GAN reference failed with model {model_name}: {str(getattr(result, 'log', ''))[-240:]}",
+            )
+            return None
+        except Exception as exc:
+            _auto_ref_log(on_progress, f"GAN reference generation failed: {exc}")
+            return None
+
+    def _run_flashvsr_reference(
+        *,
+        frame_path: Path,
+        desired_ref_path: Path,
+        work_dir: Path,
+        seed_controls: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        on_progress=None,
+    ) -> Optional[Path]:
+        try:
+            from shared.services.flashvsr_service import flashvsr_defaults, _enforce_flashvsr_guardrails
+
+            flash_defaults = flashvsr_defaults()
+            flash_cfg = _merge_tab_settings(seed_controls, "flashvsr_settings", flash_defaults)
+            if seed_controls.get("upscale_factor_val") is not None and bool(flash_cfg.get("use_resolution_tab", True)):
+                try:
+                    flash_cfg["upscale_factor"] = float(
+                        seed_controls.get("upscale_factor_val") or flash_cfg.get("upscale_factor") or 4.0
+                    )
+                except Exception:
+                    pass
+            try:
+                flash_cfg = _enforce_flashvsr_guardrails(flash_cfg, flash_defaults)
+            except Exception:
+                pass
+            flash_video = work_dir / f"{desired_ref_path.stem}_flashvsr.mp4"
+            flash_cfg.update(
+                {
+                    "input_path": str(frame_path),
+                    "_effective_input_path": str(frame_path),
+                    "_original_filename": frame_path.name,
+                    "_run_dir": str(work_dir),
+                    "global_output_dir": str(work_dir),
+                    "output_override": str(flash_video),
+                    "output_format": "mp4",
+                    "batch_enable": False,
+                    "batch_input_path": "",
+                    "batch_output_path": "",
+                    "resume_run_dir": "",
+                    "auto_transfer_output_to_input": False,
+                    "keep_only_output_files": False,
+                    "save_metadata": False,
+                    "image_output_format": "png",
+                    "image_output_quality": 100,
+                }
+            )
+            gpu = _selected_gpu_for_reference(seed_controls, snapshot)
+            if gpu:
+                flash_cfg["device"] = "cpu" if gpu == "cpu" else gpu
+
+            result = run_flashvsr(
+                flash_cfg,
+                base_dir,
+                on_progress=on_progress,
+                cancel_event=_sparkvsr_cancel_event,
+                process_handle=None,
+            )
+            if result.returncode == 0 and result.output_path:
+                final = _finalize_reference_image(result.output_path, desired_ref_path, on_progress=on_progress)
+                if final and final.exists():
+                    if bool(flash_cfg.get("face_restore_after_upscale", False)) or bool(snapshot.get("face_global", False)):
+                        try:
+                            from shared.face_restore import restore_image
+
+                            restored = restore_image(
+                                str(final),
+                                strength=float(snapshot.get("face_strength", 0.5) or 0.5),
+                                gpu_device=(None if gpu == "cpu" else gpu),
+                            )
+                            restored_final = _finalize_reference_image(restored, desired_ref_path, on_progress=on_progress)
+                            if restored_final and restored_final.exists():
+                                return restored_final
+                        except Exception as face_exc:
+                            _auto_ref_log(on_progress, f"FlashVSR+ reference face-restore warning: {face_exc}")
+                    return final
+            _auto_ref_log(on_progress, f"FlashVSR+ reference failed: {str(getattr(result, 'log', ''))[-240:]}")
+            return None
+        except Exception as exc:
+            _auto_ref_log(on_progress, f"FlashVSR+ reference generation failed: {exc}")
+            return None
+
+    def _prepare_auto_reference_for_input(
+        chunk_cfg: Dict[str, Any],
+        *,
+        seed_controls: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        ref_root: Path,
+        label: str,
+        on_progress=None,
+    ) -> Optional[str]:
+        if not _to_bool(chunk_cfg.get("auto_reference_prepass"), False):
+            return None
+        if _sparkvsr_cancel_event.is_set():
+            return None
+
+        source_input = normalize_path(chunk_cfg.get("_effective_input_path") or chunk_cfg.get("input_path") or "")
+        if not source_input:
+            return None
+        safe_label = sanitize_filename(label) or "reference"
+        work_dir = collision_safe_dir(ref_root / safe_label)
+        raw_frame = work_dir / f"{safe_label}_source_first_frame.png"
+        desired_ref = work_dir / f"{safe_label}_sr_reference.png"
+
+        _auto_ref_log(on_progress, f"{label}: extracting first frame")
+        frame = _copy_or_extract_first_frame(source_input, raw_frame, on_progress=on_progress)
+        if not frame:
+            return None
+
+        backend, gan_model = _normalize_auto_ref_key(chunk_cfg.get("auto_reference_upscaler", "SeedVR2"))
+        _auto_ref_log(on_progress, f"{label}: upscaling first frame with {chunk_cfg.get('auto_reference_upscaler', 'SeedVR2')}")
+        generated: Optional[Path] = None
+        if backend == "seedvr2":
+            generated = _run_seedvr2_reference(
+                frame_path=frame,
+                desired_ref_path=desired_ref,
+                work_dir=work_dir,
+                seed_controls=seed_controls,
+                snapshot=snapshot,
+                on_progress=on_progress,
+            )
+        elif backend == "gan":
+            generated = _run_gan_reference(
+                frame_path=frame,
+                desired_ref_path=desired_ref,
+                work_dir=work_dir,
+                seed_controls=seed_controls,
+                snapshot=snapshot,
+                gan_model=gan_model,
+                on_progress=on_progress,
+            )
+        elif backend == "flashvsr":
+            generated = _run_flashvsr_reference(
+                frame_path=frame,
+                desired_ref_path=desired_ref,
+                work_dir=work_dir,
+                seed_controls=seed_controls,
+                snapshot=snapshot,
+                on_progress=on_progress,
+            )
+
+        if generated and Path(generated).exists():
+            _auto_ref_log(on_progress, f"{label}: reference ready -> {generated}")
+            return str(generated)
+        _auto_ref_log(on_progress, f"{label}: selected upscaler did not produce a reference; stopping auto-reference prepass")
+        return None
+
+    def _apply_auto_reference_to_chunk_settings(chunk_cfg: Dict[str, Any], ref_path: Optional[str]) -> Dict[str, Any]:
+        if not ref_path:
+            return chunk_cfg
+        next_cfg = chunk_cfg.copy()
+        next_cfg["ref_mode"] = "sr_image"
+        next_cfg["ref_indices"] = "0"
+        next_cfg["ref_source_path"] = str(ref_path)
+        next_cfg["_auto_reference_source_path"] = str(ref_path)
+        return next_cfg
 
     def refresh_presets(model_name: str, select_name: Optional[str] = None):
         """Refresh preset dropdown."""
@@ -1736,6 +2209,14 @@ def build_sparkvsr_callbacks(
                         chunk_settings = item_settings.copy()
                         chunk_settings["input_path"] = effective_for_chunk
                         chunk_settings["frame_accurate_split"] = frame_accurate_split
+                        auto_ref_map: Dict[str, str] = {}
+                        auto_ref_root = Path(item_out_dir) / "reference_frames"
+
+                        def _auto_ref_chunk_key(path_value: Any) -> str:
+                            try:
+                                return str(Path(normalize_path(str(path_value))).resolve())
+                            except Exception:
+                                return normalize_path(str(path_value))
 
                         # For batch output, prefer deterministic input-stem naming.
                         try:
@@ -1745,7 +2226,38 @@ def build_sparkvsr_callbacks(
                         except Exception:
                             pass
 
+                        def _preprocess_chunk_references(chunks: List[Path], start_index: int = 0, on_progress=None) -> None:
+                            if not _to_bool(chunk_settings.get("auto_reference_prepass"), False):
+                                return
+                            for rel_idx, chunk_path in enumerate(chunks, start_index + 1):
+                                if _sparkvsr_cancel_event.is_set():
+                                    return
+                                pre_cfg = chunk_settings.copy()
+                                pre_cfg["input_path"] = str(chunk_path)
+                                pre_cfg["_effective_input_path"] = str(chunk_path)
+                                pre_cfg["output_override"] = str(
+                                    Path(item_out_dir) / "processed_chunks" / f"{Path(chunk_path).stem}_upscaled.mp4"
+                                )
+                                ref_path = _prepare_auto_reference_for_input(
+                                    pre_cfg,
+                                    seed_controls=seed_controls,
+                                    snapshot=global_settings,
+                                    ref_root=auto_ref_root,
+                                    label=f"chunk_{rel_idx:04d}",
+                                    on_progress=on_progress,
+                                )
+                                if ref_path:
+                                    auto_ref_map[_auto_ref_chunk_key(chunk_path)] = ref_path
+                                else:
+                                    raise RuntimeError(
+                                        f"{Path(chunk_path).name}: reference prepass did not produce an upscaled frame"
+                                    )
+
                         def _process_chunk(s: Dict[str, Any], on_progress=None) -> RunResult:
+                            s = _apply_auto_reference_to_chunk_settings(
+                                s,
+                                auto_ref_map.get(_auto_ref_chunk_key(s.get("input_path", ""))),
+                            )
                             r = run_sparkvsr(
                                 s,
                                 base_dir,
@@ -1770,11 +2282,28 @@ def build_sparkvsr_callbacks(
                             resume_from_partial=False,
                             progress_tracker=None,
                             process_func=_process_chunk,
+                            pre_process_chunks_func=(
+                                _preprocess_chunk_references
+                                if _to_bool(chunk_settings.get("auto_reference_prepass"), False)
+                                else None
+                            ),
                             model_type="sparkvsr",
                         )
                         result = RunResult(rc, final_output if final_output else None, clog)
                         outp = result.output_path
                     else:
+                        if _to_bool(item_settings.get("auto_reference_prepass"), False):
+                            ref_path = _prepare_auto_reference_for_input(
+                                item_settings,
+                                seed_controls=seed_controls,
+                                snapshot=global_settings,
+                                ref_root=Path(item_out_dir) / "reference_frames",
+                                label="single_input",
+                                on_progress=None,
+                            )
+                            if not ref_path:
+                                raise RuntimeError("Reference prepass did not produce an upscaled frame")
+                            item_settings = _apply_auto_reference_to_chunk_settings(item_settings, ref_path)
                         result = run_sparkvsr(
                             item_settings,
                             base_dir,
@@ -2136,6 +2665,10 @@ def build_sparkvsr_callbacks(
                     except Exception:
                         pass
             
+            # Queue progress messages before preprocessing starts; fps/pre-downscale
+            # steps may emit status before the worker thread is launched.
+            progress_queue = queue.Queue()
+
             # Output root for artifacts + preprocessing
             settings["global_output_dir"] = str(Path(settings.get("_run_dir") or output_dir))
             fps_pre_ok, fps_pre_msg = apply_video_fps_override_preprocess(
@@ -2230,7 +2763,6 @@ def build_sparkvsr_callbacks(
             
             # Run SparkVSR in thread with cancel support
             result_holder = {}
-            progress_queue = queue.Queue()
             process_handle = {"proc": None}  # Store subprocess handle
             
             def processing_thread():
@@ -2246,6 +2778,17 @@ def build_sparkvsr_callbacks(
 
                         chunk_settings = settings.copy()
                         chunk_settings["input_path"] = effective_for_chunk
+                        auto_ref_map: Dict[str, str] = {}
+                        auto_ref_root = Path(
+                            settings.get("_run_dir")
+                            or global_settings.get("output_dir", output_dir)
+                        ) / "reference_frames"
+
+                        def _auto_ref_chunk_key(path_value: Any) -> str:
+                            try:
+                                return str(Path(normalize_path(str(path_value))).resolve())
+                            except Exception:
+                                return normalize_path(str(path_value))
 
                         # Default output path: deterministic input-stem naming unless user overrides.
                         if not (chunk_settings.get("output_override") or "").strip():
@@ -2261,7 +2804,39 @@ def build_sparkvsr_callbacks(
                                 "continuing remaining chunks (same settings required)."
                             )
 
+                        def _preprocess_chunk_references(chunks: List[Path], start_index: int = 0, on_progress=None) -> None:
+                            if not _to_bool(chunk_settings.get("auto_reference_prepass"), False):
+                                return
+                            for rel_idx, chunk_path in enumerate(chunks, start_index + 1):
+                                if _sparkvsr_cancel_event.is_set():
+                                    return
+                                pre_cfg = chunk_settings.copy()
+                                pre_cfg["input_path"] = str(chunk_path)
+                                pre_cfg["_effective_input_path"] = str(chunk_path)
+                                pre_cfg["output_override"] = str(
+                                    Path(chunk_settings.get("_processed_chunks_dir") or auto_ref_root.parent / "processed_chunks")
+                                    / f"{Path(chunk_path).stem}_upscaled.mp4"
+                                )
+                                ref_path = _prepare_auto_reference_for_input(
+                                    pre_cfg,
+                                    seed_controls=seed_controls,
+                                    snapshot=global_settings,
+                                    ref_root=auto_ref_root,
+                                    label=f"chunk_{rel_idx:04d}",
+                                    on_progress=on_progress,
+                                )
+                                if ref_path:
+                                    auto_ref_map[_auto_ref_chunk_key(chunk_path)] = ref_path
+                                else:
+                                    raise RuntimeError(
+                                        f"{Path(chunk_path).name}: reference prepass did not produce an upscaled frame"
+                                    )
+
                         def _process_chunk(s: Dict[str, Any], on_progress=None) -> RunResult:
+                            s = _apply_auto_reference_to_chunk_settings(
+                                s,
+                                auto_ref_map.get(_auto_ref_chunk_key(s.get("input_path", ""))),
+                            )
                             r = run_sparkvsr(
                                 s,
                                 base_dir,
@@ -2303,12 +2878,30 @@ def build_sparkvsr_callbacks(
                             resume_from_partial=resume_requested,
                             progress_tracker=_chunk_progress_cb,
                             process_func=_process_chunk,
+                            pre_process_chunks_func=(
+                                _preprocess_chunk_references
+                                if _to_bool(chunk_settings.get("auto_reference_prepass"), False)
+                                else None
+                            ),
                             model_type="sparkvsr",
                         )
 
                         result_holder["result"] = RunResult(rc, final_output if final_output else None, clog)
                         result_holder["chunk_count"] = int(chunk_count or 0)
                     else:
+                        if _to_bool(settings.get("auto_reference_prepass"), False):
+                            ref_path = _prepare_auto_reference_for_input(
+                                settings,
+                                seed_controls=seed_controls,
+                                snapshot=global_settings,
+                                ref_root=Path(settings.get("_run_dir") or output_dir) / "reference_frames",
+                                label="single_input",
+                                on_progress=lambda msg: progress_queue.put(str(msg).strip()) if str(msg).strip() else None,
+                            )
+                            if ref_path:
+                                settings.update(_apply_auto_reference_to_chunk_settings(settings, ref_path))
+                            else:
+                                raise RuntimeError("Reference prepass did not produce an upscaled frame")
                         result = run_sparkvsr(
                             settings,
                             base_dir,

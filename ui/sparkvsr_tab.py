@@ -24,6 +24,7 @@ from shared.services.sparkvsr_service import (
     SPARKVSR_SAVE_FORMAT_OPTIONS,
     canonical_sparkvsr_scale,
 )
+from shared.services.gan_service import PREFERRED_GAN_DEFAULT_MODEL, get_gan_model_metadata_lightweight
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.models.sparkvsr_meta import get_sparkvsr_default_model, get_sparkvsr_model_names
 from shared.path_utils import get_media_dimensions, normalize_path
@@ -295,6 +296,43 @@ def sparkvsr_tab(
     model_name_value = str(_value("model_name", get_sparkvsr_default_model()) or get_sparkvsr_default_model())
     if model_name_value not in available_spark_models:
         available_spark_models = [model_name_value] + [m for m in available_spark_models if m != model_name_value]
+
+    def _scan_gan_reference_models() -> list[str]:
+        models: set[str] = set()
+        for folder_name in ("models", "Image_Upscale_Models"):
+            models_dir = base_dir / folder_name
+            if not models_dir.exists():
+                continue
+            try:
+                for f in models_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in {".pth", ".safetensors"}:
+                        models.add(f.name)
+            except Exception:
+                continue
+        ordered = sorted(models)
+        preferred = {m.lower(): m for m in ordered}.get(PREFERRED_GAN_DEFAULT_MODEL.lower())
+        if preferred:
+            ordered = [preferred] + [m for m in ordered if m != preferred]
+        return ordered
+
+    spark_auto_ref_choices: list[tuple[str, str]] = [("SeedVR2", "SeedVR2")]
+    for _gan_model in _scan_gan_reference_models():
+        try:
+            _meta = get_gan_model_metadata_lightweight(_gan_model, base_dir)
+            _label = f"GAN: {_gan_model} (x{int(getattr(_meta, 'scale', 4) or 4)})"
+        except Exception:
+            _label = f"GAN: {_gan_model}"
+        spark_auto_ref_choices.append((_label, f"GAN::{_gan_model}"))
+    spark_auto_ref_choices.append(("FlashVSR+", "FlashVSR+"))
+    spark_auto_ref_values = {str(v) for _, v in spark_auto_ref_choices}
+    auto_reference_upscaler_value = str(_value("auto_reference_upscaler", "SeedVR2") or "SeedVR2").strip()
+    if (
+        auto_reference_upscaler_value not in spark_auto_ref_values
+        and auto_reference_upscaler_value.lower().endswith((".pth", ".safetensors"))
+    ):
+        auto_reference_upscaler_value = f"GAN::{auto_reference_upscaler_value}"
+    if auto_reference_upscaler_value not in spark_auto_ref_values:
+        auto_reference_upscaler_value = "SeedVR2"
 
     # Show GPU warning if not available
     if not cuda_available:
@@ -602,8 +640,28 @@ def sparkvsr_tab(
                     label="Local SR Reference Path",
                     value=str(_value("ref_source_path", "") or ""),
                     placeholder="Leave blank for input video fallback, or provide image/video/folder",
-                    info="Used by sr_image mode. Blank uses the source video; a locally upscaled keyframe/video gives better detail.",
+                    info=(
+                        "Used by sr_image mode. Blank uses the source video; a locally upscaled keyframe/video gives better detail. "
+                        "Auto first-frame references override this per chunk when enabled."
+                    ),
                 )
+                with gr.Row():
+                    auto_reference_prepass = gr.Checkbox(
+                        label="Auto Upscale First Frame per Chunk",
+                        value=bool(_value("auto_reference_prepass", False)),
+                        info=(
+                            "Before SparkVSR processes a chunk, upscale that chunk's first frame locally and use it "
+                            "as the sr_image reference for that chunk."
+                        ),
+                        scale=1,
+                    )
+                    auto_reference_upscaler = gr.Dropdown(
+                        label="Reference Frame Upscaler",
+                        choices=spark_auto_ref_choices,
+                        value=auto_reference_upscaler_value,
+                        info="Default is SeedVR2. GAN models use the selected GAN weight; FlashVSR+ is available as the final option.",
+                        scale=1,
+                    )
                 with gr.Accordion("Local Reference Backends", open=False):
                     gr.Markdown(
                         "`sr_image`: local default; blank path uses the input video. `pisasr`: strongest fully local reference path when PiSA-SR is installed. `no_ref`: baseline without reference guidance."
@@ -959,6 +1017,7 @@ def sparkvsr_tab(
             **Model defaults**
             - `SparkVSR-S2` is the official final-stage checkpoint and is selected by default.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
+            - Enable `Auto Upscale First Frame per Chunk` to generate one local SR reference per chunk before SparkVSR processing starts.
             - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.
 
             **Runtime notes**
@@ -977,7 +1036,8 @@ def sparkvsr_tab(
         noise_step, sr_noise_step, cpu_offload, vae_tiling, group_offload, num_blocks_per_group,
         tile_height, tile_width, overlap_height, overlap_width,
         chunk_len, overlap_t, ref_mode, ref_indices, ref_guidance_scale,
-        ref_source_path, ref_pisa_cache_dir, pisa_python_executable, pisa_script_path,
+        ref_source_path, auto_reference_prepass, auto_reference_upscaler,
+        ref_pisa_cache_dir, pisa_python_executable, pisa_script_path,
         pisa_sd_model_path, pisa_chkpt_path, pisa_gpu, png_save, save_format,
         force_offload, enable_debug, seed, auto_transfer_output_to_input, device, fps_SparkVSR,
         codec, crf, start_frame, end_frame, models_dir,

@@ -2371,6 +2371,7 @@ def chunk_and_process(
     resume_from_partial: bool = False,
     progress_tracker=None,
     process_func: Optional[Callable] = None,
+    pre_process_chunks_func: Optional[Callable] = None,
     model_type: str = "seedvr2",
 ) -> Tuple[int, str, str, int]:
     """
@@ -2412,6 +2413,8 @@ def chunk_and_process(
         progress_tracker: Additional progress tracking callback
         process_func: Optional custom processing function (takes settings, returns RunResult)
                      If None, uses model_type to select runner method
+        pre_process_chunks_func: Optional callback run after chunk splitting and before
+                                 per-chunk model processing starts.
         model_type: Model type ("seedvr2", "gan", "rife", "flashvsr", "sparkvsr") - used if process_func is None
     
     Returns:
@@ -3320,6 +3323,32 @@ def chunk_and_process(
                 chunk_output=str(chunk_path),
                 resumed=True,
             )
+
+    if callable(pre_process_chunks_func) and start_chunk_idx < len(chunk_paths):
+        pending_chunks = list(chunk_paths[start_chunk_idx:])
+        try:
+            on_progress(
+                f"Preparing per-chunk reference assets for {len(pending_chunks)} chunk(s) before processing\n"
+            )
+        except Exception:
+            pass
+        _notify_progress(
+            max(0.0, float(start_chunk_idx) / max(1, len(chunk_paths))),
+            desc="Preparing per-chunk reference assets",
+            chunk_index=max(1, start_chunk_idx + 1),
+            chunk_total=len(chunk_paths),
+            phase="reference_prepass",
+        )
+        try:
+            pre_process_chunks_func(pending_chunks, start_chunk_idx, on_progress)
+        except Exception as exc:
+            msg = f"Reference prepass failed before chunk processing: {exc}"
+            try:
+                on_progress(f"{msg}\n")
+            except Exception:
+                pass
+            return 1, msg, "", len(chunk_paths)
+        _emit_overall_progress("Reference prepass complete; starting chunk processing", force=True)
 
     for idx, chunk in enumerate(chunk_paths[start_chunk_idx:], start_chunk_idx + 1):
         current_chunk_index = int(idx)

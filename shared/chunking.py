@@ -2604,9 +2604,18 @@ def chunk_and_process(
     last_emitted_fraction = -1.0
     inline_frame_progress_active = False
     inline_frame_progress_width = 0
+    progress_report_interval_sec = max(
+        1.0,
+        min(60.0, float(settings.get("progress_report_interval_sec") or 10.0)),
+    )
 
     frame_progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
     pct_progress_re = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%")
+    spark_progress_re = re.compile(r"SparkVSR\s+Progress:\s*(\d{1,3}(?:\.\d+)?)\s*%", flags=re.IGNORECASE)
+    processing_tiles_re = re.compile(
+        r"Processing\s+Tiles:\s*(\d+)\s*/\s*(\d+)(?:.*?\((\d{1,3}(?:\.\d+)?)%\))?",
+        flags=re.IGNORECASE,
+    )
     ratio_hint_re = re.compile(
         r"\b(?:processed|processing|frame|frames|step|steps|batch|batches)\b[^0-9]{0,20}(\d+)\s*/\s*(\d+)",
         flags=re.IGNORECASE,
@@ -2629,7 +2638,12 @@ def chunk_and_process(
         if not payload:
             return
         try:
-            if payload.startswith("FRAME_PROGRESS "):
+            inline_payload = (
+                payload.startswith("FRAME_PROGRESS ")
+                or payload.startswith("SparkVSR Progress:")
+                or payload.startswith("COMPARISON_PROGRESS")
+            )
+            if inline_payload:
                 padded = payload
                 if inline_frame_progress_width > len(payload):
                     padded = payload + (" " * (inline_frame_progress_width - len(payload)))
@@ -2653,6 +2667,9 @@ def chunk_and_process(
         text = str(message or "").strip()
         if not text:
             return None
+        spark_match = spark_progress_re.search(text)
+        if spark_match:
+            return max(0.0, min(1.0, float(spark_match.group(1)) / 100.0))
         if text.startswith("FRAME_PROGRESS "):
             body = text[len("FRAME_PROGRESS ") :].strip()
             m = frame_progress_re.search(body)
@@ -2664,6 +2681,13 @@ def chunk_and_process(
             if p:
                 return max(0.0, min(1.0, float(p.group(1)) / 100.0))
             return None
+        tile_match = processing_tiles_re.search(text)
+        if tile_match:
+            if tile_match.group(3) is not None:
+                return max(0.0, min(1.0, float(tile_match.group(3)) / 100.0))
+            cur = max(0, int(tile_match.group(1)) - 1)
+            total = max(1, int(tile_match.group(2)))
+            return max(0.0, min(1.0, float(cur) / float(total)))
         m = ratio_hint_re.search(text)
         if m:
             cur = int(m.group(1))
@@ -2734,7 +2758,11 @@ def chunk_and_process(
         now = time.time()
         frac = _overall_fraction()
         if not force:
-            if (now - last_overall_emit_ts) < 0.45 and abs(frac - last_emitted_fraction) < 0.004:
+            frac_delta = abs(frac - last_emitted_fraction)
+            elapsed_since_emit = now - last_overall_emit_ts
+            if frac_delta < 0.01 and elapsed_since_emit < progress_report_interval_sec:
+                return
+            if frac_delta >= 0.01 and elapsed_since_emit < 0.8:
                 return
         elapsed = max(0.0, now - run_start_ts)
         eta_seconds = _estimate_eta_from_progress(frac)
@@ -2816,6 +2844,7 @@ def chunk_and_process(
             pass
 
     def _emit_diag(message: str) -> None:
+        nonlocal inline_frame_progress_active, inline_frame_progress_width
         """
         Emit key diagnostics to both console (CMD) and progress callback.
         """
@@ -2823,6 +2852,10 @@ def chunk_and_process(
         if not line.endswith("\n"):
             line += "\n"
         try:
+            if inline_frame_progress_active:
+                print("", flush=True)
+                inline_frame_progress_active = False
+                inline_frame_progress_width = 0
             print(line, end="", flush=True)
         except Exception:
             pass
@@ -3364,16 +3397,15 @@ def chunk_and_process(
                     f"Processing chunk {idx}/{len(chunk_paths)}",
                     force=False,
                 )
+            elif stripped.lower().startswith("[sparkvsr] still running"):
+                _emit_overall_progress(
+                    f"Processing chunk {idx}/{len(chunk_paths)} - {stripped}",
+                    force=False,
+                )
             # Replace chunk-local FRAME_PROGRESS with overall progress to keep UI/CMD consistent.
             if stripped.startswith("FRAME_PROGRESS "):
                 return
-            try:
-                if text.endswith("\n"):
-                    on_progress(text)
-                else:
-                    on_progress(text + "\n")
-            except Exception:
-                pass
+            _emit_progress_line(text)
         
         # Use provided processing function or select based on model type
         if process_func:

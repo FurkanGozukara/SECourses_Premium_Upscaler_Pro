@@ -2331,6 +2331,9 @@ def build_sparkvsr_callbacks(
             live_progress_pct: Optional[float] = None
             live_progress_desc = ""
             live_log_idx: Optional[int] = None
+            saw_frame_progress = False
+            cmd_inline_progress_active = False
+            cmd_inline_progress_width = 0
             progress_tile_idx: Optional[int] = None
             progress_tile_total: Optional[int] = None
             progress_iter_idx: Optional[int] = None
@@ -2357,6 +2360,38 @@ def build_sparkvsr_callbacks(
                 live_log_idx = None
                 log_buffer.append(text)
 
+            def _print_cmd_progress(text: str, transient: bool) -> None:
+                nonlocal cmd_inline_progress_active, cmd_inline_progress_width
+                if should_use_chunking:
+                    return
+                payload = str(text or "").rstrip("\r\n")
+                if not payload:
+                    return
+                try:
+                    inline_payload = (
+                        transient
+                        and (
+                            payload.startswith("SparkVSR Progress:")
+                            or payload.startswith("FRAME_PROGRESS ")
+                            or payload.startswith("COMPARISON_PROGRESS")
+                        )
+                    )
+                    if inline_payload:
+                        padded = payload
+                        if cmd_inline_progress_width > len(payload):
+                            padded = payload + (" " * (cmd_inline_progress_width - len(payload)))
+                        print(f"\r{padded}", end="", flush=True)
+                        cmd_inline_progress_active = True
+                        cmd_inline_progress_width = len(payload)
+                    else:
+                        if cmd_inline_progress_active:
+                            print("", flush=True)
+                            cmd_inline_progress_active = False
+                            cmd_inline_progress_width = 0
+                        print(payload, flush=True)
+                except Exception:
+                    pass
+
             def _normalize_live_progress_line(msg_text: str) -> Tuple[str, bool]:
                 nonlocal progress_tile_idx, progress_tile_total
                 nonlocal progress_iter_idx, progress_iter_ts, progress_iter_ema_s
@@ -2365,6 +2400,8 @@ def build_sparkvsr_callbacks(
                 if not text:
                     return "", False
 
+                if text.startswith("FRAME_PROGRESS "):
+                    return text, True
                 if text.lower().startswith("sparkvsr progress:"):
                     return text, True
 
@@ -2446,17 +2483,36 @@ def build_sparkvsr_callbacks(
                 return text, False
 
             def _extract_progress(msg_text: str) -> Tuple[Optional[float], str]:
+                nonlocal saw_frame_progress
                 text = _strip_ansi(str(msg_text or "")).strip()
                 if not text:
                     return None, ""
 
                 pct: Optional[float] = None
+                frame_match = re.search(
+                    r"FRAME_PROGRESS\s+(\d+)\s*/\s*(\d+)(?:.*?\|\s*(\d+(?:\.\d+)?)%)?",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if frame_match:
+                    saw_frame_progress = True
+                    try:
+                        if frame_match.group(3) is not None:
+                            pct = max(0.0, min(100.0, float(frame_match.group(3)))) / 100.0
+                        else:
+                            pct = max(0.0, min(1.0, float(frame_match.group(1)) / max(1.0, float(frame_match.group(2)))))
+                    except Exception:
+                        pct = None
+                    return pct, text
+
                 m = re.search(r"SparkVSR\s+Progress:\s*(\d+(?:\.\d+)?)\s*%", text, flags=re.IGNORECASE)
                 if m:
                     try:
                         pct = max(0.0, min(100.0, float(m.group(1)))) / 100.0
                     except Exception:
                         pct = None
+                    if saw_frame_progress:
+                        return None, text
                     return pct, text
 
                 m = re.search(r"^\s*(\d+(?:\.\d+)?)\s*%", text)
@@ -2587,6 +2643,7 @@ def build_sparkvsr_callbacks(
                 try:
                     msg = progress_queue.get(timeout=0.1)
                     msg_clean, is_live_line = _normalize_live_progress_line(msg)
+                    _print_cmd_progress(msg_clean, transient=is_live_line)
                     _upsert_log_entry(msg_clean, transient=is_live_line)
                     pct_val, _ = _extract_progress(msg_clean)
 

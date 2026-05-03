@@ -263,8 +263,7 @@ def _safe_ui_video_preview_path(video_path: Optional[str]) -> Optional[str]:
 
 SPARKVSR_PRECISION_OPTIONS = ["bfloat16", "float16", "float32"]
 SPARKVSR_UPSCALE_MODE_OPTIONS = ["bilinear", "bicubic", "nearest"]
-SPARKVSR_REF_MODE_OPTIONS = ["no_ref", "gt", "api", "pisasr"]
-SPARKVSR_REF_PROMPT_MODE_OPTIONS = ["fixed", "dynamic"]
+SPARKVSR_REF_MODE_OPTIONS = ["sr_image", "pisasr", "no_ref", "gt"]
 SPARKVSR_SAVE_FORMAT_OPTIONS = ["yuv444p", "yuv420p"]
 
 
@@ -377,11 +376,10 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "overlap_width": overlap_width,
         "chunk_len": chunk_len,
         "overlap_t": overlap_t,
-        "ref_mode": "no_ref",
-        "ref_prompt_mode": "fixed",
-        "ref_indices": "",
+        "ref_mode": "sr_image",
+        "ref_indices": "0",
         "ref_guidance_scale": 1.0,
-        "ref_api_cache_dir": "",
+        "ref_source_path": "",
         "ref_pisa_cache_dir": "",
         "pisa_python_executable": "",
         "pisa_script_path": "",
@@ -439,10 +437,9 @@ SPARKVSR_ORDER: List[str] = [
     "chunk_len",
     "overlap_t",
     "ref_mode",
-    "ref_prompt_mode",
     "ref_indices",
     "ref_guidance_scale",
-    "ref_api_cache_dir",
+    "ref_source_path",
     "ref_pisa_cache_dir",
     "pisa_python_executable",
     "pisa_script_path",
@@ -549,13 +546,17 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     if cfg["chunk_len"] > 0 and cfg["overlap_t"] >= cfg["chunk_len"]:
         cfg["overlap_t"] = max(0, cfg["chunk_len"] - 1)
     ref_mode = str(cfg.get("ref_mode", defaults.get("ref_mode", "no_ref")) or "no_ref").strip().lower()
+    ref_mode = {
+        "srimg": "sr_image",
+        "sr_ref": "sr_image",
+        "reference": "sr_image",
+        "local_ref": "sr_image",
+    }.get(ref_mode, ref_mode)
     cfg["ref_mode"] = ref_mode if ref_mode in set(SPARKVSR_REF_MODE_OPTIONS) else "no_ref"
-    prompt_mode = str(cfg.get("ref_prompt_mode", defaults.get("ref_prompt_mode", "fixed")) or "fixed").strip().lower()
-    cfg["ref_prompt_mode"] = prompt_mode if prompt_mode in set(SPARKVSR_REF_PROMPT_MODE_OPTIONS) else "fixed"
-    cfg["ref_indices"] = str(cfg.get("ref_indices", "") or "").strip()
+    cfg["ref_indices"] = str(cfg.get("ref_indices", defaults.get("ref_indices", "0")) or "").strip()
     cfg["ref_guidance_scale"] = max(0.0, min(100.0, _to_float(cfg.get("ref_guidance_scale"), 1.0)))
     for key in (
-        "ref_api_cache_dir",
+        "ref_source_path",
         "ref_pisa_cache_dir",
         "pisa_python_executable",
         "pisa_script_path",

@@ -358,8 +358,6 @@ def run_sparkvsr(
             str(max(0, _parse_int(settings.get("overlap_t"), 8))),
             "--ref_mode",
             str(settings.get("ref_mode") or "no_ref"),
-            "--ref_prompt_mode",
-            str(settings.get("ref_prompt_mode") or "fixed"),
             "--ref_indices",
             str(settings.get("ref_indices") or ""),
             "--ref_guidance_scale",
@@ -385,7 +383,7 @@ def run_sparkvsr(
         if _bool(settings.get("png_save"), False):
             cmd.append("--png_save")
         for key, flag in [
-            ("ref_api_cache_dir", "--ref_api_cache_dir"),
+            ("ref_source_path", "--ref_source_path"),
             ("ref_pisa_cache_dir", "--ref_pisa_cache_dir"),
             ("pisa_python_executable", "--pisa_python_executable"),
             ("pisa_script_path", "--pisa_script_path"),

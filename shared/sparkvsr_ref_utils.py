@@ -25,7 +25,7 @@ def save_ref_frames_locally(
     is_match: bool = False,
     specific_indices: Optional[List[int]] = None,
 ) -> List[Tuple[int, str]]:
-    """Extract selected reference frames without any external API."""
+    """Extract selected reference frames locally."""
     if output_dir is None:
         raise ValueError("output_dir must be provided")
     if video_path is None:
@@ -91,17 +91,3 @@ def save_ref_frames_locally(
             cap.release()
 
     return saved
-
-
-def get_ref_frames_api(*args, **kwargs):
-    """Lazy placeholder for optional external FAL reference generation."""
-    if not os.environ.get("FAL_KEY"):
-        raise RuntimeError("SparkVSR API reference mode requires FAL_KEY in the environment.")
-    try:
-        import fal_client  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError("SparkVSR API reference mode requires fal-client to be installed.") from exc
-    raise RuntimeError(
-        "SparkVSR API reference generation is not bundled in this redistributable build. "
-        "Use no_ref, gt, or PiSA-SR mode."
-    )

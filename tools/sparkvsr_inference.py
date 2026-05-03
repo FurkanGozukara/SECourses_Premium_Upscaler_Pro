@@ -155,8 +155,9 @@ def preprocess_video_match(
 ) -> Tuple[torch.Tensor, int, int, int, Tuple[int, int, int, int]]:
     video_reader = decord.VideoReader(uri=Path(video_path).as_posix())
     total_frames = len(video_reader)
-    start = max(0, int(start_frame or 0))
-    end = total_frames if int(end_frame or -1) < 0 else min(total_frames, int(end_frame) + 1)
+    start = max(0, int(start_frame) if start_frame is not None else 0)
+    end_raw = int(end_frame) if end_frame is not None else -1
+    end = total_frames if end_raw < 0 else min(total_frames, end_raw + 1)
     if start >= end:
         raise ValueError(f"Invalid frame range: start_frame={start_frame}, end_frame={end_frame}, total={total_frames}")
 
@@ -499,8 +500,81 @@ def find_empty_prompt_embedding(model_path: Path) -> Optional[torch.Tensor]:
     return None
 
 
+def _align_reference_tensor(tensor: torch.Tensor, target_h: int, target_w: int, mode: str = "bicubic") -> torch.Tensor:
+    ref = tensor.float().contiguous()
+    if ref.shape[-2:] != (target_h, target_w):
+        ref = center_crop_to_aspect_ratio(ref, target_h, target_w)
+    if ref.shape[-2:] != (target_h, target_w):
+        ref = interpolate_2d(ref.unsqueeze(0), (target_h, target_w), mode).squeeze(0)
+    return ref.clamp(-1.0, 1.0)
+
+
+def _read_reference_video_frame(path: Path, frame_idx: int) -> torch.Tensor:
+    reader = decord.VideoReader(uri=path.as_posix())
+    if len(reader) <= 0:
+        raise ValueError(f"Reference video has no frames: {path}")
+    read_idx = min(max(0, int(frame_idx)), len(reader) - 1)
+    frame_obj = reader[read_idx]
+    if hasattr(frame_obj, "asnumpy"):
+        frame_np = frame_obj.asnumpy()
+    else:
+        frame_np = frame_obj.cpu().numpy()
+    tensor = torch.from_numpy(frame_np).permute(2, 0, 1).float() / 255.0
+    return tensor * 2.0 - 1.0
+
+
+def _list_reference_images(path: Path) -> List[Path]:
+    files: List[Path] = []
+    for ext in IMAGE_EXTENSIONS:
+        files.extend(path.glob(f"*{ext}"))
+        files.extend(path.glob(f"*{ext.upper()}"))
+    return sorted(set(files), key=lambda p: p.name.lower())
+
+
+def _load_local_sr_reference(
+    source_path: str,
+    ref_idx: int,
+    ref_order: int,
+    ref_indices: List[int],
+) -> torch.Tensor:
+    source = Path(source_path).expanduser()
+    if not source.exists():
+        raise FileNotFoundError(f"Local SR reference path not found: {source}")
+
+    if source.is_dir():
+        images = _list_reference_images(source)
+        if not images:
+            raise FileNotFoundError(f"No reference images found in directory: {source}")
+        if len(images) == len(ref_indices):
+            chosen = images[min(ref_order, len(images) - 1)]
+        elif len(images) > int(ref_idx):
+            chosen = images[int(ref_idx)]
+        elif len(images) == 1:
+            chosen = images[0]
+        else:
+            chosen = images[min(ref_order, len(images) - 1)]
+        print(f"Using local SR reference image for frame {ref_idx}: {chosen}", flush=True)
+        return image_to_tensor(chosen) * 2.0 - 1.0
+
+    if is_video_file(source):
+        print(f"Using local SR reference video frame {ref_idx}: {source}", flush=True)
+        return _read_reference_video_frame(source, int(ref_idx))
+
+    if source.suffix.lower() in IMAGE_EXTENSIONS:
+        if len(ref_indices) > 1:
+            print(
+                "Warning: one reference image was provided for multiple reference indices; "
+                "the same image will be reused.",
+                flush=True,
+            )
+        print(f"Using local SR reference image for frame {ref_idx}: {source}", flush=True)
+        return image_to_tensor(source) * 2.0 - 1.0
+
+    raise ValueError(f"Unsupported local SR reference path: {source}")
+
+
 def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor, video_lr: torch.Tensor, original_shape, effective_upscale: int) -> Tuple[List[int], List[torch.Tensor]]:
-    from shared.sparkvsr_ref_utils import _select_indices, get_ref_frames_api, save_ref_frames_locally
+    from shared.sparkvsr_ref_utils import _select_indices, save_ref_frames_locally
 
     if args.ref_mode == "no_ref":
         print("Running in No-Ref mode (0 reference frames).", flush=True)
@@ -544,6 +618,21 @@ def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor
             else:
                 print(f"Warning: GT frame {idx} not found. Using LQ frame.", flush=True)
                 ref_frames_list.append(video[0, :, idx])
+        return ref_indices, ref_frames_list
+
+    if args.ref_mode == "sr_image":
+        ref_source_path = str(args.ref_source_path or "").strip()
+        if not ref_source_path:
+            ref_source_path = str(video_path)
+            print(
+                "No local SR reference path was provided. "
+                "Using the input video as the local reference source; for best quality, "
+                "provide a locally upscaled keyframe/video or use PiSA-SR.",
+                flush=True,
+            )
+        for order, idx in enumerate(ref_indices):
+            ref = _load_local_sr_reference(ref_source_path, idx, order, ref_indices)
+            ref_frames_list.append(_align_reference_tensor(ref, target_h, target_w, mode="bicubic"))
         return ref_indices, ref_frames_list
 
     if args.ref_mode == "pisasr":
@@ -597,31 +686,6 @@ def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor
                 ref_frames_list.append(video[0, :, idx])
         return ref_indices, ref_frames_list
 
-    if args.ref_mode == "api":
-        vid_01 = ((video[0] + 1.0) / 2.0).permute(1, 0, 2, 3)
-        max_dim = max(target_h, target_w)
-        api_resolution = "1K" if max_dim <= 1536 else ("2K" if max_dim <= 3000 else "4K")
-        api_cache_base = args.ref_api_cache_dir or os.path.join(args.output_path, "ref_api_cache")
-        api_res = get_ref_frames_api(
-            output_dir=os.path.join(api_cache_base, Path(video_name).stem),
-            video_tensor=vid_01,
-            video_id=Path(video_name).stem,
-            is_match=True,
-            specific_indices=ref_indices,
-            ref_prompt_mode=args.ref_prompt_mode,
-            resolution=api_resolution,
-        )
-        for idx in ref_indices:
-            match = next((tensor for saved_idx, tensor in api_res if saved_idx == idx), None)
-            if match is None:
-                ref_frames_list.append(video[0, :, idx])
-                continue
-            s_tensor = center_crop_to_aspect_ratio(match, target_h, target_w)
-            if s_tensor.shape[-2:] != (target_h, target_w):
-                s_tensor = interpolate_2d(s_tensor.unsqueeze(0), (target_h, target_w), "bicubic").squeeze(0)
-            ref_frames_list.append(s_tensor)
-        return ref_indices, ref_frames_list
-
     raise ValueError(f"Unsupported ref_mode: {args.ref_mode}")
 
 
@@ -663,11 +727,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap_hw", type=int, nargs=2, default=(32, 32), metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--chunk_len", type=int, default=0)
     parser.add_argument("--overlap_t", type=int, default=8)
-    parser.add_argument("--ref_mode", type=str, default="no_ref", choices=["no_ref", "gt", "api", "pisasr"])
-    parser.add_argument("--ref_prompt_mode", type=str, default="fixed", choices=["fixed", "dynamic"])
+    parser.add_argument("--ref_mode", type=str, default="sr_image", choices=["sr_image", "pisasr", "no_ref", "gt"])
     parser.add_argument("--ref_indices", type=str, default="")
     parser.add_argument("--ref_guidance_scale", type=float, default=1.0)
-    parser.add_argument("--ref_api_cache_dir", type=str, default="")
+    parser.add_argument("--ref_source_path", type=str, default="")
     parser.add_argument("--ref_pisa_cache_dir", type=str, default="")
     parser.add_argument("--pisa_python_executable", type=str, default="")
     parser.add_argument("--pisa_script_path", type=str, default="")

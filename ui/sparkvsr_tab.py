@@ -21,7 +21,6 @@ from shared.services.sparkvsr_service import (
     SPARKVSR_PRECISION_OPTIONS,
     SPARKVSR_UPSCALE_MODE_OPTIONS,
     SPARKVSR_REF_MODE_OPTIONS,
-    SPARKVSR_REF_PROMPT_MODE_OPTIONS,
     SPARKVSR_SAVE_FORMAT_OPTIONS,
     canonical_sparkvsr_scale,
 )
@@ -579,21 +578,11 @@ def sparkvsr_tab(
                         label="Reference Mode",
                         choices=list(SPARKVSR_REF_MODE_OPTIONS),
                         value=(
-                            str(_value("ref_mode", "no_ref"))
-                            if str(_value("ref_mode", "no_ref")) in set(SPARKVSR_REF_MODE_OPTIONS)
-                            else "no_ref"
+                            str(_value("ref_mode", "sr_image"))
+                            if str(_value("ref_mode", "sr_image")) in set(SPARKVSR_REF_MODE_OPTIONS)
+                            else "sr_image"
                         ),
-                        info="no_ref is self-contained. api requires FAL credentials. pisasr requires external PiSA-SR paths.",
-                    )
-                    ref_prompt_mode = gr.Dropdown(
-                        label="Reference Prompt Mode",
-                        choices=list(SPARKVSR_REF_PROMPT_MODE_OPTIONS),
-                        value=(
-                            str(_value("ref_prompt_mode", "fixed"))
-                            if str(_value("ref_prompt_mode", "fixed")) in set(SPARKVSR_REF_PROMPT_MODE_OPTIONS)
-                            else "fixed"
-                        ),
-                        info="fixed uses one generated prompt; dynamic can vary prompts for reference generation.",
+                        info="sr_image is the local default. If the reference path is blank, SparkVSR uses the input video frame as the reference.",
                     )
                     ref_guidance_scale = gr.Slider(
                         label="Reference Guidance Scale",
@@ -605,14 +594,19 @@ def sparkvsr_tab(
                     )
                 ref_indices = gr.Textbox(
                     label="Reference Indices",
-                    value=str(_value("ref_indices", "") or ""),
-                    placeholder="Example: 0,16,32",
-                    info="Optional comma-separated frame indices. Empty uses SparkVSR's automatic reference selection.",
+                    value=str(_value("ref_indices", "0") or "0"),
+                    placeholder="Example: 0",
+                    info="Comma-separated source frame indices. For short clips, SparkVSR recommends using only frame 0.",
                 )
-                with gr.Accordion("Reference Backends (API / PiSA-SR)", open=False):
-                    ref_api_cache_dir = gr.Textbox(
-                        label="API Reference Cache Directory",
-                        value=str(_value("ref_api_cache_dir", "") or ""),
+                ref_source_path = gr.Textbox(
+                    label="Local SR Reference Path",
+                    value=str(_value("ref_source_path", "") or ""),
+                    placeholder="Leave blank for input video fallback, or provide image/video/folder",
+                    info="Used by sr_image mode. Blank uses the source video; a locally upscaled keyframe/video gives better detail.",
+                )
+                with gr.Accordion("Local Reference Backends", open=False):
+                    gr.Markdown(
+                        "`sr_image`: local default; blank path uses the input video. `pisasr`: strongest fully local reference path when PiSA-SR is installed. `no_ref`: baseline without reference guidance."
                     )
                     ref_pisa_cache_dir = gr.Textbox(
                         label="PiSA-SR Reference Cache Directory",
@@ -964,7 +958,8 @@ def sparkvsr_tab(
 
             **Model defaults**
             - `SparkVSR-S2` is the official final-stage checkpoint and is selected by default.
-            - `no_ref` is the self-contained reference mode. `api` and `pisasr` require external credentials or model paths.
+            - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
+            - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.
 
             **Runtime notes**
             - SparkVSR supports integer upscale factors. The default is **4x**.
@@ -981,8 +976,8 @@ def sparkvsr_tab(
         scale, precision, upscale_mode,
         noise_step, sr_noise_step, cpu_offload, vae_tiling, group_offload, num_blocks_per_group,
         tile_height, tile_width, overlap_height, overlap_width,
-        chunk_len, overlap_t, ref_mode, ref_prompt_mode, ref_indices, ref_guidance_scale,
-        ref_api_cache_dir, ref_pisa_cache_dir, pisa_python_executable, pisa_script_path,
+        chunk_len, overlap_t, ref_mode, ref_indices, ref_guidance_scale,
+        ref_source_path, ref_pisa_cache_dir, pisa_python_executable, pisa_script_path,
         pisa_sd_model_path, pisa_chkpt_path, pisa_gpu, png_save, save_format,
         force_offload, enable_debug, seed, auto_transfer_output_to_input, device, fps_SparkVSR,
         codec, crf, start_frame, end_frame, models_dir,
@@ -2483,6 +2478,3 @@ def sparkvsr_tab(
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }
-
-
-

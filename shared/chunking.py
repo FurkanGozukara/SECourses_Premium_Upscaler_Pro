@@ -2412,7 +2412,7 @@ def chunk_and_process(
         progress_tracker: Additional progress tracking callback
         process_func: Optional custom processing function (takes settings, returns RunResult)
                      If None, uses model_type to select runner method
-        model_type: Model type ("seedvr2", "gan", "rife", "flashvsr") - used if process_func is None
+        model_type: Model type ("seedvr2", "gan", "rife", "flashvsr", "sparkvsr") - used if process_func is None
     
     Returns:
         (returncode, log, final_output_path, chunk_count)
@@ -3147,6 +3147,16 @@ def chunk_and_process(
             f"(backend output codec may vary by runtime; requested codec={expected_codec_name or 'auto'}, "
             f"10bit={expected_use_10bit}).\n"
         )
+    elif model_type == "sparkvsr":
+        # SparkVSR writes MP4 internally via imageio/libx264, while the app-level
+        # Output tab may request a different final codec. Chunk merge validation
+        # should only require valid/mergeable chunk media here.
+        strict_codec_validation = False
+        _emit_diag(
+            "[codec] strict validation disabled for SparkVSR "
+            f"(backend output codec may vary; requested codec={expected_codec_name or 'auto'}, "
+            f"10bit={expected_use_10bit}).\n"
+        )
     elif model_type == "rtx":
         # RTX Super Resolution currently writes MP4 via OpenCV's mp4v path in the runner.
         # Enforcing strict equality against requested/source codec (often h264) can produce
@@ -3385,6 +3395,11 @@ def chunk_and_process(
                 res = runner.run_flashvsr(chunk_settings, on_progress=_chunk_progress_proxy)
             else:
                 raise AttributeError("chunk_and_process: model_type='flashvsr' requires runner.run_flashvsr() or a custom process_func")
+        elif model_type == "sparkvsr":
+            if hasattr(runner, "run_sparkvsr"):
+                res = runner.run_sparkvsr(chunk_settings, on_progress=_chunk_progress_proxy)
+            else:
+                raise AttributeError("chunk_and_process: model_type='sparkvsr' requires runner.run_sparkvsr() or a custom process_func")
         else:
             # Fallback to seedvr2 for backward compatibility
             res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)

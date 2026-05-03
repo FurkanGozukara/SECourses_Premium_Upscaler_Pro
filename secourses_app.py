@@ -67,6 +67,7 @@ from ui.face_tab import face_tab
 from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
+from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
@@ -1272,6 +1273,7 @@ def main(argv=None):
             get_seedvr2_models,
             scan_gan_models,
             get_flashvsr_model_names,
+            get_sparkvsr_model_names,
             get_rife_model_names,
         )
         
@@ -1293,12 +1295,14 @@ def main(argv=None):
                 seedvr2_models.append(model_name)
         gan_models = scan_gan_models(BASE_DIR)
         flashvsr_models = get_flashvsr_model_names()
+        sparkvsr_models = get_sparkvsr_model_names(BASE_DIR)
         rife_models = get_rife_model_names(BASE_DIR)
         
         all_models = sorted(list({
             *seedvr2_models,
             *gan_models,
             *flashvsr_models,
+            *sparkvsr_models,
             *rife_models,
         }))
         if not all_models:
@@ -1511,6 +1515,7 @@ def main(argv=None):
                 "gan_settings": startup_preset.get("gan", {}),
                 "rife_settings": startup_preset.get("rife", {}),
                 "flashvsr_settings": startup_preset.get("flashvsr", {}),
+                "sparkvsr_settings": startup_preset.get("sparkvsr", {}),
                 "rtx_settings": startup_preset.get("rtx", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
@@ -1868,6 +1873,7 @@ def main(argv=None):
         tab_sync_rife = gr.State(value="")
         tab_sync_gan = gr.State(value="")
         tab_sync_flashvsr = gr.State(value="")
+        tab_sync_sparkvsr = gr.State(value="")
         tab_sync_rtx = gr.State(value="")
         tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
@@ -1934,6 +1940,26 @@ def main(argv=None):
                 fn=_make_tab_sync("flashvsr"),
                 inputs=[shared_state, tab_sync_flashvsr],
                 outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("✨ SparkVSR", render_children=True) as tab_sparkvsr:
+                sparkvsr_ui = sparkvsr_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir,
+                )
+            tab_sparkvsr.select(
+                fn=_make_tab_sync("sparkvsr"),
+                inputs=[shared_state, tab_sync_sparkvsr],
+                outputs=sparkvsr_ui["inputs_list"] + [sparkvsr_ui["preset_dropdown"], sparkvsr_ui["preset_status"], tab_sync_sparkvsr],
                 queue=False,
                 show_progress="hidden",
                 trigger_mode="always_last",

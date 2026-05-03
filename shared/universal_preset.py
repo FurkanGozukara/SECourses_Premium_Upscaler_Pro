@@ -26,6 +26,10 @@ from shared.services.flashvsr_service import (
     flashvsr_defaults,
     canonical_flashvsr_scale,
 )
+from shared.services.sparkvsr_service import (
+    SPARKVSR_ORDER,
+    sparkvsr_defaults,
+)
 from shared.services.rtx_super_resolution_service import (
     RTX_ORDER,
     rtx_super_resolution_defaults,
@@ -112,6 +116,11 @@ TAB_CONFIGS = {
         "defaults_fn": flashvsr_defaults,
         "needs_model_arg": False,
     },
+    "sparkvsr": {
+        "order": SPARKVSR_ORDER,
+        "defaults_fn": sparkvsr_defaults,
+        "needs_model_arg": False,
+    },
     "rtx": {
         "order": RTX_ORDER,
         "defaults_fn": rtx_super_resolution_defaults,
@@ -178,6 +187,21 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         cfg["crf"] = 18
     cfg["quality"] = cfg["crf"]
+    cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
+    cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
+    cfg["auto_transfer_output_to_input"] = bool(cfg.get("auto_transfer_output_to_input", False))
+    return cfg
+
+
+def _normalize_sparkvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(data or {})
+    try:
+        from shared.services.sparkvsr_service import _enforce_sparkvsr_guardrails
+
+        cfg = _enforce_sparkvsr_guardrails(cfg, sparkvsr_defaults())
+    except Exception:
+        pass
+    cfg["output_format"] = "mp4"
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
     cfg["auto_transfer_output_to_input"] = bool(cfg.get("auto_transfer_output_to_input", False))
@@ -356,6 +380,8 @@ def _normalize_tab_settings(tab_name: str, data: Dict[str, Any], defaults: Dict[
         return cfg
     if tab_name == "flashvsr":
         return _normalize_flashvsr_settings(cfg)
+    if tab_name == "sparkvsr":
+        return _normalize_sparkvsr_settings(cfg)
     if tab_name == "rife":
         return _normalize_rife_settings(cfg)
     if tab_name == "output":
@@ -427,6 +453,9 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
     # FlashVSR
     defaults["flashvsr"] = flashvsr_defaults()
 
+    # SparkVSR
+    defaults["sparkvsr"] = sparkvsr_defaults()
+
     # RTX Super Resolution
     defaults["rtx"] = rtx_super_resolution_defaults()
     
@@ -493,6 +522,7 @@ def create_universal_preset(
     gan_values: List[Any] = None,
     rife_values: List[Any] = None,
     flashvsr_values: List[Any] = None,
+    sparkvsr_values: List[Any] = None,
     rtx_values: List[Any] = None,
     face_values: List[Any] = None,
     resolution_values: List[Any] = None,
@@ -544,6 +574,11 @@ def create_universal_preset(
         preset["flashvsr"] = values_to_dict("flashvsr", flashvsr_values)
     else:
         preset["flashvsr"] = defaults["flashvsr"]
+
+    if sparkvsr_values is not None:
+        preset["sparkvsr"] = values_to_dict("sparkvsr", sparkvsr_values)
+    else:
+        preset["sparkvsr"] = defaults["sparkvsr"]
 
     if rtx_values is not None:
         preset["rtx"] = values_to_dict("rtx", rtx_values)
@@ -659,6 +694,7 @@ def update_shared_state_from_preset(
     seed_controls["gan_settings"] = preset.get("gan", {})
     seed_controls["rife_settings"] = preset.get("rife", {})
     seed_controls["flashvsr_settings"] = preset.get("flashvsr", {})
+    seed_controls["sparkvsr_settings"] = preset.get("sparkvsr", {})
     seed_controls["rtx_settings"] = preset.get("rtx", {})
     seed_controls["face_settings"] = preset.get("face", {})
     seed_controls["resolution_settings"] = preset.get("resolution", {})
@@ -758,6 +794,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "gan": seed_controls.get("gan_settings", {}),
         "rife": seed_controls.get("rife_settings", {}),
         "flashvsr": seed_controls.get("flashvsr_settings", {}),
+        "sparkvsr": seed_controls.get("sparkvsr_settings", {}),
         "rtx": seed_controls.get("rtx_settings", {}),
         "face": seed_controls.get("face_settings", {}),
         "resolution": seed_controls.get("resolution_settings", {}),

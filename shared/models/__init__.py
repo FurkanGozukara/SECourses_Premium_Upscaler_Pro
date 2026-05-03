@@ -85,6 +85,12 @@ from .flashvsr_meta import (
     get_flashvsr_metadata,
     flashvsr_model_map
 )
+from .sparkvsr_meta import (
+    get_sparkvsr_model_names,
+    get_sparkvsr_default_model,
+    get_sparkvsr_metadata,
+    sparkvsr_model_map,
+)
 from .rife_meta import (
     get_rife_model_names, 
     get_rife_default_model,
@@ -102,6 +108,10 @@ __all__ = [
     "get_flashvsr_default_model",
     "get_flashvsr_metadata",
     "flashvsr_model_map",
+    "get_sparkvsr_model_names",
+    "get_sparkvsr_default_model",
+    "get_sparkvsr_metadata",
+    "sparkvsr_model_map",
     "get_rife_model_names",
     "get_rife_default_model",
     "get_rife_metadata",

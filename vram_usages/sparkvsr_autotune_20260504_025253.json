@@ -1,0 +1,73 @@
+{
+  "status": "completed",
+  "signature": {
+    "exact": {
+      "autotune_model": "sparkvsr",
+      "autotune_strategy_version": 2,
+      "autotune_target_frames": 65,
+      "model_name": "SparkVSR-S2",
+      "precision": "bfloat16",
+      "scale": "4",
+      "upscale_mode": "bilinear",
+      "noise_step": 0,
+      "sr_noise_step": 399,
+      "cpu_offload": true,
+      "vae_tiling": true,
+      "ref_mode": "sr_image",
+      "ref_guidance_scale": 1.0,
+      "save_format": "yuv444p",
+      "global_gpu_device": "0",
+      "save_vram_gb": 2.0
+    },
+    "exact_hash": "4fe0f62751a14724579a87584a09ea9784557887",
+    "target_pixels": 2073600,
+    "target_width": 1920,
+    "target_height": 1080,
+    "effective_input_width": 480,
+    "effective_input_height": 270,
+    "gpu_total_vram_gb": 31.8427734375
+  },
+  "tests": [
+    {
+      "chunk_len": 0,
+      "overlap_t": 8,
+      "tile_height": 0,
+      "tile_width": 0,
+      "overlap_height": 32,
+      "overlap_width": 32,
+      "returncode": 0,
+      "oom": false,
+      "oom_phase": "",
+      "max_vram_used_gb": 25.744,
+      "total_vram_gb": 31.843,
+      "estimated_free_gb": 6.099,
+      "telemetry_ok": true,
+      "samples": 627,
+      "phase2_samples": 547,
+      "probe_cancel_reason": "",
+      "passed": true,
+      "quality_rank": 1100000,
+      "frames": 65,
+      "chunks": 1,
+      "tiles": 1
+    }
+  ],
+  "best_config": {
+    "chunk_len": 0,
+    "overlap_t": 8,
+    "tile_height": 0,
+    "tile_width": 0,
+    "overlap_height": 32,
+    "overlap_width": 32,
+    "vae_tiling": true,
+    "min_free_vram_target_gb": 2.0,
+    "measured_peak_vram_used_gb": 25.744,
+    "estimated_free_vram_gb": 6.099,
+    "quality_rank": 1100000
+  },
+  "frontier_verified": true,
+  "started_at": "2026-05-04 02:52:53",
+  "finalized": true,
+  "updated_at": "2026-05-04 02:55:42",
+  "elapsed_sec": 168.675
+}

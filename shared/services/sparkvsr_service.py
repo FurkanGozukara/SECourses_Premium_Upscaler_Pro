@@ -351,7 +351,7 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     else:
         default_precision = "bfloat16"
         scale = 4
-        chunk_len = 0
+        chunk_len = 65
         overlap_t = 8
         tile_height = 0
         tile_width = 0
@@ -375,6 +375,7 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "sr_noise_step": 399,
         "cpu_offload": True,
         "vae_tiling": True,
+        "split_stage_subprocesses": True,
         "group_offload": False,
         "num_blocks_per_group": 1,
         "tile_height": tile_height,
@@ -437,6 +438,7 @@ SPARKVSR_ORDER: List[str] = [
     "sr_noise_step",
     "cpu_offload",
     "vae_tiling",
+    "split_stage_subprocesses",
     "group_offload",
     "num_blocks_per_group",
     "tile_height",
@@ -531,6 +533,10 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["sr_noise_step"] = max(1, _to_int(cfg.get("sr_noise_step"), 399))
     cfg["cpu_offload"] = _to_bool(cfg.get("cpu_offload"), _to_bool(defaults.get("cpu_offload", True), True))
     cfg["vae_tiling"] = _to_bool(cfg.get("vae_tiling"), _to_bool(defaults.get("vae_tiling", True), True))
+    cfg["split_stage_subprocesses"] = _to_bool(
+        cfg.get("split_stage_subprocesses"),
+        _to_bool(defaults.get("split_stage_subprocesses", True), True),
+    )
     cfg["group_offload"] = _to_bool(cfg.get("group_offload"), _to_bool(defaults.get("group_offload", False), False))
     cfg["num_blocks_per_group"] = max(1, min(64, _to_int(cfg.get("num_blocks_per_group"), 1)))
     cfg["auto_transfer_output_to_input"] = _to_bool(

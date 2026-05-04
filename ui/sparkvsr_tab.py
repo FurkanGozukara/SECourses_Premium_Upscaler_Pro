@@ -478,18 +478,28 @@ def sparkvsr_tab(
                             min_width=220,
                             elem_classes=["action-btn", "action-btn-optimize", "SparkVSR-autotune-tall"],
                         )
-                        save_vram_gb = gr.Slider(
-                            label="Save VRAM (GB)",
-                            minimum=0.0,
-                            maximum=9.9,
-                            step=0.1,
-                            value=float(_value("save_vram_gb", 2.0) or 2.0),
-                        )
+                        with gr.Row():
+                            save_vram_gb = gr.Slider(
+                                label="Save VRAM (GB)",
+                                minimum=0.0,
+                                maximum=9.9,
+                                step=0.1,
+                                value=float(_value("save_vram_gb", 2.0) or 2.0),
+                            )
+                            split_stage_subprocesses = gr.Checkbox(
+                                label="Stage Subprocess Isolation",
+                                value=bool(_value("split_stage_subprocesses", True)),
+                                info=(
+                                    "Runs VAE encode, SparkVSR transformer, and VAE decode in separate child "
+                                    "processes so VRAM is released at each stage boundary. Slower, safest memory mode."
+                                ),
+                            )
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
                 gr.Markdown(
                     (
                         "**Auto Tune:** Runs a short SparkVSR probe clip, measures live GPU VRAM, and applies the highest-quality "
-                        "spatial tile / temporal chunk settings that keep the selected free-VRAM headroom."
+                        "spatial tile / temporal chunk settings that keep the selected free-VRAM headroom. "
+                        "Default temporal chunk length is 65 frames."
                     )
                 )
 
@@ -499,9 +509,9 @@ def sparkvsr_tab(
                         minimum=0,
                         maximum=10000,
                         step=1,
-                        value=int(_value("chunk_len", 0) or 0),
+                        value=int(_value("chunk_len", 65) or 65),
                         info=(
-                            "0 = process all frames at once. Use shorter chunks for long clips or limited VRAM."
+                            "Default 65. 0 = process all frames at once. Use shorter chunks for long clips or limited VRAM."
                         ),
                     )
                     overlap_t = gr.Slider(
@@ -1015,7 +1025,7 @@ def sparkvsr_tab(
             #### SparkVSR Guide
 
             **Model defaults**
-            - `SparkVSR-S2` is the official final-stage checkpoint and is selected by default.
+            - `SparkVSR-bf16` is selected by default when the local BF16 single-file distribution exists; otherwise the app falls back to `SparkVSR-S2`.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
             - Enable `Auto Upscale First Frame per Chunk` to generate one local SR reference per chunk before SparkVSR processing starts.
             - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.
@@ -1023,9 +1033,10 @@ def sparkvsr_tab(
             **Runtime notes**
             - SparkVSR supports integer upscale factors. The default is **4x**.
             - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
+            - Temporal Chunk Length defaults to 65 frames so same-resolution long clips stay memory bounded.
             - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
             - Spatial tiling uses output-resolution tiles; `0 x 0` disables tiling.
-            - CPU offload and VAE tiling are enabled by default for safer redistribution across mixed GPUs.
+            - CPU offload, VAE tiling, and Stage Subprocess Isolation are enabled by default for safer redistribution across mixed GPUs.
             """)
     
     # Collect inputs
@@ -1033,7 +1044,7 @@ def sparkvsr_tab(
         input_path, output_override, output_format,
         model_name, model_path, lora_path,
         scale, precision, upscale_mode,
-        noise_step, sr_noise_step, cpu_offload, vae_tiling, group_offload, num_blocks_per_group,
+        noise_step, sr_noise_step, cpu_offload, vae_tiling, split_stage_subprocesses, group_offload, num_blocks_per_group,
         tile_height, tile_width, overlap_height, overlap_width,
         chunk_len, overlap_t, ref_mode, ref_indices, ref_guidance_scale,
         ref_source_path, auto_reference_prepass, auto_reference_upscaler,

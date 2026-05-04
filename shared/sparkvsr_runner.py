@@ -378,6 +378,8 @@ def run_sparkvsr(
             cmd.append("--is_cpu_offload")
         if _bool(settings.get("vae_tiling"), True):
             cmd.append("--is_vae_st")
+        if _bool(settings.get("split_stage_subprocesses"), True):
+            cmd.append("--split_stage_subprocesses")
         if _bool(settings.get("group_offload"), False):
             cmd.extend(["--group_offload", "--num_blocks_per_group", str(max(1, _parse_int(settings.get("num_blocks_per_group"), 1)))])
         if _bool(settings.get("png_save"), False):
@@ -529,6 +531,7 @@ def run_sparkvsr(
                         "chunk_len": settings.get("chunk_len"),
                         "tile_height": settings.get("tile_height"),
                         "tile_width": settings.get("tile_width"),
+                        "split_stage_subprocesses": settings.get("split_stage_subprocesses"),
                         "ref_mode": settings.get("ref_mode"),
                     },
                 )

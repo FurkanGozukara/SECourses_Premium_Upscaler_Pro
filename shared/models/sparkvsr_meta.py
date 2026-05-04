@@ -20,7 +20,7 @@ class SparkVSRModel:
     estimated_vram_gb: float
     default_dtype: str = "bfloat16"
     default_scale: int = 4
-    default_chunk_len: int = 0
+    default_chunk_len: int = 65
     default_overlap_t: int = 8
     default_tile_height: int = 0
     default_tile_width: int = 0
@@ -55,6 +55,8 @@ _BUILTIN_MODELS: List[SparkVSRModel] = [
 _SCAN_CACHE_TTL_SEC = 20.0
 _SCAN_LOCK = Lock()
 _SCAN_CACHE: tuple[float, tuple[tuple[str, float], ...], List[SparkVSRModel]] | None = None
+_SPARKVSR_BF16_MODEL_NAME = "SparkVSR-bf16"
+_SPARKVSR_S2_MODEL_NAME = "SparkVSR-S2"
 
 
 def sparkvsr_version_to_internal(version: object) -> str:
@@ -122,6 +124,10 @@ def discover_sparkvsr_model_paths(base_dir: Optional[Path] = None) -> List[Path]
     return unique
 
 
+def _local_bf16_model_exists(base_dir: Optional[Path] = None) -> bool:
+    return any(path.name == _SPARKVSR_BF16_MODEL_NAME for path in discover_sparkvsr_model_paths(base_dir))
+
+
 def get_sparkvsr_models(base_dir: Optional[Path] = None) -> List[SparkVSRModel]:
     global _SCAN_CACHE
     roots = _candidate_roots(base_dir)
@@ -141,14 +147,19 @@ def get_sparkvsr_models(base_dir: Optional[Path] = None) -> List[SparkVSRModel]:
         name = path.name
         if name in builtin_names:
             continue
+        is_bf16 = name == _SPARKVSR_BF16_MODEL_NAME
         models.append(
             SparkVSRModel(
                 name=name,
                 repo_id="local",
                 relative_path=str(path),
-                stage="Local",
-                estimated_vram_gb=18.0,
-                notes=f"Local SparkVSR diffusers model at {path}",
+                stage="Stage-2 final BF16 single-file" if is_bf16 else "Local",
+                estimated_vram_gb=20.0 if is_bf16 else 18.0,
+                notes=(
+                    "Local BF16 SparkVSR distribution with single-file text encoder and transformer checkpoints."
+                    if is_bf16
+                    else f"Local SparkVSR diffusers model at {path}"
+                ),
             )
         )
 
@@ -162,7 +173,7 @@ def get_sparkvsr_model_names(base_dir: Optional[Path] = None) -> List[str]:
 
 
 def get_sparkvsr_default_model() -> str:
-    return "SparkVSR-S2"
+    return _SPARKVSR_BF16_MODEL_NAME if _local_bf16_model_exists() else _SPARKVSR_S2_MODEL_NAME
 
 
 def get_sparkvsr_metadata(model_name: str, base_dir: Optional[Path] = None) -> Optional[SparkVSRModel]:
@@ -171,4 +182,3 @@ def get_sparkvsr_metadata(model_name: str, base_dir: Optional[Path] = None) -> O
 
 def sparkvsr_model_map(base_dir: Optional[Path] = None) -> Dict[str, SparkVSRModel]:
     return {m.name: m for m in get_sparkvsr_models(base_dir)}
-

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +39,8 @@ decord.bridge.set_bridge("torch")
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+SPLIT_STAGE_REQUEST_KIND = "sparkvsr_split_stage_request_v1"
+SPLIT_STAGE_STATE_KIND = "sparkvsr_split_stage_state_v1"
 
 
 def release_torch_memory() -> None:
@@ -349,6 +352,137 @@ def prepare_rotary_positional_embeddings(
     )
 
 
+def _save_split_blob(path: Path, kind: str, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"kind": kind, "payload": payload}, path)
+
+
+def _load_split_blob(path: Path, expected_kind: str) -> Dict[str, object]:
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict) or blob.get("kind") != expected_kind:
+        raise RuntimeError(f"Split-stage state at {path} is not {expected_kind}")
+    payload = blob.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Split-stage state at {path} is missing a payload")
+    return payload
+
+
+def _clone_tensor_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    return value
+
+
+def _clone_tensor_list_to_cpu(values):
+    if values is None:
+        return []
+    return [_clone_tensor_to_cpu(v) for v in values]
+
+
+def _build_split_stage_request(args: argparse.Namespace) -> Dict[str, object]:
+    request_args = dict(vars(args))
+    request_args["split_stage_subprocesses"] = False
+    request_args["_spark_stage"] = ""
+    request_args["_spark_request"] = ""
+    request_args["_spark_state_in"] = ""
+    request_args["_spark_state_out"] = ""
+    for path_key in (
+        "input_dir",
+        "input_json",
+        "model_path",
+        "lora_path",
+        "output_path",
+        "output_file",
+        "ref_source_path",
+        "ref_pisa_cache_dir",
+        "pisa_python_executable",
+        "pisa_script_path",
+        "pisa_sd_model_path",
+        "pisa_chkpt_path",
+    ):
+        path_value = request_args.get(path_key)
+        if isinstance(path_value, str) and path_value.strip():
+            try:
+                request_args[path_key] = str(Path(path_value).resolve())
+            except Exception:
+                request_args[path_key] = path_value
+    return {"args": request_args, "cwd": str(Path.cwd())}
+
+
+def _drop_pipeline_components(pipe: CogVideoXImageToVideoPipeline, keep: set[str]) -> None:
+    """Best-effort RAM/VRAM reduction inside short-lived split-stage workers."""
+    for name in ("vae", "transformer", "text_encoder", "tokenizer"):
+        if name in keep:
+            continue
+        with suppress(Exception):
+            component = getattr(pipe, name, None)
+            setattr(pipe, name, None)
+            del component
+    release_torch_memory()
+
+
+def load_sparkvsr_pipeline(
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    started_at: float,
+    *,
+    stage_label: str = "model",
+    component_overrides: Optional[Dict[str, object]] = None,
+) -> CogVideoXImageToVideoPipeline:
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"SparkVSR model path not found: {model_path}")
+
+    emit_progress(0.01, "model_load", f"{stage_label}: loading pipeline from {model_path}", started_at=started_at)
+    load_kwargs = dict(component_overrides or {})
+    pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+        str(model_path),
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        **load_kwargs,
+    )
+    emit_progress(0.10, "model_load", f"{stage_label}: pipeline weights loaded", started_at=started_at)
+    if args.lora_path:
+        print(f"Loading LoRA from {args.lora_path}", flush=True)
+        emit_progress(0.105, "lora", f"{stage_label}: loading LoRA {args.lora_path}", started_at=started_at)
+        pipe.load_lora_weights(args.lora_path, adapter_name="dove_ref_i2v")
+        pipe.fuse_lora(lora_scale=1.0)
+        emit_progress(0.11, "lora", f"{stage_label}: LoRA fused", started_at=started_at)
+    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+
+    device = str(args.device or "cuda").lower()
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA requested but unavailable. Falling back to CPU.", flush=True)
+        device = "cpu"
+    if args.is_cpu_offload and device != "cpu":
+        emit_progress(0.115, "memory", f"{stage_label}: enabling CPU offload", started_at=started_at)
+        pipe.enable_model_cpu_offload(device=device)
+    else:
+        emit_progress(0.115, "memory", f"{stage_label}: moving pipeline to {device}", started_at=started_at)
+        pipe.to(device)
+
+    if args.group_offload and device != "cpu" and getattr(pipe, "transformer", None) is not None:
+        try:
+            from diffusers.hooks import apply_group_offloading
+
+            apply_group_offloading(
+                pipe.transformer,
+                onload_device=torch.device("cuda"),
+                offload_type="block_level",
+                num_blocks_per_group=max(1, int(args.num_blocks_per_group or 1)),
+            )
+            print(f"Group offload enabled: num_blocks_per_group={args.num_blocks_per_group}", flush=True)
+        except Exception as exc:
+            print(f"Group offload unavailable: {exc}", flush=True)
+
+    if args.is_vae_st and getattr(pipe, "vae", None) is not None:
+        emit_progress(0.12, "memory", f"{stage_label}: enabling VAE slicing/tiling", started_at=started_at)
+        pipe.vae.enable_slicing()
+        pipe.vae.enable_tiling()
+
+    return pipe
+
+
 @no_grad
 def process_video_ref_i2v(
     pipe: CogVideoXImageToVideoPipeline,
@@ -499,6 +633,370 @@ def process_video_ref_i2v(
     release_torch_memory()
     mark(1.0, "tile complete")
     return video_generate.mul_(0.5).add_(0.5).clamp_(0.0, 1.0)
+
+
+@no_grad
+def _run_split_encode_stage(args: argparse.Namespace, state_in_path: Path, state_out_path: Path) -> None:
+    started_at = time.monotonic()
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
+    set_seed(int(args.seed or 0))
+    payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
+    video = payload.get("video")
+    if not isinstance(video, torch.Tensor):
+        raise RuntimeError("Split encode stage did not receive a video tensor")
+    ref_frames = payload.get("ref_frames")
+    if not isinstance(ref_frames, list):
+        ref_frames = []
+    ref_indices = payload.get("ref_indices")
+    if not isinstance(ref_indices, list):
+        ref_indices = []
+    chunk_start_idx = int(payload.get("chunk_start_idx") or 0)
+
+    pipe = load_sparkvsr_pipeline(
+        args,
+        dtype,
+        started_at,
+        stage_label="split encode",
+        component_overrides={"transformer": None, "text_encoder": None, "tokenizer": None},
+    )
+    pipe_dtype = pipe.dtype
+    execution_device = getattr(pipe, "_execution_device", None) or pipe.device
+    video = video.to(execution_device, dtype=pipe_dtype)
+    print("[SparkVSR split] encode: low-resolution video latents", flush=True)
+    latent_dist = pipe.vae.encode(video).latent_dist
+    lq_latent = latent_dist.sample() * pipe.vae.config.scaling_factor
+    _, _, num_frames, _, _ = lq_latent.shape
+    device = lq_latent.device
+    latent_dtype = lq_latent.dtype
+
+    print("[SparkVSR split] encode: reference keyframe latents", flush=True)
+    full_ref_latent = torch.zeros_like(lq_latent)
+    for i, idx in enumerate(ref_indices):
+        if i >= len(ref_frames):
+            break
+        ref = ref_frames[i]
+        if not isinstance(ref, torch.Tensor):
+            continue
+        local_frame_idx = int(idx) - int(chunk_start_idx)
+        target_lat_idx = local_frame_idx // 4
+        if 0 <= target_lat_idx < num_frames:
+            r_frame = ref.to(device, dtype=latent_dtype)
+            chunk = r_frame.unsqueeze(0).unsqueeze(2).repeat(1, 1, 4, 1, 1)
+            lat = pipe.vae.encode(chunk).latent_dist.sample() * pipe.vae.config.scaling_factor
+            full_ref_latent[:, :, target_lat_idx, :, :] = lat[0, :, 0, :, :]
+
+    _save_split_blob(
+        state_out_path,
+        SPLIT_STAGE_STATE_KIND,
+        {
+            "lq_latent": _clone_tensor_to_cpu(lq_latent),
+            "full_ref_latent": _clone_tensor_to_cpu(full_ref_latent),
+            "prompt": str(payload.get("prompt") or ""),
+            "vae_scale_factor_spatial": int(2 ** (len(pipe.vae.config.block_out_channels) - 1)),
+        },
+    )
+
+
+@no_grad
+def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, state_out_path: Path) -> None:
+    started_at = time.monotonic()
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
+    set_seed(int(args.seed or 0))
+    payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
+    lq_latent = payload.get("lq_latent")
+    full_ref_latent = payload.get("full_ref_latent")
+    if not isinstance(lq_latent, torch.Tensor) or not isinstance(full_ref_latent, torch.Tensor):
+        raise RuntimeError("Split transformer stage did not receive latent tensors")
+
+    pipe = load_sparkvsr_pipeline(
+        args,
+        dtype,
+        started_at,
+        stage_label="split transformer",
+        component_overrides={"vae": None},
+    )
+    pipe_dtype = pipe.dtype
+    vae_scale_factor_spatial = max(1, int(payload.get("vae_scale_factor_spatial") or 8))
+    execution_device = getattr(pipe, "_execution_device", None) or pipe.device
+    lq_latent = lq_latent.to(execution_device, dtype=pipe_dtype)
+    full_ref_latent = full_ref_latent.to(execution_device, dtype=pipe_dtype)
+    batch_size, _, num_frames, height, width = lq_latent.shape
+    device = lq_latent.device
+    latent_dtype = lq_latent.dtype
+    prompt = str(payload.get("prompt") or "")
+    ref_guidance_scale = float(args.ref_guidance_scale or 1.0)
+
+    print("[SparkVSR split] transformer: conditioning", flush=True)
+    do_cfg = abs(ref_guidance_scale - 1.0) > 1e-3
+    if do_cfg:
+        input_latent_cond = torch.cat([lq_latent, full_ref_latent], dim=1)
+        input_latent_uncond = torch.cat([lq_latent, torch.zeros_like(full_ref_latent)], dim=1)
+        input_latent = torch.cat([input_latent_uncond, input_latent_cond], dim=0)
+    else:
+        input_latent = torch.cat([lq_latent, full_ref_latent], dim=1)
+
+    patch_size_t = pipe.transformer.config.patch_size_t
+    ncopy = 0
+    if patch_size_t is not None:
+        ncopy = input_latent.shape[2] % patch_size_t
+        if ncopy:
+            input_latent = torch.cat([input_latent[:, :, :1].repeat(1, 1, ncopy, 1, 1), input_latent], dim=2)
+
+    empty_prompt_embedding = find_empty_prompt_embedding(Path(args.model_path))
+    if prompt == "" and empty_prompt_embedding is not None:
+        prompt_embedding = empty_prompt_embedding.to(device, dtype=latent_dtype)
+        if prompt_embedding.shape[0] != batch_size:
+            prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
+    else:
+        prompt_token_ids = pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=pipe.transformer.config.max_text_seq_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).input_ids
+        prompt_embedding = pipe.text_encoder(prompt_token_ids.to(device))[0]
+        _, seq_len, _ = prompt_embedding.shape
+        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_dtype)
+
+    latents = input_latent.permute(0, 2, 1, 3, 4)
+    if do_cfg:
+        prompt_embedding = torch.cat([prompt_embedding, prompt_embedding], dim=0)
+
+    if int(args.noise_step or 0) != 0:
+        lq_part = latents[:, :, :16, :, :]
+        ref_part = latents[:, :, 16:, :, :]
+        noise = torch.randn_like(lq_part)
+        add_timesteps = torch.full((latents.shape[0],), fill_value=int(args.noise_step), dtype=torch.long, device=device)
+        lq_part = pipe.scheduler.add_noise(lq_part.transpose(1, 2), noise.transpose(1, 2), add_timesteps).transpose(1, 2)
+        latents = torch.cat([lq_part, ref_part], dim=2)
+
+    timesteps = torch.full((latents.shape[0],), fill_value=int(args.sr_noise_step), dtype=torch.long, device=device)
+    rotary_emb = (
+        prepare_rotary_positional_embeddings(
+            height=height * vae_scale_factor_spatial,
+            width=width * vae_scale_factor_spatial,
+            num_frames=num_frames,
+            transformer_config=pipe.transformer.config,
+            vae_scale_factor_spatial=vae_scale_factor_spatial,
+            device=device,
+        )
+        if pipe.transformer.config.use_rotary_positional_embeddings
+        else None
+    )
+    ofs = None
+    if pipe.transformer.config.ofs_embed_dim is not None:
+        ofs = torch.full((latents.shape[0],), fill_value=2.0, device=device, dtype=latent_dtype)
+
+    print("[SparkVSR split] transformer: inference", flush=True)
+    predicted_noise = pipe.transformer(
+        hidden_states=latents,
+        encoder_hidden_states=prompt_embedding,
+        timestep=timesteps,
+        image_rotary_emb=rotary_emb,
+        ofs=ofs,
+        return_dict=False,
+    )[0]
+
+    predicted_noise_slice = predicted_noise[:, :, :16, :, :].transpose(1, 2)
+    lq_sample = latents[:, :, :16, :, :].transpose(1, 2)
+    if do_cfg:
+        noise_pred_uncond, noise_pred_cond = predicted_noise_slice.chunk(2)
+        predicted_noise_slice = noise_pred_uncond + ref_guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        lq_sample = lq_sample.chunk(2)[1]
+        timesteps = timesteps.chunk(2)[0]
+
+    latent_generate = pipe.scheduler.get_velocity(predicted_noise_slice, lq_sample, timesteps)
+    if patch_size_t is not None and ncopy > 0:
+        latent_generate = latent_generate[:, :, ncopy:, :, :]
+
+    _save_split_blob(
+        state_out_path,
+        SPLIT_STAGE_STATE_KIND,
+        {"latent_generate": _clone_tensor_to_cpu(latent_generate)},
+    )
+
+
+@no_grad
+def _run_split_decode_stage(args: argparse.Namespace, state_in_path: Path, state_out_path: Path) -> None:
+    started_at = time.monotonic()
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
+    set_seed(int(args.seed or 0))
+    payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
+    latent_generate = payload.get("latent_generate")
+    if not isinstance(latent_generate, torch.Tensor):
+        raise RuntimeError("Split decode stage did not receive generated latents")
+
+    pipe = load_sparkvsr_pipeline(
+        args,
+        dtype,
+        started_at,
+        stage_label="split decode",
+        component_overrides={"transformer": None, "text_encoder": None, "tokenizer": None},
+    )
+    pipe_dtype = pipe.dtype
+    execution_device = getattr(pipe, "_execution_device", None) or pipe.device
+    latent_generate = latent_generate.to(execution_device, dtype=pipe_dtype)
+    print("[SparkVSR split] decode: VAE decode", flush=True)
+    video_generate = pipe.vae.decode(latent_generate / pipe.vae.config.scaling_factor).sample
+    video_generate = video_generate.mul_(0.5).add_(0.5).clamp_(0.0, 1.0)
+    _save_split_blob(
+        state_out_path,
+        SPLIT_STAGE_STATE_KIND,
+        {"video_generate": _clone_tensor_to_cpu(video_generate)},
+    )
+
+
+def _run_split_stage_subprocess(
+    *,
+    stage: str,
+    args: argparse.Namespace,
+    request_path: Path,
+    state_in_path: Path,
+    state_out_path: Path,
+) -> None:
+    script_path = Path(__file__).resolve()
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script_path),
+        "--input_dir",
+        str(args.input_dir),
+        "--output_path",
+        str(args.output_path),
+        "--model_path",
+        str(args.model_path),
+        "--_spark_stage",
+        str(stage),
+        "--_spark_request",
+        str(request_path),
+        "--_spark_state_in",
+        str(state_in_path),
+        "--_spark_state_out",
+        str(state_out_path),
+    ]
+    if str(args.device or "").strip():
+        cmd.extend(["--device", str(args.device)])
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(Path.cwd()),
+        env=env,
+    )
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            print(line.rstrip("\r\n"), flush=True)
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"SparkVSR split-stage subprocess '{stage}' failed with exit code {rc}")
+    if not state_out_path.exists():
+        raise RuntimeError(f"SparkVSR split-stage subprocess '{stage}' did not produce {state_out_path}")
+
+
+def process_video_ref_i2v_split_subprocesses(
+    args: argparse.Namespace,
+    video: torch.Tensor,
+    prompt: str = "",
+    ref_frames: Optional[List[torch.Tensor]] = None,
+    ref_indices: Optional[List[int]] = None,
+    chunk_start_idx: int = 0,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+) -> torch.Tensor:
+    def mark(frac: float, detail: str) -> None:
+        if progress_cb:
+            progress_cb(max(0.0, min(1.0, float(frac))), detail)
+
+    ref_frames = ref_frames or []
+    ref_indices = ref_indices or []
+    mark(0.02, "split subprocess: preparing CPU state")
+    with tempfile.TemporaryDirectory(prefix="sparkvsr_stage_split_") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        request_path = temp_dir / "request.pt"
+        encode_input_path = temp_dir / "input.pt"
+        encode_output_path = temp_dir / "encoded.pt"
+        transform_output_path = temp_dir / "generated_latents.pt"
+        decode_output_path = temp_dir / "decoded.pt"
+
+        _save_split_blob(request_path, SPLIT_STAGE_REQUEST_KIND, _build_split_stage_request(args))
+        _save_split_blob(
+            encode_input_path,
+            SPLIT_STAGE_STATE_KIND,
+            {
+                "video": _clone_tensor_to_cpu(video),
+                "prompt": str(prompt or ""),
+                "ref_frames": _clone_tensor_list_to_cpu(ref_frames),
+                "ref_indices": [int(v) for v in ref_indices],
+                "chunk_start_idx": int(chunk_start_idx),
+            },
+        )
+
+        mark(0.08, "split subprocess: VAE encode")
+        _run_split_stage_subprocess(
+            stage="encode",
+            args=args,
+            request_path=request_path,
+            state_in_path=encode_input_path,
+            state_out_path=encode_output_path,
+        )
+        encode_input_path.unlink(missing_ok=True)
+
+        mark(0.42, "split subprocess: SparkVSR transformer")
+        _run_split_stage_subprocess(
+            stage="transform",
+            args=args,
+            request_path=request_path,
+            state_in_path=encode_output_path,
+            state_out_path=transform_output_path,
+        )
+        encode_output_path.unlink(missing_ok=True)
+
+        mark(0.88, "split subprocess: VAE decode")
+        _run_split_stage_subprocess(
+            stage="decode",
+            args=args,
+            request_path=request_path,
+            state_in_path=transform_output_path,
+            state_out_path=decode_output_path,
+        )
+        transform_output_path.unlink(missing_ok=True)
+
+        payload = _load_split_blob(decode_output_path, SPLIT_STAGE_STATE_KIND)
+        video_generate = payload.get("video_generate")
+        if not isinstance(video_generate, torch.Tensor):
+            raise RuntimeError("SparkVSR split-stage decode did not return a video tensor")
+        mark(1.0, "split subprocess: tile complete")
+        return video_generate
+
+
+def run_internal_split_stage(parsed_args: argparse.Namespace) -> int:
+    request = _load_split_blob(Path(parsed_args._spark_request), SPLIT_STAGE_REQUEST_KIND)
+    request_args = request.get("args")
+    if not isinstance(request_args, dict):
+        raise RuntimeError("SparkVSR split-stage request is missing args")
+    args = argparse.Namespace(**request_args)
+    stage = str(parsed_args._spark_stage or "").strip().lower()
+    state_in_path = Path(parsed_args._spark_state_in)
+    state_out_path = Path(parsed_args._spark_state_out)
+    print(f"[SparkVSR split] internal stage started: {stage}", flush=True)
+    if stage == "encode":
+        _run_split_encode_stage(args, state_in_path, state_out_path)
+    elif stage == "transform":
+        _run_split_transform_stage(args, state_in_path, state_out_path)
+    elif stage == "decode":
+        _run_split_decode_stage(args, state_in_path, state_out_path)
+    else:
+        raise RuntimeError(f"Unknown SparkVSR split stage: {stage!r}")
+    print(f"[SparkVSR split] internal stage complete: {stage}", flush=True)
+    return 0
 
 
 def parse_ref_indices(text: Optional[str]) -> Optional[List[int]]:
@@ -746,13 +1244,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sr_noise_step", type=int, default=399)
     parser.add_argument("--is_cpu_offload", action="store_true")
     parser.add_argument("--is_vae_st", action="store_true")
+    parser.add_argument("--split_stage_subprocesses", action="store_true")
     parser.add_argument("--group_offload", action="store_true")
     parser.add_argument("--num_blocks_per_group", type=int, default=1)
     parser.add_argument("--png_save", action="store_true")
     parser.add_argument("--save_format", type=str, default="yuv444p", choices=["yuv444p", "yuv420p"])
     parser.add_argument("--tile_size_hw", type=int, nargs=2, default=(0, 0), metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--overlap_hw", type=int, nargs=2, default=(32, 32), metavar=("HEIGHT", "WIDTH"))
-    parser.add_argument("--chunk_len", type=int, default=0)
+    parser.add_argument("--chunk_len", type=int, default=65)
     parser.add_argument("--overlap_t", type=int, default=8)
     parser.add_argument("--ref_mode", type=str, default="sr_image", choices=["sr_image", "pisasr", "no_ref", "gt"])
     parser.add_argument("--ref_indices", type=str, default="")
@@ -767,12 +1266,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start_frame", type=int, default=0)
     parser.add_argument("--end_frame", type=int, default=-1)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--_spark_stage", type=str, default="")
+    parser.add_argument("--_spark_request", type=str, default="")
+    parser.add_argument("--_spark_state_in", type=str, default="")
+    parser.add_argument("--_spark_state_out", type=str, default="")
     return parser
 
 
 def main() -> int:
     run_started_at = time.monotonic()
     args = build_parser().parse_args()
+    if str(getattr(args, "_spark_stage", "") or "").strip():
+        return run_internal_split_stage(args)
+
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     set_seed(int(args.seed or 0))
 
@@ -793,49 +1299,19 @@ def main() -> int:
 
     print(f"Loading SparkVSR model from {model_path}", flush=True)
     emit_progress(0.005, "startup", "validated inputs", started_at=run_started_at)
-    emit_progress(0.01, "model_load", f"loading pipeline from {model_path}", started_at=run_started_at)
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(str(model_path), torch_dtype=dtype, low_cpu_mem_usage=True)
-    emit_progress(0.10, "model_load", "pipeline weights loaded", started_at=run_started_at)
-    if args.lora_path:
-        print(f"Loading LoRA from {args.lora_path}", flush=True)
-        emit_progress(0.105, "lora", f"loading LoRA {args.lora_path}", started_at=run_started_at)
-        pipe.load_lora_weights(args.lora_path, adapter_name="dove_ref_i2v")
-        pipe.fuse_lora(lora_scale=1.0)
-        emit_progress(0.11, "lora", "LoRA fused", started_at=run_started_at)
-    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
-
-    device = str(args.device or "cuda").lower()
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        print("CUDA requested but unavailable. Falling back to CPU.", flush=True)
-        device = "cpu"
-    if args.is_cpu_offload and device != "cpu":
-        emit_progress(0.115, "memory", "enabling CPU offload", started_at=run_started_at)
-        pipe.enable_model_cpu_offload(device=device)
+    pipe: Optional[CogVideoXImageToVideoPipeline] = None
+    empty_prompt_embedding: Optional[torch.Tensor] = None
+    if args.split_stage_subprocesses:
+        print(
+            "[SparkVSR split] Stage subprocess isolation enabled. "
+            "The parent process will not keep SparkVSR models loaded between encode/transform/decode stages.",
+            flush=True,
+        )
+        emit_progress(0.13, "ready", "split-stage mode ready; starting videos", started_at=run_started_at)
     else:
-        emit_progress(0.115, "memory", f"moving pipeline to {device}", started_at=run_started_at)
-        pipe.to(device)
-
-    if args.group_offload and device != "cpu":
-        try:
-            from diffusers.hooks import apply_group_offloading
-
-            apply_group_offloading(
-                pipe.transformer,
-                onload_device=torch.device("cuda"),
-                offload_type="block_level",
-                num_blocks_per_group=max(1, int(args.num_blocks_per_group or 1)),
-            )
-            print(f"Group offload enabled: num_blocks_per_group={args.num_blocks_per_group}", flush=True)
-        except Exception as exc:
-            print(f"Group offload unavailable: {exc}", flush=True)
-
-    if args.is_vae_st:
-        emit_progress(0.12, "memory", "enabling VAE slicing/tiling", started_at=run_started_at)
-        pipe.vae.enable_slicing()
-        pipe.vae.enable_tiling()
-
-    empty_prompt_embedding = find_empty_prompt_embedding(model_path)
-    emit_progress(0.13, "ready", "model ready; starting videos", started_at=run_started_at)
+        pipe = load_sparkvsr_pipeline(args, dtype, run_started_at, stage_label="main")
+        empty_prompt_embedding = find_empty_prompt_embedding(model_path)
+        emit_progress(0.13, "ready", "model ready; starting videos", started_at=run_started_at)
 
     for index, video_path in enumerate(video_files, 1):
         video_base = 0.13 + (float(index - 1) / max(1, len(video_files))) * 0.86
@@ -976,19 +1452,32 @@ def main() -> int:
                         started_at=run_started_at,
                     )
 
-                generated = process_video_ref_i2v(
-                    pipe=pipe,
-                    video=video_chunk,
-                    prompt=prompt,
-                    ref_frames=current_ref_frames,
-                    ref_indices=ref_indices,
-                    chunk_start_idx=t_start,
-                    noise_step=args.noise_step,
-                    sr_noise_step=args.sr_noise_step,
-                    empty_prompt_embedding=empty_prompt_embedding,
-                    ref_guidance_scale=args.ref_guidance_scale,
-                    progress_cb=tile_progress,
-                )
+                if args.split_stage_subprocesses:
+                    generated = process_video_ref_i2v_split_subprocesses(
+                        args=args,
+                        video=video_chunk,
+                        prompt=prompt,
+                        ref_frames=current_ref_frames,
+                        ref_indices=ref_indices,
+                        chunk_start_idx=t_start,
+                        progress_cb=tile_progress,
+                    )
+                else:
+                    if pipe is None:
+                        raise RuntimeError("SparkVSR pipeline was not loaded")
+                    generated = process_video_ref_i2v(
+                        pipe=pipe,
+                        video=video_chunk,
+                        prompt=prompt,
+                        ref_frames=current_ref_frames,
+                        ref_indices=ref_indices,
+                        chunk_start_idx=t_start,
+                        noise_step=args.noise_step,
+                        sr_noise_step=args.sr_noise_step,
+                        empty_prompt_embedding=empty_prompt_embedding,
+                        ref_guidance_scale=args.ref_guidance_scale,
+                        progress_cb=tile_progress,
+                    )
                 region = get_valid_tile_region(
                     t_start,
                     t_end,

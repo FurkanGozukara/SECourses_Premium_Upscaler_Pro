@@ -23,7 +23,14 @@ import gradio as gr
 
 from shared.gpu_utils import get_global_gpu_override
 from shared.oom_alert import clear_vram_oom_alert
-from shared.path_utils import get_media_dimensions, normalize_path
+from shared.path_utils import (
+    IMAGE_EXTENSIONS,
+    detect_input_type,
+    get_media_dimensions,
+    get_media_duration_seconds,
+    get_media_fps,
+    normalize_path,
+)
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.services.flashvsr_autotune import (
     _clamp_save_vram_target_gb,
@@ -41,11 +48,12 @@ AUTOTUNE_LOG_PREFIX = "sparkvsr_autotune"
 AUTOTUNE_STRATEGY_VERSION = 2
 AUTOTUNE_TARGET_FRAMES = 65
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
-AUTOTUNE_TEMPORAL_CANDIDATES = (0, 49, 33, 17)
+AUTOTUNE_TEMPORAL_CANDIDATES = (65, 49, 33, 17)
 AUTOTUNE_SPATIAL_CANDIDATES = (0, 1024, 768, 512, 384, 256)
 AUTOTUNE_TEMPORAL_OVERLAP = 8
 AUTOTUNE_SPATIAL_OVERLAP = 32
 AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
+AUTOTUNE_FULL_SEQUENCE_FRAME_LIMIT = AUTOTUNE_TARGET_FRAMES
 
 
 def _resolve_uploaded_path(uploaded_file: Any) -> str:
@@ -78,6 +86,49 @@ def _write_autotune_log(log_dir: Path, payload: Dict[str, Any], existing_path: O
         return None
 
 
+def _estimate_input_frame_count(input_path: str) -> Tuple[Optional[int], str]:
+    """Best-effort frame count for deciding whether full-sequence probes are safe to reuse."""
+    path = Path(normalize_path(input_path))
+    try:
+        kind = detect_input_type(str(path))
+    except Exception:
+        kind = ""
+
+    if kind == "image":
+        return 1, "image"
+
+    if kind == "directory":
+        try:
+            count = sum(1 for child in path.iterdir() if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS)
+            if count > 0:
+                return int(count), "directory"
+        except Exception:
+            pass
+        return None, "directory"
+
+    if kind == "video" or path.is_file():
+        try:
+            import cv2  # type: ignore
+
+            cap = cv2.VideoCapture(str(path))
+            try:
+                count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            finally:
+                cap.release()
+            if count > 0:
+                return count, "cv2"
+        except Exception:
+            pass
+
+        duration = get_media_duration_seconds(str(path))
+        fps = get_media_fps(str(path))
+        if duration and fps and duration > 0 and fps > 0:
+            return max(1, int(round(float(duration) * float(fps)))), "duration_fps"
+        return None, "video_unknown"
+
+    return None, "unknown"
+
+
 def _build_autotune_signature(
     settings: Dict[str, Any],
     *,
@@ -88,6 +139,7 @@ def _build_autotune_signature(
     global_gpu_device: str,
     total_vram_gb: float,
     min_free_target_gb: float,
+    allow_full_sequence: bool,
 ) -> Dict[str, Any]:
     ref_mode = str(settings.get("ref_mode") or "sr_image").strip().lower()
     if bool(settings.get("auto_reference_prepass", False)) and ref_mode != "no_ref":
@@ -111,6 +163,10 @@ def _build_autotune_signature(
         "save_format": str(settings.get("save_format") or "yuv444p"),
         "global_gpu_device": str(global_gpu_device or ""),
         "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb, AUTOTUNE_MIN_FREE_VRAM_GB),
+        "split_stage_subprocesses": bool(settings.get("split_stage_subprocesses", True)),
+        "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
+        "full_sequence_frame_limit": int(AUTOTUNE_FULL_SEQUENCE_FRAME_LIMIT),
+        "long_sequence_chunk_len": int(AUTOTUNE_TARGET_FRAMES),
     }
     exact_blob = json.dumps(exact_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return {
@@ -231,7 +287,7 @@ def _detect_sparkvsr_oom_phase(log_text: str) -> str:
     return "unknown"
 
 
-def _candidate_settings() -> List[Dict[str, Any]]:
+def _candidate_settings(*, allow_full_sequence: bool = False) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen: set[Tuple[int, int, int]] = set()
 
@@ -253,20 +309,13 @@ def _candidate_settings() -> List[Dict[str, Any]]:
             }
         )
 
-    # Measured SparkVSR behavior: spatial tiling gives the best VRAM reduction
-    # for the smallest output drift. Keep full temporal context while shrinking
-    # spatial tiles first, then combine temporal chunking with spatial tiling.
-    for tile in AUTOTUNE_SPATIAL_CANDIDATES:
-        add_candidate(0, int(tile))
-
-    spatial_fallbacks = [int(t) for t in AUTOTUNE_SPATIAL_CANDIDATES if int(t) > 0]
+    _ = allow_full_sequence
     for chunk_len in AUTOTUNE_TEMPORAL_CANDIDATES:
         if int(chunk_len) <= 0:
             continue
-        for tile in spatial_fallbacks:
+        for tile in AUTOTUNE_SPATIAL_CANDIDATES:
             add_candidate(int(chunk_len), int(tile))
-        add_candidate(int(chunk_len), 0)
-    return out
+    return sorted(out, key=_quality_rank, reverse=True)
 
 
 def _quality_rank(cfg: Dict[str, Any]) -> int:
@@ -405,6 +454,25 @@ def sparkvsr_auto_tune_action(
             yield _payload("Failed to probe input dimensions.", show_indicator=False)
             return
         input_w, input_h = int(dims[0]), int(dims[1])
+        source_frame_count, frame_count_source = _estimate_input_frame_count(input_path)
+        allow_full_sequence = False
+        if source_frame_count is None:
+            _append_log(
+                "Could not determine source frame count. Auto Tune will still start with bounded "
+                f"temporal chunk_len={AUTOTUNE_TARGET_FRAMES} for safety."
+            )
+        else:
+            _append_log(
+                f"Source frame count: {source_frame_count} ({frame_count_source}). "
+                f"Auto Tune starts with bounded chunk_len={AUTOTUNE_TARGET_FRAMES}; "
+                "chunk_len=0 full-sequence probes are skipped so longer clips stay inside the measured VRAM envelope."
+            )
+        temporal_policy_label = "bounded chunks required"
+        source_frames_note = (
+            f" ({int(source_frame_count)} source frames)"
+            if source_frame_count is not None
+            else ""
+        )
 
         resolved_scale = canonical_scale_fn(
             scale_value=settings.get("scale", 4),
@@ -484,6 +552,7 @@ def sparkvsr_auto_tune_action(
             global_gpu_device=str(global_gpu_device),
             total_vram_gb=total_vram_gb,
             min_free_target_gb=min_free_vram_target_gb,
+            allow_full_sequence=allow_full_sequence,
         )
         logs_dir = Path(base_dir) / "vram_usages"
         cached = _find_cached_autotune_log(logs_dir, signature, min_free_vram_target_gb)
@@ -504,6 +573,7 @@ def sparkvsr_auto_tune_action(
             state["operation_status"] = "completed"
             summary_md = (
                 "**SparkVSR Auto Tune Result (cached)**\n"
+                f"- Temporal Policy: `{temporal_policy_label}`{source_frames_note}\n"
                 f"- Spatial Tile: `{spark_cfg['tile_height']}x{spark_cfg['tile_width']}` "
                 f"({'disabled/full-frame' if int(spark_cfg['tile_height']) <= 0 else 'enabled'})\n"
                 f"- Spatial Overlap: `{spark_cfg['overlap_height']}x{spark_cfg['overlap_width']}`\n"
@@ -548,7 +618,7 @@ def sparkvsr_auto_tune_action(
             show_indicator=True,
             tile_value=0,
             overlap_hw_value=AUTOTUNE_SPATIAL_OVERLAP,
-            chunk_value=0,
+            chunk_value=AUTOTUNE_TARGET_FRAMES,
             overlap_t_value=AUTOTUNE_TEMPORAL_OVERLAP,
             vae_tiling_value=True,
         )
@@ -557,6 +627,9 @@ def sparkvsr_auto_tune_action(
         autotune_payload = {
             "status": "running",
             "signature": signature,
+            "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
+            "source_frame_count_source": str(frame_count_source or ""),
+            "allow_full_sequence": bool(allow_full_sequence),
             "tests": tests,
             "best_config": None,
             "frontier_verified": False,
@@ -583,7 +656,7 @@ def sparkvsr_auto_tune_action(
 
         _persist("running")
         run_counter = 0
-        candidates = _candidate_settings()
+        candidates = _candidate_settings(allow_full_sequence=allow_full_sequence)
         top_rank = max(_quality_rank(c) for c in candidates)
 
         def _run_probe_once(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -761,6 +834,8 @@ def sparkvsr_auto_tune_action(
                     "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
                     "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
                     "quality_rank": int(outcome["quality_rank"]),
+                    "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
+                    "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
                 }
                 status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
                 break
@@ -797,6 +872,7 @@ def sparkvsr_auto_tune_action(
             state["operation_status"] = "completed" if status_reason in {"completed", "threshold_reached"} else "ready"
             summary_md = (
                 "**SparkVSR Auto Tune Result**\n"
+                f"- Temporal Policy: `{temporal_policy_label}`{source_frames_note}\n"
                 f"- Spatial Tile: `{spark_cfg['tile_height']}x{spark_cfg['tile_width']}` "
                 f"({'disabled/full-frame' if int(spark_cfg['tile_height']) <= 0 else 'enabled'})\n"
                 f"- Spatial Overlap: `{spark_cfg['overlap_height']}x{spark_cfg['overlap_width']}`\n"

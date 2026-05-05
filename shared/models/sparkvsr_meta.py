@@ -10,6 +10,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Optional
 
+from shared.sparkvsr_constants import SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME
+
 
 @dataclass(frozen=True)
 class SparkVSRModel:
@@ -31,32 +33,30 @@ class SparkVSRModel:
 
 _BUILTIN_MODELS: List[SparkVSRModel] = [
     SparkVSRModel(
-        name="SparkVSR-S2",
-        repo_id="JiongzeYu/SparkVSR",
-        relative_path="SparkVSR",
-        stage="Stage-2 final",
-        estimated_vram_gb=18.0,
+        name=SPARKVSR_BF16_MODEL_NAME,
+        repo_id="local",
+        relative_path=SPARKVSR_BF16_MODEL_NAME,
+        stage="Stage-2 final BF16 single-file",
+        estimated_vram_gb=20.0,
         default_dtype="bfloat16",
         default_scale=4,
-        notes="Official Stage-2 final SparkVSR model. Recommended default.",
+        notes="SparkVSR BF16 distribution. This is the default model used by the app.",
     ),
     SparkVSRModel(
-        name="SparkVSR-S1",
-        repo_id="JiongzeYu/SparkVSR-S1",
-        relative_path="SparkVSR-S1",
-        stage="Stage-1 intermediate",
-        estimated_vram_gb=18.0,
+        name=SPARKVSR_FP8_SCALED_MODEL_NAME,
+        repo_id="local-cache",
+        relative_path=SPARKVSR_FP8_SCALED_MODEL_NAME,
+        stage="Stage-2 final FP8-scaled cache",
+        estimated_vram_gb=12.0,
         default_dtype="bfloat16",
         default_scale=4,
-        notes="Official Stage-1 checkpoint, mainly useful for comparisons.",
+        notes="Optional FP8 E4M3 block-scaled cache generated locally from SparkVSR-bf16 on first use.",
     ),
 ]
 
 _SCAN_CACHE_TTL_SEC = 20.0
 _SCAN_LOCK = Lock()
 _SCAN_CACHE: tuple[float, tuple[tuple[str, float], ...], List[SparkVSRModel]] | None = None
-_SPARKVSR_BF16_MODEL_NAME = "SparkVSR-bf16"
-_SPARKVSR_S2_MODEL_NAME = "SparkVSR-S2"
 
 
 def sparkvsr_version_to_internal(version: object) -> str:
@@ -124,10 +124,6 @@ def discover_sparkvsr_model_paths(base_dir: Optional[Path] = None) -> List[Path]
     return unique
 
 
-def _local_bf16_model_exists(base_dir: Optional[Path] = None) -> bool:
-    return any(path.name == _SPARKVSR_BF16_MODEL_NAME for path in discover_sparkvsr_model_paths(base_dir))
-
-
 def get_sparkvsr_models(base_dir: Optional[Path] = None) -> List[SparkVSRModel]:
     global _SCAN_CACHE
     roots = _candidate_roots(base_dir)
@@ -140,28 +136,6 @@ def get_sparkvsr_models(base_dir: Optional[Path] = None) -> List[SparkVSRModel]:
                 return list(cached_models)
 
     models: List[SparkVSRModel] = list(_BUILTIN_MODELS)
-    builtin_names = {m.name for m in models}
-    for path in discover_sparkvsr_model_paths(base_dir):
-        if path.name in {"SparkVSR", "SparkVSR-S1"}:
-            continue
-        name = path.name
-        if name in builtin_names:
-            continue
-        is_bf16 = name == _SPARKVSR_BF16_MODEL_NAME
-        models.append(
-            SparkVSRModel(
-                name=name,
-                repo_id="local",
-                relative_path=str(path),
-                stage="Stage-2 final BF16 single-file" if is_bf16 else "Local",
-                estimated_vram_gb=20.0 if is_bf16 else 18.0,
-                notes=(
-                    "Local BF16 SparkVSR distribution with single-file text encoder and transformer checkpoints."
-                    if is_bf16
-                    else f"Local SparkVSR diffusers model at {path}"
-                ),
-            )
-        )
 
     with _SCAN_LOCK:
         _SCAN_CACHE = (now, fp, list(models))
@@ -173,7 +147,7 @@ def get_sparkvsr_model_names(base_dir: Optional[Path] = None) -> List[str]:
 
 
 def get_sparkvsr_default_model() -> str:
-    return _SPARKVSR_BF16_MODEL_NAME if _local_bf16_model_exists() else _SPARKVSR_S2_MODEL_NAME
+    return SPARKVSR_BF16_MODEL_NAME
 
 
 def get_sparkvsr_metadata(model_name: str, base_dir: Optional[Path] = None) -> Optional[SparkVSRModel]:

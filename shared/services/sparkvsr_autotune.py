@@ -45,10 +45,12 @@ from shared.sparkvsr_runner import run_sparkvsr
 
 AUTOTUNE_MODEL_ID = "sparkvsr"
 AUTOTUNE_LOG_PREFIX = "sparkvsr_autotune"
-AUTOTUNE_STRATEGY_VERSION = 2
+AUTOTUNE_STRATEGY_VERSION = 3
 AUTOTUNE_TARGET_FRAMES = 65
+AUTOTUNE_MAX_PROBE_FRAMES = 129
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
 AUTOTUNE_TEMPORAL_CANDIDATES = (65, 49, 33, 17)
+AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES = (97, 129)
 AUTOTUNE_SPATIAL_CANDIDATES = (0, 1024, 768, 512, 384, 256)
 AUTOTUNE_TEMPORAL_OVERLAP = 8
 AUTOTUNE_SPATIAL_OVERLAP = 32
@@ -150,6 +152,8 @@ def _build_autotune_signature(
         "autotune_model": AUTOTUNE_MODEL_ID,
         "autotune_strategy_version": int(AUTOTUNE_STRATEGY_VERSION),
         "autotune_target_frames": int(AUTOTUNE_TARGET_FRAMES),
+        "autotune_max_probe_frames": int(AUTOTUNE_MAX_PROBE_FRAMES),
+        "autotune_growth_candidates": list(AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES),
         "model_name": str(settings.get("model_name") or ""),
         "precision": str(settings.get("precision") or "bfloat16"),
         "scale": str(settings.get("scale") or "4"),
@@ -316,6 +320,24 @@ def _candidate_settings(*, allow_full_sequence: bool = False) -> List[Dict[str, 
         for tile in AUTOTUNE_SPATIAL_CANDIDATES:
             add_candidate(int(chunk_len), int(tile))
     return sorted(out, key=_quality_rank, reverse=True)
+
+
+def _growth_candidate_settings(probe_frames: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for chunk_len in AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES:
+        if int(chunk_len) <= AUTOTUNE_TARGET_FRAMES or int(chunk_len) > int(probe_frames):
+            continue
+        out.append(
+            {
+                "chunk_len": int(chunk_len),
+                "overlap_t": int(AUTOTUNE_TEMPORAL_OVERLAP),
+                "tile_height": 0,
+                "tile_width": 0,
+                "overlap_height": int(AUTOTUNE_SPATIAL_OVERLAP),
+                "overlap_width": int(AUTOTUNE_SPATIAL_OVERLAP),
+            }
+        )
+    return out
 
 
 def _quality_rank(cfg: Dict[str, Any]) -> int:
@@ -597,15 +619,20 @@ def sparkvsr_auto_tune_action(
             )
             return
 
+        probe_target_frames = int(AUTOTUNE_TARGET_FRAMES)
+        if source_frame_count is None or int(source_frame_count) > AUTOTUNE_TARGET_FRAMES:
+            probe_target_frames = int(AUTOTUNE_MAX_PROBE_FRAMES)
+        probe_target_frames = max(int(AUTOTUNE_TARGET_FRAMES), min(int(AUTOTUNE_MAX_PROBE_FRAMES), int(probe_target_frames)))
+
         stamp = time.strftime("%Y%m%d_%H%M%S")
         session_dir = Path(temp_dir) / "sparkvsr_autotune" / stamp
         session_dir.mkdir(parents=True, exist_ok=True)
-        demo_video_path = session_dir / "sparkvsr_autotune_demo_65f.mp4"
+        demo_video_path = session_dir / f"sparkvsr_autotune_demo_{probe_target_frames}f.mp4"
         demo_ref_path = session_dir / "sparkvsr_autotune_reference.png"
         demo_meta = _create_autotune_demo_video(
             input_path,
             demo_video_path,
-            target_frames=AUTOTUNE_TARGET_FRAMES,
+            target_frames=probe_target_frames,
             resize_to=(effective_in_w, effective_in_h),
         )
         _extract_demo_reference(demo_video_path, demo_ref_path)
@@ -630,6 +657,7 @@ def sparkvsr_auto_tune_action(
             "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
             "source_frame_count_source": str(frame_count_source or ""),
             "allow_full_sequence": bool(allow_full_sequence),
+            "probe_target_frames": int(probe_target_frames),
             "tests": tests,
             "best_config": None,
             "frontier_verified": False,
@@ -657,7 +685,8 @@ def sparkvsr_auto_tune_action(
         _persist("running")
         run_counter = 0
         candidates = _candidate_settings(allow_full_sequence=allow_full_sequence)
-        top_rank = max(_quality_rank(c) for c in candidates)
+        growth_candidates = _growth_candidate_settings(probe_target_frames)
+        top_rank = max(_quality_rank(c) for c in [*candidates, *growth_candidates])
 
         def _run_probe_once(candidate: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal run_counter
@@ -793,12 +822,29 @@ def sparkvsr_auto_tune_action(
                 "tiles": int(phase_state.get("tiles") or 0),
             }
 
-        boundary_failed = False
-        for candidate in candidates:
+        def _apply_passed_outcome(outcome: Dict[str, Any]) -> None:
+            nonlocal best_config, status_reason
+            best_config = {
+                "chunk_len": int(outcome["chunk_len"]),
+                "overlap_t": int(outcome["overlap_t"]),
+                "tile_height": int(outcome["tile_height"]),
+                "tile_width": int(outcome["tile_width"]),
+                "overlap_height": int(outcome["overlap_height"]),
+                "overlap_width": int(outcome["overlap_width"]),
+                "vae_tiling": True,
+                "min_free_vram_target_gb": float(min_free_vram_target_gb),
+                "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
+                "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
+                "quality_rank": int(outcome["quality_rank"]),
+                "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
+                "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
+            }
+            status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
+
+        def _probe_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
             if cancel_event.is_set():
-                status_reason = "cancelled"
                 _append_log("Auto Tune cancelled before next test.")
-                break
+                raise KeyboardInterrupt()
             yield _payload(
                 (
                     f"Testing chunk_len={candidate['chunk_len']}, "
@@ -821,28 +867,70 @@ def sparkvsr_auto_tune_action(
                 f"chunks={outcome.get('chunks')}, tiles={outcome.get('tiles')}, passed={outcome['passed']}"
             )
             _persist("running")
-            if bool(outcome.get("passed", False)):
-                best_config = {
-                    "chunk_len": int(outcome["chunk_len"]),
-                    "overlap_t": int(outcome["overlap_t"]),
-                    "tile_height": int(outcome["tile_height"]),
-                    "tile_width": int(outcome["tile_width"]),
-                    "overlap_height": int(outcome["overlap_height"]),
-                    "overlap_width": int(outcome["overlap_width"]),
-                    "vae_tiling": True,
-                    "min_free_vram_target_gb": float(min_free_vram_target_gb),
-                    "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
-                    "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
-                    "quality_rank": int(outcome["quality_rank"]),
-                    "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
-                    "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
-                }
-                status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
-                break
-            boundary_failed = bool(boundary_failed or outcome.get("oom") or outcome.get("probe_cancel_reason") == "threshold_reached")
-            if not bool(outcome.get("telemetry_ok", False)):
-                status_reason = "failed"
-                break
+            return outcome
+
+        boundary_failed = False
+        try:
+            first_candidate = candidates[0] if candidates else None
+            first_outcome: Optional[Dict[str, Any]] = None
+            if first_candidate is not None:
+                first_outcome = yield from _probe_candidate(first_candidate)
+
+            if first_outcome and bool(first_outcome.get("passed", False)):
+                _apply_passed_outcome(first_outcome)
+                if growth_candidates:
+                    _append_log(
+                        "Initial 65-frame probe passed. Probing larger temporal chunks for faster long-video throughput."
+                    )
+                for candidate in growth_candidates:
+                    if cancel_event.is_set():
+                        status_reason = "cancelled"
+                        _append_log("Auto Tune cancelled before next growth test.")
+                        break
+                    outcome = yield from _probe_candidate(candidate)
+                    if bool(outcome.get("passed", False)):
+                        _apply_passed_outcome(outcome)
+                        continue
+                    boundary_failed = bool(
+                        boundary_failed
+                        or outcome.get("oom")
+                        or outcome.get("probe_cancel_reason") == "threshold_reached"
+                        or int(outcome.get("returncode") or 0) != 0
+                    )
+                    if not bool(outcome.get("telemetry_ok", False)):
+                        status_reason = "failed"
+                    break
+            else:
+                if first_outcome is not None:
+                    boundary_failed = bool(
+                        boundary_failed
+                        or first_outcome.get("oom")
+                        or first_outcome.get("probe_cancel_reason") == "threshold_reached"
+                        or int(first_outcome.get("returncode") or 0) != 0
+                    )
+                    if not bool(first_outcome.get("telemetry_ok", False)):
+                        status_reason = "failed"
+                if status_reason != "failed":
+                    for candidate in candidates[1:]:
+                        if cancel_event.is_set():
+                            status_reason = "cancelled"
+                            _append_log("Auto Tune cancelled before next fallback test.")
+                            break
+                        outcome = yield from _probe_candidate(candidate)
+                        if bool(outcome.get("passed", False)):
+                            _apply_passed_outcome(outcome)
+                            break
+                        boundary_failed = bool(
+                            boundary_failed
+                            or outcome.get("oom")
+                            or outcome.get("probe_cancel_reason") == "threshold_reached"
+                            or int(outcome.get("returncode") or 0) != 0
+                        )
+                        if not bool(outcome.get("telemetry_ok", False)):
+                            status_reason = "failed"
+                            break
+        except KeyboardInterrupt:
+            status_reason = "cancelled"
 
         frontier_ok = bool(best_config and (best_config.get("quality_rank") == top_rank or boundary_failed))
         _persist(status_reason, finalized=True, frontier_verified=frontier_ok)

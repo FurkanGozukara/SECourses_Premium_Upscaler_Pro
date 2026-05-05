@@ -1025,7 +1025,8 @@ def sparkvsr_tab(
             #### SparkVSR Guide
 
             **Model defaults**
-            - `SparkVSR-bf16` is selected by default when the local BF16 single-file distribution exists; otherwise the app falls back to `SparkVSR-S2`.
+            - `SparkVSR-bf16` is the default distributed model.
+            - `SparkVSR-fp8-scaled` is optional and generated locally from `SparkVSR-bf16` on first use, then reused from cache.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
             - Enable `Auto Upscale First Frame per Chunk` to generate one local SR reference per chunk before SparkVSR processing starts.
             - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.

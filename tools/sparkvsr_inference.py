@@ -37,6 +37,14 @@ import decord  # isort:skip
 
 decord.bridge.set_bridge("torch")
 
+from shared.sparkvsr_fp8_scaled import (
+    SPARKVSR_BF16_MODEL_NAME,
+    ensure_sparkvsr_fp8_scaled_cache,
+    is_fp8_scaled_model_path,
+    load_fp8_scaled_text_encoder,
+    load_fp8_scaled_transformer,
+)
+
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 SPLIT_STAGE_REQUEST_KIND = "sparkvsr_split_stage_request_v1"
@@ -421,6 +429,121 @@ def _drop_pipeline_components(pipe: CogVideoXImageToVideoPipeline, keep: set[str
     release_torch_memory()
 
 
+def _is_fp8_scaled_args(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "_spark_fp8_scaled", False)) or is_fp8_scaled_model_path(str(getattr(args, "model_path", "") or ""))
+
+
+def _compute_dtype_from_args(args: argparse.Namespace, fallback: torch.dtype) -> torch.dtype:
+    raw = str(getattr(args, "dtype", "") or "").strip().lower()
+    return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(raw, fallback)
+
+
+def _pipeline_compute_dtype(pipe: CogVideoXImageToVideoPipeline, fallback: torch.dtype) -> torch.dtype:
+    return getattr(pipe, "_sparkvsr_compute_dtype", fallback)
+
+
+def _profile_cuda_memory(label: str, *, reset_peak: bool = False) -> None:
+    if os.environ.get("SPARKVSR_PROFILE_MEMORY", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not torch.cuda.is_available():
+        return
+    with suppress(Exception):
+        torch.cuda.synchronize()
+    device_index = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device_index) / 1024**3
+    reserved = torch.cuda.memory_reserved(device_index) / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated(device_index) / 1024**3
+    max_reserved = torch.cuda.max_memory_reserved(device_index) / 1024**3
+    print(
+        f"[SparkVSR memory] {label}: "
+        f"allocated={allocated:.3f}GiB reserved={reserved:.3f}GiB "
+        f"max_allocated={max_allocated:.3f}GiB max_reserved={max_reserved:.3f}GiB",
+        flush=True,
+    )
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats(device_index)
+
+
+def _vae_decode_to_cpu_low_vram(pipe: CogVideoXImageToVideoPipeline, z: torch.Tensor) -> torch.Tensor:
+    vae = pipe.vae
+    if vae is None:
+        raise RuntimeError("SparkVSR split decode requires a VAE")
+
+    use_tiling = bool(
+        getattr(vae, "use_tiling", False)
+        and (z.shape[-1] > int(getattr(vae, "tile_latent_min_width", 0) or 0) or z.shape[-2] > int(getattr(vae, "tile_latent_min_height", 0) or 0))
+    )
+    if not use_tiling:
+        decoded = vae.decode(z).sample.detach().cpu()
+        release_torch_memory()
+        return decoded
+
+    _, _, _, height, width = z.shape
+    tile_latent_h = int(vae.tile_latent_min_height)
+    tile_latent_w = int(vae.tile_latent_min_width)
+    overlap_h = max(1, int(tile_latent_h * (1 - float(vae.tile_overlap_factor_height))))
+    overlap_w = max(1, int(tile_latent_w * (1 - float(vae.tile_overlap_factor_width))))
+    blend_extent_h = int(vae.tile_sample_min_height * float(vae.tile_overlap_factor_height))
+    blend_extent_w = int(vae.tile_sample_min_width * float(vae.tile_overlap_factor_width))
+    row_limit_h = int(vae.tile_sample_min_height) - blend_extent_h
+    row_limit_w = int(vae.tile_sample_min_width) - blend_extent_w
+
+    rows: List[List[torch.Tensor]] = []
+    old_use_tiling = bool(getattr(vae, "use_tiling", False))
+    vae.use_tiling = False
+    try:
+        for i in range(0, height, overlap_h):
+            row: List[torch.Tensor] = []
+            for j in range(0, width, overlap_w):
+                tile = z[:, :, :, i : i + tile_latent_h, j : j + tile_latent_w]
+                decoded_tile = vae.decode(tile).sample.detach().cpu()
+                row.append(decoded_tile)
+                del decoded_tile
+                del tile
+                release_torch_memory()
+            rows.append(row)
+    finally:
+        vae.use_tiling = old_use_tiling
+
+    result_rows: List[torch.Tensor] = []
+    for i, row in enumerate(rows):
+        result_row: List[torch.Tensor] = []
+        for j, tile in enumerate(row):
+            if i > 0:
+                tile = vae.blend_v(rows[i - 1][j], tile, blend_extent_h)
+            if j > 0:
+                tile = vae.blend_h(row[j - 1], tile, blend_extent_w)
+            result_row.append(tile[:, :, :, :row_limit_h, :row_limit_w])
+        result_rows.append(torch.cat(result_row, dim=4))
+    decoded = torch.cat(result_rows, dim=3)
+    release_torch_memory()
+    return decoded
+
+
+def _max_text_seq_length_for_model(model_path: Path) -> int:
+    try:
+        config = CogVideoXTransformer3DModel.load_config(str(model_path / "transformer"))
+        if isinstance(config, dict):
+            value = config.get("max_text_seq_length")
+        else:
+            value = getattr(config, "max_text_seq_length", None)
+        return max(1, int(value or 226))
+    except Exception:
+        return 226
+
+
+def _ensure_model_path_ready(args: argparse.Namespace, started_at: float, *, stage_label: str = "model") -> Path:
+    model_path = Path(args.model_path)
+    if is_fp8_scaled_model_path(model_path):
+        bf16_source = model_path.parent / SPARKVSR_BF16_MODEL_NAME
+        if not model_path.exists():
+            emit_progress(0.008, "fp8_cache", f"{stage_label}: generating FP8-scaled cache from {bf16_source}", started_at=started_at)
+        model_path = ensure_sparkvsr_fp8_scaled_cache(fp8_model_path=model_path, bf16_model_path=bf16_source)
+        args.model_path = str(model_path)
+        setattr(args, "_spark_fp8_scaled", True)
+    return model_path
+
+
 def load_sparkvsr_pipeline(
     args: argparse.Namespace,
     dtype: torch.dtype,
@@ -429,18 +552,27 @@ def load_sparkvsr_pipeline(
     stage_label: str = "model",
     component_overrides: Optional[Dict[str, object]] = None,
 ) -> CogVideoXImageToVideoPipeline:
-    model_path = Path(args.model_path)
+    model_path = _ensure_model_path_ready(args, started_at, stage_label=stage_label)
     if not model_path.exists():
         raise FileNotFoundError(f"SparkVSR model path not found: {model_path}")
+    fp8_scaled = _is_fp8_scaled_args(args)
+    if fp8_scaled and str(args.lora_path or "").strip():
+        raise RuntimeError("SparkVSR FP8-scaled mode does not support LoRA yet. Use SparkVSR-bf16 for LoRA runs.")
 
     emit_progress(0.01, "model_load", f"{stage_label}: loading pipeline from {model_path}", started_at=started_at)
     load_kwargs = dict(component_overrides or {})
+    if fp8_scaled:
+        if "text_encoder" not in load_kwargs:
+            load_kwargs["text_encoder"] = load_fp8_scaled_text_encoder(model_path)
+        if "transformer" not in load_kwargs:
+            load_kwargs["transformer"] = load_fp8_scaled_transformer(model_path)
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         str(model_path),
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         **load_kwargs,
     )
+    pipe._sparkvsr_compute_dtype = dtype
     emit_progress(0.10, "model_load", f"{stage_label}: pipeline weights loaded", started_at=started_at)
     if args.lora_path:
         print(f"Loading LoRA from {args.lora_path}", flush=True)
@@ -478,7 +610,9 @@ def load_sparkvsr_pipeline(
     if args.is_vae_st and getattr(pipe, "vae", None) is not None:
         emit_progress(0.12, "memory", f"{stage_label}: enabling VAE slicing/tiling", started_at=started_at)
         pipe.vae.enable_slicing()
-        pipe.vae.enable_tiling()
+        tile_min_h = int(os.environ.get("SPARKVSR_VAE_TILE_SAMPLE_MIN_HEIGHT", "240") or 240)
+        tile_min_w = int(os.environ.get("SPARKVSR_VAE_TILE_SAMPLE_MIN_WIDTH", "360") or 360)
+        pipe.vae.enable_tiling(tile_sample_min_height=max(64, tile_min_h), tile_sample_min_width=max(64, tile_min_w))
 
     return pipe
 
@@ -505,7 +639,7 @@ def process_video_ref_i2v(
     ref_indices = ref_indices or []
     mark(0.02, "moving tile tensors to device")
     execution_device = getattr(pipe, "_execution_device", None) or pipe.device
-    video = video.to(execution_device, dtype=pipe.dtype)
+    video = video.to(execution_device, dtype=_pipeline_compute_dtype(pipe, torch.bfloat16))
     mark(0.08, "encoding low-resolution video latents")
     latent_dist = pipe.vae.encode(video).latent_dist
     lq_latent = latent_dist.sample() * pipe.vae.config.scaling_factor
@@ -640,6 +774,7 @@ def _run_split_encode_stage(args: argparse.Namespace, state_in_path: Path, state
     started_at = time.monotonic()
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     set_seed(int(args.seed or 0))
+    _profile_cuda_memory("split encode start", reset_peak=True)
     payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
     video = payload.get("video")
     if not isinstance(video, torch.Tensor):
@@ -659,12 +794,14 @@ def _run_split_encode_stage(args: argparse.Namespace, state_in_path: Path, state
         stage_label="split encode",
         component_overrides={"transformer": None, "text_encoder": None, "tokenizer": None},
     )
-    pipe_dtype = pipe.dtype
+    _profile_cuda_memory("split encode after model load", reset_peak=True)
+    pipe_dtype = _pipeline_compute_dtype(pipe, dtype)
     execution_device = getattr(pipe, "_execution_device", None) or pipe.device
     video = video.to(execution_device, dtype=pipe_dtype)
     print("[SparkVSR split] encode: low-resolution video latents", flush=True)
     latent_dist = pipe.vae.encode(video).latent_dist
     lq_latent = latent_dist.sample() * pipe.vae.config.scaling_factor
+    _profile_cuda_memory("split encode after lq vae encode")
     _, _, num_frames, _, _ = lq_latent.shape
     device = lq_latent.device
     latent_dtype = lq_latent.dtype
@@ -684,6 +821,7 @@ def _run_split_encode_stage(args: argparse.Namespace, state_in_path: Path, state
             chunk = r_frame.unsqueeze(0).unsqueeze(2).repeat(1, 1, 4, 1, 1)
             lat = pipe.vae.encode(chunk).latent_dist.sample() * pipe.vae.config.scaling_factor
             full_ref_latent[:, :, target_lat_idx, :, :] = lat[0, :, 0, :, :]
+    _profile_cuda_memory("split encode complete")
 
     _save_split_blob(
         state_out_path,
@@ -698,13 +836,61 @@ def _run_split_encode_stage(args: argparse.Namespace, state_in_path: Path, state
 
 
 @no_grad
+def _run_split_text_stage(args: argparse.Namespace, state_in_path: Path, state_out_path: Path) -> None:
+    started_at = time.monotonic()
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
+    set_seed(int(args.seed or 0))
+    _profile_cuda_memory("split text start", reset_peak=True)
+    payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
+    prompt = str(payload.get("prompt") or "")
+    lq_latent = payload.get("lq_latent")
+    batch_size = int(lq_latent.shape[0]) if isinstance(lq_latent, torch.Tensor) and lq_latent.ndim >= 1 else 1
+
+    model_path = _ensure_model_path_ready(args, started_at, stage_label="split text")
+    cached_empty_embedding = find_empty_prompt_embedding(model_path) if prompt == "" else None
+    if cached_empty_embedding is not None:
+        print("[SparkVSR split] text: using cached empty prompt embedding", flush=True)
+        prompt_embedding = cached_empty_embedding
+    else:
+        pipe = load_sparkvsr_pipeline(
+            args,
+            dtype,
+            started_at,
+            stage_label="split text",
+            component_overrides={"vae": None, "transformer": None},
+        )
+        _profile_cuda_memory("split text after model load", reset_peak=True)
+        execution_device = getattr(pipe, "_execution_device", None) or pipe.device
+        max_text_seq_length = _max_text_seq_length_for_model(model_path)
+        prompt_token_ids = pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_text_seq_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).input_ids
+        print("[SparkVSR split] text: prompt encoding", flush=True)
+        prompt_embedding = pipe.text_encoder(prompt_token_ids.to(execution_device))[0]
+        _profile_cuda_memory("split text after prompt encode")
+
+    if prompt_embedding.shape[0] != batch_size:
+        prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
+    prompt_embedding = prompt_embedding.to(dtype=dtype)
+    payload["prompt_embedding"] = _clone_tensor_to_cpu(prompt_embedding)
+    _save_split_blob(state_out_path, SPLIT_STAGE_STATE_KIND, payload)
+
+
+@no_grad
 def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, state_out_path: Path) -> None:
     started_at = time.monotonic()
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     set_seed(int(args.seed or 0))
+    _profile_cuda_memory("split transformer start", reset_peak=True)
     payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
     lq_latent = payload.get("lq_latent")
     full_ref_latent = payload.get("full_ref_latent")
+    split_prompt_embedding = payload.get("prompt_embedding")
     if not isinstance(lq_latent, torch.Tensor) or not isinstance(full_ref_latent, torch.Tensor):
         raise RuntimeError("Split transformer stage did not receive latent tensors")
 
@@ -713,9 +899,10 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         dtype,
         started_at,
         stage_label="split transformer",
-        component_overrides={"vae": None},
+        component_overrides={"vae": None, "text_encoder": None, "tokenizer": None},
     )
-    pipe_dtype = pipe.dtype
+    _profile_cuda_memory("split transformer after model load", reset_peak=True)
+    pipe_dtype = _pipeline_compute_dtype(pipe, dtype)
     vae_scale_factor_spatial = max(1, int(payload.get("vae_scale_factor_spatial") or 8))
     execution_device = getattr(pipe, "_execution_device", None) or pipe.device
     lq_latent = lq_latent.to(execution_device, dtype=pipe_dtype)
@@ -742,21 +929,30 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         if ncopy:
             input_latent = torch.cat([input_latent[:, :, :1].repeat(1, 1, ncopy, 1, 1), input_latent], dim=2)
 
-    empty_prompt_embedding = find_empty_prompt_embedding(Path(args.model_path))
-    if prompt == "" and empty_prompt_embedding is not None:
-        prompt_embedding = empty_prompt_embedding.to(device, dtype=latent_dtype)
+    if isinstance(split_prompt_embedding, torch.Tensor):
+        prompt_embedding = split_prompt_embedding.to(device, dtype=latent_dtype)
         if prompt_embedding.shape[0] != batch_size:
-            prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
+            prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
     else:
-        prompt_token_ids = pipe.tokenizer(
+        print("[SparkVSR split] transformer: prompt embedding missing; loading text encoder fallback", flush=True)
+        fallback_pipe = load_sparkvsr_pipeline(
+            args,
+            dtype,
+            started_at,
+            stage_label="split transformer text fallback",
+            component_overrides={"vae": None, "transformer": None},
+        )
+        fallback_device = getattr(fallback_pipe, "_execution_device", None) or fallback_pipe.device
+        max_text_seq_length = _max_text_seq_length_for_model(Path(args.model_path))
+        prompt_token_ids = fallback_pipe.tokenizer(
             prompt,
             padding="max_length",
-            max_length=pipe.transformer.config.max_text_seq_length,
+            max_length=max_text_seq_length,
             truncation=True,
             add_special_tokens=True,
             return_tensors="pt",
         ).input_ids
-        prompt_embedding = pipe.text_encoder(prompt_token_ids.to(device))[0]
+        prompt_embedding = fallback_pipe.text_encoder(prompt_token_ids.to(fallback_device))[0]
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_dtype)
 
@@ -798,6 +994,7 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         ofs=ofs,
         return_dict=False,
     )[0]
+    _profile_cuda_memory("split transformer after inference")
 
     predicted_noise_slice = predicted_noise[:, :, :16, :, :].transpose(1, 2)
     lq_sample = latents[:, :, :16, :, :].transpose(1, 2)
@@ -816,6 +1013,7 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         SPLIT_STAGE_STATE_KIND,
         {"latent_generate": _clone_tensor_to_cpu(latent_generate)},
     )
+    _profile_cuda_memory("split transformer complete")
 
 
 @no_grad
@@ -823,6 +1021,7 @@ def _run_split_decode_stage(args: argparse.Namespace, state_in_path: Path, state
     started_at = time.monotonic()
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     set_seed(int(args.seed or 0))
+    _profile_cuda_memory("split decode start", reset_peak=True)
     payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
     latent_generate = payload.get("latent_generate")
     if not isinstance(latent_generate, torch.Tensor):
@@ -835,12 +1034,15 @@ def _run_split_decode_stage(args: argparse.Namespace, state_in_path: Path, state
         stage_label="split decode",
         component_overrides={"transformer": None, "text_encoder": None, "tokenizer": None},
     )
-    pipe_dtype = pipe.dtype
+    _profile_cuda_memory("split decode after model load", reset_peak=True)
+    pipe_dtype = _pipeline_compute_dtype(pipe, dtype)
     execution_device = getattr(pipe, "_execution_device", None) or pipe.device
     latent_generate = latent_generate.to(execution_device, dtype=pipe_dtype)
     print("[SparkVSR split] decode: VAE decode", flush=True)
-    video_generate = pipe.vae.decode(latent_generate / pipe.vae.config.scaling_factor).sample
+    video_generate = _vae_decode_to_cpu_low_vram(pipe, latent_generate / pipe.vae.config.scaling_factor)
+    _profile_cuda_memory("split decode after vae decode")
     video_generate = video_generate.mul_(0.5).add_(0.5).clamp_(0.0, 1.0)
+    _profile_cuda_memory("split decode complete")
     _save_split_blob(
         state_out_path,
         SPLIT_STAGE_STATE_KIND,
@@ -923,6 +1125,7 @@ def process_video_ref_i2v_split_subprocesses(
         request_path = temp_dir / "request.pt"
         encode_input_path = temp_dir / "input.pt"
         encode_output_path = temp_dir / "encoded.pt"
+        text_output_path = temp_dir / "text_encoded.pt"
         transform_output_path = temp_dir / "generated_latents.pt"
         decode_output_path = temp_dir / "decoded.pt"
 
@@ -949,15 +1152,25 @@ def process_video_ref_i2v_split_subprocesses(
         )
         encode_input_path.unlink(missing_ok=True)
 
-        mark(0.42, "split subprocess: SparkVSR transformer")
+        mark(0.38, "split subprocess: text encoder")
+        _run_split_stage_subprocess(
+            stage="text",
+            args=args,
+            request_path=request_path,
+            state_in_path=encode_output_path,
+            state_out_path=text_output_path,
+        )
+        encode_output_path.unlink(missing_ok=True)
+
+        mark(0.48, "split subprocess: SparkVSR transformer")
         _run_split_stage_subprocess(
             stage="transform",
             args=args,
             request_path=request_path,
-            state_in_path=encode_output_path,
+            state_in_path=text_output_path,
             state_out_path=transform_output_path,
         )
-        encode_output_path.unlink(missing_ok=True)
+        text_output_path.unlink(missing_ok=True)
 
         mark(0.88, "split subprocess: VAE decode")
         _run_split_stage_subprocess(
@@ -989,6 +1202,8 @@ def run_internal_split_stage(parsed_args: argparse.Namespace) -> int:
     print(f"[SparkVSR split] internal stage started: {stage}", flush=True)
     if stage == "encode":
         _run_split_encode_stage(args, state_in_path, state_out_path)
+    elif stage == "text":
+        _run_split_text_stage(args, state_in_path, state_out_path)
     elif stage == "transform":
         _run_split_transform_stage(args, state_in_path, state_out_path)
     elif stage == "decode":
@@ -1282,7 +1497,7 @@ def main() -> int:
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     set_seed(int(args.seed or 0))
 
-    model_path = Path(args.model_path)
+    model_path = _ensure_model_path_ready(args, run_started_at, stage_label="startup")
     if not model_path.exists():
         raise FileNotFoundError(f"SparkVSR model path not found: {model_path}")
     output_dir = Path(args.output_path)

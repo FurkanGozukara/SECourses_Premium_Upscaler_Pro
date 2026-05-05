@@ -383,7 +383,8 @@ def run_sparkvsr(
             cmd.append("--is_cpu_offload")
         if _bool(settings.get("vae_tiling"), True):
             cmd.append("--is_vae_st")
-        if _bool(settings.get("split_stage_subprocesses"), True):
+        split_stage_enabled = _bool(settings.get("split_stage_subprocesses"), True)
+        if split_stage_enabled:
             cmd.append("--split_stage_subprocesses")
         if _bool(settings.get("group_offload"), False):
             cmd.extend(["--group_offload", "--num_blocks_per_group", str(max(1, _parse_int(settings.get("num_blocks_per_group"), 1)))])
@@ -406,6 +407,11 @@ def run_sparkvsr(
             f"Running SparkVSR: model={settings.get('model_name')}, scale={scale}x, "
             f"dtype={settings.get('precision')}, chunk_len={settings.get('chunk_len')}, "
             f"tile={tile_h}x{tile_w}"
+        )
+        log(
+            "[SparkVSR] Stage Subprocess Isolation: "
+            f"{'ON' if split_stage_enabled else 'OFF'} "
+            f"({'--split_stage_subprocesses will be passed' if split_stage_enabled else 'single-process SparkVSR path'})"
         )
         log(f"Command: {' '.join(cmd)}")
 
@@ -449,7 +455,11 @@ def run_sparkvsr(
         last_progress_text = ""
         while True:
             if cancel_event and cancel_event.is_set():
-                log("Cancellation requested - terminating SparkVSR process")
+                cancel_reason = str(getattr(cancel_event, "sparkvsr_cancel_reason", "") or "").strip().lower()
+                if cancel_reason == "vram_threshold":
+                    log("VRAM threshold reached during probe - terminating SparkVSR process")
+                else:
+                    log("Cancellation requested - terminating SparkVSR process")
                 with suppress(Exception):
                     proc.terminate()
                     proc.wait(timeout=5.0)

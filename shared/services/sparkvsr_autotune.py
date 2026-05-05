@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import queue
 import re
 import shutil
 import threading
@@ -40,22 +41,25 @@ from shared.services.flashvsr_autotune import (
     _query_gpu_memory_snapshot_gb,
     _sample_peak_vram_gb,
 )
-from shared.sparkvsr_runner import run_sparkvsr
+from shared.sparkvsr_runner import SparkVSRResult, run_sparkvsr
 
 
 AUTOTUNE_MODEL_ID = "sparkvsr"
 AUTOTUNE_LOG_PREFIX = "sparkvsr_autotune"
-AUTOTUNE_STRATEGY_VERSION = 3
+AUTOTUNE_STRATEGY_VERSION = 5
 AUTOTUNE_TARGET_FRAMES = 65
 AUTOTUNE_MAX_PROBE_FRAMES = 129
+AUTOTUNE_INITIAL_PROBE_FRAMES = AUTOTUNE_TARGET_FRAMES
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
 AUTOTUNE_TEMPORAL_CANDIDATES = (65, 49, 33, 17)
-AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES = (97, 129)
+AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES = tuple(range(AUTOTUNE_TARGET_FRAMES + 8, AUTOTUNE_MAX_PROBE_FRAMES + 1, 8))
 AUTOTUNE_SPATIAL_CANDIDATES = (0, 1024, 768, 512, 384, 256)
 AUTOTUNE_TEMPORAL_OVERLAP = 8
 AUTOTUNE_SPATIAL_OVERLAP = 32
 AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
 AUTOTUNE_FULL_SEQUENCE_FRAME_LIMIT = AUTOTUNE_TARGET_FRAMES
+AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC = 0.10
+AUTOTUNE_UI_UPDATE_INTERVAL_SEC = 0.50
 
 
 def _resolve_uploaded_path(uploaded_file: Any) -> str:
@@ -152,6 +156,7 @@ def _build_autotune_signature(
         "autotune_model": AUTOTUNE_MODEL_ID,
         "autotune_strategy_version": int(AUTOTUNE_STRATEGY_VERSION),
         "autotune_target_frames": int(AUTOTUNE_TARGET_FRAMES),
+        "autotune_initial_probe_frames": int(AUTOTUNE_INITIAL_PROBE_FRAMES),
         "autotune_max_probe_frames": int(AUTOTUNE_MAX_PROBE_FRAMES),
         "autotune_growth_candidates": list(AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES),
         "model_name": str(settings.get("model_name") or ""),
@@ -291,6 +296,51 @@ def _detect_sparkvsr_oom_phase(log_text: str) -> str:
     return "unknown"
 
 
+def _strip_ansi(text: str) -> str:
+    try:
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", str(text or ""))
+    except Exception:
+        return str(text or "")
+
+
+def _parse_sparkvsr_progress_fraction(text: str) -> Optional[float]:
+    line = _strip_ansi(text).strip()
+    if not line:
+        return None
+    m = re.search(r"SparkVSR\s+Progress:\s*(\d+(?:\.\d+)?)\s*%", line, flags=re.IGNORECASE)
+    if m:
+        with suppress(Exception):
+            return max(0.0, min(1.0, float(m.group(1)) / 100.0))
+    m = re.search(r"Processing\s+Tiles:\s*(\d+)\s*/\s*(\d+).*?\((\d+(?:\.\d+)?)%\)", line, flags=re.IGNORECASE)
+    if m:
+        with suppress(Exception):
+            return max(0.0, min(1.0, float(m.group(3)) / 100.0))
+    m = re.search(r"Processing\s+Tiles:\s*(\d+)\s*/\s*(\d+)", line, flags=re.IGNORECASE)
+    if m:
+        with suppress(Exception):
+            return max(0.0, min(1.0, float(max(0, int(m.group(1)) - 1)) / float(max(1, int(m.group(2))))))
+    m = re.search(r"(?:Processed|Processing):\s*(\d+)\s*/\s*(\d+)", line, flags=re.IGNORECASE)
+    if m:
+        with suppress(Exception):
+            return max(0.0, min(1.0, float(int(m.group(1))) / float(max(1, int(m.group(2))))))
+    return None
+
+
+def _normalize_probe_progress_line(text: str) -> Tuple[str, bool]:
+    line = _strip_ansi(text).strip()
+    if not line:
+        return "", False
+    lc = line.lower()
+    transient = (
+        lc.startswith("sparkvsr progress:")
+        or lc.startswith("processing tiles:")
+        or lc.startswith("[sparkvsr] still running")
+        or "loading pipeline components" in lc
+        or "loading checkpoint shards" in lc
+    )
+    return line, transient
+
+
 def _candidate_settings(*, allow_full_sequence: bool = False) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen: set[Tuple[int, int, int]] = set()
@@ -374,6 +424,61 @@ def sparkvsr_auto_tune_action(
     state.setdefault("seed_controls", {})
     seed_controls = state.get("seed_controls", {})
     log_lines: List[str] = []
+    live_log_idx: Optional[int] = None
+    cmd_inline_progress_active = False
+    cmd_inline_progress_width = 0
+
+    def _finish_cmd_inline() -> None:
+        nonlocal cmd_inline_progress_active, cmd_inline_progress_width
+        if not cmd_inline_progress_active:
+            return
+        try:
+            print("", flush=True)
+        except Exception:
+            pass
+        cmd_inline_progress_active = False
+        cmd_inline_progress_width = 0
+
+    def _append_live_log(text: str, *, transient: bool = False) -> None:
+        nonlocal live_log_idx
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if transient:
+            if live_log_idx is None or live_log_idx >= len(log_lines):
+                log_lines.append(msg)
+                live_log_idx = len(log_lines) - 1
+            else:
+                log_lines[live_log_idx] = msg
+            return
+        live_log_idx = None
+        log_lines.append(msg)
+
+    def _print_probe_cmd_line(text: str, *, transient: bool = False) -> None:
+        nonlocal cmd_inline_progress_active, cmd_inline_progress_width
+        payload = str(text or "").rstrip("\r\n")
+        if not payload:
+            return
+        try:
+            if transient:
+                padded = payload
+                if cmd_inline_progress_width > len(payload):
+                    padded = payload + (" " * (cmd_inline_progress_width - len(payload)))
+                print(f"\r[SparkVSR AutoTune] {padded}", end="", flush=True)
+                cmd_inline_progress_active = True
+                cmd_inline_progress_width = len(payload)
+                return
+            _finish_cmd_inline()
+            print(f"[SparkVSR AutoTune] {payload}", flush=True)
+        except Exception:
+            pass
+
+    def _append_probe_output(text: str, *, transient: bool = False) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        _append_live_log(msg, transient=transient)
+        _print_probe_cmd_line(msg, transient=transient)
 
     def _indicator(title: str, subtitle: str) -> Dict[str, Any]:
         return gr.update(
@@ -420,8 +525,8 @@ def sparkvsr_auto_tune_action(
         msg = str(text or "").strip()
         if not msg:
             return
-        print(f"[SparkVSR AutoTune] {msg}", flush=True)
-        log_lines.append(msg)
+        _append_live_log(msg, transient=False)
+        _print_probe_cmd_line(msg, transient=False)
 
     session_dir: Optional[Path] = None
     autotune_log_path: Optional[Path] = None
@@ -469,6 +574,16 @@ def sparkvsr_auto_tune_action(
             _append_log("Global GPU selector is set to CPU. Auto Tune requires CUDA GPU mode.")
             yield _payload("Auto Tune unavailable in CPU mode.", show_indicator=False)
             return
+        split_stage_label = "ON" if bool(settings.get("split_stage_subprocesses", True)) else "OFF"
+        _append_log(
+            "Using current UI settings for SparkVSR probes: "
+            f"model={settings.get('model_name')}, precision={settings.get('precision')}, "
+            f"scale={settings.get('scale')}x, ref_mode={settings.get('ref_mode')}, "
+            f"cpu_offload={'ON' if bool(settings.get('cpu_offload', True)) else 'OFF'}, "
+            "vae_tiling=ON (forced during autotune), "
+            f"stage_subprocess_isolation={split_stage_label}, "
+            f"device={settings.get('device')}, save_vram={min_free_vram_target_gb:.1f}GB."
+        )
 
         dims = get_media_dimensions(input_path)
         if not dims:
@@ -480,13 +595,15 @@ def sparkvsr_auto_tune_action(
         allow_full_sequence = False
         if source_frame_count is None:
             _append_log(
-                "Could not determine source frame count. Auto Tune will still start with bounded "
-                f"temporal chunk_len={AUTOTUNE_TARGET_FRAMES} for safety."
+                "Could not determine source frame count. Auto Tune will start with a "
+                f"{AUTOTUNE_INITIAL_PROBE_FRAMES}-frame bounded probe and only create the "
+                f"{AUTOTUNE_MAX_PROBE_FRAMES}-frame growth clip if the top candidate passes."
             )
         else:
             _append_log(
                 f"Source frame count: {source_frame_count} ({frame_count_source}). "
-                f"Auto Tune starts with bounded chunk_len={AUTOTUNE_TARGET_FRAMES}; "
+                f"Auto Tune starts with a {AUTOTUNE_INITIAL_PROBE_FRAMES}-frame bounded probe; "
+                f"{AUTOTUNE_MAX_PROBE_FRAMES}-frame growth probes are deferred until needed. "
                 "chunk_len=0 full-sequence probes are skipped so longer clips stay inside the measured VRAM envelope."
             )
         temporal_policy_label = "bounded chunks required"
@@ -592,7 +709,20 @@ def sparkvsr_auto_tune_action(
                 else int(AUTOTUNE_TEMPORAL_OVERLAP)
             )
             spark_cfg["vae_tiling"] = True
+            spark_cfg["save_vram_gb"] = float(min_free_vram_target_gb)
             state["operation_status"] = "completed"
+            cached_path = str(cached.get("_path") or "cached log")
+            _append_log(f"Matched completed SparkVSR Auto Tune result: {cached_path}")
+            _append_log(
+                "Applied cached best config: "
+                f"chunk_len={spark_cfg['chunk_len']}, overlap_t={spark_cfg['overlap_t']}, "
+                f"tile={spark_cfg['tile_height']}x{spark_cfg['tile_width']}, "
+                f"spatial_overlap={spark_cfg['overlap_height']}x{spark_cfg['overlap_width']}, "
+                f"peak={float(best.get('measured_peak_vram_used_gb') or 0.0):.2f}GB, "
+                f"free={float(best.get('estimated_free_vram_gb') or 0.0):.2f}GB "
+                f"(target >= {min_free_vram_target_gb:.1f}GB), "
+                f"split_stage={'ON' if bool(settings.get('split_stage_subprocesses', True)) else 'OFF'}."
+            )
             summary_md = (
                 "**SparkVSR Auto Tune Result (cached)**\n"
                 f"- Temporal Policy: `{temporal_policy_label}`{source_frames_note}\n"
@@ -602,10 +732,11 @@ def sparkvsr_auto_tune_action(
                 f"- Temporal Chunk Length: `{spark_cfg['chunk_len']}` "
                 f"({'disabled/full sequence' if int(spark_cfg['chunk_len']) <= 0 else 'enabled'})\n"
                 f"- Temporal Overlap: `{spark_cfg['overlap_t']}`\n"
+                f"- Stage Subprocess Isolation: `{'ON' if bool(settings.get('split_stage_subprocesses', True)) else 'OFF'}`\n"
                 f"- Peak VRAM: `{float(best.get('measured_peak_vram_used_gb') or 0.0):.2f} GB`\n"
                 f"- Free VRAM estimate: `{float(best.get('estimated_free_vram_gb') or 0.0):.2f} GB` "
                 f"(target >= `{min_free_vram_target_gb:.1f} GB`)\n"
-                f"- Log file: `{cached.get('_path') or 'cached log'}`"
+                f"- Log file: `{cached_path}`"
             )
             yield _payload(
                 "Auto Tune reused a matching cached result.",
@@ -619,16 +750,24 @@ def sparkvsr_auto_tune_action(
             )
             return
 
-        probe_target_frames = int(AUTOTUNE_TARGET_FRAMES)
-        if source_frame_count is None or int(source_frame_count) > AUTOTUNE_TARGET_FRAMES:
-            probe_target_frames = int(AUTOTUNE_MAX_PROBE_FRAMES)
-        probe_target_frames = max(int(AUTOTUNE_TARGET_FRAMES), min(int(AUTOTUNE_MAX_PROBE_FRAMES), int(probe_target_frames)))
+        initial_probe_frames = int(AUTOTUNE_INITIAL_PROBE_FRAMES)
+        if source_frame_count is None:
+            growth_probe_frames = int(AUTOTUNE_MAX_PROBE_FRAMES)
+        else:
+            growth_probe_frames = max(
+                initial_probe_frames,
+                min(int(AUTOTUNE_MAX_PROBE_FRAMES), int(source_frame_count)),
+            )
+        probe_target_frames = initial_probe_frames
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
         session_dir = Path(temp_dir) / "sparkvsr_autotune" / stamp
         session_dir.mkdir(parents=True, exist_ok=True)
         demo_video_path = session_dir / f"sparkvsr_autotune_demo_{probe_target_frames}f.mp4"
         demo_ref_path = session_dir / "sparkvsr_autotune_reference.png"
+        growth_demo_video_path = session_dir / f"sparkvsr_autotune_demo_{growth_probe_frames}f.mp4"
+        growth_demo_ref_path = session_dir / "sparkvsr_autotune_reference_growth.png"
+        growth_demo_meta: Optional[Dict[str, Any]] = None
         demo_meta = _create_autotune_demo_video(
             input_path,
             demo_video_path,
@@ -637,7 +776,7 @@ def sparkvsr_auto_tune_action(
         )
         _extract_demo_reference(demo_video_path, demo_ref_path)
         _append_log(
-            f"Demo clip: {demo_meta['written_frames']} frames, {demo_meta['width']}x{demo_meta['height']} -> "
+            f"Initial demo clip: {demo_meta['written_frames']} frames, {demo_meta['width']}x{demo_meta['height']} -> "
             f"target {target_w}x{target_h}; keeping >= {min_free_vram_target_gb:.1f}GB free."
         )
         yield _payload(
@@ -658,6 +797,8 @@ def sparkvsr_auto_tune_action(
             "source_frame_count_source": str(frame_count_source or ""),
             "allow_full_sequence": bool(allow_full_sequence),
             "probe_target_frames": int(probe_target_frames),
+            "initial_probe_frames": int(initial_probe_frames),
+            "growth_probe_frames": int(growth_probe_frames),
             "tests": tests,
             "best_config": None,
             "frontier_verified": False,
@@ -685,50 +826,96 @@ def sparkvsr_auto_tune_action(
         _persist("running")
         run_counter = 0
         candidates = _candidate_settings(allow_full_sequence=allow_full_sequence)
-        growth_candidates = _growth_candidate_settings(probe_target_frames)
+        growth_candidates = _growth_candidate_settings(growth_probe_frames)
+        total_estimated_runs = max(1, len(candidates) + len(growth_candidates))
         top_rank = max(_quality_rank(c) for c in [*candidates, *growth_candidates])
+
+        def _ensure_growth_demo():
+            nonlocal growth_demo_meta
+            if growth_demo_meta is not None or int(growth_probe_frames) <= int(initial_probe_frames):
+                return
+            _append_log(
+                f"Creating {growth_probe_frames}-frame growth demo clip only after the initial safe probe passed."
+            )
+            yield _payload(
+                f"Preparing {growth_probe_frames}-frame growth probe clip...",
+                show_indicator=True,
+                tile_value=0,
+                overlap_hw_value=AUTOTUNE_SPATIAL_OVERLAP,
+                chunk_value=AUTOTUNE_TARGET_FRAMES,
+                overlap_t_value=AUTOTUNE_TEMPORAL_OVERLAP,
+                vae_tiling_value=True,
+            )
+            growth_demo_meta = _create_autotune_demo_video(
+                input_path,
+                growth_demo_video_path,
+                target_frames=int(growth_probe_frames),
+                resize_to=(effective_in_w, effective_in_h),
+            )
+            _extract_demo_reference(growth_demo_video_path, growth_demo_ref_path)
+            autotune_payload["growth_demo_clip"] = dict(growth_demo_meta)
+            _append_log(
+                f"Growth demo clip: {growth_demo_meta['written_frames']} frames, "
+                f"{growth_demo_meta['width']}x{growth_demo_meta['height']}."
+            )
+            _persist("running")
 
         def _run_probe_once(candidate: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal run_counter
             run_counter += 1
             tile = int(candidate["tile_height"])
             chunk_len = int(candidate["chunk_len"])
+            use_growth_demo = bool(chunk_len > int(initial_probe_frames))
+            active_demo_path = growth_demo_video_path if use_growth_demo else demo_video_path
+            active_demo_ref_path = growth_demo_ref_path if use_growth_demo else demo_ref_path
+            active_demo_meta = growth_demo_meta if use_growth_demo else demo_meta
+            if active_demo_meta is None:
+                raise RuntimeError(f"Growth probe clip was not prepared for chunk_len={chunk_len}.")
+
             probe_settings = settings.copy()
             probe_settings.update(candidate)
-            probe_settings["input_path"] = str(demo_video_path)
-            probe_settings["_effective_input_path"] = str(demo_video_path)
+            probe_settings["input_path"] = str(active_demo_path)
+            probe_settings["_effective_input_path"] = str(active_demo_path)
             probe_settings["_original_filename"] = Path(input_path).name
             probe_settings["_run_dir"] = str(session_dir)
             probe_settings["global_output_dir"] = str(session_dir)
             probe_settings["output_override"] = str(session_dir / f"probe_{run_counter:03d}_c{chunk_len}_t{tile}.mp4")
             probe_settings["auto_reference_prepass"] = False
             probe_settings["save_metadata"] = False
-            probe_settings["fps"] = float(demo_meta.get("fps") or 30.0)
+            probe_settings["fps"] = float(active_demo_meta.get("fps") or 30.0)
             probe_settings["vae_tiling"] = True
             probe_ref_mode = _normalize_probe_ref_mode(settings)
             probe_settings["ref_mode"] = probe_ref_mode
-            if probe_ref_mode == "sr_image" and demo_ref_path.exists():
-                probe_settings["ref_source_path"] = str(demo_ref_path)
+            if probe_ref_mode == "sr_image" and active_demo_ref_path.exists():
+                probe_settings["ref_source_path"] = str(active_demo_ref_path)
                 probe_settings["ref_indices"] = "0"
             elif probe_ref_mode == "no_ref":
                 probe_settings["ref_source_path"] = ""
 
             label = f"Test {run_counter}: chunk_len={chunk_len}, tile={tile if tile > 0 else 'full-frame'}"
-            _append_log(f"{label} - starting")
+            split_stage_requested = bool(probe_settings.get("split_stage_subprocesses", True))
+            _append_log(
+                f"{label} - starting | probe_frames={active_demo_meta.get('written_frames')} | "
+                f"split_stage={'ON' if split_stage_requested else 'OFF'}"
+            )
             if progress:
-                progress(min(0.99, run_counter / max(1, len(candidates))), desc=label)
-            yield_status = f"{label} | target {target_w}x{target_h} | keep >= {min_free_vram_target_gb:.1f}GB free"
+                progress(min(0.99, float(run_counter - 1) / float(total_estimated_runs)), desc=label)
 
             phase_state: Dict[str, Any] = {"phase": "startup", "chunks": 0, "tiles": 0}
             probe_cancel_event = threading.Event()
+            setattr(probe_cancel_event, "sparkvsr_cancel_reason", "vram_threshold")
             sampler_stop = threading.Event()
             sampler_box: Dict[str, Any] = {}
+            live_queue: "queue.Queue[str]" = queue.Queue()
+            result_box: Dict[str, Any] = {}
             process_re = re.compile(r"Processing:\s*F=(\d+)\s+H=(\d+)\s+W=(\d+)\s*\|\s*Chunks=(\d+)\s+Tiles=(\d+)", re.IGNORECASE)
 
             def _probe_progress(msg: str) -> None:
                 line = str(msg or "").strip()
                 if not line:
                     return
+                with suppress(Exception):
+                    live_queue.put_nowait(line)
                 lc = line.lower()
                 if "phase=tile" in lc or "running sparkvsr transformer" in lc:
                     phase_state["phase"] = "phase2"
@@ -746,7 +933,20 @@ def sparkvsr_auto_tune_action(
                     phase_state["chunks"] = int(m.group(4))
                     phase_state["tiles"] = int(m.group(5))
                 if cancel_event.is_set():
+                    setattr(probe_cancel_event, "sparkvsr_cancel_reason", "user_cancelled")
                     probe_cancel_event.set()
+
+            def _run_probe_worker() -> None:
+                try:
+                    result_box["result"] = run_sparkvsr(
+                        probe_settings,
+                        base_dir,
+                        on_progress=_probe_progress,
+                        cancel_event=probe_cancel_event,
+                        process_handle=None,
+                    )
+                except Exception as exc:
+                    result_box["result"] = SparkVSRResult(1, None, f"SparkVSR probe error: {exc}")
 
             sampler_thread = threading.Thread(
                 target=_sample_peak_vram_gb,
@@ -754,7 +954,7 @@ def sparkvsr_auto_tune_action(
                     sampler_stop,
                     sampler_box,
                     telemetry_gpu_ids,
-                    0.20,
+                    AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC,
                     phase_state,
                     probe_cancel_event,
                     min_free_vram_target_gb,
@@ -762,18 +962,74 @@ def sparkvsr_auto_tune_action(
                 ),
                 daemon=True,
             )
+            probe_thread = threading.Thread(target=_run_probe_worker, daemon=True)
             sampler_thread.start()
+            probe_thread.start()
             try:
-                result = run_sparkvsr(
-                    probe_settings,
-                    base_dir,
-                    on_progress=_probe_progress,
-                    cancel_event=probe_cancel_event,
-                    process_handle=None,
-                )
+                last_ui_emit = 0.0
+                last_live_line = ""
+                last_outer_progress = min(0.99, float(run_counter - 1) / float(total_estimated_runs))
+                while probe_thread.is_alive() or not live_queue.empty():
+                    drained = False
+                    for _ in range(80):
+                        try:
+                            raw_line = live_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        drained = True
+                        display_line, transient = _normalize_probe_progress_line(raw_line)
+                        if not display_line:
+                            continue
+                        last_live_line = display_line
+                        _append_probe_output(f"{label} | {display_line}", transient=transient)
+                        pct = _parse_sparkvsr_progress_fraction(display_line)
+                        if pct is not None and progress:
+                            outer_pct = min(
+                                0.99,
+                                (float(run_counter - 1) + max(0.0, min(1.0, float(pct)))) / float(total_estimated_runs),
+                            )
+                            outer_pct = max(last_outer_progress, outer_pct)
+                            last_outer_progress = outer_pct
+                            progress(outer_pct, desc=display_line[:120])
+
+                    if cancel_event.is_set():
+                        setattr(probe_cancel_event, "sparkvsr_cancel_reason", "user_cancelled")
+                        probe_cancel_event.set()
+
+                    now = time.time()
+                    if now - last_ui_emit >= AUTOTUNE_UI_UPDATE_INTERVAL_SEC:
+                        last_ui_emit = now
+                        peak_live = float(sampler_box.get("max_used_gb", 0.0) or 0.0)
+                        total_live = float(sampler_box.get("total_gb", 0.0) or total_vram_gb or 0.0)
+                        free_live = max(0.0, total_live - peak_live) if total_live > 0 and peak_live > 0 else 0.0
+                        vram_note = (
+                            f" | live peak={peak_live:.2f}GB, free={free_live:.2f}GB"
+                            if peak_live > 0
+                            else ""
+                        )
+                        detail = last_live_line or "waiting for SparkVSR progress output"
+                        yield _payload(
+                            f"{label} | {detail}{vram_note}",
+                            show_indicator=True,
+                            tile_value=int(tile),
+                            overlap_hw_value=int(candidate["overlap_height"]),
+                            chunk_value=int(chunk_len),
+                            overlap_t_value=int(candidate["overlap_t"]),
+                            vae_tiling_value=True,
+                        )
+
+                    if not drained:
+                        time.sleep(0.10)
+
+                probe_thread.join(timeout=1.0)
             finally:
                 sampler_stop.set()
                 sampler_thread.join(timeout=2.0)
+                _finish_cmd_inline()
+
+            result = result_box.get("result")
+            if not isinstance(result, SparkVSRResult):
+                result = SparkVSRResult(1, None, "SparkVSR probe ended without a result.")
 
             with suppress(Exception):
                 outp = Path(str(probe_settings.get("output_override") or ""))
@@ -790,6 +1046,15 @@ def sparkvsr_auto_tune_action(
             oom_phase = _detect_sparkvsr_oom_phase(result.log) if oom else ""
             canceled_by_user = bool(cancel_event.is_set())
             fast_probe_stop = bool(early_stop_reason == "threshold_reached")
+            result_log = str(result.log or "")
+            result_log_lc = result_log.lower()
+            split_cli_flag = bool("--split_stage_subprocesses" in result_log)
+            split_runtime_seen = bool(
+                "stage subprocess isolation enabled" in result_log_lc
+                or "[sparkvsr split] internal stage started" in result_log_lc
+            )
+            if split_stage_requested and not split_cli_flag:
+                _append_log(f"{label} warning: split-stage was requested but the CLI flag was not found in the runner log.")
             passed = bool(
                 int(result.returncode) == 0
                 and telemetry_ok
@@ -815,6 +1080,10 @@ def sparkvsr_auto_tune_action(
                 "samples": int(sampler_box.get("samples", 0) or 0),
                 "phase2_samples": int(sampler_box.get("phase2_samples", 0) or 0),
                 "probe_cancel_reason": early_stop_reason,
+                "split_stage_subprocesses": bool(split_stage_requested),
+                "split_stage_cli_flag": bool(split_cli_flag),
+                "split_stage_runtime_seen": bool(split_runtime_seen),
+                "probe_frames": int(active_demo_meta.get("written_frames") or 0),
                 "passed": bool(passed),
                 "quality_rank": int(_quality_rank(candidate)),
                 "frames": int(phase_state.get("frames") or 0),
@@ -838,6 +1107,8 @@ def sparkvsr_auto_tune_action(
                 "quality_rank": int(outcome["quality_rank"]),
                 "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
                 "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
+                "split_stage_subprocesses": bool(outcome.get("split_stage_subprocesses", True)),
+                "probe_frames": int(outcome.get("probe_frames") or 0),
             }
             status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
 
@@ -857,14 +1128,17 @@ def sparkvsr_auto_tune_action(
                 overlap_t_value=int(candidate["overlap_t"]),
                 vae_tiling_value=True,
             )
-            outcome = _run_probe_once(candidate)
+            outcome = yield from _run_probe_once(candidate)
             tests.append(outcome)
             _append_log(
                 f"Result chunk_len={outcome['chunk_len']} tile={outcome['tile_height'] or 'full-frame'} -> "
                 f"rc={outcome['returncode']}, peak={outcome['max_vram_used_gb']:.2f}GB, "
                 f"free={outcome['estimated_free_gb']:.2f}GB, telemetry_ok={outcome['telemetry_ok']}, "
                 f"oom={outcome['oom']}, stop={outcome.get('probe_cancel_reason') or 'none'}, "
-                f"chunks={outcome.get('chunks')}, tiles={outcome.get('tiles')}, passed={outcome['passed']}"
+                f"chunks={outcome.get('chunks')}, tiles={outcome.get('tiles')}, "
+                f"split_stage={outcome.get('split_stage_subprocesses')}, "
+                f"cli_flag={outcome.get('split_stage_cli_flag')}, runtime_seen={outcome.get('split_stage_runtime_seen')}, "
+                f"passed={outcome['passed']}"
             )
             _persist("running")
             return outcome
@@ -882,6 +1156,7 @@ def sparkvsr_auto_tune_action(
                     _append_log(
                         "Initial 65-frame probe passed. Probing larger temporal chunks for faster long-video throughput."
                     )
+                    yield from _ensure_growth_demo()
                 for candidate in growth_candidates:
                     if cancel_event.is_set():
                         status_reason = "cancelled"
@@ -968,6 +1243,7 @@ def sparkvsr_auto_tune_action(
                 f"({'disabled/full sequence' if int(spark_cfg['chunk_len']) <= 0 else 'enabled'})\n"
                 f"- Temporal Overlap: `{spark_cfg['overlap_t']}`\n"
                 f"- VAE Tiling: `ON`\n"
+                f"- Stage Subprocess Isolation: `{'ON' if bool(settings.get('split_stage_subprocesses', True)) else 'OFF'}`\n"
                 f"- Peak VRAM: `{float(best_config.get('measured_peak_vram_used_gb') or 0.0):.2f} GB`\n"
                 f"- Free VRAM estimate: `{float(best_config.get('estimated_free_vram_gb') or 0.0):.2f} GB` "
                 f"(target >= `{min_free_vram_target_gb:.1f} GB`)\n"

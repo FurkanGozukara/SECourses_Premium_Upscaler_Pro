@@ -665,7 +665,7 @@ def sparkvsr_tab(
                     placeholder="Leave blank for input video fallback, or provide image/video/folder",
                     info=(
                         "Used by sr_image mode. Blank uses the source video; a locally upscaled keyframe/video gives better detail. "
-                        "Auto first-frame references override this per chunk when enabled."
+                        "Auto first-frame references override this per SparkVSR temporal chunk when enabled."
                     ),
                 )
                 with gr.Row():
@@ -673,8 +673,8 @@ def sparkvsr_tab(
                         label="Auto Upscale First Frame per Chunk",
                         value=bool(_value("auto_reference_prepass", True)),
                         info=(
-                            "Before SparkVSR processes a chunk, upscale that chunk's first frame locally and use it "
-                            "as the sr_image reference for that chunk."
+                            "Before SparkVSR starts, upscale the first frame of each Temporal Chunk Length section "
+                            "and use the matching image as sr_image for that temporal chunk."
                         ),
                         scale=1,
                     )
@@ -1042,7 +1042,7 @@ def sparkvsr_tab(
             - `SparkVSR-fp8-scaled` is optional and generated locally from `SparkVSR-bf16` on first use, then reused from cache.
             - Precision is selected by the SparkVSR model.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
-            - Enable `Auto Upscale First Frame per Chunk` to generate one local SR reference per chunk before SparkVSR processing starts.
+            - Enable `Auto Upscale First Frame per Chunk` to generate local SR references for every SparkVSR `Temporal Chunk Length` section before SparkVSR processing starts. Each temporal chunk uses its own first-frame `sr_image` reference.
             - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.
 
             **Runtime notes**

@@ -57,6 +57,10 @@ from shared.comparison_video_service import maybe_generate_input_vs_output_compa
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
+from shared.sparkvsr_ref_utils import (
+    build_temporal_reference_specs,
+    write_temporal_reference_manifest,
+)
 
 # Cancel event for SparkVSR processing
 _sparkvsr_cancel_event = threading.Event()
@@ -763,13 +767,20 @@ def build_sparkvsr_callbacks(
             return "gan", raw
         return "seedvr2", ""
 
-    def _copy_or_extract_first_frame(src_input: str, dst_path: Path, on_progress=None) -> Optional[Path]:
+    def _copy_or_extract_reference_frame(
+        src_input: str,
+        dst_path: Path,
+        *,
+        frame_index: int = 0,
+        on_progress=None,
+    ) -> Optional[Path]:
         try:
             src = Path(normalize_path(src_input))
             dst = Path(dst_path)
             dst.parent.mkdir(parents=True, exist_ok=True)
+            requested_idx = max(0, int(frame_index or 0))
             if not src.exists():
-                _auto_ref_log(on_progress, f"source missing for first-frame extraction: {src}")
+                _auto_ref_log(on_progress, f"source missing for reference frame extraction: {src}")
                 return None
 
             kind = detect_input_type(str(src))
@@ -788,21 +799,53 @@ def build_sparkvsr_callbacks(
                 if not frames:
                     _auto_ref_log(on_progress, f"frame directory has no supported images: {src}")
                     return None
-                return _copy_or_extract_first_frame(str(frames[0]), dst, on_progress=on_progress)
+                chosen = frames[min(requested_idx, len(frames) - 1)]
+                return _copy_or_extract_reference_frame(str(chosen), dst, frame_index=0, on_progress=on_progress)
 
             if kind == "video":
-                from shared.frame_utils import extract_first_frame
+                try:
+                    from decord import VideoReader, cpu  # type: ignore
+                    from PIL import Image
 
-                ok, frame_path, err = extract_first_frame(str(src), str(dst), format="png")
+                    vr = VideoReader(str(src), ctx=cpu(0))
+                    if len(vr) > 0:
+                        read_idx = min(requested_idx, len(vr) - 1)
+                        frame_obj = vr[read_idx]
+                        frame_np = frame_obj.asnumpy() if hasattr(frame_obj, "asnumpy") else frame_obj.cpu().numpy()
+                        Image.fromarray(frame_np).convert("RGB").save(dst, format="PNG")
+                        return dst if dst.exists() else None
+                except Exception:
+                    pass
+
+                try:
+                    import cv2  # type: ignore
+
+                    cap = cv2.VideoCapture(str(src))
+                    if cap.isOpened():
+                        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                        read_idx = min(requested_idx, max(0, total - 1)) if total > 0 else requested_idx
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, read_idx)
+                        ok, frame = cap.read()
+                        cap.release()
+                        if ok and frame is not None and cv2.imwrite(str(dst), frame):
+                            return dst if dst.exists() else None
+                    else:
+                        cap.release()
+                except Exception:
+                    pass
+
+                from shared.frame_utils import extract_frame_by_number
+
+                ok, frame_path, err = extract_frame_by_number(str(src), requested_idx, str(dst), format="png")
                 if ok and frame_path and Path(frame_path).exists():
                     return Path(frame_path)
-                _auto_ref_log(on_progress, f"failed to extract first frame from {src.name}: {err}")
+                _auto_ref_log(on_progress, f"failed to extract frame {requested_idx} from {src.name}: {err}")
                 return None
 
             _auto_ref_log(on_progress, f"unsupported source type for first-frame reference: {src}")
             return None
         except Exception as exc:
-            _auto_ref_log(on_progress, f"first-frame extraction failed: {exc}")
+            _auto_ref_log(on_progress, f"reference frame extraction failed: {exc}")
             return None
 
     def _finalize_reference_image(candidate_path: Optional[str], dst_path: Path, on_progress=None) -> Optional[Path]:
@@ -1108,35 +1151,47 @@ def build_sparkvsr_callbacks(
             _auto_ref_log(on_progress, f"FlashVSR+ reference generation failed: {exc}")
             return None
 
-    def _prepare_auto_reference_for_input(
-        chunk_cfg: Dict[str, Any],
+    def _estimate_auto_ref_source_frame_count(source_input: str) -> Optional[int]:
+        try:
+            src = Path(normalize_path(source_input))
+            kind = detect_input_type(str(src))
+            if kind == "image":
+                return 1
+            if kind == "directory":
+                return len(list_files_sorted(src, IMAGE_EXTENSIONS))
+            if kind == "video":
+                try:
+                    import cv2  # type: ignore
+
+                    cap = cv2.VideoCapture(str(src))
+                    try:
+                        if cap.isOpened():
+                            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                            if count > 0:
+                                return count
+                    finally:
+                        cap.release()
+                except Exception:
+                    pass
+                duration = get_media_duration_seconds(str(src))
+                fps = get_media_fps(str(src))
+                if duration and fps and duration > 0 and fps > 0:
+                    return max(1, int(round(float(duration) * float(fps))))
+        except Exception:
+            return None
+        return None
+
+    def _upscale_auto_reference_frame(
         *,
+        frame: Path,
+        desired_ref: Path,
+        work_dir: Path,
+        chunk_cfg: Dict[str, Any],
         seed_controls: Dict[str, Any],
         snapshot: Dict[str, Any],
-        ref_root: Path,
-        label: str,
         on_progress=None,
-    ) -> Optional[str]:
-        if not _to_bool(chunk_cfg.get("auto_reference_prepass"), False):
-            return None
-        if _sparkvsr_cancel_event.is_set():
-            return None
-
-        source_input = normalize_path(chunk_cfg.get("_effective_input_path") or chunk_cfg.get("input_path") or "")
-        if not source_input:
-            return None
-        safe_label = sanitize_filename(label) or "reference"
-        work_dir = collision_safe_dir(ref_root / safe_label)
-        raw_frame = work_dir / f"{safe_label}_source_first_frame.png"
-        desired_ref = work_dir / f"{safe_label}_sr_reference.png"
-
-        _auto_ref_log(on_progress, f"{label}: extracting first frame")
-        frame = _copy_or_extract_first_frame(source_input, raw_frame, on_progress=on_progress)
-        if not frame:
-            return None
-
+    ) -> Optional[Path]:
         backend, gan_model = _normalize_auto_ref_key(chunk_cfg.get("auto_reference_upscaler", "SeedVR2"))
-        _auto_ref_log(on_progress, f"{label}: upscaling first frame with {chunk_cfg.get('auto_reference_upscaler', 'SeedVR2')}")
         generated: Optional[Path] = None
         if backend == "seedvr2":
             generated = _run_seedvr2_reference(
@@ -1166,12 +1221,123 @@ def build_sparkvsr_callbacks(
                 snapshot=snapshot,
                 on_progress=on_progress,
             )
+        return generated if generated and Path(generated).exists() else None
 
-        if generated and Path(generated).exists():
-            _auto_ref_log(on_progress, f"{label}: reference ready -> {generated}")
-            return str(generated)
-        _auto_ref_log(on_progress, f"{label}: selected upscaler did not produce a reference; stopping auto-reference prepass")
-        return None
+    def _prepare_auto_references_for_temporal_chunks(
+        chunk_cfg: Dict[str, Any],
+        *,
+        seed_controls: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        ref_root: Path,
+        label: str,
+        on_progress=None,
+    ) -> Optional[str]:
+        if not _to_bool(chunk_cfg.get("auto_reference_prepass"), False):
+            return None
+        if _sparkvsr_cancel_event.is_set():
+            return None
+
+        source_input = normalize_path(chunk_cfg.get("_effective_input_path") or chunk_cfg.get("input_path") or "")
+        if not source_input:
+            return None
+        total_frames = _estimate_auto_ref_source_frame_count(source_input)
+        if not total_frames or total_frames <= 0:
+            _auto_ref_log(on_progress, f"{label}: could not determine frame count for temporal reference prepass")
+            return None
+
+        chunk_len = max(0, _to_int(chunk_cfg.get("chunk_len"), 65))
+        overlap_t = max(0, _to_int(chunk_cfg.get("overlap_t"), 8 if chunk_len > 0 else 0))
+        if chunk_len > 0 and overlap_t >= chunk_len:
+            overlap_t = max(0, chunk_len - 1)
+        start_frame = max(0, _to_int(chunk_cfg.get("start_frame"), 0))
+        end_frame = _to_int(chunk_cfg.get("end_frame"), -1)
+        specs = build_temporal_reference_specs(
+            int(total_frames),
+            chunk_len,
+            overlap_t,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+        if not specs:
+            _auto_ref_log(on_progress, f"{label}: no temporal reference frames were selected")
+            return None
+
+        safe_label = sanitize_filename(label) or "reference"
+        work_dir = collision_safe_dir(ref_root / safe_label)
+        upscaler_name = str(chunk_cfg.get("auto_reference_upscaler", "SeedVR2") or "SeedVR2")
+        _auto_ref_log(
+            on_progress,
+            (
+                f"{label}: preparing {len(specs)} temporal reference(s) "
+                f"(chunk_len={chunk_len}, overlap={overlap_t}, frames={specs[0]['effective_frame_count']})"
+            ),
+        )
+
+        manifest_entries: List[Dict[str, Any]] = []
+        for spec in specs:
+            if _sparkvsr_cancel_event.is_set():
+                return None
+            order = int(spec["order"])
+            t_start = int(spec["t_start"])
+            source_frame = int(spec["source_frame"])
+            raw_frame = work_dir / f"{safe_label}_temporal_{order:04d}_source_frame_{source_frame:06d}.png"
+            desired_ref = work_dir / f"{safe_label}_temporal_{order:04d}_frame_{t_start:06d}_sr_reference.png"
+
+            _auto_ref_log(
+                on_progress,
+                f"{label}: extracting temporal chunk {order}/{len(specs)} first frame (source frame {source_frame})",
+            )
+            frame = _copy_or_extract_reference_frame(
+                source_input,
+                raw_frame,
+                frame_index=source_frame,
+                on_progress=on_progress,
+            )
+            if not frame:
+                return None
+
+            _auto_ref_log(
+                on_progress,
+                f"{label}: upscaling temporal reference {order}/{len(specs)} with {upscaler_name}",
+            )
+            generated = _upscale_auto_reference_frame(
+                frame=frame,
+                desired_ref=desired_ref,
+                work_dir=work_dir,
+                chunk_cfg=chunk_cfg,
+                seed_controls=seed_controls,
+                snapshot=snapshot,
+                on_progress=on_progress,
+            )
+            if not generated:
+                _auto_ref_log(
+                    on_progress,
+                    f"{label}: selected upscaler did not produce temporal reference {order}/{len(specs)}",
+                )
+                return None
+
+            manifest_entries.append(
+                {
+                    "order": order,
+                    "t_start": t_start,
+                    "t_end": int(spec["t_end"]),
+                    "source_frame": source_frame,
+                    "reference_path": Path(generated).name,
+                }
+            )
+
+        manifest = write_temporal_reference_manifest(
+            work_dir,
+            source_path=source_input,
+            entries=manifest_entries,
+            chunk_len=chunk_len,
+            overlap_t=overlap_t,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            upscaler=upscaler_name,
+        )
+        _auto_ref_log(on_progress, f"{label}: temporal reference manifest ready -> {manifest}")
+        return str(work_dir)
 
     def _apply_auto_reference_to_chunk_settings(chunk_cfg: Dict[str, Any], ref_path: Optional[str]) -> Dict[str, Any]:
         if not ref_path:
@@ -2268,7 +2434,7 @@ def build_sparkvsr_callbacks(
                                 pre_cfg["output_override"] = str(
                                     Path(item_out_dir) / "processed_chunks" / f"{Path(chunk_path).stem}_upscaled.mp4"
                                 )
-                                ref_path = _prepare_auto_reference_for_input(
+                                ref_path = _prepare_auto_references_for_temporal_chunks(
                                     pre_cfg,
                                     seed_controls=seed_controls,
                                     snapshot=global_settings,
@@ -2323,7 +2489,7 @@ def build_sparkvsr_callbacks(
                         outp = result.output_path
                     else:
                         if _to_bool(item_settings.get("auto_reference_prepass"), False):
-                            ref_path = _prepare_auto_reference_for_input(
+                            ref_path = _prepare_auto_references_for_temporal_chunks(
                                 item_settings,
                                 seed_controls=seed_controls,
                                 snapshot=global_settings,
@@ -2847,7 +3013,7 @@ def build_sparkvsr_callbacks(
                                     Path(chunk_settings.get("_processed_chunks_dir") or auto_ref_root.parent / "processed_chunks")
                                     / f"{Path(chunk_path).stem}_upscaled.mp4"
                                 )
-                                ref_path = _prepare_auto_reference_for_input(
+                                ref_path = _prepare_auto_references_for_temporal_chunks(
                                     pre_cfg,
                                     seed_controls=seed_controls,
                                     snapshot=global_settings,
@@ -2920,7 +3086,7 @@ def build_sparkvsr_callbacks(
                         result_holder["chunk_count"] = int(chunk_count or 0)
                     else:
                         if _to_bool(settings.get("auto_reference_prepass"), False):
-                            ref_path = _prepare_auto_reference_for_input(
+                            ref_path = _prepare_auto_references_for_temporal_chunks(
                                 settings,
                                 seed_controls=seed_controls,
                                 snapshot=global_settings,

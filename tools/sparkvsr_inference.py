@@ -45,6 +45,12 @@ from shared.sparkvsr_fp8_scaled import (
     load_fp8_scaled_text_encoder,
     load_fp8_scaled_transformer,
 )
+from shared.sparkvsr_ref_utils import (
+    choose_temporal_reference_path,
+    load_temporal_reference_manifest,
+    make_temporal_chunks,
+    temporal_padding_to_vae_grid,
+)
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
@@ -215,16 +221,6 @@ def remove_padding_and_extra_frames(video: torch.Tensor, pad_f: int, pad_h: int,
     return video
 
 
-def temporal_padding_to_vae_grid(frame_count: int, period: int = 8) -> int:
-    """SparkVSR/CogVideoX VAE round-trips frame counts exactly on the 8n+1 grid."""
-    frame_count = int(frame_count)
-    period = max(1, int(period or 1))
-    if frame_count <= 0:
-        return 0
-    remainder = (frame_count - 1) % period
-    return 0 if remainder == 0 else period - remainder
-
-
 def pad_video_chunk_to_vae_grid(video_chunk: torch.Tensor) -> Tuple[torch.Tensor, int]:
     if video_chunk.ndim != 5:
         raise ValueError(f"Expected video chunk tensor [B,C,F,H,W], got shape={tuple(video_chunk.shape)}")
@@ -277,27 +273,6 @@ def fit_generated_slice_to_target(
             flush=True,
         )
     return fitted
-
-
-def make_temporal_chunks(frame_count: int, chunk_len: int, overlap_t: int = 8) -> List[Tuple[int, int]]:
-    frame_count = int(frame_count)
-    if int(chunk_len or 0) <= 0 or frame_count <= int(chunk_len or 0):
-        return [(0, frame_count)]
-    chunk = int(chunk_len)
-    overlap = int(overlap_t or 0)
-    effective_stride = chunk - overlap
-    if effective_stride <= 0:
-        raise ValueError("chunk_len must be greater than overlap_t")
-    starts = [0]
-    while starts[-1] + chunk < frame_count:
-        next_start = starts[-1] + effective_stride
-        if next_start + chunk >= frame_count:
-            if next_start < frame_count and next_start != starts[-1]:
-                starts.append(next_start)
-            break
-        starts.append(next_start)
-    starts = sorted(set(max(0, min(int(s), max(0, frame_count - 1))) for s in starts))
-    return [(s, min(s + chunk, frame_count)) for s in starts]
 
 
 def make_spatial_tiles(height: int, width: int, tile_size_hw: Tuple[int, int], overlap_hw: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
@@ -1506,21 +1481,38 @@ def _load_local_sr_reference(
     raise ValueError(f"Unsupported local SR reference path: {source}")
 
 
-def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor, video_lr: torch.Tensor, original_shape, effective_upscale: int) -> Tuple[List[int], List[torch.Tensor]]:
+def build_ref_frames(
+    args,
+    video_name: str,
+    video_path: str,
+    video: torch.Tensor,
+    video_lr: torch.Tensor,
+    original_shape,
+    effective_upscale: int,
+    *,
+    ref_source_override: Optional[str] = None,
+    ref_indices_override: Optional[List[int]] = None,
+    log_label: str = "",
+) -> Tuple[List[int], List[torch.Tensor]]:
     from shared.sparkvsr_ref_utils import _select_indices, save_ref_frames_locally
 
     if args.ref_mode == "no_ref":
         print("Running in No-Ref mode (0 reference frames).", flush=True)
         return [], []
 
-    ref_indices = parse_ref_indices(args.ref_indices)
-    if ref_indices is not None:
+    if ref_indices_override is not None:
+        ref_indices = sorted(set(int(v) for v in ref_indices_override))
+        label = f" for {log_label}" if log_label else ""
+        print(f"Using temporal chunk reference indices{label}: {ref_indices}", flush=True)
+    else:
+        ref_indices = parse_ref_indices(args.ref_indices)
+    if ref_indices is not None and ref_indices_override is None:
         ref_indices = sorted(set(ref_indices))
         for i in range(len(ref_indices) - 1):
             if ref_indices[i + 1] - ref_indices[i] < 4:
                 raise ValueError("Reference frame interval must be >= 4.")
         print(f"Using manually specified reference indices: {ref_indices}", flush=True)
-    else:
+    elif ref_indices is None:
         ref_indices = _select_indices(video.shape[2])
         print(f"Using auto-selected reference indices: {ref_indices}", flush=True)
 
@@ -1554,7 +1546,7 @@ def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor
         return ref_indices, ref_frames_list
 
     if args.ref_mode == "sr_image":
-        ref_source_path = str(args.ref_source_path or "").strip()
+        ref_source_path = str(ref_source_override or args.ref_source_path or "").strip()
         if not ref_source_path:
             ref_source_path = str(video_path)
             print(
@@ -1620,6 +1612,38 @@ def build_ref_frames(args, video_name: str, video_path: str, video: torch.Tensor
         return ref_indices, ref_frames_list
 
     raise ValueError(f"Unsupported ref_mode: {args.ref_mode}")
+
+
+def build_temporal_chunk_ref_frames(
+    args,
+    video_name: str,
+    video_path: str,
+    video: torch.Tensor,
+    video_lr: torch.Tensor,
+    original_shape,
+    effective_upscale: int,
+    temporal_ref_index: Dict[int, Path],
+    t_start: int,
+) -> Tuple[List[int], List[torch.Tensor]]:
+    ref_path = choose_temporal_reference_path(temporal_ref_index, int(t_start))
+    if ref_path is None:
+        return build_ref_frames(args, video_name, video_path, video, video_lr, original_shape, effective_upscale)
+    print(
+        f"Using temporal sr_image reference for chunk starting at frame {int(t_start)}: {ref_path}",
+        flush=True,
+    )
+    return build_ref_frames(
+        args,
+        video_name,
+        video_path,
+        video,
+        video_lr,
+        original_shape,
+        effective_upscale,
+        ref_source_override=str(ref_path),
+        ref_indices_override=[int(t_start)],
+        log_label=f"t={int(t_start)}",
+    )
 
 
 def collect_video_files(input_dir: str) -> List[str]:
@@ -1800,23 +1824,47 @@ def main() -> int:
         video = (video_up / 255.0 * 2.0) - 1.0
         video = video.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
 
-        emit_progress(video_pct(0.13), "references", f"preparing reference mode: {args.ref_mode}", step=index, total=len(video_files), started_at=run_started_at)
-        ref_indices, ref_frames_list = build_ref_frames(args, video_name, video_path, video, video_lr, original_shape, effective_upscale)
-        emit_progress(
-            video_pct(0.16),
-            "references",
-            f"reference frames ready: {len(ref_frames_list)}",
-            step=index,
-            total=len(video_files),
-            started_at=run_started_at,
-        )
-
         _, _, frame_count, height, width = video.shape
         overlap_t = int(args.overlap_t if args.chunk_len > 0 else 0)
         tile_size_hw = (int(args.tile_size_hw[0]), int(args.tile_size_hw[1]))
         overlap_hw = (int(args.overlap_hw[0]), int(args.overlap_hw[1])) if tile_size_hw != (0, 0) else (0, 0)
         time_chunks = make_temporal_chunks(frame_count, int(args.chunk_len), overlap_t)
         spatial_tiles = make_spatial_tiles(height, width, tile_size_hw, overlap_hw)
+
+        emit_progress(video_pct(0.13), "references", f"preparing reference mode: {args.ref_mode}", step=index, total=len(video_files), started_at=run_started_at)
+        temporal_ref_index: Dict[int, Path] = {}
+        if args.ref_mode == "sr_image":
+            temporal_ref_index = load_temporal_reference_manifest(str(args.ref_source_path or ""))
+            if temporal_ref_index:
+                print(
+                    f"Using temporal sr_image reference manifest with {len(temporal_ref_index)} reference(s): "
+                    f"{args.ref_source_path}",
+                    flush=True,
+                )
+        if temporal_ref_index:
+            ref_indices: List[int] = []
+            ref_frames_list: List[torch.Tensor] = []
+            ref_ready_detail = f"temporal references ready: {len(temporal_ref_index)} for {len(time_chunks)} chunk(s)"
+        else:
+            ref_indices, ref_frames_list = build_ref_frames(
+                args,
+                video_name,
+                video_path,
+                video,
+                video_lr,
+                original_shape,
+                effective_upscale,
+            )
+            ref_ready_detail = f"reference frames ready: {len(ref_frames_list)}"
+        emit_progress(
+            video_pct(0.16),
+            "references",
+            ref_ready_detail,
+            step=index,
+            total=len(video_files),
+            started_at=run_started_at,
+        )
+
         output_video = torch.zeros_like(video)
         print(
             f"Processing: F={frame_count} H={height} W={width} | "
@@ -1834,7 +1882,25 @@ def main() -> int:
 
         total_steps = max(1, len(time_chunks) * len(spatial_tiles))
         step_idx = 0
+        temporal_ref_cache: Dict[int, Tuple[List[int], List[torch.Tensor]]] = {}
         for t_start, t_end in time_chunks:
+            if temporal_ref_index and int(t_start) not in temporal_ref_cache:
+                temporal_ref_cache[int(t_start)] = build_temporal_chunk_ref_frames(
+                    args,
+                    video_name,
+                    video_path,
+                    video,
+                    video_lr,
+                    original_shape,
+                    effective_upscale,
+                    temporal_ref_index,
+                    int(t_start),
+                )
+            chunk_ref_indices, chunk_ref_frames = (
+                temporal_ref_cache[int(t_start)]
+                if temporal_ref_index
+                else (ref_indices, ref_frames_list)
+            )
             for h_start, h_end, w_start, w_end in spatial_tiles:
                 step_idx += 1
                 tile_start_local = 0.18 + ((step_idx - 1) / total_steps) * 0.68
@@ -1862,7 +1928,7 @@ def main() -> int:
                         f"{int(inference_video_chunk.shape[2])} for VAE frame-grid compatibility",
                         flush=True,
                     )
-                current_ref_frames = [rf[:, h_start:h_end, w_start:w_end] for rf in ref_frames_list]
+                current_ref_frames = [rf[:, h_start:h_end, w_start:w_end] for rf in chunk_ref_frames]
 
                 def tile_progress(local_frac: float, detail: str) -> None:
                     tile_local = 0.18 + (((step_idx - 1) + max(0.0, min(1.0, float(local_frac)))) / total_steps) * 0.68
@@ -1881,7 +1947,7 @@ def main() -> int:
                         video=inference_video_chunk,
                         prompt=prompt,
                         ref_frames=current_ref_frames,
-                        ref_indices=ref_indices,
+                        ref_indices=chunk_ref_indices,
                         chunk_start_idx=t_start,
                         progress_cb=tile_progress,
                     )
@@ -1893,7 +1959,7 @@ def main() -> int:
                         video=inference_video_chunk,
                         prompt=prompt,
                         ref_frames=current_ref_frames,
-                        ref_indices=ref_indices,
+                        ref_indices=chunk_ref_indices,
                         chunk_start_idx=t_start,
                         noise_step=args.noise_step,
                         sr_noise_step=args.sr_noise_step,

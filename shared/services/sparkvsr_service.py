@@ -61,6 +61,48 @@ from shared.video_fps_utils import apply_video_fps_override_preprocess
 # Cancel event for SparkVSR processing
 _sparkvsr_cancel_event = threading.Event()
 
+SPARKVSR_DEFAULT_PROMPT = (
+    "Super-resolution and restoration task: upscale this low-resolution video to high definition. "
+    "Restore sharpness, clarity, natural fine detail, and temporal consistency while removing blur, "
+    "digital noise, grain, and compression artifacts. Preserve the original content, identity, motion, "
+    "colors, lighting, and scene structure without adding new objects or stylization."
+)
+SPARKVSR_PROMPT_PRESETS: Dict[str, str] = {
+    "Faithful Restoration": SPARKVSR_DEFAULT_PROMPT,
+    "Noisy / Compressed Video": (
+        "Super-resolution and restoration task: upscale this low-resolution video to high definition. "
+        "Prioritize clean reconstruction by removing compression blocks, ringing, mosquito noise, banding, "
+        "blur, and digital noise while preserving natural texture, colors, motion, and temporal consistency. "
+        "Avoid oversharpening, waxy smoothing, new objects, or stylized detail."
+    ),
+    "Old Film Restoration": (
+        "Super-resolution and old-film restoration task: upscale this degraded archival video to high definition. "
+        "Recover stable sharp detail and temporal consistency while reducing blur, flicker, dust, scratches, "
+        "noise, grain, and compression artifacts. Preserve the original era, faces, costumes, lighting, colors, "
+        "film character, and scene structure without modernizing or stylizing the footage."
+    ),
+    "People / Faces": (
+        "Super-resolution and restoration task: upscale this low-resolution video to high definition. "
+        "Preserve identity, facial structure, skin texture, hair detail, expressions, body motion, clothing, "
+        "lighting, and natural colors while restoring sharpness and reducing blur, noise, and compression artifacts. "
+        "Avoid changing age, face shape, eye direction, makeup, or adding artificial beauty effects."
+    ),
+    "Animation / Anime": (
+        "Super-resolution and restoration task: upscale this animated video to high definition. "
+        "Preserve clean line art, flat colors, cel shading, character identity, motion, and temporal consistency "
+        "while reducing blur, noise, banding, and compression artifacts. Keep edges crisp without adding realistic "
+        "texture, film grain, or style changes."
+    ),
+    "Text / Signs": (
+        "Super-resolution and restoration task: upscale this video to high definition with extra care for text, "
+        "signs, subtitles, labels, patterns, edges, and small high-frequency details. Improve clarity and readability "
+        "while preserving the original content, colors, perspective, motion, and temporal consistency. Avoid inventing "
+        "new letters, symbols, logos, or scene details."
+    ),
+}
+SPARKVSR_PROMPT_CUSTOM_PRESET = "Custom"
+SPARKVSR_PROMPT_PRESET_CHOICES: List[str] = [*SPARKVSR_PROMPT_PRESETS.keys(), SPARKVSR_PROMPT_CUSTOM_PRESET]
+
 
 def run_sparkvsr(*args, **kwargs):
     """Lazy-import SparkVSR runner so the Gradio process stays backend-light."""
@@ -324,6 +366,15 @@ def canonical_sparkvsr_scale(
     return _nearest_supported_scale(scale_value, default_scale)
 
 
+def sparkvsr_precision_for_model(model_name: Optional[str] = None) -> str:
+    model = str(model_name or get_sparkvsr_default_model() or "").strip()
+    model_meta = get_sparkvsr_metadata(model)
+    raw = str(getattr(model_meta, "default_dtype", "bfloat16") if model_meta else "bfloat16").strip().lower()
+    precision_aliases = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+    precision = precision_aliases.get(raw, raw)
+    return precision if precision in set(SPARKVSR_PRECISION_OPTIONS) else "bfloat16"
+
+
 def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Defaults aligned to the official SparkVSR inference script and ComfyUI node defaults.
@@ -339,7 +390,7 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
     model_meta = get_sparkvsr_metadata(default_model)
 
     if model_meta:
-        default_precision = model_meta.default_dtype
+        default_precision = sparkvsr_precision_for_model(default_model)
         scale = int(model_meta.default_scale)
         chunk_len = int(model_meta.default_chunk_len)
         overlap_t = int(model_meta.default_overlap_t)
@@ -402,6 +453,8 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "enable_debug": False,
         "seed": 0,
         "auto_transfer_output_to_input": False,
+        "prompt_preset": "Faithful Restoration",
+        "prompt": SPARKVSR_DEFAULT_PROMPT,
         "device": cuda_default,
         "fps": 0.0,
         "codec": "libx264",
@@ -465,6 +518,8 @@ SPARKVSR_ORDER: List[str] = [
     "enable_debug",
     "seed",
     "auto_transfer_output_to_input",
+    "prompt_preset",
+    "prompt",
     "device",
     "fps",
     "codec",
@@ -523,10 +578,7 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["scale"] = str(scale)
     cfg["upscale_factor"] = float(scale)
 
-    precision = str(cfg.get("precision", cfg.get("dtype", defaults.get("precision", "bfloat16")))).strip().lower()
-    precision_aliases = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
-    precision = precision_aliases.get(precision, precision)
-    cfg["precision"] = precision if precision in set(SPARKVSR_PRECISION_OPTIONS) else "bfloat16"
+    cfg["precision"] = sparkvsr_precision_for_model(model_name)
     upscale_mode = str(cfg.get("upscale_mode", defaults.get("upscale_mode", "bilinear")) or "bilinear").strip().lower()
     cfg["upscale_mode"] = upscale_mode if upscale_mode in set(SPARKVSR_UPSCALE_MODE_OPTIONS) else "bilinear"
     cfg["noise_step"] = max(0, _to_int(cfg.get("noise_step"), 0))
@@ -543,6 +595,13 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         cfg.get("auto_transfer_output_to_input"),
         _to_bool(defaults.get("auto_transfer_output_to_input", False), False),
     )
+    prompt_preset = str(cfg.get("prompt_preset", defaults.get("prompt_preset", "Faithful Restoration")) or "").strip()
+    if prompt_preset not in SPARKVSR_PROMPT_PRESET_CHOICES:
+        prompt_preset = SPARKVSR_PROMPT_CUSTOM_PRESET
+    cfg["prompt_preset"] = prompt_preset
+    cfg["prompt"] = str(cfg.get("prompt", defaults.get("prompt", SPARKVSR_DEFAULT_PROMPT)) or "").strip()
+    if len(cfg["prompt"]) > 2000:
+        cfg["prompt"] = cfg["prompt"][:2000]
     cfg["force_offload"] = _to_bool(cfg.get("force_offload"), _to_bool(defaults.get("force_offload", True), True))
     cfg["enable_debug"] = _to_bool(cfg.get("enable_debug"), _to_bool(defaults.get("enable_debug", False), False))
 

@@ -4,7 +4,9 @@ SparkVSR subprocess runner for the SECourses pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -63,6 +65,12 @@ def _bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _format_command_for_log(cmd: List[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline([str(part) for part in cmd])
+    return shlex.join([str(part) for part in cmd])
 
 
 def _format_duration(seconds: float) -> str:
@@ -313,6 +321,8 @@ def run_sparkvsr(
             log(gpu_note)
         if python_exe != sys.executable:
             log(f"[SparkVSR] Using venv python: {python_exe}")
+        prompt_text = str(settings.get("prompt") or "").strip()
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
         tile_h = max(0, _parse_int(settings.get("tile_height"), 0))
         tile_w = max(0, _parse_int(settings.get("tile_width"), 0))
@@ -376,6 +386,8 @@ def run_sparkvsr(
             "--device",
             device_arg,
         ]
+        if prompt_text:
+            cmd.extend(["--prompt", prompt_text])
         lora_path = normalize_path(settings.get("lora_path") or "")
         if lora_path:
             cmd.extend(["--lora_path", lora_path])
@@ -408,12 +420,13 @@ def run_sparkvsr(
             f"dtype={settings.get('precision')}, chunk_len={settings.get('chunk_len')}, "
             f"tile={tile_h}x{tile_w}"
         )
+        log(f"[SparkVSR] Prompt: chars={len(prompt_text)}, sha256={prompt_hash[:12]}")
         log(
             "[SparkVSR] Stage Subprocess Isolation: "
             f"{'ON' if split_stage_enabled else 'OFF'} "
             f"({'--split_stage_subprocesses will be passed' if split_stage_enabled else 'single-process SparkVSR path'})"
         )
-        log(f"Command: {' '.join(cmd)}")
+        log(f"Command: {_format_command_for_log(cmd)}")
 
         env = {
             **os.environ,
@@ -548,6 +561,8 @@ def run_sparkvsr(
                         "tile_width": settings.get("tile_width"),
                         "split_stage_subprocesses": settings.get("split_stage_subprocesses"),
                         "ref_mode": settings.get("ref_mode"),
+                        "prompt_sha256": prompt_hash,
+                        "prompt_chars": len(prompt_text),
                     },
                 )
                 log_lines.append("Command logged to executed_commands folder")

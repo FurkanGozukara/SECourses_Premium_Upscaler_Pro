@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import hashlib
 import json
 import os
 import subprocess
@@ -27,7 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
 import imageio.v3 as iio
 import torch
 from PIL import Image
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from transformers import set_seed
 
 from diffusers import CogVideoXDPMScheduler, CogVideoXImageToVideoPipeline
@@ -49,6 +50,8 @@ VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 SPLIT_STAGE_REQUEST_KIND = "sparkvsr_split_stage_request_v1"
 SPLIT_STAGE_STATE_KIND = "sparkvsr_split_stage_state_v1"
+PROMPT_EMBEDDING_KEY = "prompt_embedding"
+EMPTY_PROMPT_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 def release_torch_memory() -> None:
@@ -191,9 +194,8 @@ def preprocess_video_match(
     pad_w = 0
 
     if is_match:
-        remainder = (frame_count - 1) % 8
-        if remainder != 0:
-            pad_f = 8 - remainder
+        pad_f = temporal_padding_to_vae_grid(frame_count)
+        if pad_f > 0:
             frames = torch.cat([frames, frames[-1:].repeat(pad_f, 1, 1, 1)], dim=0)
         pad_h = (4 - height % 4) % 4
         pad_w = (4 - width % 4) % 4
@@ -211,6 +213,70 @@ def remove_padding_and_extra_frames(video: torch.Tensor, pad_f: int, pad_h: int,
     if pad_w > 0:
         video = video[:, :, :, :, :-pad_w]
     return video
+
+
+def temporal_padding_to_vae_grid(frame_count: int, period: int = 8) -> int:
+    """SparkVSR/CogVideoX VAE round-trips frame counts exactly on the 8n+1 grid."""
+    frame_count = int(frame_count)
+    period = max(1, int(period or 1))
+    if frame_count <= 0:
+        return 0
+    remainder = (frame_count - 1) % period
+    return 0 if remainder == 0 else period - remainder
+
+
+def pad_video_chunk_to_vae_grid(video_chunk: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    if video_chunk.ndim != 5:
+        raise ValueError(f"Expected video chunk tensor [B,C,F,H,W], got shape={tuple(video_chunk.shape)}")
+    frame_count = int(video_chunk.shape[2])
+    pad_t = temporal_padding_to_vae_grid(frame_count)
+    if pad_t <= 0:
+        return video_chunk, 0
+    if frame_count <= 0:
+        raise ValueError("Cannot pad an empty temporal chunk")
+    tail = video_chunk[:, :, -1:, :, :].repeat(1, 1, pad_t, 1, 1)
+    return torch.cat([video_chunk, tail], dim=2), pad_t
+
+
+def _repeat_last_to_size(tensor: torch.Tensor, dim: int, target_size: int) -> torch.Tensor:
+    current = int(tensor.shape[dim])
+    target_size = int(target_size)
+    if current >= target_size:
+        return tensor
+    if current <= 0:
+        raise ValueError(f"Cannot pad empty tensor dimension {dim} to {target_size}")
+    index = [slice(None)] * tensor.ndim
+    index[dim] = slice(current - 1, current)
+    tail = tensor[tuple(index)]
+    repeats = [1] * tensor.ndim
+    repeats[dim] = target_size - current
+    return torch.cat([tensor, tail.repeat(*repeats)], dim=dim)
+
+
+def fit_generated_slice_to_target(
+    generated_slice: torch.Tensor,
+    target_shape: Tuple[int, ...],
+    *,
+    context: str,
+) -> torch.Tensor:
+    fitted = generated_slice
+    target_shape = tuple(int(v) for v in target_shape)
+    if fitted.ndim != len(target_shape):
+        raise RuntimeError(f"{context}: generated rank {fitted.ndim} does not match target rank {len(target_shape)}")
+    original_shape = tuple(int(v) for v in fitted.shape)
+    for dim, target_size in enumerate(target_shape):
+        current = int(fitted.shape[dim])
+        if current > target_size:
+            fitted = fitted.narrow(dim, 0, target_size)
+        elif current < target_size:
+            fitted = _repeat_last_to_size(fitted, dim, target_size)
+    if tuple(int(v) for v in fitted.shape) != original_shape:
+        print(
+            f"[SparkVSR] Warning: adjusted generated tile slice for merge: "
+            f"{context}, source={original_shape}, target={target_shape}, fitted={tuple(fitted.shape)}",
+            flush=True,
+        )
+    return fitted
 
 
 def make_temporal_chunks(frame_count: int, chunk_len: int, overlap_t: int = 8) -> List[Tuple[int, int]]:
@@ -630,6 +696,8 @@ def process_video_ref_i2v(
     empty_prompt_embedding: Optional[torch.Tensor] = None,
     ref_guidance_scale: float = 1.0,
     progress_cb: Optional[Callable[[float, str], None]] = None,
+    prompt_embedding_cache: Optional[Dict[str, torch.Tensor]] = None,
+    model_path_for_prompt_cache: Optional[Path] = None,
 ) -> torch.Tensor:
     def mark(frac: float, detail: str) -> None:
         if progress_cb:
@@ -676,11 +744,27 @@ def process_video_ref_i2v(
         if ncopy:
             input_latent = torch.cat([input_latent[:, :, :1].repeat(1, 1, ncopy, 1, 1), input_latent], dim=2)
 
-    if prompt == "" and empty_prompt_embedding is not None:
+    prompt = normalize_prompt_text(prompt)
+    prompt_hash = prompt_embedding_hash(prompt)
+    prompt_embedding: Optional[torch.Tensor] = None
+    if prompt_embedding_cache is not None and prompt_hash in prompt_embedding_cache:
+        mark(0.36, f"using cached text prompt embedding {prompt_hash[:12]}")
+        prompt_embedding = prompt_embedding_cache[prompt_hash].to(device, dtype=dtype)
+    elif prompt == "" and empty_prompt_embedding is not None:
+        mark(0.36, f"using cached text prompt embedding {prompt_hash[:12]}")
         prompt_embedding = empty_prompt_embedding.to(device, dtype=dtype)
-        if prompt_embedding.shape[0] != batch_size:
-            prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
     else:
+        if model_path_for_prompt_cache is not None:
+            cached_embedding, cached_path = load_prompt_embedding_from_cache(model_path_for_prompt_cache, prompt)
+            if cached_embedding is not None:
+                print(
+                    f"[SparkVSR] text: using cached prompt embedding {prompt_hash[:12]} from {cached_path}",
+                    flush=True,
+                )
+                mark(0.36, f"using cached text prompt embedding {prompt_hash[:12]}")
+                prompt_embedding = cached_embedding.to(device, dtype=dtype)
+
+    if prompt_embedding is None:
         mark(0.36, "encoding text prompt")
         prompt_token_ids = pipe.tokenizer(
             prompt,
@@ -690,9 +774,19 @@ def process_video_ref_i2v(
             add_special_tokens=True,
             return_tensors="pt",
         ).input_ids
+        print(f"[SparkVSR] text: prompt encoding (hash={prompt_hash[:12]}, chars={len(prompt)})", flush=True)
         prompt_embedding = pipe.text_encoder(prompt_token_ids.to(device))[0]
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=dtype)
+        if model_path_for_prompt_cache is not None:
+            saved_path = save_prompt_embedding_to_cache(model_path_for_prompt_cache, prompt, prompt_embedding)
+            if saved_path is not None:
+                print(f"[SparkVSR] text: prompt cache saved: {saved_path}", flush=True)
+
+    if prompt_embedding.shape[0] != batch_size:
+        prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
+    if prompt_embedding_cache is not None:
+        prompt_embedding_cache[prompt_hash] = _clone_tensor_to_cpu(prompt_embedding[:1])
 
     latents = input_latent.permute(0, 2, 1, 3, 4)
     if do_cfg:
@@ -842,15 +936,31 @@ def _run_split_text_stage(args: argparse.Namespace, state_in_path: Path, state_o
     set_seed(int(args.seed or 0))
     _profile_cuda_memory("split text start", reset_peak=True)
     payload = _load_split_blob(state_in_path, SPLIT_STAGE_STATE_KIND)
-    prompt = str(payload.get("prompt") or "")
+    prompt = normalize_prompt_text(payload.get("prompt"))
+    prompt_hash = prompt_embedding_hash(prompt)
     lq_latent = payload.get("lq_latent")
     batch_size = int(lq_latent.shape[0]) if isinstance(lq_latent, torch.Tensor) and lq_latent.ndim >= 1 else 1
 
     model_path = _ensure_model_path_ready(args, started_at, stage_label="split text")
-    cached_empty_embedding = find_empty_prompt_embedding(model_path) if prompt == "" else None
-    if cached_empty_embedding is not None:
-        print("[SparkVSR split] text: using cached empty prompt embedding", flush=True)
-        prompt_embedding = cached_empty_embedding
+    emit_progress(
+        0.02,
+        "prompt_cache",
+        f"split text: checking prompt cache {prompt_hash[:12]}",
+        started_at=started_at,
+    )
+    cached_embedding, cached_path = load_prompt_embedding_from_cache(model_path, prompt)
+    if cached_embedding is not None:
+        print(
+            f"[SparkVSR split] text: using cached prompt embedding {prompt_hash[:12]} from {cached_path}",
+            flush=True,
+        )
+        emit_progress(
+            0.12,
+            "prompt_cache",
+            f"split text: prompt cache hit {prompt_hash[:12]}",
+            started_at=started_at,
+        )
+        prompt_embedding = cached_embedding
     else:
         pipe = load_sparkvsr_pipeline(
             args,
@@ -870,9 +980,12 @@ def _run_split_text_stage(args: argparse.Namespace, state_in_path: Path, state_o
             add_special_tokens=True,
             return_tensors="pt",
         ).input_ids
-        print("[SparkVSR split] text: prompt encoding", flush=True)
+        print(f"[SparkVSR split] text: prompt encoding (hash={prompt_hash[:12]}, chars={len(prompt)})", flush=True)
         prompt_embedding = pipe.text_encoder(prompt_token_ids.to(execution_device))[0]
         _profile_cuda_memory("split text after prompt encode")
+        saved_path = save_prompt_embedding_to_cache(model_path, prompt, prompt_embedding)
+        if saved_path is not None:
+            print(f"[SparkVSR split] text: prompt cache saved: {saved_path}", flush=True)
 
     if prompt_embedding.shape[0] != batch_size:
         prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
@@ -910,7 +1023,8 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
     batch_size, _, num_frames, height, width = lq_latent.shape
     device = lq_latent.device
     latent_dtype = lq_latent.dtype
-    prompt = str(payload.get("prompt") or "")
+    prompt = normalize_prompt_text(payload.get("prompt"))
+    prompt_hash = prompt_embedding_hash(prompt)
     ref_guidance_scale = float(args.ref_guidance_scale or 1.0)
 
     print("[SparkVSR split] transformer: conditioning", flush=True)
@@ -934,27 +1048,40 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         if prompt_embedding.shape[0] != batch_size:
             prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
     else:
-        print("[SparkVSR split] transformer: prompt embedding missing; loading text encoder fallback", flush=True)
-        fallback_pipe = load_sparkvsr_pipeline(
-            args,
-            dtype,
-            started_at,
-            stage_label="split transformer text fallback",
-            component_overrides={"vae": None, "transformer": None},
-        )
-        fallback_device = getattr(fallback_pipe, "_execution_device", None) or fallback_pipe.device
-        max_text_seq_length = _max_text_seq_length_for_model(Path(args.model_path))
-        prompt_token_ids = fallback_pipe.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_text_seq_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        ).input_ids
-        prompt_embedding = fallback_pipe.text_encoder(prompt_token_ids.to(fallback_device))[0]
-        _, seq_len, _ = prompt_embedding.shape
-        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_dtype)
+        cached_embedding, cached_path = load_prompt_embedding_from_cache(Path(args.model_path), prompt)
+        if cached_embedding is not None:
+            print(
+                f"[SparkVSR split] transformer: using cached prompt embedding {prompt_hash[:12]} from {cached_path}",
+                flush=True,
+            )
+            prompt_embedding = cached_embedding.to(device, dtype=latent_dtype)
+            if prompt_embedding.shape[0] != batch_size:
+                prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
+        else:
+            print("[SparkVSR split] transformer: prompt embedding missing; loading text encoder fallback", flush=True)
+            fallback_pipe = load_sparkvsr_pipeline(
+                args,
+                dtype,
+                started_at,
+                stage_label="split transformer text fallback",
+                component_overrides={"vae": None, "transformer": None},
+            )
+            fallback_device = getattr(fallback_pipe, "_execution_device", None) or fallback_pipe.device
+            max_text_seq_length = _max_text_seq_length_for_model(Path(args.model_path))
+            prompt_token_ids = fallback_pipe.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=max_text_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            ).input_ids
+            prompt_embedding = fallback_pipe.text_encoder(prompt_token_ids.to(fallback_device))[0]
+            _, seq_len, _ = prompt_embedding.shape
+            prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_dtype)
+            saved_path = save_prompt_embedding_to_cache(Path(args.model_path), prompt, prompt_embedding)
+            if saved_path is not None:
+                print(f"[SparkVSR split] transformer: prompt cache saved: {saved_path}", flush=True)
 
     latents = input_latent.permute(0, 2, 1, 3, 4)
     if do_cfg:
@@ -1228,16 +1355,82 @@ def parse_ref_indices(text: Optional[str]) -> Optional[List[int]]:
     return values if values else None
 
 
-def find_empty_prompt_embedding(model_path: Path) -> Optional[torch.Tensor]:
-    candidates = [
-        Path.cwd() / "pretrained_models" / "prompt_embeddings" / "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors",
-        model_path / "prompt_embeddings" / "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors",
-        model_path.parent / "prompt_embeddings" / "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors",
-    ]
+def normalize_prompt_text(prompt: object) -> str:
+    return str(prompt or "").strip()
+
+
+def prompt_embedding_hash(prompt: object) -> str:
+    return hashlib.sha256(normalize_prompt_text(prompt).encode("utf-8")).hexdigest()
+
+
+def _prompt_embedding_cache_path(model_path: Path, prompt_hash: str) -> Path:
+    return model_path / "prompt_embeddings" / f"{prompt_hash}.safetensors"
+
+
+def _prompt_embedding_cache_candidates(model_path: Path, prompt_hash: str) -> List[Path]:
+    candidates = [_prompt_embedding_cache_path(model_path, prompt_hash)]
+    if prompt_hash == EMPTY_PROMPT_SHA256:
+        candidates = [
+            Path.cwd() / "pretrained_models" / "prompt_embeddings" / f"{prompt_hash}.safetensors",
+            *candidates,
+            model_path.parent / "prompt_embeddings" / f"{prompt_hash}.safetensors",
+        ]
+    deduped: List[Path] = []
+    seen = set()
     for candidate in candidates:
-        if candidate.exists():
-            return load_file(str(candidate))["prompt_embedding"]
-    return None
+        key = str(candidate)
+        if key not in seen:
+            deduped.append(candidate)
+            seen.add(key)
+    return deduped
+
+
+def load_prompt_embedding_from_cache(model_path: Path, prompt: object) -> Tuple[Optional[torch.Tensor], Optional[Path]]:
+    prompt_hash = prompt_embedding_hash(prompt)
+    for candidate in _prompt_embedding_cache_candidates(model_path, prompt_hash):
+        if not candidate.exists():
+            continue
+        try:
+            payload = load_file(str(candidate), device="cpu")
+            tensor = payload.get(PROMPT_EMBEDDING_KEY)
+            if isinstance(tensor, torch.Tensor):
+                return tensor, candidate
+        except Exception as exc:
+            print(f"[SparkVSR] prompt cache unreadable: {candidate} ({exc})", flush=True)
+    return None, None
+
+
+def save_prompt_embedding_to_cache(model_path: Path, prompt: object, prompt_embedding: torch.Tensor) -> Optional[Path]:
+    if not isinstance(prompt_embedding, torch.Tensor):
+        return None
+    prompt_hash = prompt_embedding_hash(prompt)
+    cache_path = _prompt_embedding_cache_path(model_path, prompt_hash)
+    tmp_path: Optional[Path] = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tensor = prompt_embedding.detach().cpu()
+        if tensor.ndim >= 1 and tensor.shape[0] > 1:
+            tensor = tensor[:1]
+        tensor = tensor.contiguous()
+        tmp_path = cache_path.with_name(f".{cache_path.stem}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
+        save_file(
+            {PROMPT_EMBEDDING_KEY: tensor},
+            str(tmp_path),
+            metadata={"prompt_sha256": prompt_hash, "prompt_chars": str(len(normalize_prompt_text(prompt)))},
+        )
+        os.replace(str(tmp_path), str(cache_path))
+        return cache_path
+    except Exception as exc:
+        print(f"[SparkVSR] prompt cache save failed: {cache_path} ({exc})", flush=True)
+        if tmp_path is not None:
+            with suppress(Exception):
+                tmp_path.unlink(missing_ok=True)
+        return None
+
+
+def find_empty_prompt_embedding(model_path: Path) -> Optional[torch.Tensor]:
+    tensor, _ = load_prompt_embedding_from_cache(model_path, "")
+    return tensor
 
 
 def _align_reference_tensor(tensor: torch.Tensor, target_h: int, target_w: int, mode: str = "bicubic") -> torch.Tensor:
@@ -1445,6 +1638,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SparkVSR inference entrypoint for SECourses.")
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--input_json", type=str, default=None)
+    parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--lora_path", type=str, default="")
     parser.add_argument("--output_path", type=str, required=True)
@@ -1516,6 +1710,7 @@ def main() -> int:
     emit_progress(0.005, "startup", "validated inputs", started_at=run_started_at)
     pipe: Optional[CogVideoXImageToVideoPipeline] = None
     empty_prompt_embedding: Optional[torch.Tensor] = None
+    prompt_embedding_cache: Dict[str, torch.Tensor] = {}
     if args.split_stage_subprocesses:
         print(
             "[SparkVSR split] Stage subprocess isolation enabled. "
@@ -1526,6 +1721,8 @@ def main() -> int:
     else:
         pipe = load_sparkvsr_pipeline(args, dtype, run_started_at, stage_label="main")
         empty_prompt_embedding = find_empty_prompt_embedding(model_path)
+        if empty_prompt_embedding is not None:
+            prompt_embedding_cache[EMPTY_PROMPT_SHA256] = _clone_tensor_to_cpu(empty_prompt_embedding[:1])
         emit_progress(0.13, "ready", "model ready; starting videos", started_at=run_started_at)
 
     for index, video_path in enumerate(video_files, 1):
@@ -1536,7 +1733,9 @@ def main() -> int:
             return video_base + max(0.0, min(1.0, float(local))) * video_span
 
         video_name = Path(video_path).name
-        prompt = prompt_dict.get(video_name, "")
+        prompt = normalize_prompt_text(prompt_dict.get(video_name, getattr(args, "prompt", "") or ""))
+        prompt_hash = prompt_embedding_hash(prompt)
+        print(f"Prompt: sha256={prompt_hash[:12]}, chars={len(prompt)}", flush=True)
         print(f"[{index}/{len(video_files)}] Reading {video_name}", flush=True)
         emit_progress(
             video_pct(0.02),
@@ -1654,6 +1853,15 @@ def main() -> int:
                     started_at=run_started_at,
                 )
                 video_chunk = video[:, :, t_start:t_end, h_start:h_end, w_start:w_end]
+                original_chunk_frames = int(video_chunk.shape[2])
+                inference_video_chunk, chunk_pad_t = pad_video_chunk_to_vae_grid(video_chunk)
+                if chunk_pad_t > 0:
+                    print(
+                        f"[SparkVSR] Temporal chunk padding: tile {step_idx}/{total_steps} "
+                        f"frames {t_start}:{t_end} padded {original_chunk_frames} -> "
+                        f"{int(inference_video_chunk.shape[2])} for VAE frame-grid compatibility",
+                        flush=True,
+                    )
                 current_ref_frames = [rf[:, h_start:h_end, w_start:w_end] for rf in ref_frames_list]
 
                 def tile_progress(local_frac: float, detail: str) -> None:
@@ -1670,7 +1878,7 @@ def main() -> int:
                 if args.split_stage_subprocesses:
                     generated = process_video_ref_i2v_split_subprocesses(
                         args=args,
-                        video=video_chunk,
+                        video=inference_video_chunk,
                         prompt=prompt,
                         ref_frames=current_ref_frames,
                         ref_indices=ref_indices,
@@ -1682,7 +1890,7 @@ def main() -> int:
                         raise RuntimeError("SparkVSR pipeline was not loaded")
                     generated = process_video_ref_i2v(
                         pipe=pipe,
-                        video=video_chunk,
+                        video=inference_video_chunk,
                         prompt=prompt,
                         ref_frames=current_ref_frames,
                         ref_indices=ref_indices,
@@ -1692,7 +1900,11 @@ def main() -> int:
                         empty_prompt_embedding=empty_prompt_embedding,
                         ref_guidance_scale=args.ref_guidance_scale,
                         progress_cb=tile_progress,
+                        prompt_embedding_cache=prompt_embedding_cache,
+                        model_path_for_prompt_cache=model_path,
                     )
+                if int(generated.shape[2]) > original_chunk_frames:
+                    generated = generated[:, :, :original_chunk_frames, :, :].contiguous()
                 region = get_valid_tile_region(
                     t_start,
                     t_end,
@@ -1705,21 +1917,34 @@ def main() -> int:
                     overlap_hw[0],
                     overlap_hw[1],
                 )
-                output_video[
+                output_region = output_video[
                     :,
                     :,
                     region["out_t_start"] : region["out_t_end"],
                     region["out_h_start"] : region["out_h_end"],
                     region["out_w_start"] : region["out_w_end"],
-                ] = generated[
+                ]
+                generated_region = generated[
                     :,
                     :,
                     region["valid_t_start"] : region["valid_t_end"],
                     region["valid_h_start"] : region["valid_h_end"],
                     region["valid_w_start"] : region["valid_w_end"],
                 ]
+                generated_region = fit_generated_slice_to_target(
+                    generated_region,
+                    tuple(output_region.shape),
+                    context=(
+                        f"tile {step_idx}/{total_steps}, t={t_start}:{t_end}, "
+                        f"h={h_start}:{h_end}, w={w_start}:{w_end}"
+                    ),
+                )
+                output_region.copy_(generated_region)
                 del generated
                 del video_chunk
+                del inference_video_chunk
+                del generated_region
+                del output_region
                 del current_ref_frames
                 release_torch_memory()
                 emit_progress(

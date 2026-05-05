@@ -18,11 +18,15 @@ import time
 from shared.services.sparkvsr_service import (
     build_sparkvsr_callbacks,
     SPARKVSR_ORDER,
-    SPARKVSR_PRECISION_OPTIONS,
     SPARKVSR_UPSCALE_MODE_OPTIONS,
     SPARKVSR_REF_MODE_OPTIONS,
     SPARKVSR_SAVE_FORMAT_OPTIONS,
+    SPARKVSR_DEFAULT_PROMPT,
+    SPARKVSR_PROMPT_PRESETS,
+    SPARKVSR_PROMPT_PRESET_CHOICES,
+    SPARKVSR_PROMPT_CUSTOM_PRESET,
     canonical_sparkvsr_scale,
+    sparkvsr_precision_for_model,
 )
 from shared.services.gan_service import PREFERRED_GAN_DEFAULT_MODEL, get_gan_model_metadata_lightweight
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
@@ -433,33 +437,24 @@ def sparkvsr_tab(
             
             with gr.Group():
                 with gr.Row():
-                    precision = gr.Dropdown(
-                        label="Precision",
-                        choices=list(SPARKVSR_PRECISION_OPTIONS),
-                        value=(
-                            str(_value("precision", _value("dtype", "bfloat16")))
-                            if str(_value("precision", _value("dtype", "bfloat16"))) in set(SPARKVSR_PRECISION_OPTIONS)
-                            else "bfloat16"
-                        ),
-                        info="Default is bfloat16, matching the official SparkVSR script.",
-                    )
-                    noise_step = gr.Slider(
-                        label="Noise Step",
-                        minimum=0,
-                        maximum=999,
-                        step=1,
-                        value=int(_value("noise_step", 0) or 0),
-                        info="Reference/noise timestep. Official default is 0.",
-                    )
-                    sr_noise_step = gr.Slider(
-                        label="SR Noise Step",
-                        minimum=1,
-                        maximum=999,
-                        step=1,
-                        value=int(_value("sr_noise_step", 399) or 399),
-                        info="Super-resolution denoise timestep. Official default is 399.",
-                    )
-                    with gr.Column(scale=1):
+                    precision = gr.State(value=sparkvsr_precision_for_model(model_name_value))
+                    with gr.Column(scale=1, min_width=240):
+                        noise_step = gr.Slider(
+                            label="Noise Step",
+                            minimum=0,
+                            maximum=999,
+                            step=1,
+                            value=int(_value("noise_step", 0) or 0),
+                            info="Reference/noise timestep. Official default is 0.",
+                        )
+                        sr_noise_step = gr.Slider(
+                            label="SR Noise Step",
+                            minimum=1,
+                            maximum=999,
+                            step=1,
+                            value=int(_value("sr_noise_step", 399) or 399),
+                            info="Super-resolution denoise timestep. Official default is 399.",
+                        )
                         seed = gr.Number(
                             label="Random Seed",
                             value=_value("seed", 0),
@@ -471,7 +466,25 @@ def sparkvsr_tab(
                             value=bool(_value("auto_transfer_output_to_input", False)),
                             info="After upscale completes, automatically copy the latest output path into Input Path.",
                         )
-                    with gr.Column(scale=1):
+                    with gr.Column(scale=2, min_width=320):
+                        _prompt_preset_value = str(_value("prompt_preset", "Faithful Restoration") or "Faithful Restoration")
+                        if _prompt_preset_value not in set(SPARKVSR_PROMPT_PRESET_CHOICES):
+                            _prompt_preset_value = SPARKVSR_PROMPT_CUSTOM_PRESET
+                        prompt_preset = gr.Dropdown(
+                            label="Prompt Preset",
+                            choices=SPARKVSR_PROMPT_PRESET_CHOICES,
+                            value=_prompt_preset_value,
+                            interactive=True,
+                            info="Select a task prompt, then edit the prompt text if needed.",
+                        )
+                        prompt = gr.Textbox(
+                            label="Prompt",
+                            value=str(_value("prompt", SPARKVSR_DEFAULT_PROMPT) or ""),
+                            lines=4,
+                            max_lines=8,
+                            info="Text conditioning for SparkVSR. Encodings are cached by prompt hash and reused.",
+                        )
+                    with gr.Column(scale=1, min_width=260):
                         auto_tune_btn = gr.Button(
                             "Auto Tune for Max Quality - VRAM Optimized",
                             size="md",
@@ -1027,6 +1040,7 @@ def sparkvsr_tab(
             **Model defaults**
             - `SparkVSR-bf16` is the default distributed model.
             - `SparkVSR-fp8-scaled` is optional and generated locally from `SparkVSR-bf16` on first use, then reused from cache.
+            - Precision is selected by the SparkVSR model.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.
             - Enable `Auto Upscale First Frame per Chunk` to generate one local SR reference per chunk before SparkVSR processing starts.
             - Best local quality comes from `sr_image` with a locally upscaled keyframe/video, or `pisasr` when PiSA-SR is installed. `no_ref` is only a baseline.
@@ -1038,6 +1052,7 @@ def sparkvsr_tab(
             - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
             - Spatial tiling uses output-resolution tiles; `0 x 0` disables tiling.
             - CPU offload, VAE tiling, and Stage Subprocess Isolation are enabled by default for safer redistribution across mixed GPUs.
+            - Prompt presets fill the prompt box; prompt text is hashed and its text-encoder output is cached per SparkVSR model.
             """)
     
     # Collect inputs
@@ -1051,7 +1066,7 @@ def sparkvsr_tab(
         ref_source_path, auto_reference_prepass, auto_reference_upscaler,
         ref_pisa_cache_dir, pisa_python_executable, pisa_script_path,
         pisa_sd_model_path, pisa_chkpt_path, pisa_gpu, png_save, save_format,
-        force_offload, enable_debug, seed, auto_transfer_output_to_input, device, fps_SparkVSR,
+        force_offload, enable_debug, seed, auto_transfer_output_to_input, prompt_preset, prompt, device, fps_SparkVSR,
         codec, crf, start_frame, end_frame, models_dir,
         save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
@@ -1066,6 +1081,27 @@ def sparkvsr_tab(
         )
     
     # Wire up events
+    def _apply_prompt_preset(preset_name: str, current_prompt: str) -> gr.update:
+        preset = str(preset_name or "").strip()
+        if preset == SPARKVSR_PROMPT_CUSTOM_PRESET:
+            return gr.update(value=str(current_prompt or ""))
+        return gr.update(value=SPARKVSR_PROMPT_PRESETS.get(preset, str(current_prompt or "")))
+
+    prompt_preset.change(
+        fn=_apply_prompt_preset,
+        inputs=[prompt_preset, prompt],
+        outputs=[prompt],
+        queue=False,
+        show_progress="hidden",
+    )
+    model_name.change(
+        fn=lambda selected_model: sparkvsr_precision_for_model(selected_model),
+        inputs=[model_name],
+        outputs=[precision],
+        queue=False,
+        show_progress="hidden",
+    )
+
     def _analysis_progress_note(state: Dict[str, Any], pct: int) -> str:
         seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
         scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))

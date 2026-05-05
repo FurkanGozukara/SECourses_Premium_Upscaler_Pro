@@ -575,10 +575,13 @@ def sparkvsr_auto_tune_action(
             yield _payload("Auto Tune unavailable in CPU mode.", show_indicator=False)
             return
         split_stage_label = "ON" if bool(settings.get("split_stage_subprocesses", True)) else "OFF"
+        prompt_text = str(settings.get("prompt") or "")
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
         _append_log(
             "Using current UI settings for SparkVSR probes: "
             f"model={settings.get('model_name')}, precision={settings.get('precision')}, "
             f"scale={settings.get('scale')}x, ref_mode={settings.get('ref_mode')}, "
+            f"prompt_sha256={prompt_hash[:12]}, prompt_chars={len(prompt_text)}, "
             f"cpu_offload={'ON' if bool(settings.get('cpu_offload', True)) else 'OFF'}, "
             "vae_tiling=ON (forced during autotune), "
             f"stage_subprocess_isolation={split_stage_label}, "

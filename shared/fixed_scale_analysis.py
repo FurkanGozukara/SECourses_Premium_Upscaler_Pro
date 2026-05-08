@@ -343,7 +343,7 @@ def build_fixed_scale_analysis_update(
         requested_scale=float(scale_x),
         model_scale=int(ms),
         max_edge=int(max_edge or 0),
-        force_pre_downscale=True,
+        force_pre_downscale=pre_down,
     )
 
     out_w = int(plan.final_saved_width or plan.resize_width)
@@ -386,9 +386,10 @@ def build_fixed_scale_analysis_update(
                 f"then upscaled {ms}x"
             )
         else:
-            cap_base_w = max(1, int(round(float(out_w) / float(ms))))
-            cap_base_h = max(1, int(round(float(out_h) / float(ms))))
-            cap_path = f"equivalent base: ~{cap_base_w}x{cap_base_h}px for fixed {ms}x pass"
+            cap_path = (
+                f"post-resize after raw fixed {ms}x model output "
+                f"({plan.resize_width}x{plan.resize_height} -> {out_w}x{out_h})"
+            )
         sizing_rows.append(_stat_row("Cap-Aware Upscale Path", cap_path))
 
     if plan.pre_downscale_then_upscale and plan.preprocess_scale < 0.999999:
@@ -435,7 +436,12 @@ def build_fixed_scale_analysis_update(
                 )
             )
         else:
-            runtime_rows.append(_stat_row("Actual Preprocess", "OFF: no input pre-downscale before model pass"))
+            runtime_rows.append(
+                _stat_row(
+                    "Actual Preprocess",
+                    "OFF: no input pre-downscale before model pass; final output is post-resized",
+                )
+            )
 
         requested_long = int(round(input_long * scale_x))
         clamp_line = (

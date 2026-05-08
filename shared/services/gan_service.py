@@ -32,6 +32,7 @@ from shared.output_run_manager import (
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
+from shared.fixed_scale_output import enforce_fixed_scale_output_size
 from shared.comparison_unified import create_unified_comparison, create_video_comparison_slider
 from shared.video_comparison_slider import create_video_comparison_html
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
@@ -518,6 +519,7 @@ def build_gan_callbacks(
                 scale_raw = s.get("upscale_factor", 4.0)
 
             scale_x = float(scale_raw or 4.0)
+            s["_resolved_upscale_factor"] = float(scale_x)
             # Max-edge cap is local to GAN settings (no global max propagation).
             max_edge = int(s.get("max_resolution", 0) or 0)
 
@@ -533,7 +535,7 @@ def build_gan_callbacks(
                 requested_scale=float(scale_x),
                 model_scale=int(model_scale),
                 max_edge=int(max_edge or 0),
-                force_pre_downscale=True,
+                force_pre_downscale=bool(s.get("pre_downscale_then_upscale", True)),
             )
 
             optimal_w, optimal_h = int(plan.preprocess_width), int(plan.preprocess_height)
@@ -1482,6 +1484,25 @@ def build_gan_callbacks(
                             status = "OOM: Out of VRAM (GPU) - see banner above"
 
                         outp = final_output
+                        if outp and Path(outp).exists():
+                            outp_new, resized_final, resize_msg = enforce_fixed_scale_output_size(
+                                output_path=outp,
+                                source_input_path=(
+                                    runtime_settings.get("_original_input_path_before_preprocess")
+                                    or runtime_settings.get("input_path")
+                                ),
+                                requested_scale=runtime_settings.get("_resolved_upscale_factor", runtime_settings.get("upscale_factor")),
+                                model_scale=runtime_settings.get("scale"),
+                                max_edge=runtime_settings.get("max_resolution", 0),
+                                pre_downscale_then_upscale=runtime_settings.get("pre_downscale_then_upscale", True),
+                                settings=runtime_settings,
+                                label="GAN final sizing",
+                                on_log=progress_cb if progress_cb else None,
+                            )
+                            if outp_new and outp_new != outp:
+                                outp = outp_new
+                            if resize_msg and progress_cb and (resized_final or "failed" in resize_msg.lower()):
+                                progress_cb(resize_msg)
                         if outp and Path(outp).exists() and face_apply:
                             restored = restore_video(
                                 outp,
@@ -1667,6 +1688,27 @@ def build_gan_callbacks(
                             result.output_path = final_out_path
                     except Exception:
                         pass
+
+                if final_out_path and Path(final_out_path).exists():
+                    final_out_new, resized_final, resize_msg = enforce_fixed_scale_output_size(
+                        output_path=final_out_path,
+                        source_input_path=(
+                            runtime_settings.get("_original_input_path_before_preprocess")
+                            or runtime_settings.get("input_path")
+                        ),
+                        requested_scale=runtime_settings.get("_resolved_upscale_factor", runtime_settings.get("upscale_factor")),
+                        model_scale=runtime_settings.get("scale"),
+                        max_edge=runtime_settings.get("max_resolution", 0),
+                        pre_downscale_then_upscale=runtime_settings.get("pre_downscale_then_upscale", True),
+                        settings=runtime_settings,
+                        label="GAN final sizing",
+                        on_log=progress_cb if progress_cb else None,
+                    )
+                    if final_out_new and final_out_new != final_out_path:
+                        final_out_path = final_out_new
+                        result.output_path = final_out_path
+                    if resize_msg and progress_cb and (resized_final or "failed" in resize_msg.lower()):
+                        progress_cb(resize_msg)
 
                 # Preserve audio for video outputs (GAN video pipeline reconstructs video from frames -> no audio by default).
                 try:

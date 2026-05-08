@@ -52,6 +52,7 @@ from shared.output_run_manager import (
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
+from shared.fixed_scale_output import enforce_fixed_scale_output_size
 from shared.global_rife import maybe_apply_global_rife
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
@@ -3525,6 +3526,29 @@ def build_sparkvsr_callbacks(
             
             # Apply face restoration if enabled (per-run toggle OR global setting)
             output_path = result.output_path
+
+            if output_path and Path(output_path).exists():
+                source_for_final_size = (
+                    settings.get("_original_input_path_before_preprocess")
+                    or settings.get("_effective_input_path")
+                    or input_path
+                )
+                output_path_new, resized_final, resize_msg = enforce_fixed_scale_output_size(
+                    output_path=output_path,
+                    source_input_path=source_for_final_size,
+                    requested_scale=settings.get("upscale_factor") or settings.get("scale"),
+                    model_scale=settings.get("scale"),
+                    max_edge=settings.get("max_target_resolution", 0),
+                    pre_downscale_then_upscale=settings.get("pre_downscale_then_upscale", True),
+                    settings=settings,
+                    label="SparkVSR final sizing",
+                    on_log=lambda x: log_buffer.append(x) if x else None,
+                )
+                if output_path_new and output_path_new != output_path:
+                    output_path = output_path_new
+                    result.output_path = output_path
+                if resize_msg and (resized_final or "failed" in resize_msg.lower()):
+                    log_buffer.append(resize_msg)
             
             if face_apply and output_path and Path(output_path).exists():
                 from shared.face_restore import restore_video, restore_image

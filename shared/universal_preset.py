@@ -195,12 +195,18 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_sparkvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(data or {})
+    original_scale = cfg.get("scale")
     try:
         from shared.services.sparkvsr_service import _enforce_sparkvsr_guardrails
 
         cfg = _enforce_sparkvsr_guardrails(cfg, sparkvsr_defaults())
     except Exception:
         pass
+    if isinstance(original_scale, int) and not isinstance(original_scale, bool):
+        try:
+            cfg["scale"] = int(float(cfg.get("scale", original_scale)))
+        except Exception:
+            cfg["scale"] = original_scale
     cfg["output_format"] = "mp4"
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))

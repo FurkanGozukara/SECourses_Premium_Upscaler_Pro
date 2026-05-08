@@ -240,9 +240,9 @@ def estimate_fixed_scale_upscale_plan_from_dims(
     We compute the capped effective scale, then (by default) PRE-DOWNSCALE input so
     that model_scale-upscaling lands at the capped target.
 
-    If force_pre_downscale is False, the plan still reports the pre-downscale path
-    (because it's the only way to hit arbitrary effective scales without post-resize),
-    but callers may decide to post-downscale instead.
+    If force_pre_downscale is False, the model input is left unchanged and the plan
+    reports a larger raw fixed-scale model output plus the final saved size that a
+    post-resize pass must enforce.
     """
     notes: List[str] = []
     in_w_i = int(in_w or 0)
@@ -275,9 +275,9 @@ def estimate_fixed_scale_upscale_plan_from_dims(
     pre_scale = effective_scale / float(ms)
 
     do_pre = bool(force_pre_downscale) and pre_scale < 0.999999
-    if not do_pre and pre_scale < 0.999999:
-        notes.append("Pre-downscale is required to avoid post-resize for fixed-scale models.")
-        do_pre = True
+    post_resize_required = (not do_pre) and abs(effective_scale - float(ms)) > 0.000001
+    if post_resize_required:
+        notes.append("Pre-downscale is disabled; final output must be post-resized to the requested/capped size.")
 
     pre_w = in_w_i
     pre_h = in_h_i
@@ -289,19 +289,28 @@ def estimate_fixed_scale_upscale_plan_from_dims(
     pre_w = max(min_side, _floor_to_even(pre_w))
     pre_h = max(min_side, _floor_to_even(pre_h))
 
-    out_w = _floor_to_even(pre_w * ms)
-    out_h = _floor_to_even(pre_h * ms)
+    model_out_w = _floor_to_even(pre_w * ms)
+    model_out_h = _floor_to_even(pre_h * ms)
+
+    if do_pre:
+        final_w = model_out_w
+        final_h = model_out_h
+    else:
+        final_w = _floor_to_even(int(round(in_w_i * effective_scale)))
+        final_h = _floor_to_even(int(round(in_h_i * effective_scale)))
+        final_w = max(2, final_w)
+        final_h = max(2, final_h)
 
     max_edge_i = int(max_edge or 0)
-    if max_edge_i > 0 and max(out_w, out_h) > max_edge_i:
+    if max_edge_i > 0 and max(final_w, final_h) > max_edge_i:
         # Due to rounding/alignment we may exceed slightly; clamp defensively.
-        s = float(max_edge_i) / float(max(out_w, out_h))
-        out_w = _floor_to_even(int(round(out_w * s)))
-        out_h = _floor_to_even(int(round(out_h * s)))
+        s = float(max_edge_i) / float(max(final_w, final_h))
+        final_w = max(2, _floor_to_even(int(round(final_w * s))))
+        final_h = max(2, _floor_to_even(int(round(final_h * s))))
         notes.append("Rounded output exceeded max edge; clamped slightly for safety.")
 
-    padded_w = _pad_to_factor(out_w, 16)
-    padded_h = _pad_to_factor(out_h, 16)
+    padded_w = _pad_to_factor(model_out_w, 16)
+    padded_h = _pad_to_factor(model_out_h, 16)
 
     return UpscalePlan(
         input_width=in_w_i,
@@ -314,12 +323,12 @@ def estimate_fixed_scale_upscale_plan_from_dims(
         preprocess_width=pre_w if do_pre else in_w_i,
         preprocess_height=pre_h if do_pre else in_h_i,
         preprocess_scale=pre_scale if do_pre else 1.0,
-        resize_width=out_w,
-        resize_height=out_h,
+        resize_width=model_out_w,
+        resize_height=model_out_h,
         padded_width=padded_w,
         padded_height=padded_h,
-        final_saved_width=out_w,
-        final_saved_height=out_h,
+        final_saved_width=final_w,
+        final_saved_height=final_h,
         model_scale=ms,
         notes=notes,
     )

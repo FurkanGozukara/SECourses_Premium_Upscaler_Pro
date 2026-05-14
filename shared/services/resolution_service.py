@@ -1,8 +1,19 @@
+import queue
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 
 from shared.preset_manager import PresetManager
-from shared.path_utils import normalize_path, get_media_duration_seconds
+from shared.path_utils import (
+    collision_safe_dir,
+    get_media_duration_seconds,
+    normalize_path,
+    sanitize_filename,
+)
 from shared.path_utils import get_media_dimensions
 from shared.resolution_calculator import (
     calculate_resolution, calculate_chunk_count, calculate_disk_space_required,
@@ -99,6 +110,76 @@ def _get_aspect_ratio_str(aspect_ratio: float) -> Tuple[int, int]:
     return (w // divisor, h // divisor)
 
 
+def _resolve_standalone_split_root(state: Dict[str, Any], base_dir: Optional[Path]) -> Path:
+    seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+    global_settings = seed_controls.get("global_settings", {}) if isinstance(seed_controls, dict) else {}
+    configured_root = global_settings.get("output_dir") if isinstance(global_settings, dict) else None
+    if configured_root:
+        return Path(normalize_path(str(configured_root)))
+    return Path(base_dir or Path.cwd()).resolve() / "outputs"
+
+
+def _copy_or_remux_full_video_to_mp4(input_path: Path, output_path: Path) -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if input_path.suffix.lower() == ".mp4":
+        try:
+            shutil.copy2(input_path, output_path)
+            return output_path.exists() and output_path.stat().st_size > 0
+        except Exception:
+            pass
+
+    copy_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        proc = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+
+    encode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        proc = subprocess.run(encode_cmd, capture_output=True, text=True, timeout=600)
+        return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+    except Exception:
+        return False
+
+
 def chunk_estimate(chunk_size: float, chunk_overlap: float):
     if chunk_size <= 0:
         return gr.update(value="Chunking disabled.")
@@ -113,6 +194,7 @@ def build_resolution_callbacks(
     preset_manager: PresetManager,
     shared_state: gr.State,
     models: List[str],
+    base_dir: Optional[Path] = None,
 ):
     defaults = resolution_defaults(models)
 
@@ -411,6 +493,384 @@ def build_resolution_callbacks(
         except Exception as e:
             return f"❌ Error estimating chunks: {str(e)}", state
     
+    def standalone_scene_split(
+        input_path: str,
+        auto_chunk: bool,
+        frame_accurate_split: bool,
+        chunk_size: float,
+        chunk_overlap: float,
+        scene_threshold: float,
+        min_scene_len: float,
+        state: Dict,
+        progress=gr.Progress(track_tqdm=False),
+    ) -> Any:
+        """
+        Standalone scene/chunk splitter for the Resolution tab.
+
+        Creates one output directory containing MP4 scene files with video and
+        audio together, without running any upscaler pipeline.
+        """
+        state = state if isinstance(state, dict) else {"seed_controls": {}}
+        seed_controls = state.setdefault("seed_controls", {})
+        if not isinstance(seed_controls, dict):
+            seed_controls = {}
+            state["seed_controls"] = seed_controls
+
+        progress_messages: List[str] = []
+
+        def _result(message: str, output_dir: Optional[Path] = None, show_open: bool = False):
+            has_output_dir = bool(output_dir)
+            return (
+                gr.update(value=message, visible=True),
+                gr.update(value=str(output_dir) if output_dir else "", visible=has_output_dir),
+                gr.update(visible=bool(show_open and output_dir)),
+                state,
+            )
+
+        def _collect_progress(message: str) -> None:
+            if not message:
+                return
+            clean = str(message).strip()
+            if clean:
+                progress_messages.append(clean)
+
+        def _status(title: str, details: Optional[List[str]] = None) -> str:
+            lines = ["### Standalone Split Progress", "", f"**{title}**"]
+            if details:
+                lines.append("")
+                lines.extend([f"- {line}" for line in details if line])
+            tail = [msg for msg in progress_messages[-8:] if msg]
+            if tail:
+                lines.append("")
+                lines.append("Recent log:")
+                lines.extend([f"- {msg}" for msg in tail])
+            return "\n".join(lines)
+
+        def _emit_progress(value: float, desc: str) -> None:
+            try:
+                progress(max(0.0, min(1.0, float(value))), desc=desc)
+            except Exception:
+                pass
+
+        def _scene_seconds_label(start_sec: float, end_sec: float) -> str:
+            return f"{float(start_sec):.3f}s to {float(end_sec):.3f}s"
+
+        def _is_full_scene(scene: Tuple[float, float], duration: float) -> bool:
+            if duration <= 0:
+                return False
+            start_sec, end_sec = float(scene[0]), float(scene[1])
+            tol = max(0.05, duration * 0.005)
+            return abs(start_sec) <= tol and abs(end_sec - duration) <= tol
+
+        try:
+            _emit_progress(0.01, "Starting standalone split")
+            yield _result(_status("Validating input..."))
+
+            if not input_path or not str(input_path).strip():
+                input_path = str(seed_controls.get("last_input_path") or "").strip()
+            if not input_path:
+                yield _result("ERROR: No input video path provided.")
+                return
+
+            input_info = detect_input(input_path)
+            if not input_info.is_valid:
+                yield _result(f"ERROR: {input_info.error_message}")
+                return
+            if input_info.input_type != "video":
+                yield _result(f"ERROR: Standalone scene split requires a video file. Detected: {input_info.input_type}.")
+                return
+
+            norm_path = normalize_path(input_path)
+            if not norm_path:
+                yield _result("ERROR: Could not normalize input path.")
+                return
+            source_path = Path(norm_path)
+            if not source_path.exists() or not source_path.is_file():
+                yield _result(f"ERROR: Input video does not exist: {norm_path}")
+                return
+
+            # Keep shared caches aligned with the latest Resolution tab controls.
+            seed_controls["last_input_path"] = str(source_path)
+            seed_controls["auto_chunk"] = bool(auto_chunk)
+            seed_controls["frame_accurate_split"] = bool(frame_accurate_split)
+            seed_controls["chunk_size_sec"] = float(chunk_size or 0)
+            seed_controls["chunk_overlap_sec"] = 0.0 if bool(auto_chunk) else float(chunk_overlap or 0)
+            seed_controls["scene_threshold"] = float(scene_threshold or 27.0)
+            seed_controls["min_scene_len"] = float(min_scene_len or 1.0)
+            state["seed_controls"] = seed_controls
+
+            scenes = []
+            mode_label = "PySceneDetect scenes"
+            total_duration = float(get_media_duration_seconds(str(source_path)) or 0.0)
+            if bool(auto_chunk):
+                _emit_progress(0.04, "Detecting scenes")
+                yield _result(
+                    _status(
+                        "Detecting scene cuts...",
+                        [
+                            f"Input: {source_path.name}",
+                            f"Threshold: {float(scene_threshold or 27.0):g}",
+                            f"Minimum scene length: {float(min_scene_len or 1.0):g}s",
+                        ],
+                    )
+                )
+                from shared.chunking import detect_scenes
+
+                scan_events: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+                scan_result: Dict[str, Any] = {"scenes": [], "error": None}
+
+                def _scan_worker() -> None:
+                    try:
+                        scan_result["scenes"] = detect_scenes(
+                            str(source_path),
+                            threshold=float(scene_threshold or 27.0),
+                            min_scene_len=float(min_scene_len or 1.0),
+                            overlap_sec=0.0,
+                            on_progress=lambda msg: scan_events.put(("log", msg)),
+                            on_progress_pct=lambda pct: scan_events.put(("pct", pct)),
+                        )
+                    except Exception as exc:
+                        scan_result["error"] = exc
+                    finally:
+                        scan_events.put(("done", None))
+
+                scan_thread = threading.Thread(target=_scan_worker, daemon=True)
+                scan_thread.start()
+                scene_pct = 0
+                scan_done = False
+                last_yield = 0.0
+
+                while not scan_done:
+                    try:
+                        kind, value = scan_events.get(timeout=0.25)
+                        if kind == "pct":
+                            scene_pct = max(0, min(100, int(value)))
+                        elif kind == "log":
+                            _collect_progress(str(value))
+                        elif kind == "done":
+                            scan_done = True
+                    except queue.Empty:
+                        pass
+
+                    now = time.monotonic()
+                    if scan_done or (now - last_yield) >= 0.5:
+                        _emit_progress(0.04 + (0.38 * scene_pct / 100.0), f"Detecting scenes {scene_pct}%")
+                        yield _result(
+                            _status(
+                                f"Detecting scene cuts... {scene_pct}%",
+                                [
+                                    "This scans the video once on CPU.",
+                                    "Long videos can stay on this step for a while.",
+                                ],
+                            )
+                        )
+                        last_yield = now
+
+                scan_thread.join(timeout=1.0)
+                if scan_result.get("error") is not None:
+                    raise scan_result["error"]
+                scenes = scan_result.get("scenes") or []
+                if not scenes:
+                    if total_duration > 0:
+                        scenes = [(0.0, total_duration)]
+                        progress_messages.append("Scene detection returned no cuts; exporting the full video as scene_0001.mp4.")
+                    else:
+                        yield _result("ERROR: Scene detection failed and video duration could not be read.")
+                        return
+                _emit_progress(0.43, f"Detected {len(scenes)} scene(s)")
+                yield _result(
+                    _status(
+                        f"Detected {len(scenes)} scene(s).",
+                        [
+                            f"Duration: {total_duration:.2f}s" if total_duration > 0 else "",
+                            "Preparing output folder...",
+                        ],
+                    )
+                )
+            else:
+                fixed_seconds = float(chunk_size or 0)
+                if fixed_seconds <= 0:
+                    yield _result(
+                        "ERROR: Auto Chunk is off and Chunk Size is 0. Enable Auto Chunk for scene splitting, "
+                        "or set a fixed Chunk Size for standalone chunk export."
+                    )
+                    return
+                from shared.chunking import fallback_scenes
+
+                mode_label = f"fixed {fixed_seconds:g}s chunks"
+                _emit_progress(0.08, "Creating fixed chunks")
+                scenes = fallback_scenes(
+                    str(source_path),
+                    chunk_seconds=fixed_seconds,
+                    overlap_seconds=float(chunk_overlap or 0),
+                )
+                yield _result(
+                    _status(
+                        f"Prepared {len(scenes)} fixed chunk(s).",
+                        [f"Chunk size: {fixed_seconds:g}s", f"Overlap: {float(chunk_overlap or 0):g}s"],
+                    )
+                )
+
+            if not scenes:
+                yield _result("ERROR: No scenes/chunks were produced for this input.")
+                return
+
+            output_root = _resolve_standalone_split_root(state, base_dir)
+            safe_stem = sanitize_filename(source_path.stem) or "video"
+            split_dir = collision_safe_dir(output_root / f"{safe_stem}_scene_split")
+            split_dir.mkdir(parents=True, exist_ok=True)
+            work_root = split_dir / "_split_work"
+            work_root.mkdir(parents=True, exist_ok=True)
+
+            _emit_progress(0.46, "Output folder ready")
+            yield _result(
+                _status(
+                    "Output folder ready.",
+                    [
+                        f"Folder: {split_dir}",
+                        f"Writing {len(scenes)} MP4 file(s) with video and audio...",
+                    ],
+                ),
+                split_dir,
+                show_open=False,
+            )
+
+            from shared.chunking import split_video
+
+            source_resolved = source_path.resolve()
+            final_paths: List[Path] = []
+            total_scenes = max(1, len(scenes))
+            for idx, scene in enumerate(scenes, 1):
+                start_sec, end_sec = float(scene[0]), float(scene[1])
+                chunk_dir = work_root / f"scene_{idx:04d}"
+                chunk_dir.mkdir(parents=True, exist_ok=True)
+                target = split_dir / f"scene_{idx:04d}.mp4"
+
+                base_progress = 0.48 + (0.46 * (idx - 1) / total_scenes)
+                _emit_progress(base_progress, f"Writing scene {idx}/{total_scenes}")
+                yield _result(
+                    _status(
+                        f"Writing scene {idx}/{total_scenes}...",
+                        [
+                            f"Time range: {_scene_seconds_label(start_sec, end_sec)}",
+                            f"Output: {target.name}",
+                            f"Completed files: {len(final_paths)}/{total_scenes}",
+                        ],
+                    ),
+                    split_dir,
+                    show_open=False,
+                )
+
+                raw_paths = split_video(
+                    str(source_path),
+                    [(start_sec, end_sec)],
+                    chunk_dir,
+                    precise=bool(frame_accurate_split),
+                    preserve_quality=True,
+                    include_audio=True,
+                    on_progress=_collect_progress,
+                )
+
+                raw_resolved = [Path(p).resolve() for p in raw_paths if p]
+                if len(raw_resolved) == 1 and raw_resolved[0] == source_resolved:
+                    if len(scenes) == 1 and _is_full_scene((start_sec, end_sec), total_duration):
+                        if not _copy_or_remux_full_video_to_mp4(source_path, target):
+                            yield _result("ERROR: Could not export the single-scene MP4.", split_dir, show_open=True)
+                            return
+                    else:
+                        yield _result(
+                            "ERROR: ffmpeg did not produce a split file for this scene. "
+                            "Try Frame-Accurate Split, or check ffmpeg support for this source file.",
+                            split_dir,
+                            show_open=True,
+                        )
+                        return
+                elif len(raw_paths) == 1:
+                    src = Path(raw_paths[0])
+                    if src.resolve() != target.resolve():
+                        try:
+                            src.replace(target)
+                        except Exception:
+                            shutil.copy2(src, target)
+                            try:
+                                src.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                else:
+                    yield _result(
+                        f"ERROR: Expected one MP4 for scene {idx}, but ffmpeg returned {len(raw_paths)} file(s).",
+                        split_dir,
+                        show_open=True,
+                    )
+                    return
+
+                if not target.exists() or target.stat().st_size <= 0:
+                    yield _result(f"ERROR: Scene {idx} output is missing or empty: {target}", split_dir, show_open=True)
+                    return
+
+                final_paths.append(target)
+                _emit_progress(0.48 + (0.46 * idx / total_scenes), f"Finished scene {idx}/{total_scenes}")
+                yield _result(
+                    _status(
+                        f"Finished scene {idx}/{total_scenes}.",
+                        [
+                            f"Created: {target.name}",
+                            f"Completed files: {len(final_paths)}/{total_scenes}",
+                        ],
+                    ),
+                    split_dir,
+                    show_open=False,
+                )
+
+            try:
+                shutil.rmtree(work_root, ignore_errors=True)
+            except Exception:
+                pass
+
+            final_paths = [p for p in final_paths if p.exists() and p.stat().st_size > 0]
+            if len(final_paths) != len(scenes):
+                yield _result(
+                    f"ERROR: Expected {len(scenes)} MP4 files but found {len(final_paths)} complete files.",
+                    split_dir,
+                    show_open=True,
+                )
+                return
+
+            seed_controls["last_standalone_scene_split_dir"] = str(split_dir)
+            seed_controls["last_output_dir"] = str(split_dir)
+            seed_controls["last_output_path"] = str(final_paths[0]) if final_paths else None
+            seed_controls["last_scene_scan"] = {
+                "input_path": str(source_path),
+                "scene_threshold": float(scene_threshold or 27.0),
+                "min_scene_len": float(min_scene_len or 1.0),
+                "scene_count": int(len(scenes)),
+            }
+            state["seed_controls"] = seed_controls
+
+            _emit_progress(1.0, "Standalone split complete")
+
+            listed = "\n".join(f"- {p.name}" for p in final_paths[:30])
+            if len(final_paths) > 30:
+                listed += f"\n- ... {len(final_paths) - 30} more"
+
+            message = (
+                "SUCCESS: Standalone split complete.\n\n"
+                f"- Output directory: `{split_dir}`\n"
+                f"- Files created: **{len(final_paths)}**\n"
+                f"- Mode: {mode_label}\n"
+                f"- Split: {'frame-accurate lossless' if frame_accurate_split else 'fast stream-copy'}\n\n"
+                f"{listed}"
+            )
+            if progress_messages:
+                tail = [msg for msg in progress_messages[-4:] if msg]
+                if tail:
+                    message += "\n\nRecent log:\n" + "\n".join(f"- {msg}" for msg in tail)
+
+            yield _result(message, split_dir, show_open=True)
+
+        except Exception as e:
+            yield _result(f"ERROR: Standalone scene split failed: {str(e)}")
+
     def apply_to_seed(*args):
         """Apply resolution settings to ALL upscaler pipelines via shared state"""
         state = args[-1]
@@ -478,6 +938,7 @@ def build_resolution_callbacks(
         "estimate_from_input": estimate_from_input,
         "calculate_auto_resolution": calculate_auto_resolution,
         "calculate_chunk_estimate": calculate_chunk_estimate,
+        "standalone_scene_split": standalone_scene_split,
     }
 
 

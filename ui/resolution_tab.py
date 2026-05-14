@@ -7,6 +7,7 @@ import gradio as gr
 from pathlib import Path
 
 from shared.path_dialogs import get_any_file_path
+from shared.services.global_service import open_outputs_folder
 from shared.services.resolution_service import (
     build_resolution_callbacks, RESOLUTION_ORDER
 )
@@ -53,7 +54,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         combined_models = ["default"]
 
     # Build service callbacks
-    service = build_resolution_callbacks(preset_manager, shared_state, combined_models)
+    service = build_resolution_callbacks(preset_manager, shared_state, combined_models, base_dir=base_dir)
 
     # Get defaults
     defaults = service["defaults"]
@@ -178,14 +179,39 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                     scale=20,
                 )
                 calc_input_browse_btn = gr.Button(
-                    "Browse",
+                    "Pick File",
                     size="lg",
-                    elem_id="open_folder_small",
-                    scale=1,
+                    elem_id="resolution_pick_file_btn",
+                    elem_classes=["action-btn", "resolution-btn-browse"],
+                    scale=3,
                 )
             
             with gr.Row():
-                calc_chunks_btn = gr.Button("Estimate Chunks", variant="primary")
+                calc_chunks_btn = gr.Button(
+                    "Estimate Chunks",
+                    variant="primary",
+                    elem_classes=["action-btn", "resolution-btn-estimate"],
+                )
+
+            gr.Markdown("#### Standalone Scene Split")
+            with gr.Row():
+                standalone_split_btn = gr.Button(
+                    "Split Scenes to MP4",
+                    variant="primary",
+                    elem_classes=["action-btn", "resolution-btn-split"],
+                )
+            standalone_split_output_dir = gr.Textbox(
+                label="Standalone Split Output Folder",
+                interactive=False,
+                visible=False,
+            )
+            with gr.Group(visible=False) as standalone_open_split_folder_group:
+                standalone_open_split_folder_btn = gr.Button(
+                    "Open Split Location",
+                    size="lg",
+                    elem_classes=["action-btn", "resolution-btn-open-split"],
+                )
+            standalone_split_result = gr.Markdown("", visible=False)
             
             # Results display
             calc_result = gr.Markdown("", visible=False)
@@ -331,6 +357,39 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         fn=calculate_chunks_wrapper,
         inputs=[calc_input_path, auto_chunk, chunk_size, chunk_overlap, shared_state],
         outputs=[calc_result, shared_state, disk_space_warning]
+    )
+
+    standalone_split_btn.click(
+        fn=service["standalone_scene_split"],
+        inputs=[
+            calc_input_path,
+            auto_chunk,
+            frame_accurate_split,
+            chunk_size,
+            chunk_overlap,
+            scene_threshold,
+            min_scene_len,
+            shared_state,
+        ],
+        outputs=[
+            standalone_split_result,
+            standalone_split_output_dir,
+            standalone_open_split_folder_group,
+            shared_state,
+        ],
+        api_name="standalone_scene_split",
+    )
+
+    def open_standalone_split_folder(folder_path: str):
+        folder_path = str(folder_path or "").strip()
+        if not folder_path:
+            return gr.update(value="WARNING: No standalone split folder is available yet.", visible=True)
+        return open_outputs_folder(folder_path)
+
+    standalone_open_split_folder_btn.click(
+        fn=open_standalone_split_folder,
+        inputs=standalone_split_output_dir,
+        outputs=standalone_split_result,
     )
 
     calc_input_browse_btn.click(

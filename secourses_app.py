@@ -799,6 +799,65 @@ def main(argv=None):
       min-height: 46px;
       font-size: 0.95rem;
     }
+    .resolution-btn-browse button,
+    button.resolution-btn-browse {
+      background: linear-gradient(135deg, #0e7490 0%, #0284c7 55%, #2563eb 100%) !important;
+      border-color: rgba(191, 219, 254, 0.95) !important;
+      box-shadow: 0 10px 22px rgba(37, 99, 235, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+      min-width: 7.25rem !important;
+      padding-left: 1rem !important;
+      padding-right: 1rem !important;
+      white-space: nowrap !important;
+      font-size: 1rem !important;
+      line-height: 1.15 !important;
+    }
+    #resolution_pick_file_btn {
+      min-width: 7.25rem !important;
+      max-width: 9rem !important;
+      flex-grow: 0 !important;
+    }
+    .resolution-btn-estimate button,
+    button.resolution-btn-estimate {
+      background: linear-gradient(135deg, #5b21b6 0%, #7c3aed 48%, #0ea5e9 100%) !important;
+      border-color: rgba(221, 214, 254, 0.95) !important;
+      box-shadow: 0 12px 26px rgba(124, 58, 237, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+    }
+    .resolution-btn-split button,
+    button.resolution-btn-split {
+      background: linear-gradient(135deg, #166534 0%, #059669 48%, #22c55e 100%) !important;
+      border-color: rgba(187, 247, 208, 0.98) !important;
+      box-shadow: 0 13px 30px rgba(5, 150, 105, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+    }
+    .resolution-btn-open-split button,
+    button.resolution-btn-open-split {
+      background: linear-gradient(135deg, #0f766e 0%, #0891b2 52%, #38bdf8 100%) !important;
+      border-color: rgba(186, 230, 253, 0.98) !important;
+      box-shadow: 0 12px 26px rgba(8, 145, 178, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+    }
+    .resolution-btn-preset-save button,
+    button.resolution-btn-preset-save {
+      background: linear-gradient(135deg, #312e81 0%, #4f46e5 52%, #06b6d4 100%) !important;
+      border-color: rgba(199, 210, 254, 0.95) !important;
+      box-shadow: 0 11px 25px rgba(79, 70, 229, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+    }
+    .resolution-btn-preset-load button,
+    button.resolution-btn-preset-load {
+      background: linear-gradient(135deg, #075985 0%, #0284c7 48%, #2dd4bf 100%) !important;
+      border-color: rgba(186, 230, 253, 0.95) !important;
+      box-shadow: 0 11px 25px rgba(2, 132, 199, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+    }
+    .resolution-btn-preset-reset button,
+    button.resolution-btn-preset-reset {
+      background: linear-gradient(135deg, #92400e 0%, #d97706 52%, #facc15 100%) !important;
+      border-color: rgba(254, 240, 138, 0.95) !important;
+      box-shadow: 0 11px 25px rgba(217, 119, 6, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+    }
+    .resolution-btn-preset-delete button,
+    button.resolution-btn-preset-delete {
+      background: linear-gradient(135deg, #9f1239 0%, #e11d48 52%, #fb7185 100%) !important;
+      border-color: rgba(254, 205, 211, 0.95) !important;
+      box-shadow: 0 11px 25px rgba(225, 29, 72, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+    }
     .action-btn-source-seed button,
     button.action-btn-source-seed {
       background: linear-gradient(135deg, #1d4ed8 0%, #0369a1 52%, #0f766e 100%) !important;

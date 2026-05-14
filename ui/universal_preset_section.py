@@ -313,6 +313,11 @@ def universal_preset_section(
     # Get list of presets
     presets = callbacks["get_presets_list"]()
     selected_preset = current_preset if current_preset in presets else (presets[-1] if presets else None)
+
+    def _preset_button_classes(name: str):
+        if tab_name == "resolution":
+            return ["action-btn", f"resolution-btn-preset-{name}"]
+        return None
     
     with gr.Accordion("📦 Universal Preset (All Tabs)", open=open_accordion):
         gr.Markdown("""
@@ -334,12 +339,31 @@ def universal_preset_section(
                 placeholder="my_settings",
                 scale=3
             )
-            save_preset_btn = gr.Button("💾 Save", variant="primary", scale=1)
+            save_preset_btn = gr.Button(
+                "💾 Save",
+                variant="primary",
+                scale=1,
+                elem_classes=_preset_button_classes("save"),
+            )
         
         with gr.Row():
-            load_preset_btn = gr.Button("📂 Load Selected", scale=1)
-            reset_defaults_btn = gr.Button("🔄 Reset All", variant="secondary", scale=1)
-            delete_preset_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
+            load_preset_btn = gr.Button(
+                "📂 Load Selected",
+                scale=1,
+                elem_classes=_preset_button_classes("load"),
+            )
+            reset_defaults_btn = gr.Button(
+                "🔄 Reset All",
+                variant="secondary",
+                scale=1,
+                elem_classes=_preset_button_classes("reset"),
+            )
+            delete_preset_btn = gr.Button(
+                "🗑️ Delete",
+                variant="stop",
+                scale=1,
+                elem_classes=_preset_button_classes("delete"),
+            )
         
         preset_status = gr.Markdown("")
     

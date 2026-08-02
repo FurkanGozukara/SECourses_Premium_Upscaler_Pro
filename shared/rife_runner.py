@@ -75,27 +75,88 @@ def discover_rife_models(base_dir: Path) -> List[str]:
     return sorted(discovered) if discovered else default_models
 
 
+def resolve_rife_model_dir(model_name: str, base_dir: Path) -> Optional[Path]:
+    """
+    Resolve a RIFE model name to its weights directory (contains flownet.pkl).
+
+    Supports both local layouts (same rules as shared/models/rife_meta.py):
+    - RIFE/models/<name>/flownet.pkl (current repo layout, e.g. models/4.25)
+    - RIFE/train_log/<name>/flownet.pkl (legacy layout)
+    plus a one-level nested folder inside either (zip extraction artifacts),
+    and 'rife-v4.25' aliases for a plain '4.25' folder name.
+    """
+    from shared.models.rife_meta import _resolve_model_bundle_dir
+
+    name = str(model_name or "").strip()
+    candidates = [name]
+    if name.lower().startswith("rife-v"):
+        candidates.append(name[len("rife-v"):])
+    for root in (base_dir / "RIFE" / "models", base_dir / "RIFE" / "train_log"):
+        for candidate in candidates:
+            bundle = _resolve_model_bundle_dir(root / candidate)
+            if bundle is not None:
+                return bundle
+    return None
+
+
+def _ensure_train_log_for_model(resolved_model_dir: Path, base_dir: Path, log) -> bool:
+    """
+    Stage the selected RIFE model into RIFE/train_log.
+
+    inference_video.py (and the model bundles themselves) hardcode imports like
+    `from train_log.RIFE_HDv3 import Model`, so whichever model the user picks
+    must be present directly inside RIFE/train_log/. The repo ships models in
+    versioned folders (RIFE/models/4.25/...), so we copy the selected bundle
+    over (a ~50 MB one-time copy per model switch, tracked via a marker file).
+    """
+    import shutil
+
+    rife_root = base_dir / "RIFE"
+    train_log = rife_root / "train_log"
+    resolved = Path(resolved_model_dir).resolve()
+    marker = train_log / ".model_source.txt"
+    try:
+        if train_log.exists() and marker.exists():
+            if marker.read_text(encoding="utf-8").strip() == str(resolved):
+                return True
+        if train_log.exists():
+            if marker.exists() or not (train_log / "flownet.pkl").exists():
+                shutil.rmtree(train_log, ignore_errors=True)
+            else:
+                # A real train_log the user populated manually - keep it safe.
+                backup = rife_root / "train_log_backup"
+                if backup.exists():
+                    shutil.rmtree(backup, ignore_errors=True)
+                train_log.rename(backup)
+                log(f"Existing train_log preserved as {backup}")
+        train_log.mkdir(parents=True, exist_ok=True)
+        for item in resolved.iterdir():
+            if item.is_file():
+                shutil.copy2(item, train_log / item.name)
+        marker.write_text(str(resolved), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log(f"Failed to stage RIFE model into train_log: {exc}")
+        return False
+
+
 def validate_rife_model(model_name: str, base_dir: Path) -> Tuple[bool, str]:
     """
     Validate that RIFE model exists and has required files.
     
     Args:
-        model_name: Model name (e.g., "rife-v4.6")
+        model_name: Model name (e.g., "rife-v4.6" or "4.25")
         base_dir: Base directory
         
     Returns:
         (is_valid, message)
     """
-    model_dir = base_dir / "RIFE" / "train_log" / model_name
-    
-    if not model_dir.exists():
-        return False, f"Model directory not found: {model_dir}"
-    
-    # Check for flownet.pkl (required by RIFE)
-    flownet = model_dir / "flownet.pkl"
-    if not flownet.exists():
-        return False, f"flownet.pkl not found in {model_name}"
-    
+    model_dir = resolve_rife_model_dir(model_name, base_dir)
+    if model_dir is None:
+        return False, (
+            f"Model directory not found for '{model_name}' "
+            f"(searched RIFE/models and RIFE/train_log, including rife-v aliases)"
+        )
     return True, f"Model {model_name} validated"
 
 
@@ -205,8 +266,14 @@ def run_rife_interpolation(
         
         cmd.extend(["--output", str(output_path)])
         
-        # Model directory
-        cmd.extend(["--model", model_name])
+        # Model directory: inference_video.py expects a directory path for
+        # --model (dest=modelDir) and imports the model classes from the
+        # train_log package, so stage the selected bundle there first.
+        resolved_model_dir = resolve_rife_model_dir(model_name, base_dir)
+        if resolved_model_dir is not None:
+            _ensure_train_log_for_model(resolved_model_dir, base_dir, log)
+        staged_dir = base_dir / "RIFE" / "train_log"
+        cmd.extend(["--model", str(staged_dir if (staged_dir / "flownet.pkl").exists() else (resolved_model_dir or model_name))])
         
         # FPS settings
         if target_fps > 0:

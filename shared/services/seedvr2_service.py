@@ -430,6 +430,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "cache_dit": False,
         "cache_vae": False,
         "split_phase_subprocesses": True,
+        "int8_convrot": False,
         "debug": False,
         "resume_chunking": False,
         "resume_run_dir": "",
@@ -672,6 +673,8 @@ SEEDVR2_ORDER: List[str] = [
     "keep_only_output_files",
     # Isolate encode/upscale/decode into fresh child processes.
     "split_phase_subprocesses",
+    # INT8 ConvRot on-the-fly DiT quantization (safetensors models only).
+    "int8_convrot",
 ]
 
 
@@ -792,6 +795,17 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
                     cfg["compile_vae"] = False
                     cfg["_compile_disabled_reason"] = f"Model {model_name} is not compile-compatible"
             
+            # INT8 ConvRot: GGUF models are already quantized, and the patched
+            # Linear forward cannot be traced by torch.compile.
+            if cfg.get("int8_convrot"):
+                if str(cfg.get("dit_model", "")).lower().endswith(".gguf"):
+                    cfg["int8_convrot"] = False
+                    cfg["_int8_convrot_disabled_reason"] = "GGUF models are already quantized"
+                elif cfg.get("compile_dit"):
+                    error_logger.warning("INT8 ConvRot is incompatible with Compile DiT - disabling Compile DiT")
+                    cfg["compile_dit"] = False
+                    cfg["_compile_disabled_reason"] = "INT8 ConvRot uses a non-traceable Linear forward"
+
             # Enforce multi-GPU support check
             supports_multi_gpu = getattr(model_meta, 'supports_multi_gpu', True)
             cuda_device_str = str(cfg.get("cuda_device", ""))
@@ -5948,7 +5962,8 @@ def build_seedvr2_callbacks(
             while proc_thread.is_alive() or not progress_queue.empty():
                 try:
                     update_type, data = progress_queue.get(timeout=0.1)
-                    current_time = time.time()                    if update_type == "progress":
+                    current_time = time.time()
+                    if update_type == "progress":
                         raw_message = str(data or "").strip()
                         if not raw_message:
                             continue
@@ -6282,7 +6297,8 @@ def build_seedvr2_callbacks(
                         processing_complete = True
                         if progress:
                             progress(1.0, desc="Complete!")
-                        break                    elif update_type == "error":
+                        break
+                    elif update_type == "error":
                         if progress:
                             progress(0, desc="Error occurred")
                         if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=data, settings=settings):
@@ -6307,7 +6323,8 @@ def build_seedvr2_callbacks(
                         )
                         return
                 except queue.Empty:
-                    continue            if not processing_complete:
+                    continue
+            if not processing_complete:
                 yield (
                     "Processing timed out",  # status_box
                     "Processing did not complete within expected time",  # log_box
@@ -6327,7 +6344,8 @@ def build_seedvr2_callbacks(
                 )
                 return
 
-            # Final pass: if logs contain VRAM OOM signatures, raise the global banner.            if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=logs, settings=settings):
+            # Final pass: if logs contain VRAM OOM signatures, raise the global banner.
+            if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=logs, settings=settings):
                 state["operation_status"] = "error"
                 status = "Out of VRAM (GPU) - see banner above"
                 show_vram_oom_modal(state, title="Out of VRAM (GPU) - SeedVR2", duration=None)

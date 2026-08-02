@@ -165,7 +165,7 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     mode_raw = str(cfg.get("mode", "tiny") or "tiny").strip().lower()
     cfg["mode"] = mode_raw if mode_raw in {"tiny", "tiny-long", "full"} else "tiny"
     precision_raw = str(cfg.get("precision", cfg.get("dtype", "auto")) or "auto").strip().lower()
-    cfg["precision"] = precision_raw if precision_raw in {"auto", "bf16", "fp16"} else "auto"
+    cfg["precision"] = precision_raw if precision_raw in {"auto", "bf16", "fp16", "int8_convrot"} else "auto"
     cfg["dtype"] = cfg["precision"]
     att_raw = str(cfg.get("attention_mode", cfg.get("attention", "sparse_sage_attention")) or "sparse_sage_attention").strip().lower()
     if att_raw in {"sage", "sparse_sage", "sparse_sage_attention"}:

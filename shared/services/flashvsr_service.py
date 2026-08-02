@@ -265,7 +265,7 @@ def _safe_ui_video_preview_path(video_path: Optional[str]) -> Optional[str]:
 
 
 FLASHVSR_VAE_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
-FLASHVSR_PRECISION_OPTIONS = ["auto", "bf16", "fp16"]
+FLASHVSR_PRECISION_OPTIONS = ["auto", "bf16", "fp16", "int8_convrot"]
 FLASHVSR_ATTENTION_OPTIONS = ["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"]
 FLASHVSR_CODEC_OPTIONS = ["libx264", "libx265", "h264_nvenc"]
 
@@ -487,7 +487,7 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["upscale_factor"] = float(scale)
 
     precision = str(cfg.get("precision", cfg.get("dtype", defaults.get("precision", "auto")))).strip().lower()
-    cfg["precision"] = precision if precision in {"auto", "bf16", "fp16"} else "auto"
+    cfg["precision"] = precision if precision in {"auto", "bf16", "fp16", "int8_convrot"} else "auto"
 
     att_raw = str(cfg.get("attention_mode", cfg.get("attention", defaults.get("attention_mode", "flash_attention_2")))).strip().lower()
     att_map = {

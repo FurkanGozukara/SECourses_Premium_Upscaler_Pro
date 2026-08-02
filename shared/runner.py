@@ -1966,6 +1966,8 @@ class Runner:
             cmd.append("--compile_dit")
         if settings.get("compile_vae"):
             cmd.append("--compile_vae")
+        if settings.get("int8_convrot"):
+            cmd.append("--int8_convrot")
         if settings.get("compile_backend"):
             cmd.extend(["--compile_backend", settings["compile_backend"]])
         if settings.get("compile_mode"):

@@ -523,6 +523,12 @@ def seedvr2_tab(
                     interactive=compile_available,  # Disable if compile not available
                     scale=1,
                 )
+                int8_convrot = gr.Checkbox(
+                    label="INT8 ConvRot (DiT)",
+                    value=bool(values[56]) if len(values) > 56 else False,
+                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
+                    scale=1,
+                )
                 compile_backend = gr.Dropdown(
                     label="Compile Backend",
                     choices=["inductor", "cudagraphs"],
@@ -1053,7 +1059,7 @@ def seedvr2_tab(
     #  BACKWARD COMPATIBILITY:
     # Old presets automatically get new defaults via merge_config() - no migration needed!
     #
-    # Current count: len(SEEDVR2_ORDER) = 56, len(inputs_list) must also = 56
+    # Current count: len(SEEDVR2_ORDER) = 57, len(inputs_list) must also = 57
     # ============================================================================
     
     inputs_list = [
@@ -1086,6 +1092,8 @@ def seedvr2_tab(
         keep_only_output_files,
         # Split heavy phases into isolated subprocesses
         split_phase_subprocesses,
+        # INT8 ConvRot on-the-fly DiT quantization
+        int8_convrot,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

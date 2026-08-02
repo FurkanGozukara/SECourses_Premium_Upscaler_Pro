@@ -217,7 +217,7 @@ def _sanitize_mode(value: Any) -> str:
 
 def _sanitize_precision(value: Any) -> str:
     precision = str(value or "auto").strip().lower()
-    return precision if precision in {"auto", "fp16", "bf16"} else "auto"
+    return precision if precision in {"auto", "fp16", "bf16", "int8_convrot"} else "auto"
 
 
 def _sanitize_attention(value: Any) -> str:

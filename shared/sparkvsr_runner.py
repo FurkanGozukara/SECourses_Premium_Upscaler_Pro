@@ -19,7 +19,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .command_logger import get_command_logger
 from .models.sparkvsr_meta import get_sparkvsr_metadata
-from .sparkvsr_constants import SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME
+from .sparkvsr_constants import (
+    SPARKVSR_BF16_MODEL_NAME,
+    SPARKVSR_FP8_SCALED_MODEL_NAME,
+    SPARKVSR_INT8_CONVROT_MODEL_NAME,
+)
 from .path_utils import (
     IMAGE_EXTENSIONS,
     collision_safe_path,
@@ -133,6 +137,10 @@ def _resolve_model_path(base_dir: Path, settings: Dict[str, Any]) -> tuple[Optio
         bf16_source = models_dir / SPARKVSR_BF16_MODEL_NAME
         if bf16_source.exists():
             return candidate, f"[SparkVSR] Using FP8-scaled cache path: {candidate} (generated from SparkVSR-bf16 if missing)"
+    if model_name == SPARKVSR_INT8_CONVROT_MODEL_NAME:
+        bf16_source = models_dir / SPARKVSR_BF16_MODEL_NAME
+        if bf16_source.exists():
+            return candidate, f"[SparkVSR] Using INT8 ConvRot cache path: {candidate} (generated from SparkVSR-bf16 if missing)"
     if candidate.exists():
         return candidate, f"[SparkVSR] Using local model directory: {candidate}"
     repo_hint = f" ({meta.repo_id})" if meta and meta.repo_id else ""
@@ -575,5 +583,5 @@ def run_sparkvsr(
 def discover_sparkvsr_models(base_dir: Path) -> List[str]:
     models_dir = base_dir / "SparkVSR" / "models"
     if not models_dir.exists():
-        return [SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME]
-    return [SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME]
+        return [SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME, SPARKVSR_INT8_CONVROT_MODEL_NAME]
+    return [SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME, SPARKVSR_INT8_CONVROT_MODEL_NAME]

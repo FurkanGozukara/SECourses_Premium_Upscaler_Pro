@@ -285,6 +285,22 @@ def _finalize_fp8_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def _retie_t5_embeddings(model: T5EncoderModel) -> None:
+    """
+    T5 checkpoints store only shared.weight; encoder.embed_tokens is tied to it.
+    load_state_dict(assign=True) replaces shared.weight with a fresh tensor, so
+    the tie must be re-established or embed_tokens stays a meta tensor (newer
+    transformers versions no longer re-tie automatically on assign loads).
+    """
+    try:
+        shared = getattr(model, "shared", None)
+        embed = getattr(getattr(model, "encoder", None), "embed_tokens", None)
+        if shared is not None and embed is not None and embed.weight.device.type == "meta":
+            embed.weight = shared.weight
+    except Exception:
+        pass
+
+
 def load_fp8_scaled_text_encoder(model_path: str | Path) -> T5EncoderModel:
     path = Path(model_path)
     state = load_file(str(_component_file(path, "text_encoder")), device="cpu")
@@ -298,6 +314,7 @@ def load_fp8_scaled_text_encoder(model_path: str | Path) -> T5EncoderModel:
     missing = [key for key in missing if not key.endswith("encoder.embed_tokens.weight")]
     if missing:
         raise RuntimeError(f"Missing SparkVSR FP8 text encoder keys: {missing[:8]}")
+    _retie_t5_embeddings(model)
     print(f"[SparkVSR FP8] loaded text encoder with {patched} FP8-scaled Linear layers", flush=True)
     return _finalize_fp8_model(model)
 

@@ -10,7 +10,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Optional
 
-from shared.sparkvsr_constants import SPARKVSR_BF16_MODEL_NAME, SPARKVSR_FP8_SCALED_MODEL_NAME
+from shared.sparkvsr_constants import (
+    SPARKVSR_BF16_MODEL_NAME,
+    SPARKVSR_FP8_SCALED_MODEL_NAME,
+    SPARKVSR_INT8_CONVROT_MODEL_NAME,
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,20 @@ _BUILTIN_MODELS: List[SparkVSRModel] = [
         default_dtype="bfloat16",
         default_scale=4,
         notes="Optional FP8 E4M3 block-scaled cache generated locally from SparkVSR-bf16 on first use.",
+    ),
+    SparkVSRModel(
+        name=SPARKVSR_INT8_CONVROT_MODEL_NAME,
+        repo_id="local-cache",
+        relative_path=SPARKVSR_INT8_CONVROT_MODEL_NAME,
+        stage="Stage-2 final INT8 ConvRot cache",
+        estimated_vram_gb=11.0,
+        default_dtype="bfloat16",
+        default_scale=4,
+        notes=(
+            "INT8 ConvRot cache generated locally from SparkVSR-bf16 on first use. "
+            "Better quality than FP8-scaled (Hadamard rotation + MSE-optimized scales) "
+            "and faster than BF16 on RTX 2000 or newer GPUs via fused INT8 matmul."
+        ),
     ),
 ]
 

@@ -45,6 +45,12 @@ from shared.sparkvsr_fp8_scaled import (
     load_fp8_scaled_text_encoder,
     load_fp8_scaled_transformer,
 )
+from shared.sparkvsr_int8_convrot import (
+    ensure_sparkvsr_int8_convrot_cache,
+    is_int8_convrot_model_path,
+    load_int8_convrot_text_encoder,
+    load_int8_convrot_transformer,
+)
 from shared.sparkvsr_ref_utils import (
     choose_temporal_reference_path,
     load_temporal_reference_manifest,
@@ -474,6 +480,10 @@ def _is_fp8_scaled_args(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "_spark_fp8_scaled", False)) or is_fp8_scaled_model_path(str(getattr(args, "model_path", "") or ""))
 
 
+def _is_int8_convrot_args(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "_spark_int8_convrot", False)) or is_int8_convrot_model_path(str(getattr(args, "model_path", "") or ""))
+
+
 def _compute_dtype_from_args(args: argparse.Namespace, fallback: torch.dtype) -> torch.dtype:
     raw = str(getattr(args, "dtype", "") or "").strip().lower()
     return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(raw, fallback)
@@ -582,6 +592,18 @@ def _ensure_model_path_ready(args: argparse.Namespace, started_at: float, *, sta
         model_path = ensure_sparkvsr_fp8_scaled_cache(fp8_model_path=model_path, bf16_model_path=bf16_source)
         args.model_path = str(model_path)
         setattr(args, "_spark_fp8_scaled", True)
+    elif is_int8_convrot_model_path(model_path):
+        bf16_source = model_path.parent / SPARKVSR_BF16_MODEL_NAME
+        if not model_path.exists():
+            emit_progress(
+                0.008,
+                "int8_cache",
+                f"{stage_label}: generating INT8 ConvRot cache from {bf16_source} (first run only)",
+                started_at=started_at,
+            )
+        model_path = ensure_sparkvsr_int8_convrot_cache(int8_model_path=model_path, bf16_model_path=bf16_source)
+        args.model_path = str(model_path)
+        setattr(args, "_spark_int8_convrot", True)
     return model_path
 
 
@@ -597,8 +619,11 @@ def load_sparkvsr_pipeline(
     if not model_path.exists():
         raise FileNotFoundError(f"SparkVSR model path not found: {model_path}")
     fp8_scaled = _is_fp8_scaled_args(args)
+    int8_convrot = _is_int8_convrot_args(args)
     if fp8_scaled and str(args.lora_path or "").strip():
         raise RuntimeError("SparkVSR FP8-scaled mode does not support LoRA yet. Use SparkVSR-bf16 for LoRA runs.")
+    if int8_convrot and str(args.lora_path or "").strip():
+        raise RuntimeError("SparkVSR INT8 ConvRot mode does not support LoRA yet. Use SparkVSR-bf16 for LoRA runs.")
 
     emit_progress(0.01, "model_load", f"{stage_label}: loading pipeline from {model_path}", started_at=started_at)
     load_kwargs = dict(component_overrides or {})
@@ -607,6 +632,11 @@ def load_sparkvsr_pipeline(
             load_kwargs["text_encoder"] = load_fp8_scaled_text_encoder(model_path)
         if "transformer" not in load_kwargs:
             load_kwargs["transformer"] = load_fp8_scaled_transformer(model_path)
+    elif int8_convrot:
+        if "text_encoder" not in load_kwargs:
+            load_kwargs["text_encoder"] = load_int8_convrot_text_encoder(model_path)
+        if "transformer" not in load_kwargs:
+            load_kwargs["transformer"] = load_int8_convrot_transformer(model_path)
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         str(model_path),
         torch_dtype=dtype,

@@ -1,0 +1,100 @@
+<h1>SECourses Ultimate Video and Image Upscaler Pro V6.0</h1>
+<h2>SeedVR2 &bull; FlashVSR+ &bull; SparkVSR &bull; NVIDIA RTX Super Resolution &bull; GAN Upscalers &bull; RIFE &bull; Face Restoration &bull; NEW INT8 ConvRot &mdash; The Fully Automated Movie Restoration and Upscale Studio</h2>
+<p><strong>Latest Installer Zip File:</strong> SECourses_Premium_Upscaler_Pro_V6.zip (attached to this post)</p>
+<p><strong>4K Tutorial:</strong> <a href="https://youtu.be/_WT4C78j5-c">https://youtu.be/_WT4C78j5-c</a> &nbsp;&bull;&nbsp; <strong>Quick 4K demo:</strong> <a href="https://youtu.be/bPWsg8DREiM">https://youtu.be/bPWsg8DREiM</a></p>
+<p>Turn any low-resolution video or image into crisp 4K/8K &mdash; on your own GPU, with one click. Upscaler Pro is the only app that puts <strong>all seven state-of-the-art upscaling engines</strong> behind one polished interface, installs itself fully automatically on <strong>Windows, RunPod, Massed Compute and SimplePod</strong>, and is optimized so hard that a <strong>120-minute movie upscales end-to-end on a consumer GPU</strong> &mdash; with scene detection, resume, queueing, audio handling and color fixing all done for you.</p>
+<p>It runs on everything from an <strong>RTX 2000-series</strong> card all the way to <strong>H100 / H200 / B200 / RTX PRO 6000</strong>, with pre-compiled Torch 2.13 + CUDA 13 wheels, working torch.compile, FlashAttention, SageAttention and Triton &mdash; zero manual setup.</p>
+
+<h2>NEW in V6.0: INT8 ConvRot Quantization &mdash; Faster Than BF16, Better Than FP8</h2>
+<p>V6 brings the same cutting-edge quantization that recently landed in ComfyUI and our Musubi Trainer to video upscaling: <strong>group-wise Hadamard rotation + per-row MSE-optimized INT8 weights</strong>, executed with fused Triton INT8 tensor-core matmuls.</p>
+<p>Measured head-to-head on an RTX 5090 (SparkVSR, 33 frames, 480&times;272 &rarr; 1920&times;1088, identical settings):</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/17_benchmark_table.png" alt="Benchmark table"></p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/18_benchmark_chart.png" alt="Benchmark chart"></p>
+<ul>
+<li><strong>SparkVSR:</strong> new SparkVSR-int8-convrot model choice &mdash; <strong>11% faster than BF16, 26% faster than FP8 Scaled</strong>, about 4 GB less peak VRAM than BF16, and <strong>closer to BF16 quality than FP8 is</strong> (49.1 dB vs 47.8 dB PSNR). The INT8 model is generated automatically from the BF16 weights the first time you pick it.</li>
+<li><strong>SeedVR2:</strong> new <strong>INT8 ConvRot (DiT)</strong> checkbox &mdash; about <strong>half the DiT weight VRAM</strong> and ~15% faster sampling on the FP16 models, quantized on load.</li>
+<li><strong>FlashVSR+:</strong> new int8_convrot precision &mdash; half the DiT weight VRAM with near-BF16 output.</li>
+<li>Works on <strong>RTX 2000 (Turing) and newer</strong>; older GPUs automatically fall back to a compatible path with identical output. No extra downloads, no extra setup.</li>
+</ul>
+
+<h2>Also New in V6.0</h2>
+<ul>
+<li><strong>Modernized interface on Gradio 6.22</strong> &mdash; every button on every tab has its own distinct color, so you always know where you are and what you are clicking. Tab switching stays fluid even while a heavy upscale is running (measured 0.1&ndash;0.3 s under full GPU load).</li>
+<li><strong>Version History tab</strong> &mdash; the complete changelog of the app, inside the app, each release in its own expandable section.</li>
+<li><strong>Polished light theme</strong> (dark stays the default) and <strong>theme choice that sticks</strong> across restarts.</li>
+<li><strong>No more silent failures</strong> &mdash; every invalid input now shows an instant, clear error message on every tab, and unexpected errors pop up as toasts.</li>
+<li><strong>Deep compatibility pass</strong> on the newest Torch 2.13 + CUDA 13 + Gradio 6.22 stack: fresh-install FlashVSR+ setup fixed, RIFE fixed for the current model layout and NumPy 2, GGUF support restored, video saving fixed, SparkVSR dependencies restored.</li>
+</ul>
+
+<h2>The Seven Engines</h2>
+
+<h3>1. SeedVR2 &mdash; the quality king for low-resolution sources</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/01_seedvr2_dark.png" alt="SeedVR2 tab"></p>
+<p>The legendary one-step diffusion restorer. 3B and 7B models (plus Sharp variants) in FP16, FP8, <strong>GGUF Q8/Q4</strong> and now <strong>INT8 ConvRot</strong> &mdash; take a 256px webcam relic to 1024px and beyond with details that GAN upscalers simply cannot invent.</p>
+<ul>
+<li><strong>Auto Tune for Max Quality:</strong> one button tests your GPU and locks in the best batch size, block swap and tiling &mdash; with a huge library of pre-measured configs for 6 GB to 32 GB GPUs.</li>
+<li>BlockSwap, VAE tiling, model offloading, working torch.compile, attention backend selection (FlashAttention / SageAttention / SDPA).</li>
+<li>VAE Encode &rarr; Upscale &rarr; VAE Decode run as <strong>isolated subprocesses</strong>: zero VRAM/RAM leaks on multi-hour jobs.</li>
+<li>First-frame preview, streaming chunk mode, batch folders (videos + images mixed), full resume.</li>
+</ul>
+
+<h3>2. FlashVSR+ &mdash; the speed demon</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/02_flashvsr_dark.png" alt="FlashVSR+ tab"></p>
+<p>Blazing-fast streaming diffusion upscaler (v1.0 and v1.1), often the best choice for 720p &rarr; 4K. Tiny, tiny-long and full pipelines, five VAE options including LightVAE, a DiT tile counter that tells you exactly how tiling affects speed, Auto Tune, experimental CFG/noise controls &mdash; and it upscales images beautifully too.</p>
+
+<h3>3. SparkVSR &mdash; reference-guided restoration</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/03_sparkvsr_dark.png" alt="SparkVSR tab"></p>
+<p>The famous reference-frame VSR model, made practical: our exclusive <strong>auto-reference system upscales the first frame of every scene chunk with the model of your choice</strong> (SeedVR2 by default) so SparkVSR always has a perfect anchor. Text prompt guidance with cached encodings, BF16 / FP8-Scaled / <strong>INT8 ConvRot</strong>, stage subprocess isolation (about 1/3 the RAM/VRAM of the public release), Auto Tune.</p>
+
+<h3>4. NVIDIA RTX Super Resolution &mdash; instant results</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/04_rtx_superres_dark.png" alt="RTX Super Resolution tab"></p>
+<p>Driver-accelerated upscaling up to <strong>8x</strong> with minimal VRAM &mdash; perfect when you need speed above all. Quality presets up to HIGHBITRATE_ULTRA with its own auto-tune.</p>
+
+<h3>5. Image-Based GAN Upscalers &mdash; classic, instant, sharp</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/06_gan_dark.png" alt="GAN tab"></p>
+<p>Real-ESRGAN, 4x-UltraSharp (V1/V2), AniScale, NomosUni, DAT-2, HAT-L, SPAN and more &mdash; with automatic model metadata via spandrel and the Open Model Database. Works on images, videos (with batch-size acceleration) and entire folders.</p>
+
+<h3>6. RIFE Frame Interpolation + Video Editing</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/08_rife_dark.png" alt="RIFE tab"></p>
+<p>2x/4x FPS with every Practical-RIFE model from 4.6 to 4.26, batch folders, PNG/JPG sequence export, plus trim / concatenate / speed-change tools. Also available as <strong>Global RIFE</strong>: automatically interpolate the output of ANY upscaler, chunk-safely.</p>
+
+<h3>7. Face Restoration</h3>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/09_face_dark.png" alt="Face Restoration tab"></p>
+<p>GFPGAN-powered restoration as a standalone processor (images, videos, batches) or as an automatic post-step inside every upscaler pipeline, with a global strength slider.</p>
+
+<h2>Built for Real Work &mdash; Not Just Demos</h2>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/05_resolution_dark.png" alt="Resolution and Scene Split tab"></p>
+<p><strong>Movie-scale processing is the core design goal.</strong> Automatic PySceneDetect scene splitting, frame-accurate lossless chunking, per-chunk cleanup, disk-space forecasting, and <strong>full resume</strong> &mdash; stop anytime (or survive a power cut) and continue from the last finished chunk. You can even scene-split any video without upscaling at all.</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/07_output_comparison_dark.png" alt="Output and Comparison tab"></p>
+<p><strong>A complete output studio:</strong> H.264 / H.265 / AV1 with tune options and film grain synthesis, CRF and preset control, 10-bit output, two-pass encoding, pixel format selection, audio copy/re-encode/remove, FPS override, PNG/JPG sequences, quick presets for YouTube/Archival/Editing/Web. Compare results with native sliders, multi-video and multi-image comparison galleries, or generate <strong>animated slider comparison videos</strong> with custom text.</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/10_queue_dark.png" alt="Queue tab"></p>
+<p><strong>Per-GPU queue system:</strong> stack jobs from any tab; each GPU processes its own FIFO queue, so a multi-GPU rig runs multiple upscales simultaneously. Every queued job snapshots its settings.</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/11_health_dark.png" alt="Health Check tab"></p>
+<p><strong>Self-diagnosing:</strong> health checks for ffmpeg, CUDA, VS Build Tools, driver version, disk space; a Gradio installation scanner; a bundled-repository scanner; VRAM OOM detection with a prominent alert banner and remediation guidance; structured run metadata and command logging.</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/12_global_settings_dark.png" alt="Global Settings tab"></p>
+<p><strong>Universal preset system:</strong> one preset stores every setting of every tab. Auto-loads on startup, propagates across tabs, migrates automatically between versions. Global settings for paths, theme, GPU, execution mode and model cache locations.</p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/13_changelog_dark.png" alt="Changelog tab"></p>
+
+<h2>Dark AND Light &mdash; Both First-Class</h2>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/14_seedvr2_light.png" alt="Light theme SeedVR2"></p>
+<p><img src="https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/Upscaler_Pro_V6_Screenshots/15_output_comparison_light.png" alt="Light theme Output"></p>
+
+<h2>Why This Instead of the Original Repos or ComfyUI?</h2>
+<ul>
+<li><strong>One-click installers for Windows, RunPod, Massed Compute and SimplePod</strong> &mdash; venv, pre-compiled CUDA-13 wheels (FlashAttention, SageAttention, xformers, Triton, torchao), model downloads: all automatic. The original repos require manual dependency battles; several don't even run on consumer GPUs without the optimizations we wrote.</li>
+<li><strong>Optimizations you won't find upstream:</strong> SparkVSR at ~1/3 the RAM/VRAM of the public code with our BF16/FP8/INT8 weights; SeedVR2 with phase-isolated subprocesses and unlimited-resolution color fix; FlashVSR+ with a rebuilt stable backend; Auto Tune buttons backed by a downloadable database of real measured VRAM configs from 6 GB to 32 GB GPUs.</li>
+<li><strong>Pipeline features no node graph gives you for free:</strong> scene-based chunking with resume, per-GPU queues, batch folders of mixed videos+images, collision-safe naming, salvage-on-cancel, automatic audio handling, comparison video generation, telemetry you can audit.</li>
+<li><strong>A real product, continuously maintained:</strong> 60+ releases since February (see the in-app Version History tab), same-week fixes when users report issues, tutorials, and a Discord community.</li>
+</ul>
+
+<h2>Requirements &amp; Installation</h2>
+<p><strong>Windows:</strong> Python 3.10&ndash;3.12, FFmpeg, CUDA 13, cuDNN 9.17+, C++ Build Tools, Git &mdash; follow the requirements tutorial once: <a href="https://youtu.be/DrhUHnYfwC0">https://youtu.be/DrhUHnYfwC0</a> (works on all GPUs from RTX 2000 up). Then run Windows_Install_and_Update.bat and Windows_Run_SECourses_Upscaler_Pro.bat. Done.</p>
+<p><strong>Massed Compute (recommended cloud):</strong> register via <a href="https://vm.massedcompute.com/signup?linkId=lp_034338&amp;sourceId=secourses&amp;tenantId=massed-compute">this link</a> &mdash; coupon <strong>SECourses</strong> for all GPUs. Pick the SECourses creator image and follow Massed_Compute_Instructions_READ.txt. GPU guide: <a href="https://www.patreon.com/posts/126671823">https://www.patreon.com/posts/126671823</a></p>
+<p><strong>RunPod:</strong> <a href="https://get.runpod.io/955rkuppqv4h">https://get.runpod.io/955rkuppqv4h</a> &nbsp;&bull;&nbsp; <strong>SimplePod:</strong> <a href="https://simplepod.ai/ref?user=secourses">https://simplepod.ai/ref?user=secourses</a> &mdash; follow Runpod_SimplePod_Premium_Upscaler_Instructions.txt. Setup video (RunPod from 22:03): <a href="https://youtu.be/KW-MHmoNcqo?t=1323">https://youtu.be/KW-MHmoNcqo?t=1323</a> &bull; SimplePod from 21:51: <a href="https://youtu.be/yOj9PYq3XYM?t=1311">https://youtu.be/yOj9PYq3XYM?t=1311</a></p>
+
+<h2>Full 4K Screenshot Gallery</h2>
+<p>All screenshots in full 4K resolution: <a href="https://huggingface.co/MonsterMMORPG/Wan_GGUF/discussions/13">https://huggingface.co/MonsterMMORPG/Wan_GGUF/discussions/13</a></p>
+
+<h2>Community &amp; Support</h2>
+<p>Join the SECourses Discord to get help, discuss and get your special rank: <a href="https://discord.com/servers/software-engineering-courses-secourses-772774097734074388">SECourses Discord</a></p>
+<p>Please also Star, Watch and Fork our <a href="https://github.com/FurkanGozukara/Stable-Diffusion">Stable Diffusion &amp; Generative AI GitHub repository</a>, join our <a href="https://www.reddit.com/r/SECourses/">Reddit</a> and follow me on <a href="https://www.linkedin.com/in/furkangozukara/">LinkedIn</a>.</p>

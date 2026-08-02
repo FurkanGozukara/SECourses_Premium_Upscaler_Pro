@@ -112,6 +112,15 @@ def merge_payload_state(payload: Any, live_state: Any) -> Any:
     """Replace payload's trailing state with merged live runtime state."""
     if isinstance(payload, tuple) and payload:
         merged = merge_runtime_state(live_state, payload[-1])
+        first = payload[0]
+        if isinstance(first, str) and first.strip():
+            # Every processing tab's first output is its status Markdown, which
+            # is created with visible=False. A bare string only updates the
+            # value, so errors like "Input path missing" rendered into an
+            # invisible component and the user saw nothing happen. Wrap bare
+            # status strings so the box also becomes visible.
+            first = {"value": first, "visible": True, "__type__": "update"}
+            return (first, *payload[1:-1], merged)
         return (*payload[:-1], merged)
     return payload
 

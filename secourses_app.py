@@ -32,8 +32,10 @@ if sys.platform == 'win32':
     import io
     if sys.stdout.encoding != 'utf-8':
         try:
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+            # write_through so output is not held in an 8KB buffer when stdout
+            # is redirected to a file (otherwise logs appear empty mid-run).
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
         except Exception:
             pass  # Silently ignore if we can't change encoding
 
@@ -2414,6 +2416,9 @@ def main(argv=None):
         # SECOURSES_NO_BROWSER=1 disables auto-opening a browser tab (useful for
         # headless/cloud servers and automated testing). Default keeps old behavior.
         "inbrowser": os.environ.get("SECOURSES_NO_BROWSER", "0") != "1",
+        # Surface unexpected handler exceptions as visible error toasts instead
+        # of failing silently (users otherwise see nothing when a callback dies).
+        "show_error": True,
         "allowed_paths": launch_allowed_paths,
         "share": share_enabled,
         "theme": modern_theme,

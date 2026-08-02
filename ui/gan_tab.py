@@ -266,7 +266,7 @@ def gan_tab(
             with gr.Row():
                 copy_output_into_input_btn = gr.Button(
                     "Copy Output Into Input",
-                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    elem_classes=["action-btn", "action-btn-source-seed", "sec-btn-teal"],
                     scale=1,
                 )
                 auto_transfer_output_to_input = gr.Checkbox(
@@ -437,12 +437,12 @@ def gan_tab(
                         "Start Upscaling",
                         variant="primary",
                         size="lg",
-                        elem_classes=["action-btn", "action-btn-upscale"],
+                        elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
                     )
                     preview_btn = gr.Button(
                         "Preview First Frame",
                         size="lg",
-                        elem_classes=["action-btn", "action-btn-preview"],
+                        elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"],
                     )
 
                 with gr.Row():
@@ -458,7 +458,7 @@ def gan_tab(
                         size="md",
                         min_width=170,
                         scale=1,
-                        elem_classes=["action-btn", "action-btn-cancel"],
+                        elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
             output_override = gr.Textbox(
@@ -544,11 +544,11 @@ def gan_tab(
             with gr.Row():
                 open_outputs_btn = gr.Button(
                     "Open Outputs Folder",
-                    elem_classes=["action-btn", "action-btn-open"],
+                    elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
                 )
                 clear_temp_btn = gr.Button(
                     "Clear Temp Files",
-                    elem_classes=["action-btn", "action-btn-clear"],
+                    elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
                 )
 
             log_box = gr.Textbox(

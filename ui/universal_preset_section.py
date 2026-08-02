@@ -314,10 +314,15 @@ def universal_preset_section(
     presets = callbacks["get_presets_list"]()
     selected_preset = current_preset if current_preset in presets else (presets[-1] if presets else None)
 
+    # V6: unique color per preset action, consistent across every tab
+    # (green / sky / amber / rose are reserved app-wide for the preset row).
+    _PRESET_BTN_HUES = {"save": "green", "load": "sky", "reset": "amber", "delete": "rose"}
+
     def _preset_button_classes(name: str):
+        classes = ["action-btn", f"sec-btn-{_PRESET_BTN_HUES[name]}"]
         if tab_name == "resolution":
-            return ["action-btn", f"resolution-btn-preset-{name}"]
-        return None
+            classes.append(f"resolution-btn-preset-{name}")
+        return classes
     
     with gr.Accordion("📦 Universal Preset (All Tabs)", open=open_accordion):
         gr.Markdown("""

@@ -68,9 +68,9 @@ def queue_tab(queue_tab_component) -> None:
     )
 
     with gr.Row():
-        refresh_btn = gr.Button("Refresh", variant="secondary")
-        delete_btn = gr.Button("Delete Selected", variant="stop")
-        clear_btn = gr.Button("Clear All Waiting", variant="stop")
+        refresh_btn = gr.Button("Refresh", variant="secondary", elem_classes=["action-btn", "sec-btn-cyan"])
+        delete_btn = gr.Button("Delete Selected", variant="stop", elem_classes=["action-btn", "sec-btn-orange"])
+        clear_btn = gr.Button("Clear All Waiting", variant="stop", elem_classes=["action-btn", "sec-btn-red"])
 
     action_status = gr.Markdown("")
     queue_timer = gr.Timer(value=2.0, active=True)

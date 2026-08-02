@@ -502,13 +502,13 @@ def rife_tab(
                     "Process Video",
                     variant="primary",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-upscale"],
+                    elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
                 )
                 cancel_btn = gr.Button(
                     "Cancel",
                     variant="stop",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-cancel"],
+                    elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                 )
             
             cancel_confirm = gr.Checkbox(
@@ -521,11 +521,11 @@ def rife_tab(
             with gr.Row():
                 open_outputs_btn = gr.Button(
                     "Open Outputs Folder",
-                    elem_classes=["action-btn", "action-btn-open"],
+                    elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
                 )
                 clear_temp_btn = gr.Button(
                     "Clear Temp Files",
-                    elem_classes=["action-btn", "action-btn-clear"],
+                    elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
                 )
 
             # UNIVERSAL PRESET MANAGEMENT

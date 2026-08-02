@@ -839,7 +839,7 @@ def rtx_super_resolution_tab(
                     with gr.Column(scale=3):
                         input_file = gr.File(label="Upload video or image (optional)", type="filepath", file_types=["video", "image"])
                         input_path = gr.Textbox(label="Input Path", value=_value("input_path", ""), placeholder="C:/path/to/video.mp4 or C:/path/to/frames/")
-                        copy_output_into_input_btn = gr.Button("Copy Output Into Input", elem_classes=["action-btn", "action-btn-source-seed"])
+                        copy_output_into_input_btn = gr.Button("Copy Output Into Input", elem_classes=["action-btn", "action-btn-source-seed", "sec-btn-teal"])
                         auto_transfer_output_to_input = gr.Checkbox(label="Auto Transfer Output to Input", value=bool(_value("auto_transfer_output_to_input", False)))
                     with gr.Column(scale=3):
                         input_image_preview = gr.Image(label="Input Preview (Image)", type="filepath", interactive=False, height=220, visible=False)
@@ -873,7 +873,7 @@ def rtx_super_resolution_tab(
                 label="Apply Face Restoration after upscale",
                 value=bool(_value("face_restore_after_upscale", False)),
             )
-            auto_tune_btn = gr.Button("Auto Tune Max Quality (VRAM Optimized)", elem_classes=["action-btn", "action-btn-source-seed"])
+            auto_tune_btn = gr.Button("Auto Tune Max Quality (VRAM Optimized)", elem_classes=["action-btn", "action-btn-optimize", "sec-btn-crimson"])
             gr.Markdown(
                 (
                     "**How Auto Tune works (RTX Super Resolution):** Tests a short preview input against RTX presets "
@@ -900,8 +900,8 @@ def rtx_super_resolution_tab(
                     scale=1,
                 )
             with gr.Row():
-                open_outputs_btn = gr.Button("Open Outputs Folder", elem_classes=["action-btn", "action-btn-open"])
-                clear_temp_btn = gr.Button("Delete Temp Folder", elem_classes=["action-btn", "action-btn-clear"])
+                open_outputs_btn = gr.Button("Open Outputs Folder", elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"])
+                clear_temp_btn = gr.Button("Delete Temp Folder", elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"])
             delete_temp_confirm = gr.Checkbox(label="Confirm delete temp folder (required for safety)", value=False)
 
             (
@@ -991,8 +991,8 @@ def rtx_super_resolution_tab(
                         scale=1,
                     )
                 with gr.Row():
-                    upscale_btn = gr.Button("Upscale", variant="primary", elem_classes=["action-btn", "action-btn-upscale"])
-                    preview_btn = gr.Button("First-frame Preview", elem_classes=["action-btn", "action-btn-preview"])
+                    upscale_btn = gr.Button("Upscale", variant="primary", elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"])
+                    preview_btn = gr.Button("First-frame Preview", elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"])
                 with gr.Row():
                     cancel_confirm = gr.Checkbox(
                         label="Confirm cancel (subprocess mode only)",
@@ -1000,7 +1000,7 @@ def rtx_super_resolution_tab(
                         info="Cancel only works in subprocess mode. Check Global Settings to verify mode.",
                         scale=3,
                     )
-                    cancel_btn = gr.Button("Cancel (subprocess only)", variant="stop", elem_classes=["action-btn", "action-btn-cancel"], scale=1)
+                    cancel_btn = gr.Button("Cancel (subprocess only)", variant="stop", elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"], scale=1)
                 resume_run_dir = gr.Textbox(
                     label="Resume Run Folder (chunk/scene resume)",
                     value=str(_value("resume_run_dir", "") or ""),

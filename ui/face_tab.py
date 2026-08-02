@@ -193,7 +193,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                         "✨ Restore Faces",
                         variant="primary",
                         size="lg",
-                        elem_classes=["action-btn", "action-btn-upscale"],
+                        elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
                     )
 
                 # Right: output

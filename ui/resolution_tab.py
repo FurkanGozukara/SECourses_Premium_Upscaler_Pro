@@ -182,7 +182,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                     "Pick File",
                     size="lg",
                     elem_id="resolution_pick_file_btn",
-                    elem_classes=["action-btn", "resolution-btn-browse"],
+                    elem_classes=["action-btn", "resolution-btn-browse", "sec-btn-blue"],
                     scale=3,
                 )
             
@@ -190,7 +190,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 calc_chunks_btn = gr.Button(
                     "Estimate Chunks",
                     variant="primary",
-                    elem_classes=["action-btn", "resolution-btn-estimate"],
+                    elem_classes=["action-btn", "resolution-btn-estimate", "sec-btn-violet"],
                 )
 
             gr.Markdown("#### Standalone Scene Split")
@@ -198,7 +198,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 standalone_split_btn = gr.Button(
                     "Split Scenes to MP4",
                     variant="primary",
-                    elem_classes=["action-btn", "resolution-btn-split"],
+                    elem_classes=["action-btn", "resolution-btn-split", "sec-btn-emerald"],
                 )
             standalone_split_output_dir = gr.Textbox(
                 label="Standalone Split Output Folder",
@@ -209,7 +209,7 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 standalone_open_split_folder_btn = gr.Button(
                     "Open Split Location",
                     size="lg",
-                    elem_classes=["action-btn", "resolution-btn-open-split"],
+                    elem_classes=["action-btn", "resolution-btn-open-split", "sec-btn-cyan"],
                 )
             standalone_split_result = gr.Markdown("", visible=False)
             
@@ -226,17 +226,17 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
                 use_seedvr2_input_btn = gr.Button(
                     "Use SeedVR2 Input",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    elem_classes=["action-btn", "action-btn-source-seed", "sec-btn-indigo"],
                 )
                 use_gan_input_btn = gr.Button(
                     "Use GAN Input",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-source-gan"],
+                    elem_classes=["action-btn", "action-btn-source-gan", "sec-btn-purple"],
                 )
                 use_flashvsr_input_btn = gr.Button(
                     "Use FlashVSR Input",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-source-flash"],
+                    elem_classes=["action-btn", "action-btn-source-flash", "sec-btn-fuchsia"],
                 )
 
     # UNIVERSAL PRESET MANAGEMENT

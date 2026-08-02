@@ -184,7 +184,7 @@ def health_tab(global_settings: Dict[str, Any], shared_state: gr.State, temp_dir
             "Run Health Check",
             variant="primary",
             size="lg",
-            elem_classes=["action-btn", "action-btn-preview"],
+            elem_classes=["action-btn", "action-btn-preview", "sec-btn-emerald"],
         )
 
     health_report = gr.HTML(
@@ -231,12 +231,12 @@ def health_tab(global_settings: Dict[str, Any], shared_state: gr.State, temp_dir
 
     with gr.Accordion("Gradio Source Scan", open=False):
         gr.Markdown("Scan installed Gradio package for components and feature surface.")
-        gradio_scan_btn = gr.Button("Scan Gradio Installation", variant="secondary")
+        gradio_scan_btn = gr.Button("Scan Gradio Installation", variant="secondary", elem_classes=["action-btn", "sec-btn-violet"])
         gradio_scan_report = gr.Markdown("Click to scan Gradio source...", buttons=["copy"])
 
     with gr.Accordion("Repository Scan (SeedVR2, Real-ESRGAN, OMDB)", open=False):
         gr.Markdown("Scan external repositories for recent commits and changes.")
-        repo_scan_btn = gr.Button("Scan Repositories", variant="secondary")
+        repo_scan_btn = gr.Button("Scan Repositories", variant="secondary", elem_classes=["action-btn", "sec-btn-blue"])
         repo_scan_report = gr.Markdown("Click to scan repositories...", buttons=["copy"])
 
     health_btn.click(

@@ -380,11 +380,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
 
                     gr.Markdown("**Quick Presets**")
                     with gr.Row():
-                        preset_youtube = gr.Button("YouTube", size="lg")
-                        preset_archival = gr.Button("Archival", size="lg")
+                        preset_youtube = gr.Button("YouTube", size="lg", elem_classes=["action-btn", "sec-btn-red"])
+                        preset_archival = gr.Button("Archival", size="lg", elem_classes=["action-btn", "sec-btn-indigo"])
                     with gr.Row():
-                        preset_editing = gr.Button("Editing", size="lg")
-                        preset_web = gr.Button("Web", size="lg")
+                        preset_editing = gr.Button("Editing", size="lg", elem_classes=["action-btn", "sec-btn-purple"])
+                        preset_web = gr.Button("Web", size="lg", elem_classes=["action-btn", "sec-btn-cyan"])
 
         with gr.TabItem("Frame Processing"):
             gr.Markdown("#### Frame Range Controls")
@@ -576,12 +576,12 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         )
 
                     with gr.Row():
-                        direct_compare_btn = gr.Button("Render Live Slider", size="lg")
-                        direct_compare_video_btn = gr.Button("Generate Comparison Video", variant="primary", size="lg")
-                        direct_compare_preview_btn = gr.Button("Preview Frame", size="lg")
-                        direct_compare_clear_btn = gr.Button("Clear", size="lg")
+                        direct_compare_btn = gr.Button("Render Live Slider", size="lg", elem_classes=["action-btn", "sec-btn-blue"])
+                        direct_compare_video_btn = gr.Button("Generate Comparison Video", variant="primary", size="lg", elem_classes=["action-btn", "sec-btn-emerald"])
+                        direct_compare_preview_btn = gr.Button("Preview Frame", size="lg", elem_classes=["action-btn", "sec-btn-teal"])
+                        direct_compare_clear_btn = gr.Button("Clear", size="lg", elem_classes=["action-btn", "sec-btn-orange"])
                     with gr.Row():
-                        direct_open_outputs_btn = gr.Button("Open Outputs Folder", size="lg")
+                        direct_open_outputs_btn = gr.Button("Open Outputs Folder", size="lg", elem_classes=["action-btn", "sec-btn-lime"])
 
                     direct_compare_status = gr.Markdown("")
 
@@ -698,9 +698,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         )
 
                     with gr.Row():
-                        multi_video_swap_btn = gr.Button("Swap", size="lg")
-                        multi_video_render_btn = gr.Button("Render", variant="primary", size="lg")
-                        multi_video_clear_btn = gr.Button("Clear", size="lg")
+                        multi_video_swap_btn = gr.Button("Swap", size="lg", elem_classes=["action-btn", "sec-btn-violet"])
+                        multi_video_render_btn = gr.Button("Render", variant="primary", size="lg", elem_classes=["action-btn", "sec-btn-fuchsia"])
+                        multi_video_clear_btn = gr.Button("Clear", size="lg", elem_classes=["action-btn", "sec-btn-crimson"])
 
                     multi_video_status = gr.Markdown("Upload at least 2 videos to compare.")
 
@@ -766,9 +766,9 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         )
 
                     with gr.Row():
-                        multi_image_swap_btn = gr.Button("Swap", size="lg")
-                        multi_image_render_btn = gr.Button("Render", variant="primary", size="lg")
-                        multi_image_clear_btn = gr.Button("Clear", size="lg")
+                        multi_image_swap_btn = gr.Button("Swap", size="lg", elem_classes=["action-btn", "sec-btn-pink"])
+                        multi_image_render_btn = gr.Button("Render", variant="primary", size="lg", elem_classes=["action-btn", "sec-btn-yellow"])
+                        multi_image_clear_btn = gr.Button("Clear", size="lg", elem_classes=["action-btn", "sec-btn-slate"])
 
                     multi_image_status = gr.Markdown("Upload at least 2 images to compare.")
 

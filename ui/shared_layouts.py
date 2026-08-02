@@ -189,7 +189,7 @@ def create_action_buttons(
             variant="primary" if ffmpeg_available else "stop",
             size="lg",
             interactive=ffmpeg_available,
-            elem_classes=["action-btn", "action-btn-upscale"],
+            elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
         )
         
         cancel_confirm = None
@@ -204,7 +204,7 @@ def create_action_buttons(
                 "⏹️ Cancel",
                 variant="stop",
                 scale=1,
-                elem_classes=["action-btn", "action-btn-cancel"],
+                elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
             )
         
         preview_btn = None
@@ -213,7 +213,7 @@ def create_action_buttons(
                 "👁️ Preview First Frame" if ffmpeg_available else "❌ Preview (ffmpeg required)",
                 size="lg",
                 interactive=ffmpeg_available,
-                elem_classes=["action-btn", "action-btn-preview"],
+                elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"],
             )
     
     return upscale_btn, cancel_confirm, cancel_btn, preview_btn
@@ -230,12 +230,12 @@ def create_utility_buttons() -> Tuple[gr.Button, gr.Button, gr.Checkbox]:
         open_outputs_btn = gr.Button(
             "📂 Open Outputs Folder",
             size="lg",
-            elem_classes=["action-btn", "action-btn-open"],
+            elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
         )
         clear_temp_btn = gr.Button(
             "🗑️ Clear Temp Files",
             size="lg",
-            elem_classes=["action-btn", "action-btn-clear"],
+            elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
         )
     
     delete_confirm = gr.Checkbox(

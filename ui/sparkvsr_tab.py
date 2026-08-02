@@ -370,7 +370,7 @@ def sparkvsr_tab(
                         )
                         copy_output_into_input_btn = gr.Button(
                             "Copy Output Into Input",
-                            elem_classes=["action-btn", "action-btn-source-seed", "SparkVSR-copy-output-compact"],
+                            elem_classes=["action-btn", "action-btn-source-seed", "SparkVSR-copy-output-compact", "sec-btn-teal"],
                             size="md",
                         )
 
@@ -489,7 +489,7 @@ def sparkvsr_tab(
                             "Auto Tune for Max Quality - VRAM Optimized",
                             size="md",
                             min_width=220,
-                            elem_classes=["action-btn", "action-btn-optimize", "SparkVSR-autotune-tall"],
+                            elem_classes=["action-btn", "action-btn-optimize", "SparkVSR-autotune-tall", "sec-btn-crimson"],
                         )
                         with gr.Row():
                             save_vram_gb = gr.Slider(
@@ -820,10 +820,10 @@ def sparkvsr_tab(
                 with gr.Group(elem_classes=["autotune-modal-card"]):
                     with gr.Row(elem_classes=["autotune-modal-header"]):
                         gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
-                        flash_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close"])
+                        flash_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
                     flash_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
                     with gr.Row(elem_classes=["autotune-modal-actions"]):
-                        flash_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok"])
+                        flash_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
 
             with gr.Group():
                 _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
@@ -894,12 +894,12 @@ def sparkvsr_tab(
                         " Start Upscaling",
                         variant="primary",
                         size="lg",
-                        elem_classes=["action-btn", "action-btn-upscale"],
+                        elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
                     )
                     preview_btn = gr.Button(
                         "Preview First Frame",
                         size="lg",
-                        elem_classes=["action-btn", "action-btn-preview"],
+                        elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"],
                     )
 
                 with gr.Row():
@@ -915,7 +915,7 @@ def sparkvsr_tab(
                         size="md",
                         min_width=170,
                         scale=1,
-                        elem_classes=["action-btn", "action-btn-cancel"],
+                        elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
             resume_run_dir = gr.Textbox(
@@ -994,11 +994,11 @@ def sparkvsr_tab(
             with gr.Row():
                 open_outputs_btn = gr.Button(
                     " Open Outputs",
-                    elem_classes=["action-btn", "action-btn-open"],
+                    elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
                 )
                 clear_temp_btn = gr.Button(
                     " Clear Temp",
-                    elem_classes=["action-btn", "action-btn-clear"],
+                    elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
                 )
 
             with gr.Accordion(" Batch Processing", open=True):

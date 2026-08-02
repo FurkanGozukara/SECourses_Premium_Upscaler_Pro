@@ -96,8 +96,9 @@ def check_gradio_version() -> Tuple[bool, str, Dict[str, Any]]:
         except Exception:
             version_tuple = (0, 0, 0)
             
-        # Minimum required version: 4.0.0 (for ImageSlider, Timer, etc.)
-        min_version = (4, 0, 0)
+        # Minimum required version: 6.0.0 (the app targets the Gradio 6.x API:
+        # launch(theme=/css=/head=), unified buttons=[...], Timer, ImageSlider).
+        min_version = (6, 0, 0)
         
         is_compatible = version_tuple >= min_version
         
@@ -126,7 +127,7 @@ def check_gradio_version() -> Tuple[bool, str, Dict[str, Any]]:
         
         # Build message with source scan results
         if is_compatible:
-            msg = f"✅ Gradio {version} is compatible (minimum: 4.0.0)"
+            msg = f"✅ Gradio {version} is compatible (minimum: 6.0.0)"
             msg += f"\n📦 Installed at: {source_scan.get('install_path', 'unknown')}"
             msg += f"\n🔍 Discovered {len(source_scan.get('components', []))} components in source"
             
@@ -135,7 +136,7 @@ def check_gradio_version() -> Tuple[bool, str, Dict[str, Any]]:
             if missing:
                 msg += f"\n⚠️ Missing optional features: {', '.join(missing)}"
         else:
-            msg = f"❌ Gradio {version} is too old (minimum: 4.0.0)\n"
+            msg = f"❌ Gradio {version} is too old (minimum: 6.0.0)\n"
             msg += "Please upgrade: pip install --upgrade gradio"
             
         logger.info(f"Gradio compatibility check: {msg}")

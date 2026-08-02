@@ -252,7 +252,7 @@ def seedvr2_tab(
                 with gr.Column(scale=2):
                     auto_tune_btn = gr.Button(
                         "Auto Tune for Max Quality - VRAM Optimized",
-                        elem_classes=["action-btn", "action-btn-optimize"],
+                        elem_classes=["action-btn", "action-btn-optimize", "sec-btn-crimson"],
                     )
                     save_vram_gb = gr.Slider(
                         label="Save VRAM (GB)",
@@ -276,7 +276,7 @@ def seedvr2_tab(
             with gr.Row():
                 copy_output_into_input_btn = gr.Button(
                     "Copy Output Into Input",
-                    elem_classes=["action-btn", "action-btn-source-seed"],
+                    elem_classes=["action-btn", "action-btn-source-seed", "sec-btn-teal"],
                     scale=1,
                 )
                 auto_transfer_output_to_input = gr.Checkbox(
@@ -660,10 +660,10 @@ def seedvr2_tab(
                 with gr.Group(elem_classes=["autotune-modal-card"]):
                     with gr.Row(elem_classes=["autotune-modal-header"]):
                         gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
-                        seed_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close"])
+                        seed_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
                     seed_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
                     with gr.Row(elem_classes=["autotune-modal-actions"]):
-                        seed_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok"])
+                        seed_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
             
             # Upscale factor + action buttons (placed directly above  Run Log)
             with gr.Group():
@@ -717,13 +717,13 @@ def seedvr2_tab(
                         variant="primary" if ffmpeg_available else "stop",
                         size="lg",
                         interactive=ffmpeg_available,
-                        elem_classes=["action-btn", "action-btn-upscale"],
+                        elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
                     )
                     preview_btn = gr.Button(
                         " First-frame Preview" if ffmpeg_available else " Preview (ffmpeg required)",
                         size="lg",
                         interactive=ffmpeg_available,
-                        elem_classes=["action-btn", "action-btn-preview"],
+                        elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"],
                     )
 
                 # Row 2: Confirm cancel + Cancel
@@ -740,7 +740,7 @@ def seedvr2_tab(
                         size="md",
                         min_width=170,  # Middle size: larger than small, not oversized
                         scale=1,
-                        elem_classes=["action-btn", "action-btn-cancel"],
+                        elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
                 resume_run_dir = gr.Textbox(
@@ -861,12 +861,12 @@ def seedvr2_tab(
                 open_outputs_btn = gr.Button(
                     " Open Outputs Folder",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-open"],
+                    elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
                 )
                 delete_temp_btn = gr.Button(
                     " Delete Temp Folder",
                     size="lg",
-                    elem_classes=["action-btn", "action-btn-clear"],
+                    elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
                 )
             
             delete_confirm = gr.Checkbox(
@@ -971,8 +971,8 @@ def seedvr2_tab(
             - **In-app mode** (when implemented) will cache models between runs - then these buttons will actually unload persistent models
             """)
             with gr.Row():
-                unload_model_btn = gr.Button(" Clear CUDA Cache", variant="secondary", size="lg")
-                unload_all_models_btn = gr.Button(" Clear All CUDA Caches", variant="stop", size="lg")
+                unload_model_btn = gr.Button(" Clear CUDA Cache", variant="secondary", size="lg", elem_classes=["action-btn", "sec-btn-violet"])
+                unload_all_models_btn = gr.Button(" Clear All CUDA Caches", variant="stop", size="lg", elem_classes=["action-btn", "sec-btn-purple"])
             model_unload_status = gr.Markdown("", visible=False)
 
             # Timer for periodic model status updates
@@ -1018,7 +1018,7 @@ def seedvr2_tab(
                     value=values[46] if len(values) > 46 else False,  # Now index 46 (was 49, removed 3 items)
                     info="Resume interrupted chunking from existing partial outputs. Useful for recovering from crashes or cancellations."
                 )
-                check_resume_btn = gr.Button(" Check Resume Status", size="lg")
+                check_resume_btn = gr.Button(" Check Resume Status", size="lg", elem_classes=["action-btn", "sec-btn-lime"])
 
             # Mode information
             gr.Markdown("####  Processing Mode")
@@ -1718,7 +1718,7 @@ def seedvr2_tab(
 
     # Add a refresh button for model status
     with gr.Row():
-        refresh_model_status_btn = gr.Button(" Refresh Model Status", size="lg", variant="secondary")
+        refresh_model_status_btn = gr.Button(" Refresh Model Status", size="lg", variant="secondary", elem_classes=["action-btn", "sec-btn-indigo"])
         toggle_auto_refresh = gr.Checkbox(label="Auto-refresh (2s)", value=False, scale=0)
     
     refresh_model_status_btn.click(

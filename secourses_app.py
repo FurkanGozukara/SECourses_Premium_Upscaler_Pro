@@ -71,12 +71,14 @@ from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
+from ui.changelog_tab import changelog_tab
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_TITLE = "SECourses Ultimate Video and Image Upscaler Pro V5.4 – https://www.patreon.com/posts/150202809"
+APP_VERSION = "6.0"
+APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – https://www.patreon.com/posts/150202809"
 
 
 # --------------------------------------------------------------------- #
@@ -213,6 +215,105 @@ def _build_launch_allowed_paths(output_dir: str | Path, temp_dir: str | Path) ->
     }
     allowed_paths.update(_scan_disk_roots())
     return sorted(allowed_paths)
+
+
+# --------------------------------------------------------------------- #
+# Per-tab unique button colors (V6 modernization)
+# --------------------------------------------------------------------- #
+# Every button inside a tab gets a distinct hue via elem_classes
+# ("sec-btn-<hue>"). The classes only override colors; sizing, radius,
+# transitions and the sweep/pulse animations still come from the existing
+# .action-btn* rules, so nothing else about the design changes.
+# (dark stop, mid stop, light stop) per hue - readable in dark AND light mode.
+_SEC_BTN_HUES = {
+    "red":     ("#991b1b", "#dc2626", "#f87171"),
+    "crimson": ("#4c0519", "#be123c", "#fb7185"),
+    "rose":    ("#9f1239", "#e11d48", "#fda4af"),
+    "pink":    ("#9d174d", "#db2777", "#f9a8d4"),
+    "fuchsia": ("#86198f", "#c026d3", "#e879f9"),
+    "purple":  ("#6b21a8", "#9333ea", "#c084fc"),
+    "violet":  ("#5b21b6", "#7c3aed", "#a78bfa"),
+    "indigo":  ("#3730a3", "#4f46e5", "#818cf8"),
+    "blue":    ("#1e40af", "#2563eb", "#60a5fa"),
+    "sky":     ("#075985", "#0284c7", "#38bdf8"),
+    "cyan":    ("#155e75", "#0891b2", "#22d3ee"),
+    "teal":    ("#115e59", "#0d9488", "#2dd4bf"),
+    "emerald": ("#065f46", "#059669", "#34d399"),
+    "green":   ("#166534", "#16a34a", "#4ade80"),
+    "lime":    ("#3f6212", "#65a30d", "#a3e635"),
+    "yellow":  ("#854d0e", "#ca8a04", "#facc15"),
+    "amber":   ("#92400e", "#d97706", "#fbbf24"),
+    "orange":  ("#9a3412", "#ea580c", "#fb923c"),
+    "bronze":  ("#78350f", "#b45309", "#d6a05a"),
+    "slate":   ("#334155", "#475569", "#94a3b8"),
+}
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    value = hex_color.lstrip("#")
+    return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def _build_sec_btn_css() -> str:
+    """Generate the sec-btn-<hue> color classes appended after the action-btn rules."""
+    rules = []
+    for name, (dark, mid, light) in _SEC_BTN_HUES.items():
+        r, g, b = _hex_to_rgb(mid)
+        lr, lg, lb = _hex_to_rgb(light)
+        rules.append(
+            f"""
+    .sec-btn-{name} button,
+    button.sec-btn-{name} {{
+      background: linear-gradient(135deg, {dark} 0%, {mid} 55%, {light} 100%) !important;
+      border-color: rgba({lr}, {lg}, {lb}, 0.72) !important;
+      color: #f8fafc !important;
+      text-shadow: 0 1px 2px rgba(2, 6, 23, 0.45);
+      box-shadow: 0 10px 24px rgba({r}, {g}, {b}, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+    }}
+    .sec-btn-{name} button:hover,
+    button.sec-btn-{name}:hover {{
+      box-shadow: 0 13px 30px rgba({r}, {g}, {b}, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+      border-color: rgba({lr}, {lg}, {lb}, 0.95) !important;
+    }}"""
+        )
+    return "\n".join(rules)
+
+
+# Light theme corrections: the main tab bar was designed dark-first; give it a
+# proper light appearance without touching the dark look users already have.
+_LIGHT_THEME_CSS = """
+    /* NOTE: Gradio 6 injects custom CSS twice (raw + auto-prefixed with
+       .gradio-container .contain, which has higher specificity). body:not(.dark)
+       selectors cannot receive that prefix, so these light-mode overrides need
+       !important to beat the prefixed dark-first rules. */
+    body:not(.dark) #secourses-main-tabs .tab-wrapper {
+      border: 1px solid rgba(37, 99, 235, 0.22) !important;
+      background: linear-gradient(130deg, rgba(219, 234, 254, 0.55), rgba(204, 251, 241, 0.45) 48%, rgba(209, 250, 229, 0.5)) !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 8px 18px rgba(15, 23, 42, 0.08) !important;
+    }
+    body:not(.dark) #secourses-main-tabs .tab-container button,
+    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button {
+      border: 1px solid rgba(100, 116, 139, 0.35) !important;
+      background: linear-gradient(160deg, rgba(255, 255, 255, 0.92), rgba(226, 232, 240, 0.85)) !important;
+      color: #0f172a !important;
+      box-shadow: 0 3px 8px rgba(15, 23, 42, 0.08) !important;
+    }
+    body:not(.dark) #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected),
+    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button:hover:not(:disabled):not(.selected) {
+      border-color: rgba(14, 165, 233, 0.66) !important;
+      background: linear-gradient(160deg, rgba(224, 242, 254, 0.95), rgba(240, 249, 255, 0.9)) !important;
+    }
+    body:not(.dark) #secourses-main-tabs .tab-container button.selected,
+    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected {
+      color: #f0fdfa !important;
+      border-color: rgba(13, 148, 136, 0.9) !important;
+      background: linear-gradient(145deg, rgba(37, 99, 235, 0.92), rgba(13, 148, 136, 0.92)) !important;
+      box-shadow: 0 8px 18px rgba(13, 148, 136, 0.28) !important;
+    }
+    body:not(.dark) .health-banner {
+      color: #0f172a !important;
+    }
+"""
 
 
 def main(argv=None):
@@ -1248,6 +1349,9 @@ def main(argv=None):
       }
     }
     """
+    # V6: unique per-tab button colors + light-theme corrections (appended last
+    # so they win the cascade at equal specificity without extra !important).
+    CUSTOM_CSS = CUSTOM_CSS + _build_sec_btn_css() + _LIGHT_THEME_CSS
     CUSTOM_HEAD = """
     <script>
     (() => {
@@ -1514,7 +1618,14 @@ def main(argv=None):
     <script>
     (() => {{
       try {{
-        const preferredTheme = {json.dumps(startup_theme_mode)};
+        // Priority: 1) user's last in-browser choice (theme radio persists it),
+        // 2) server-side preset value baked at startup. This keeps the theme
+        // stable across reloads even before the user saves a preset.
+        let preferredTheme = null;
+        try {{ preferredTheme = localStorage.getItem("secourses_theme_mode"); }} catch (_) {{}}
+        if (preferredTheme !== "dark" && preferredTheme !== "light") {{
+          preferredTheme = {json.dumps(startup_theme_mode)};
+        }}
         if (!preferredTheme || (preferredTheme !== "dark" && preferredTheme !== "light")) return;
         const url = new URL(window.location.href);
         if (url.searchParams.get("__theme") !== preferredTheme) {{
@@ -1680,7 +1791,7 @@ def main(argv=None):
         # NOTE: We update this via a Timer tick because gr.State change events can be
         # inconsistent across Gradio versions/environments.
         oom_banner = gr.HTML(value="", visible=False)
-        oom_dismiss_btn = gr.Button("Dismiss VRAM Alert", variant="secondary", size="sm", visible=False)
+        oom_dismiss_btn = gr.Button("Dismiss VRAM Alert", variant="secondary", size="sm", visible=False, elem_classes=["action-btn", "sec-btn-slate"])
         oom_timer = gr.Timer(value=2.0, active=True)
         health_sync_signature = gr.State(value="")
         oom_sync_signature = gr.State(value="")
@@ -1727,6 +1838,9 @@ def main(argv=None):
                     (mode) => {
                       try {
                         const chosen = (mode === "dark" || mode === "light") ? mode : "dark";
+                        // Persist in the browser so reloads keep the chosen theme
+                        // even before the preset is saved (see theme bootstrap head).
+                        try { localStorage.setItem("secourses_theme_mode", chosen); } catch (_) {}
                         const url = new URL(window.location.href);
                         url.searchParams.set("__theme", chosen);
                         window.history.replaceState(null, "", url.toString());
@@ -2142,6 +2256,11 @@ def main(argv=None):
                     output_dir=active_output_dir
                 )
 
+            # Version history: closed accordions are cheap in Gradio 6 (children
+            # are lazily mounted), so this tab costs nothing at startup.
+            with gr.Tab("📜 Changelog", render_children=False):
+                changelog_tab()
+
             # Global Settings should be the last tab (far-right)
             global_ui = render_global_settings_tab()
             global_ui["tab"].select(
@@ -2292,7 +2411,9 @@ def main(argv=None):
     demo.queue()
     launch_allowed_paths = _build_launch_allowed_paths(output_dir=active_output_dir, temp_dir=active_temp_dir)
     launch_kwargs = {
-        "inbrowser": True,
+        # SECOURSES_NO_BROWSER=1 disables auto-opening a browser tab (useful for
+        # headless/cloud servers and automated testing). Default keeps old behavior.
+        "inbrowser": os.environ.get("SECOURSES_NO_BROWSER", "0") != "1",
         "allowed_paths": launch_allowed_paths,
         "share": share_enabled,
         "theme": modern_theme,

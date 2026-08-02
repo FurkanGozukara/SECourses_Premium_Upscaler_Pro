@@ -15,17 +15,18 @@ CHANGELOG_ENTRIES = [
         """
 **A massive quality-of-life and performance release.**
 
-- **NEW: INT8 ConvRot quantization** — a third precision option next to BF16 and FP8 Scaled.
-  - Better quality than FP8 Scaled (closer to the original BF16 model) while using about **half the VRAM of BF16**.
-  - **Faster than BF16** on RTX 2000, 3000, 4000 and 5000 series GPUs (works on any NVIDIA GPU from GTX 1650 Super / RTX 2000 "Turing" and newer).
-  - Available for **SparkVSR** (new "SparkVSR-int8-convrot" model choice) — the quantized model is generated automatically from the BF16 weights the first time you use it, exactly like the FP8 Scaled option.
-  - Uses the same proven technology recently added to ComfyUI and our Musubi Trainer (group-wise Hadamard rotation + per-row MSE-optimized INT8).
+- **NEW: INT8 ConvRot quantization for all three diffusion upscalers** — a new precision option next to BF16 and FP8 Scaled, using the same proven technology recently added to ComfyUI and our Musubi Trainer (group-wise Hadamard rotation + per-row MSE-optimized INT8, fused Triton INT8 matmul).
+  - **SparkVSR**: new "SparkVSR-int8-convrot" model choice. The quantized model is generated automatically from the BF16 weights on first use (like FP8 Scaled). Measured on RTX 5090 (33 frames, 480p to 1080p): **11% faster than BF16 and 26% faster than FP8 Scaled**, about **4 GB less peak VRAM than BF16**, and **better quality than FP8 Scaled** (PSNR vs BF16: 49.1 dB for INT8 vs 47.8 dB for FP8; SSIM 0.9954 vs 0.9948). Transformer file shrinks from 11 GB to 6 GB.
+  - **SeedVR2**: new "INT8 ConvRot (DiT)" checkbox (Performance & Compile section). Works with the FP16 models, quantizing on load - about **half the DiT weight VRAM** and around **15% faster sampling** measured on the 3B model. Not needed for GGUF models (those are already quantized).
+  - **FlashVSR+**: new "int8_convrot" choice in the Precision dropdown - about half the DiT weight VRAM with near-BF16 quality (36 dB PSNR). FlashVSR is attention-bound, so treat this one as a VRAM saver rather than a speedup.
+  - Works on any NVIDIA GPU from RTX 2000 "Turing" and newer; older GPUs automatically fall back to a compatible slower path with identical output.
 - **Modernized interface on Gradio 6.22** — every button on every tab now has its own distinct color so you can find actions at a glance. Smoother tab switching, cleaner look in both themes.
+- **Fixed: silent errors** — clicking Upscale with a missing/invalid input used to do nothing visible (the error went to an invisible status box). Errors now appear instantly on every processing tab, and unexpected internal errors show as pop-up toasts.
+- **Fixed: fresh installs had a broken FlashVSR+ tab** — the installer never downloaded the FlashVSR runtime code, only its models. All installers (Windows, RunPod, Massed Compute) now set it up correctly.
 - **Light theme fixed and polished** — the top navigation bar and health banner now look correct in light mode (dark mode unchanged and still the default).
 - **Theme choice now sticks** — switching dark/light in Global Settings is remembered by your browser immediately, even before you save a preset and even after restarting the app.
 - **NEW: this Version History tab** — the full release history of the app, right inside the interface.
-- Internal health checks updated for the Gradio 6 interface engine.
-- Library upgrade pass: everything re-tested against Torch 2.13 + CUDA 13 + Gradio 6.22 with fixes where needed.
+- Library upgrade pass for Torch 2.13 + CUDA 13 + Gradio 6.22: restored missing `decord`, `sentencepiece`, `av`, `imageio-ffmpeg` dependencies (their absence broke SparkVSR entirely and broke video saving), fixed T5 text-encoder loading with the newest transformers, and updated internal health checks for Gradio 6.
 """,
     ),
     (

@@ -11,6 +11,19 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V6.1 — 5 August 2026 — INT8 ConvRot V2: Higher Quality, Shippable Caches",
+        """
+**A pure quality upgrade for INT8 ConvRot on all three diffusion upscalers.** Existing INT8 caches are rebuilt automatically on first use (one-time).
+
+- **Smarter layer selection (all models)** — a new automatic policy keeps the quality-critical conditioning layers (timestep/text embedders, modulation projections, input/output heads) in full precision, exactly like the official recipes for Wan, Qwen-Image and LTX-2 do. The biggest winner is **FlashVSR+**, which previously quantized its timestep-modulation projection - the layer that steers every block.
+- **Better quantization math (all models, no calibration needed)** — full [-128, 127] INT8 range, a closed-form least-squares scale refit after the MSE clip search, corrupted-weight sanitization before rotation, and a built-in **low-rank error-recovery adapter (ARA)** stored inside the same single cache file (~1-2% larger, measurably closer to BF16). A small "rescue budget" automatically keeps the few worst-quantizing layers in full precision.
+- **Sharper INT8 runtime** — the fused Triton kernel now does its quantization arithmetic in full FP32 (the old BF16 division added small rounding noise on large values), and supports the new optional per-group weight scales.
+- **Optional calibration for maximum quality** — run any upscale once with `SECOURSES_INT8_CALIBRATE=1` (plus `SECOURSES_INT8_HESSIAN=1` for GPTQ) on the BF16/FP16 model and the next INT8 conversion automatically uses activation statistics: energy-weighted scales, GPTQ rounding, Hessian-fitted ARA and bias correction.
+- **Shippable caches** — INT8 cache files are now validated by content instead of machine-specific file timestamps, so a cache generated on one PC (for example one we distribute) loads instantly on any other PC. If the cache is missing, it is still generated locally on first use exactly as before.
+- **New benchmark tool** — `python tools/int8_quality_benchmark.py --model sparkvsr|seedvr2|flashvsr` measures how close the INT8 weights stay to the BF16/FP16 originals (per-layer and model-wide SQNR) and compares the old V6.0 pipeline against the new one.
+""",
+    ),
+    (
         "V6.0 — 2 August 2026 — INT8 ConvRot Quantization, Modernized Interface, Gradio 6.22",
         """
 **A massive quality-of-life and performance release.**

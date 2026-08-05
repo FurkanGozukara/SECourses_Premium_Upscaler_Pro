@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Dict
@@ -20,27 +19,24 @@ from diffusers import CogVideoXTransformer3DModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from shared.int8_convrot import (
-    best_int8_convrot_groupsize,
-    int8_convrot_linear,
-    quantize_int8_convrot_weight,
-)
+from shared.int8_convert_engine import Int8ConversionEngine
+from shared.int8_convrot import int8_convrot_linear
 from shared.sparkvsr_constants import (
     SPARKVSR_BF16_MODEL_NAME,
     SPARKVSR_INT8_CONVROT_CACHE_NAME,
     SPARKVSR_INT8_CONVROT_MODEL_NAME,
 )
-from shared.sparkvsr_fp8_scaled import (
-    _component_file,
-    _format_bytes,
-    _linear_weight_names_for_component,
-)
+from shared.sparkvsr_fp8_scaled import _component_file, _format_bytes
 
-INT8_CACHE_FORMAT = "sparkvsr-transformer-int8-convrot-v2"
+# v3: V6.1 pipeline (policy exclusions, -128 range, LS scale refit, optional
+# calibration features, ARA low-rank recovery, budgeted rescue) + portable
+# validation so locally generated caches can be shipped to other machines.
+INT8_CACHE_FORMAT = "sparkvsr-transformer-int8-convrot-v3"
 INT8_GROUPSIZE_KEY_SUFFIX = ".int8_convrot_groupsize"
+INT8_ARA_DOWN_SUFFIX = ".int8_ara_down"
+INT8_ARA_UP_SUFFIX = ".int8_ara_up"
 
-# Retained only so an existing V6 directory cache can be migrated without
-# quantizing the 6 GB transformer again.
+# Legacy (V6.0) directory-cache marker, only used to recognize old paths.
 INT8_MANIFEST_NAME = "sparkvsr_int8_convrot_manifest.json"
 
 
@@ -85,62 +81,33 @@ def _source_metadata(source: Path) -> Dict[str, str]:
 
 
 def _has_valid_int8_cache(cache_path: Path, source: Path) -> bool:
+    """
+    Portable validation: the cache must carry the current format marker and
+    per-layer group-size keys. When the BF16 source file is present its size
+    must match the recorded one; path and mtime are informational only, so a
+    cache generated on one machine loads on any other (shipped caches).
+    """
     if not cache_path.is_file():
         return False
     try:
-        expected = _source_metadata(source)
         with safe_open(str(cache_path), framework="pt", device="cpu") as handle:
             metadata = handle.metadata() or {}
             keys = list(handle.keys())
         if metadata.get("sparkvsr_int8_convrot") != "true":
             return False
+        if metadata.get("int8_convrot_format") != INT8_CACHE_FORMAT:
+            return False
         if not any(key.endswith(INT8_GROUPSIZE_KEY_SUFFIX) for key in keys):
             return False
-        if metadata.get("int8_convrot_format") == INT8_CACHE_FORMAT:
-            return all(metadata.get(key) == value for key, value in expected.items())
-
-        # V6.0 directory caches recorded the source directory but not a file
-        # fingerprint. Accept one only when it points at this exact BF16 model.
-        return (
-            metadata.get("component") == "transformer"
-            and metadata.get("source") == expected["source"]
-            and cache_path.stat().st_mtime_ns >= _component_file(source, "transformer").stat().st_mtime_ns
-        )
-    except Exception:
-        return False
-
-
-def _migrate_legacy_transformer_cache(cache_path: Path, source: Path) -> bool:
-    legacy_dir = cache_path.parent / SPARKVSR_INT8_CONVROT_MODEL_NAME
-    legacy_file = _component_file(legacy_dir, "transformer")
-    if not legacy_file.is_file():
-        return False
-    try:
-        with safe_open(str(legacy_file), framework="pt", device="cpu") as handle:
-            metadata = handle.metadata() or {}
-            has_groups = any(key.endswith(INT8_GROUPSIZE_KEY_SUFFIX) for key in handle.keys())
-        if metadata.get("sparkvsr_int8_convrot") != "true" or not has_groups:
-            return False
-        recorded_source = metadata.get("source")
-        if recorded_source and recorded_source != str(source.resolve()):
-            return False
-        if legacy_file.stat().st_mtime_ns < _component_file(source, "transformer").stat().st_mtime_ns:
-            return False
-
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
         try:
-            os.link(legacy_file, temp_path)
-        except OSError:
-            shutil.copyfile(legacy_file, temp_path)
-        os.replace(temp_path, cache_path)
-        print(
-            f"[SparkVSR INT8] migrated legacy transformer cache to {cache_path}",
-            flush=True,
-        )
-        return True
-    except Exception as exc:
-        print(f"[SparkVSR INT8] legacy cache migration skipped: {exc}", flush=True)
+            source_file = _component_file(source, "transformer")
+        except Exception:
+            return True
+        if not source_file.is_file():
+            return True
+        recorded = metadata.get("source_size")
+        return recorded is None or recorded == str(source_file.stat().st_size)
+    except Exception:
         return False
 
 
@@ -154,56 +121,86 @@ def ensure_sparkvsr_int8_convrot_cache(
     """Create or reuse one transformer-only safetensors cache."""
     output = _normalize_cache_path(int8_model_path)
     source = Path(bf16_model_path)
-    source_file = _component_file(source, "transformer")
 
-    if not source_file.is_file():
-        raise FileNotFoundError(f"SparkVSR BF16 transformer is required to build the INT8 cache: {source_file}")
     if not force and _has_valid_int8_cache(output, source):
         print(f"[SparkVSR INT8] cache hit: {output}", flush=True)
         return output
-    if not force and _migrate_legacy_transformer_cache(output, source):
-        return output
 
-    if calc_device == "cpu" and torch.cuda.is_available():
-        calc_device = "cuda"
-    target_weights = _linear_weight_names_for_component(source, "transformer")
-    state: Dict[str, torch.Tensor] = {}
-    optimized = 0
+    source_file = _component_file(source, "transformer")
+    if not source_file.is_file():
+        raise FileNotFoundError(
+            f"SparkVSR BF16 transformer is required to build the INT8 cache: {source_file}"
+        )
+
+    engine = Int8ConversionEngine(
+        source_file, calc_device=calc_device, log_prefix="[SparkVSR INT8]"
+    )
     started = time.monotonic()
     print(
         f"[SparkVSR INT8] building transformer cache from {source_file} -> {output} "
-        f"(calc device: {calc_device})",
+        f"(calc device: {engine.calc_device})",
         flush=True,
     )
+
+    state: Dict[str, torch.Tensor] = {}
+    results = {}
     with safe_open(str(source_file), framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
+        shapes: Dict[str, tuple] = {}
+        for key in keys:
+            if not key.endswith(".weight"):
+                continue
+            shape = handle.get_slice(key).get_shape()
+            if len(shape) == 2:
+                shapes[key[: -len(".weight")]] = (int(shape[0]), int(shape[1]))
+        decisions = engine.plan(shapes)
+        key_set = set(keys)
+
         for index, key in enumerate(keys, 1):
-            tensor = handle.get_tensor(key)
-            group_size = None
-            if key in target_weights and tensor.ndim == 2:
-                group_size = best_int8_convrot_groupsize(int(tensor.shape[1]))
-            if group_size is None:
-                state[key] = tensor.detach().cpu().contiguous()
+            base = key[: -len(".weight")] if key.endswith(".weight") else None
+            decision = decisions.get(base) if base else None
+            if decision is None or not decision.quantize:
+                state[key] = handle.get_tensor(key).detach().cpu().contiguous()
             else:
-                quantized, scale = quantize_int8_convrot_weight(
+                tensor = handle.get_tensor(key)
+                result = engine.quantize_layer(
+                    base,
                     tensor,
-                    group_size=group_size,
-                    calc_device=calc_device,
-                    mse_clip=True,
+                    decision.group_size,
+                    has_bias=f"{base}.bias" in key_set,
+                    source_bytes_per_element=tensor.element_size(),
                 )
-                base = key[: -len(".weight")]
-                state[key] = quantized.contiguous()
-                state[base + ".scale_weight"] = scale.contiguous()
-                state[base + INT8_GROUPSIZE_KEY_SUFFIX] = torch.tensor(
-                    int(group_size), dtype=torch.int32
-                )
-                optimized += 1
+                results[base] = result
+                del tensor
             if index % 100 == 0 or index == len(keys):
                 print(
                     f"[SparkVSR INT8] transformer: {index}/{len(keys)} tensors, "
-                    f"quantized={optimized}",
+                    f"quantized={len(results)}",
                     flush=True,
                 )
+
+        rescued = engine.select_rescue(results)
+        for base, result in results.items():
+            key = f"{base}.weight"
+            if base in rescued:
+                state[key] = handle.get_tensor(key).detach().cpu().contiguous()
+                continue
+            state[key] = result.q
+            state[base + ".scale_weight"] = result.scale
+            state[base + INT8_GROUPSIZE_KEY_SUFFIX] = torch.tensor(
+                result.group_size, dtype=torch.int32
+            )
+            if result.ara_up is not None and result.ara_down is not None:
+                state[base + INT8_ARA_UP_SUFFIX] = result.ara_up
+                state[base + INT8_ARA_DOWN_SUFFIX] = result.ara_down
+            if result.bias_delta is not None:
+                bias_key = f"{base}.bias"
+                bias = state.get(bias_key)
+                if bias is not None:
+                    state[bias_key] = (
+                        (bias.float() - result.bias_delta).to(bias.dtype).contiguous()
+                    )
+    print(engine.summary_line(results, rescued), flush=True)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output.with_name(output.name + f".{os.getpid()}.tmp")
@@ -215,6 +212,7 @@ def ensure_sparkvsr_int8_convrot_cache(
         "scale_dtype": "float32",
         "rotation": "hadamard-regular",
         "mse_clip": "true",
+        "conversion_report": engine.report.metadata_json(),
         **_source_metadata(source),
     }
     try:
@@ -239,7 +237,15 @@ def _patch_int8_linear_forward(module: nn.Linear) -> None:
         if group_size is None:
             group_size = int(self.int8_convrot_groupsize.item())
             self._int8_convrot_gs = group_size
-        return int8_convrot_linear(x, self.weight, self.scale_weight, group_size, self.bias)
+        return int8_convrot_linear(
+            x,
+            self.weight,
+            self.scale_weight,
+            group_size,
+            self.bias,
+            getattr(self, "int8_ara_down", None),
+            getattr(self, "int8_ara_up", None),
+        )
 
     module.forward = int8_convrot_forward.__get__(module, type(module))
     module._sparkvsr_int8_convrot = True
@@ -265,6 +271,19 @@ def _register_int8_buffers_and_patch(model: nn.Module, state_dict: Dict[str, tor
             torch.empty((), dtype=torch.int32, device="meta"),
             persistent=True,
         )
+        ara_down = state_dict.get(f"{name}{INT8_ARA_DOWN_SUFFIX}")
+        ara_up = state_dict.get(f"{name}{INT8_ARA_UP_SUFFIX}")
+        if ara_down is not None and ara_up is not None:
+            module.register_buffer(
+                INT8_ARA_DOWN_SUFFIX.lstrip("."),
+                torch.empty(tuple(ara_down.shape), dtype=ara_down.dtype, device="meta"),
+                persistent=True,
+            )
+            module.register_buffer(
+                INT8_ARA_UP_SUFFIX.lstrip("."),
+                torch.empty(tuple(ara_up.shape), dtype=ara_up.dtype, device="meta"),
+                persistent=True,
+            )
         module.weight.requires_grad_(False)
         _patch_int8_linear_forward(module)
         patched += 1

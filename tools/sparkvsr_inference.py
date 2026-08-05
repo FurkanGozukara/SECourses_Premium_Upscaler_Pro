@@ -661,6 +661,16 @@ def load_sparkvsr_pipeline(
         **load_kwargs,
     )
     pipe._sparkvsr_compute_dtype = dtype
+    if not fp8_scaled and not int8_convrot and getattr(pipe, "transformer", None) is not None:
+        # Env-gated (SECOURSES_INT8_CALIBRATE=1): record rotated-activation
+        # statistics during this BF16 run for the INT8 ConvRot converter.
+        try:
+            from shared.int8_calibration import maybe_start_calibration
+            from shared.sparkvsr_fp8_scaled import _component_file
+
+            maybe_start_calibration(pipe.transformer, _component_file(model_path, "transformer"))
+        except Exception as exc:
+            print(f"[SparkVSR] INT8 calibration attach failed: {exc}", flush=True)
     emit_progress(0.10, "model_load", f"{stage_label}: pipeline weights loaded", started_at=started_at)
     if args.lora_path:
         print(f"Loading LoRA from {args.lora_path}", flush=True)

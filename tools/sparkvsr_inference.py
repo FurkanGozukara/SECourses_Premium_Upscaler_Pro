@@ -27,6 +27,11 @@ for _stream in (sys.stdout, sys.stderr):
 
 import imageio.v3 as iio
 import torch
+
+from shared.torch_runtime_compat import configure_torch_runtime_compat
+
+configure_torch_runtime_compat()
+
 from PIL import Image
 from safetensors.torch import load_file, save_file
 from transformers import set_seed
@@ -48,7 +53,6 @@ from shared.sparkvsr_fp8_scaled import (
 from shared.sparkvsr_int8_convrot import (
     ensure_sparkvsr_int8_convrot_cache,
     is_int8_convrot_model_path,
-    load_int8_convrot_text_encoder,
     load_int8_convrot_transformer,
 )
 from shared.sparkvsr_ref_utils import (
@@ -484,6 +488,11 @@ def _is_int8_convrot_args(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "_spark_int8_convrot", False)) or is_int8_convrot_model_path(str(getattr(args, "model_path", "") or ""))
 
 
+def _spark_base_model_path(args: argparse.Namespace) -> Path:
+    int8_base = str(getattr(args, "_spark_int8_base_model_path", "") or "").strip()
+    return Path(int8_base) if int8_base else Path(args.model_path)
+
+
 def _compute_dtype_from_args(args: argparse.Namespace, fallback: torch.dtype) -> torch.dtype:
     raw = str(getattr(args, "dtype", "") or "").strip().lower()
     return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(raw, fallback)
@@ -601,9 +610,15 @@ def _ensure_model_path_ready(args: argparse.Namespace, started_at: float, *, sta
                 f"{stage_label}: generating INT8 ConvRot cache from {bf16_source} (first run only)",
                 started_at=started_at,
             )
-        model_path = ensure_sparkvsr_int8_convrot_cache(int8_model_path=model_path, bf16_model_path=bf16_source)
-        args.model_path = str(model_path)
+        cache_path = ensure_sparkvsr_int8_convrot_cache(
+            int8_model_path=model_path,
+            bf16_model_path=bf16_source,
+        )
+        args.model_path = str(cache_path)
+        setattr(args, "_spark_int8_cache_path", str(cache_path))
+        setattr(args, "_spark_int8_base_model_path", str(bf16_source))
         setattr(args, "_spark_int8_convrot", True)
+        model_path = bf16_source
     return model_path
 
 
@@ -633,10 +648,12 @@ def load_sparkvsr_pipeline(
         if "transformer" not in load_kwargs:
             load_kwargs["transformer"] = load_fp8_scaled_transformer(model_path)
     elif int8_convrot:
-        if "text_encoder" not in load_kwargs:
-            load_kwargs["text_encoder"] = load_int8_convrot_text_encoder(model_path)
         if "transformer" not in load_kwargs:
-            load_kwargs["transformer"] = load_int8_convrot_transformer(model_path)
+            cache_path = Path(getattr(args, "_spark_int8_cache_path", args.model_path))
+            load_kwargs["transformer"] = load_int8_convrot_transformer(
+                cache_path,
+                bf16_model_path=model_path,
+            )
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         str(model_path),
         torch_dtype=dtype,
@@ -1053,7 +1070,8 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
         if prompt_embedding.shape[0] != batch_size:
             prompt_embedding = prompt_embedding[:1].repeat(batch_size, 1, 1)
     else:
-        cached_embedding, cached_path = load_prompt_embedding_from_cache(Path(args.model_path), prompt)
+        base_model_path = _spark_base_model_path(args)
+        cached_embedding, cached_path = load_prompt_embedding_from_cache(base_model_path, prompt)
         if cached_embedding is not None:
             print(
                 f"[SparkVSR split] transformer: using cached prompt embedding {prompt_hash[:12]} from {cached_path}",
@@ -1072,7 +1090,7 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
                 component_overrides={"vae": None, "transformer": None},
             )
             fallback_device = getattr(fallback_pipe, "_execution_device", None) or fallback_pipe.device
-            max_text_seq_length = _max_text_seq_length_for_model(Path(args.model_path))
+            max_text_seq_length = _max_text_seq_length_for_model(base_model_path)
             prompt_token_ids = fallback_pipe.tokenizer(
                 prompt,
                 padding="max_length",
@@ -1084,7 +1102,7 @@ def _run_split_transform_stage(args: argparse.Namespace, state_in_path: Path, st
             prompt_embedding = fallback_pipe.text_encoder(prompt_token_ids.to(fallback_device))[0]
             _, seq_len, _ = prompt_embedding.shape
             prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_dtype)
-            saved_path = save_prompt_embedding_to_cache(Path(args.model_path), prompt, prompt_embedding)
+            saved_path = save_prompt_embedding_to_cache(base_model_path, prompt, prompt_embedding)
             if saved_path is not None:
                 print(f"[SparkVSR split] transformer: prompt cache saved: {saved_path}", flush=True)
 

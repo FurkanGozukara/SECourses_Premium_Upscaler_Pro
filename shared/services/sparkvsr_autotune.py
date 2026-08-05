@@ -33,6 +33,7 @@ from shared.path_utils import (
     normalize_path,
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
+from shared.services.autotune_search import dedupe_sparkvsr_tile_candidates, frontier_bisect
 from shared.services.flashvsr_autotune import (
     _clamp_save_vram_target_gb,
     _create_autotune_demo_video,
@@ -40,6 +41,7 @@ from shared.services.flashvsr_autotune import (
     _parse_cuda_device_ids,
     _query_gpu_memory_snapshot_gb,
     _sample_peak_vram_gb,
+    _wait_for_vram_drain,
 )
 from shared.sparkvsr_runner import SparkVSRResult, run_sparkvsr
 
@@ -341,7 +343,12 @@ def _normalize_probe_progress_line(text: str) -> Tuple[str, bool]:
     return line, transient
 
 
-def _candidate_settings(*, allow_full_sequence: bool = False) -> List[Dict[str, Any]]:
+def _candidate_settings(
+    *,
+    allow_full_sequence: bool = False,
+    effective_h: int = 0,
+    effective_w: int = 0,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen: set[Tuple[int, int, int]] = set()
 
@@ -364,10 +371,18 @@ def _candidate_settings(*, allow_full_sequence: bool = False) -> List[Dict[str, 
         )
 
     _ = allow_full_sequence
+    spatial_candidates: List[int] = [int(t) for t in AUTOTUNE_SPATIAL_CANDIDATES]
+    if int(effective_h) > 0 and int(effective_w) > 0:
+        # Tiles covering the whole frame are byte-identical to full-frame
+        # (tile=0), so probing them separately is wasted work.
+        deduped = dedupe_sparkvsr_tile_candidates(
+            int(effective_h), int(effective_w), spatial_candidates, int(AUTOTUNE_SPATIAL_OVERLAP)
+        )
+        spatial_candidates = ([0] if 0 in spatial_candidates else []) + list(deduped)
     for chunk_len in AUTOTUNE_TEMPORAL_CANDIDATES:
         if int(chunk_len) <= 0:
             continue
-        for tile in AUTOTUNE_SPATIAL_CANDIDATES:
+        for tile in spatial_candidates:
             add_candidate(int(chunk_len), int(tile))
     return sorted(out, key=_quality_rank, reverse=True)
 
@@ -684,6 +699,15 @@ def sparkvsr_auto_tune_action(
             _append_log("Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi memory query support.")
             yield _payload("Auto Tune requires live VRAM telemetry from nvidia-smi.", show_indicator=False)
             return
+        # Let leftovers from any previous run drain before measuring the ambient
+        # baseline, otherwise the drain gate inherits the residue.
+        _wait_for_vram_drain(telemetry_gpu_ids, 1.5, float(total_vram_gb), _append_log, timeout_sec=30.0)
+        ambient_snap = _query_gpu_memory_snapshot_gb()
+        ambient_used_gb = (
+            sum(float(ambient_snap[g][0]) for g in telemetry_gpu_ids if g in ambient_snap)
+            if ambient_snap
+            else 0.0
+        )
 
         signature = _build_autotune_signature(
             settings,
@@ -752,6 +776,90 @@ def sparkvsr_auto_tune_action(
                 summary_text=summary_md,
             )
             return
+
+        # Per-test history resume: reuse individual probe outcomes from earlier
+        # (possibly interrupted) runs with a matching signature so a restarted
+        # Auto Tune continues instead of starting from zero.
+        history_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int, int], Dict[str, Any]] = {}
+        history_sources: List[str] = []
+        try:
+            history_logs = (
+                sorted(logs_dir.glob(f"{AUTOTUNE_LOG_PREFIX}_*.json"), key=lambda p: p.stat().st_mtime)
+                if logs_dir.exists()
+                else []
+            )
+        except Exception:
+            history_logs = []
+        for history_path in history_logs:
+            try:
+                history_payload = json.loads(history_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(history_payload, dict):
+                continue
+            if not _signature_matches(history_payload.get("signature"), signature):
+                continue
+            tests_blob = history_payload.get("tests")
+            if not isinstance(tests_blob, list):
+                continue
+            matched_any = False
+            for raw in tests_blob:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                probe_stop = str(item.get("probe_cancel_reason") or "").strip().lower()
+                try:
+                    peak = float(item.get("max_vram_used_gb") or 0.0)
+                except Exception:
+                    peak = 0.0
+                try:
+                    total_hist = float(item.get("total_vram_gb") or 0.0)
+                except Exception:
+                    total_hist = 0.0
+                total_for_eval = float(total_vram_gb if total_vram_gb > 0 else total_hist)
+                if peak > 0 and total_for_eval > 0:
+                    item["estimated_free_gb"] = max(0.0, total_for_eval - peak)
+                try:
+                    returncode_ok = int(item.get("returncode", 1)) == 0
+                except Exception:
+                    returncode_ok = False
+                item["passed"] = bool(
+                    returncode_ok
+                    and bool(item.get("telemetry_ok", False))
+                    and (not bool(item.get("oom", False)))
+                    and float(item.get("estimated_free_gb") or 0.0) >= float(min_free_vram_target_gb)
+                    and probe_stop != "threshold_reached"
+                )
+                is_boundary_fail = bool(
+                    bool(item.get("oom", False))
+                    or probe_stop == "threshold_reached"
+                    or (
+                        bool(item.get("telemetry_ok", False))
+                        and float(item.get("estimated_free_gb") or 1e9) < float(min_free_vram_target_gb)
+                    )
+                )
+                if (not item["passed"]) and (not is_boundary_fail):
+                    # Indeterminate rows (crashes without a VRAM signature)
+                    # must not be replayed as settled results.
+                    continue
+                history_key = (
+                    int(item.get("chunk_len") or 0),
+                    int(item.get("tile_height") or 0),
+                    int(item.get("tile_width") or 0),
+                    int(item.get("overlap_t") or 0),
+                    int(item.get("overlap_height") or 0),
+                    int(item.get("overlap_width") or 0),
+                    int(item.get("probe_frames") or 0),
+                )
+                history_outcomes_by_key[history_key] = item
+                matched_any = True
+            if matched_any:
+                history_sources.append(str(history_path))
+        if history_outcomes_by_key:
+            _append_log(
+                f"Loaded {len(history_outcomes_by_key)} matching historical probe result(s) from "
+                f"{len(history_sources)} log(s). Auto Tune will continue from previous progress."
+            )
 
         initial_probe_frames = int(AUTOTUNE_INITIAL_PROBE_FRAMES)
         if source_frame_count is None:
@@ -828,9 +936,20 @@ def sparkvsr_auto_tune_action(
 
         _persist("running")
         run_counter = 0
-        candidates = _candidate_settings(allow_full_sequence=allow_full_sequence)
+        candidates = _candidate_settings(
+            allow_full_sequence=allow_full_sequence,
+            effective_h=int(effective_in_h),
+            effective_w=int(effective_in_w),
+        )
         growth_candidates = _growth_candidate_settings(growth_probe_frames)
-        total_estimated_runs = max(1, len(candidates) + len(growth_candidates))
+        spatial_per_chunk = sorted({int(c["tile_height"]) for c in candidates})
+        _append_log(
+            f"Spatial candidates deduped for {effective_in_w}x{effective_in_h}: "
+            f"{list(AUTOTUNE_SPATIAL_CANDIDATES)} -> {spatial_per_chunk} "
+            "(tiles covering the whole frame equal full-frame and are skipped)."
+        )
+        # Bisection probes far fewer points than the full candidate grid.
+        total_estimated_runs = max(1, min(12, len(candidates) + len(growth_candidates)))
         top_rank = max(_quality_rank(c) for c in [*candidates, *growth_candidates])
 
         def _ensure_growth_demo():
@@ -904,6 +1023,8 @@ def sparkvsr_auto_tune_action(
             if progress:
                 progress(min(0.99, float(run_counter - 1) / float(total_estimated_runs)), desc=label)
 
+            _wait_for_vram_drain(telemetry_gpu_ids, ambient_used_gb, float(total_vram_gb), _append_log)
+
             phase_state: Dict[str, Any] = {"phase": "startup", "chunks": 0, "tiles": 0}
             probe_cancel_event = threading.Event()
             setattr(probe_cancel_event, "sparkvsr_cancel_reason", "vram_threshold")
@@ -951,6 +1072,9 @@ def sparkvsr_auto_tune_action(
                 except Exception as exc:
                     result_box["result"] = SparkVSRResult(1, None, f"SparkVSR probe error: {exc}")
 
+            # Threshold-abort only - no early-success stop for SparkVSR: its VAE
+            # decode runs after ALL transformer work, so a peak that looks stable
+            # mid-transformer cannot cover the decode spike.
             sampler_thread = threading.Thread(
                 target=_sample_peak_vram_gb,
                 args=(
@@ -1115,10 +1239,39 @@ def sparkvsr_auto_tune_action(
             }
             status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
 
+        def _candidate_history_key(candidate: Dict[str, Any]) -> Tuple[int, int, int, int, int, int, int]:
+            chunk_len = int(candidate["chunk_len"])
+            expected_frames = int(
+                growth_probe_frames if chunk_len > int(initial_probe_frames) else initial_probe_frames
+            )
+            return (
+                chunk_len,
+                int(candidate["tile_height"]),
+                int(candidate["tile_width"]),
+                int(candidate["overlap_t"]),
+                int(candidate["overlap_height"]),
+                int(candidate["overlap_width"]),
+                expected_frames,
+            )
+
         def _probe_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
             if cancel_event.is_set():
                 _append_log("Auto Tune cancelled before next test.")
                 raise KeyboardInterrupt()
+            history_key = _candidate_history_key(candidate)
+            known_outcome = history_outcomes_by_key.get(history_key)
+            if isinstance(known_outcome, dict):
+                outcome = dict(known_outcome)
+                _append_log(
+                    f"History hit chunk_len={outcome.get('chunk_len')} "
+                    f"tile={outcome.get('tile_height') or 'full-frame'} -> reusing prior VRAM result "
+                    f"(passed={bool(outcome.get('passed', False))})."
+                )
+                tests.append(outcome)
+                _persist("running")
+                return outcome
+            if int(candidate["chunk_len"]) > int(initial_probe_frames):
+                yield from _ensure_growth_demo()
             yield _payload(
                 (
                     f"Testing chunk_len={candidate['chunk_len']}, "
@@ -1133,6 +1286,7 @@ def sparkvsr_auto_tune_action(
             )
             outcome = yield from _run_probe_once(candidate)
             tests.append(outcome)
+            history_outcomes_by_key[history_key] = dict(outcome)
             _append_log(
                 f"Result chunk_len={outcome['chunk_len']} tile={outcome['tile_height'] or 'full-frame'} -> "
                 f"rc={outcome['returncode']}, peak={outcome['max_vram_used_gb']:.2f}GB, "
@@ -1147,66 +1301,79 @@ def sparkvsr_auto_tune_action(
             return outcome
 
         boundary_failed = False
+
+        def _classify_outcome(outcome: Optional[Dict[str, Any]]) -> str:
+            if outcome is None:
+                return "hard_fail"
+            if bool(outcome.get("passed", False)):
+                return "pass"
+            if not bool(outcome.get("telemetry_ok", False)):
+                return "hard_fail"
+            # OOM, threshold abort, nonzero exit, or clean-but-low-headroom runs
+            # all mark the VRAM boundary (matches the previous walk's semantics).
+            return "boundary_fail"
+
         try:
             first_candidate = candidates[0] if candidates else None
             first_outcome: Optional[Dict[str, Any]] = None
             if first_candidate is not None:
                 first_outcome = yield from _probe_candidate(first_candidate)
 
-            if first_outcome and bool(first_outcome.get("passed", False)):
+            first_verdict = _classify_outcome(first_outcome) if first_outcome is not None else "hard_fail"
+            if first_outcome is not None and first_verdict == "boundary_fail":
+                boundary_failed = True
+
+            if first_outcome is not None and first_verdict == "pass":
                 _apply_passed_outcome(first_outcome)
                 if growth_candidates:
                     _append_log(
-                        "Initial 65-frame probe passed. Probing larger temporal chunks for faster long-video throughput."
+                        "Initial 65-frame probe passed. Bisecting larger temporal chunks "
+                        f"({[int(c['chunk_len']) for c in growth_candidates]}) - largest first - "
+                        "for faster long-video throughput."
                     )
-                    yield from _ensure_growth_demo()
-                for candidate in growth_candidates:
-                    if cancel_event.is_set():
-                        status_reason = "cancelled"
-                        _append_log("Auto Tune cancelled before next growth test.")
-                        break
-                    outcome = yield from _probe_candidate(candidate)
-                    if bool(outcome.get("passed", False)):
-                        _apply_passed_outcome(outcome)
-                        continue
-                    boundary_failed = bool(
-                        boundary_failed
-                        or outcome.get("oom")
-                        or outcome.get("probe_cancel_reason") == "threshold_reached"
-                        or int(outcome.get("returncode") or 0) != 0
-                    )
-                    if not bool(outcome.get("telemetry_ok", False)):
-                        status_reason = "failed"
-                    break
-            else:
-                if first_outcome is not None:
-                    boundary_failed = bool(
-                        boundary_failed
-                        or first_outcome.get("oom")
-                        or first_outcome.get("probe_cancel_reason") == "threshold_reached"
-                        or int(first_outcome.get("returncode") or 0) != 0
-                    )
-                    if not bool(first_outcome.get("telemetry_ok", False)):
-                        status_reason = "failed"
-                if status_reason != "failed":
-                    for candidate in candidates[1:]:
-                        if cancel_event.is_set():
-                            status_reason = "cancelled"
-                            _append_log("Auto Tune cancelled before next fallback test.")
-                            break
-                        outcome = yield from _probe_candidate(candidate)
-                        if bool(outcome.get("passed", False)):
+
+                    def _growth_probe(idx: int, _require_full: bool):
+                        outcome = yield from _probe_candidate(growth_candidates[int(idx)])
+                        verdict = _classify_outcome(outcome)
+                        if verdict == "pass":
                             _apply_passed_outcome(outcome)
-                            break
-                        boundary_failed = bool(
-                            boundary_failed
-                            or outcome.get("oom")
-                            or outcome.get("probe_cancel_reason") == "threshold_reached"
-                            or int(outcome.get("returncode") or 0) != 0
-                        )
-                        if not bool(outcome.get("telemetry_ok", False)):
-                            status_reason = "failed"
-                            break
+                        return {"outcome": verdict, "early_stopped_pass": False}
+
+                    growth_res = yield from frontier_bisect(len(growth_candidates), _growth_probe)
+                    boundary_failed = boundary_failed or bool(growth_res.get("boundary_failed"))
+                    if growth_res.get("stopped") == "hard_fail":
+                        status_reason = "failed"
+            elif first_verdict == "hard_fail" and first_outcome is not None:
+                status_reason = "failed"
+            elif first_outcome is not None:
+                # Fallback: highest chunk first; within each chunk level bisect the
+                # spatial candidates (ascending memory: small tiles -> full-frame).
+                # The first chunk level with any pass wins, since chunk length
+                # dominates the quality ranking.
+                remaining_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
+                for cand in candidates:
+                    remaining_by_chunk.setdefault(int(cand["chunk_len"]), []).append(cand)
+                for chunk_len in sorted(remaining_by_chunk.keys(), reverse=True):
+                    chunk_cands = sorted(remaining_by_chunk[chunk_len], key=_quality_rank)
+
+                    def _tile_probe(idx: int, _require_full: bool, _cands=chunk_cands):
+                        outcome = yield from _probe_candidate(_cands[int(idx)])
+                        verdict = _classify_outcome(outcome)
+                        if verdict == "pass":
+                            _apply_passed_outcome(outcome)
+                        return {"outcome": verdict, "early_stopped_pass": False}
+
+                    _append_log(
+                        f"Fallback search at chunk_len={chunk_len}: bisecting "
+                        f"{len(chunk_cands)} spatial candidate(s)."
+                    )
+                    chunk_res = yield from frontier_bisect(len(chunk_cands), _tile_probe)
+                    boundary_failed = boundary_failed or bool(chunk_res.get("boundary_failed"))
+                    if chunk_res.get("stopped") == "hard_fail":
+                        status_reason = "failed"
+                        break
+                    if chunk_res.get("best_idx") is not None:
+                        break
         except KeyboardInterrupt:
             status_reason = "cancelled"
 

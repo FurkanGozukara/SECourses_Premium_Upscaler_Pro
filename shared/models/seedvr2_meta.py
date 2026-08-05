@@ -197,7 +197,11 @@ def _scan_local_weights() -> List[str]:
             if not base.exists():
                 continue
             for f in base.iterdir():
-                if f.is_file() and f.suffix.lower() in MODEL_EXTS:
+                if (
+                    f.is_file()
+                    and f.suffix.lower() in MODEL_EXTS
+                    and not f.name.lower().endswith("_int8_convrot.safetensors")
+                ):
                     found.append(f.name)
         result = sorted(list({*found}))
         with _SEED_SCAN_CACHE_LOCK:

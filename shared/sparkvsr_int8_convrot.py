@@ -1,158 +1,147 @@
-"""
-SparkVSR INT8 ConvRot cache generation and runtime loading.
-
-Mirrors shared/sparkvsr_fp8_scaled.py, but the target Linear weights are
-quantized to INT8 after a group-wise Hadamard rotation (ConvRot) with
-per-output-channel MSE-optimized scales. Unlike the FP8-scaled path (which
-dequantizes back to BF16 for every matmul), the INT8 path runs a real fused
-INT8 GEMM at inference time - lower VRAM than BF16 *and* faster on
-Turing (SM 7.5) or newer NVIDIA GPUs.
-
-Quality: group-wise Hadamard rotation + per-row MSE clipping gives roughly
-41 dB weight SQNR versus roughly 32 dB for scaled FP8, so outputs track the
-BF16 reference more closely than FP8-scaled does.
-
-The cache is generated automatically from the local SparkVSR-bf16 weights on
-first use (exactly like the FP8-scaled cache) and reused afterwards.
-"""
+"""Single-file SparkVSR transformer INT8 ConvRot cache support."""
 
 from __future__ import annotations
 
-import json
+import os
+import shutil
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
+
+from shared.torch_runtime_compat import configure_torch_runtime_compat
+
+configure_torch_runtime_compat()
+
 from diffusers import CogVideoXTransformer3DModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
-from transformers import T5Config, T5EncoderModel
 
 from shared.int8_convrot import (
     best_int8_convrot_groupsize,
     int8_convrot_linear,
     quantize_int8_convrot_weight,
 )
-from shared.sparkvsr_constants import SPARKVSR_BF16_MODEL_NAME, SPARKVSR_INT8_CONVROT_MODEL_NAME
+from shared.sparkvsr_constants import (
+    SPARKVSR_BF16_MODEL_NAME,
+    SPARKVSR_INT8_CONVROT_CACHE_NAME,
+    SPARKVSR_INT8_CONVROT_MODEL_NAME,
+)
 from shared.sparkvsr_fp8_scaled import (
     _component_file,
-    _copy_layout,
     _format_bytes,
     _linear_weight_names_for_component,
 )
 
-INT8_MANIFEST_NAME = "sparkvsr_int8_convrot_manifest.json"
+INT8_CACHE_FORMAT = "sparkvsr-transformer-int8-convrot-v2"
 INT8_GROUPSIZE_KEY_SUFFIX = ".int8_convrot_groupsize"
+
+# Retained only so an existing V6 directory cache can be migrated without
+# quantizing the 6 GB transformer again.
+INT8_MANIFEST_NAME = "sparkvsr_int8_convrot_manifest.json"
+
+
+def _normalize_cache_path(path: str | Path) -> Path:
+    cache_path = Path(path)
+    if cache_path.suffix.lower() == ".safetensors":
+        return cache_path
+    if cache_path.name == SPARKVSR_INT8_CONVROT_MODEL_NAME:
+        return cache_path.parent / SPARKVSR_INT8_CONVROT_CACHE_NAME
+    return cache_path
 
 
 def is_int8_convrot_model_path(path: str | Path) -> bool:
     model_path = Path(path)
-    return model_path.name == SPARKVSR_INT8_CONVROT_MODEL_NAME or (model_path / INT8_MANIFEST_NAME).exists()
+    return (
+        model_path.name in {
+            SPARKVSR_INT8_CONVROT_MODEL_NAME,
+            SPARKVSR_INT8_CONVROT_CACHE_NAME,
+        }
+        or (model_path.is_dir() and (model_path / INT8_MANIFEST_NAME).exists())
+    )
 
 
 def default_int8_convrot_model_path(base_dir: str | Path) -> Path:
-    return Path(base_dir) / "SparkVSR" / "models" / SPARKVSR_INT8_CONVROT_MODEL_NAME
+    return Path(base_dir) / "SparkVSR" / "models" / SPARKVSR_INT8_CONVROT_CACHE_NAME
 
 
-def _convert_component_to_int8_convrot(
-    source: Path,
-    output: Path,
-    component: str,
-    *,
-    force: bool,
-    calc_device: str = "cpu",
-) -> Dict[str, object]:
-    src_file = _component_file(source, component)
-    out_file = _component_file(output, component)
-    if out_file.exists() and not force:
-        return {"component": component, "status": "exists", "bytes": out_file.stat().st_size}
-    if not src_file.exists():
-        raise FileNotFoundError(f"SparkVSR BF16 source component not found: {src_file}")
+def int8_convrot_base_model_path(cache_path: str | Path) -> Path:
+    path = _normalize_cache_path(cache_path)
+    return path.parent / SPARKVSR_BF16_MODEL_NAME
 
-    target_weights = _linear_weight_names_for_component(source, component)
-    state: Dict[str, torch.Tensor] = {}
-    optimized = 0
-    skipped_groupsize = 0
-    total = 0
-    started = time.monotonic()
-    print(
-        f"[SparkVSR INT8] converting {component}: {src_file} ({_format_bytes(src_file.stat().st_size)})",
-        flush=True,
-    )
-    with safe_open(str(src_file), framework="pt", device="cpu") as handle:
-        keys = list(handle.keys())
-        for index, key in enumerate(keys, 1):
-            tensor = handle.get_tensor(key)
-            group_size = None
-            if key in target_weights and tensor.ndim == 2:
-                group_size = best_int8_convrot_groupsize(int(tensor.shape[1]))
-            if group_size is not None:
-                quantized, scale = quantize_int8_convrot_weight(
-                    tensor, group_size=group_size, calc_device=calc_device, mse_clip=True
-                )
-                base = key[: -len(".weight")]
-                state[key] = quantized
-                state[base + ".scale_weight"] = scale
-                state[base + INT8_GROUPSIZE_KEY_SUFFIX] = torch.tensor(int(group_size), dtype=torch.int32)
-                optimized += 1
-            else:
-                if key in target_weights:
-                    skipped_groupsize += 1
-                state[key] = tensor.detach().cpu().contiguous()
-            total += 1
-            if index % 100 == 0 or index == len(keys):
-                print(
-                    f"[SparkVSR INT8] {component}: {index}/{len(keys)} tensors, quantized={optimized}",
-                    flush=True,
-                )
 
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    save_file(
-        state,
-        str(out_file),
-        metadata={
-            "format": "pt",
-            "sparkvsr_int8_convrot": "true",
-            "source": str(source.resolve()),
-            "component": component,
-            "scale_dtype": "float32",
-            "rotation": "hadamard-regular",
-            "mse_clip": "true",
-        },
-    )
-    del state
-    for index_name in ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json"):
-        stale = out_file.parent / index_name
-        if stale.exists():
-            stale.unlink()
-    elapsed = time.monotonic() - started
-    print(
-        f"[SparkVSR INT8] {component}: wrote {out_file} ({_format_bytes(out_file.stat().st_size)}) in {elapsed:.1f}s",
-        flush=True,
-    )
+def _source_metadata(source: Path) -> Dict[str, str]:
+    transformer_file = _component_file(source, "transformer")
+    stat = transformer_file.stat()
     return {
-        "component": component,
-        "status": "converted",
-        "source_bytes": src_file.stat().st_size,
-        "bytes": out_file.stat().st_size,
-        "tensors": total,
-        "quantized_linear_weights": optimized,
-        "skipped_groupsize": skipped_groupsize,
-        "seconds": elapsed,
+        "source": str(source.resolve()),
+        "source_transformer": str(transformer_file.resolve()),
+        "source_size": str(stat.st_size),
+        "source_mtime_ns": str(stat.st_mtime_ns),
     }
 
 
-def _has_valid_int8_cache(path: Path) -> bool:
-    return (
-        (path / "model_index.json").exists()
-        and (path / INT8_MANIFEST_NAME).exists()
-        and _component_file(path, "text_encoder").exists()
-        and _component_file(path, "transformer").exists()
-        and (path / "vae" / "diffusion_pytorch_model.safetensors").exists()
-    )
+def _has_valid_int8_cache(cache_path: Path, source: Path) -> bool:
+    if not cache_path.is_file():
+        return False
+    try:
+        expected = _source_metadata(source)
+        with safe_open(str(cache_path), framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+            keys = list(handle.keys())
+        if metadata.get("sparkvsr_int8_convrot") != "true":
+            return False
+        if not any(key.endswith(INT8_GROUPSIZE_KEY_SUFFIX) for key in keys):
+            return False
+        if metadata.get("int8_convrot_format") == INT8_CACHE_FORMAT:
+            return all(metadata.get(key) == value for key, value in expected.items())
+
+        # V6.0 directory caches recorded the source directory but not a file
+        # fingerprint. Accept one only when it points at this exact BF16 model.
+        return (
+            metadata.get("component") == "transformer"
+            and metadata.get("source") == expected["source"]
+            and cache_path.stat().st_mtime_ns >= _component_file(source, "transformer").stat().st_mtime_ns
+        )
+    except Exception:
+        return False
+
+
+def _migrate_legacy_transformer_cache(cache_path: Path, source: Path) -> bool:
+    legacy_dir = cache_path.parent / SPARKVSR_INT8_CONVROT_MODEL_NAME
+    legacy_file = _component_file(legacy_dir, "transformer")
+    if not legacy_file.is_file():
+        return False
+    try:
+        with safe_open(str(legacy_file), framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+            has_groups = any(key.endswith(INT8_GROUPSIZE_KEY_SUFFIX) for key in handle.keys())
+        if metadata.get("sparkvsr_int8_convrot") != "true" or not has_groups:
+            return False
+        recorded_source = metadata.get("source")
+        if recorded_source and recorded_source != str(source.resolve()):
+            return False
+        if legacy_file.stat().st_mtime_ns < _component_file(source, "transformer").stat().st_mtime_ns:
+            return False
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+        try:
+            os.link(legacy_file, temp_path)
+        except OSError:
+            shutil.copyfile(legacy_file, temp_path)
+        os.replace(temp_path, cache_path)
+        print(
+            f"[SparkVSR INT8] migrated legacy transformer cache to {cache_path}",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        print(f"[SparkVSR INT8] legacy cache migration skipped: {exc}", flush=True)
+        return False
 
 
 def ensure_sparkvsr_int8_convrot_cache(
@@ -162,37 +151,85 @@ def ensure_sparkvsr_int8_convrot_cache(
     force: bool = False,
     calc_device: str = "cpu",
 ) -> Path:
-    output = Path(int8_model_path)
+    """Create or reuse one transformer-only safetensors cache."""
+    output = _normalize_cache_path(int8_model_path)
     source = Path(bf16_model_path)
-    if _has_valid_int8_cache(output) and not force:
-        return output
-    if not (source / "model_index.json").exists():
-        raise FileNotFoundError(f"SparkVSR BF16 model is required to build the INT8 ConvRot cache: {source}")
-    if not _component_file(source, "text_encoder").exists() or not _component_file(source, "transformer").exists():
-        raise FileNotFoundError(f"SparkVSR BF16 model is missing single-file text_encoder/transformer weights: {source}")
+    source_file = _component_file(source, "transformer")
 
-    started = time.monotonic()
+    if not source_file.is_file():
+        raise FileNotFoundError(f"SparkVSR BF16 transformer is required to build the INT8 cache: {source_file}")
+    if not force and _has_valid_int8_cache(output, source):
+        print(f"[SparkVSR INT8] cache hit: {output}", flush=True)
+        return output
+    if not force and _migrate_legacy_transformer_cache(output, source):
+        return output
+
     if calc_device == "cpu" and torch.cuda.is_available():
-        # The MSE clip search is 80 quantization passes per weight; the GPU
-        # finishes the whole model in well under a minute.
         calc_device = "cuda"
-    print(f"[SparkVSR INT8] building ConvRot cache from {source} -> {output} (calc device: {calc_device})", flush=True)
-    _copy_layout(source, output, force=force)
-    component_results = [
-        _convert_component_to_int8_convrot(source, output, "text_encoder", force=force, calc_device=calc_device),
-        _convert_component_to_int8_convrot(source, output, "transformer", force=force, calc_device=calc_device),
-    ]
-    manifest = {
-        "format": "sparkvsr-int8-convrot-v1",
-        "source": str(source.resolve()),
-        "output": str(output.resolve()),
+    target_weights = _linear_weight_names_for_component(source, "transformer")
+    state: Dict[str, torch.Tensor] = {}
+    optimized = 0
+    started = time.monotonic()
+    print(
+        f"[SparkVSR INT8] building transformer cache from {source_file} -> {output} "
+        f"(calc device: {calc_device})",
+        flush=True,
+    )
+    with safe_open(str(source_file), framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+        for index, key in enumerate(keys, 1):
+            tensor = handle.get_tensor(key)
+            group_size = None
+            if key in target_weights and tensor.ndim == 2:
+                group_size = best_int8_convrot_groupsize(int(tensor.shape[1]))
+            if group_size is None:
+                state[key] = tensor.detach().cpu().contiguous()
+            else:
+                quantized, scale = quantize_int8_convrot_weight(
+                    tensor,
+                    group_size=group_size,
+                    calc_device=calc_device,
+                    mse_clip=True,
+                )
+                base = key[: -len(".weight")]
+                state[key] = quantized.contiguous()
+                state[base + ".scale_weight"] = scale.contiguous()
+                state[base + INT8_GROUPSIZE_KEY_SUFFIX] = torch.tensor(
+                    int(group_size), dtype=torch.int32
+                )
+                optimized += 1
+            if index % 100 == 0 or index == len(keys):
+                print(
+                    f"[SparkVSR INT8] transformer: {index}/{len(keys)} tensors, "
+                    f"quantized={optimized}",
+                    flush=True,
+                )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output.with_name(output.name + f".{os.getpid()}.tmp")
+    metadata = {
+        "format": "pt",
+        "int8_convrot_format": INT8_CACHE_FORMAT,
+        "sparkvsr_int8_convrot": "true",
+        "component": "transformer",
+        "scale_dtype": "float32",
         "rotation": "hadamard-regular",
-        "scale": "per-row-mse-clip",
-        "group_sizes": "auto (256/64/16)",
-        "components": component_results,
-        "seconds": time.monotonic() - started,
+        "mse_clip": "true",
+        **_source_metadata(source),
     }
-    (output / INT8_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    try:
+        save_file(state, str(temp_path), metadata=metadata)
+        os.replace(temp_path, output)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        del state
+
+    print(
+        f"[SparkVSR INT8] wrote {output} ({_format_bytes(output.stat().st_size)}) "
+        f"in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
     return output
 
 
@@ -216,52 +253,32 @@ def _register_int8_buffers_and_patch(model: nn.Module, state_dict: Dict[str, tor
     }
     patched = 0
     for name, module in model.named_modules():
-        if name in quantized_layers and isinstance(module, nn.Linear):
-            scale = state_dict[f"{name}.scale_weight"]
-            module.register_buffer("scale_weight", torch.empty(tuple(scale.shape), dtype=torch.float32, device="meta"))
-            module.register_buffer(
-                "int8_convrot_groupsize", torch.empty((), dtype=torch.int32, device="meta"), persistent=True
-            )
-            # load_state_dict(assign=True) re-wraps the checkpoint tensor as a
-            # Parameter that inherits requires_grad from the existing one, and
-            # integer Parameters cannot require grad - clear it up front.
-            module.weight.requires_grad_(False)
-            _patch_int8_linear_forward(module)
-            patched += 1
+        if name not in quantized_layers or not isinstance(module, nn.Linear):
+            continue
+        scale = state_dict[f"{name}.scale_weight"]
+        module.register_buffer(
+            "scale_weight",
+            torch.empty(tuple(scale.shape), dtype=torch.float32, device="meta"),
+        )
+        module.register_buffer(
+            "int8_convrot_groupsize",
+            torch.empty((), dtype=torch.int32, device="meta"),
+            persistent=True,
+        )
+        module.weight.requires_grad_(False)
+        _patch_int8_linear_forward(module)
+        patched += 1
     return patched
 
 
-def _finalize_int8_model(model: nn.Module) -> nn.Module:
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad_(False)
-    return model
-
-
-def load_int8_convrot_text_encoder(model_path: str | Path) -> T5EncoderModel:
-    path = Path(model_path)
-    state = load_file(str(_component_file(path, "text_encoder")), device="cpu")
-    config = T5Config.from_pretrained(str(path / "text_encoder"))
-    with init_empty_weights():
-        model = T5EncoderModel(config)
-    patched = _register_int8_buffers_and_patch(model, state)
-    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
-    if unexpected:
-        raise RuntimeError(f"Unexpected SparkVSR INT8 text encoder keys: {unexpected[:8]}")
-    missing = [key for key in missing if not key.endswith("encoder.embed_tokens.weight")]
-    if missing:
-        raise RuntimeError(f"Missing SparkVSR INT8 text encoder keys: {missing[:8]}")
-    from shared.sparkvsr_fp8_scaled import _retie_t5_embeddings
-
-    _retie_t5_embeddings(model)
-    print(f"[SparkVSR INT8] loaded text encoder with {patched} INT8 ConvRot Linear layers", flush=True)
-    return _finalize_int8_model(model)
-
-
-def load_int8_convrot_transformer(model_path: str | Path) -> CogVideoXTransformer3DModel:
-    path = Path(model_path)
-    state = load_file(str(_component_file(path, "transformer")), device="cpu")
-    config = CogVideoXTransformer3DModel.load_config(str(path / "transformer"))
+def load_int8_convrot_transformer(
+    cache_path: str | Path,
+    bf16_model_path: str | Path | None = None,
+) -> CogVideoXTransformer3DModel:
+    path = _normalize_cache_path(cache_path)
+    base_model = Path(bf16_model_path) if bf16_model_path else int8_convrot_base_model_path(path)
+    state = load_file(str(path), device="cpu")
+    config = CogVideoXTransformer3DModel.load_config(str(base_model / "transformer"))
     with init_empty_weights():
         model = CogVideoXTransformer3DModel.from_config(config)
     patched = _register_int8_buffers_and_patch(model, state)
@@ -270,8 +287,14 @@ def load_int8_convrot_transformer(model_path: str | Path) -> CogVideoXTransforme
         raise RuntimeError(f"Unexpected SparkVSR INT8 transformer keys: {unexpected[:8]}")
     if missing:
         raise RuntimeError(f"Missing SparkVSR INT8 transformer keys: {missing[:8]}")
-    print(f"[SparkVSR INT8] loaded transformer with {patched} INT8 ConvRot Linear layers", flush=True)
-    return _finalize_int8_model(model)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    print(
+        f"[SparkVSR INT8] cache hit: loaded {patched} transformer INT8 ConvRot Linear layers",
+        flush=True,
+    )
+    return model
 
 
 def count_int8_convrot_linears(model: nn.Module) -> int:
@@ -283,25 +306,23 @@ def count_int8_convrot_linears(model: nn.Module) -> int:
 
 
 def summarize_int8_convrot_cache(model_path: str | Path) -> Dict[str, object]:
-    path = Path(model_path)
-    summary: Dict[str, object] = {}
-    for component in ("text_encoder", "transformer"):
-        file_path = _component_file(path, component)
-        dtype_counts: Dict[str, int] = {}
-        tensor_count = 0
-        with safe_open(str(file_path), framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                tensor_count += 1
-                dtype = str(handle.get_slice(key).get_dtype())
-                shape = handle.get_slice(key).get_shape()
-                params = 1
-                for dim in shape:
-                    params *= int(dim)
-                dtype_counts[dtype] = dtype_counts.get(dtype, 0) + params
-        summary[component] = {
-            "file": str(file_path),
-            "bytes": file_path.stat().st_size,
+    path = _normalize_cache_path(model_path)
+    dtype_counts: Dict[str, int] = {}
+    tensor_count = 0
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            tensor_count += 1
+            tensor_slice = handle.get_slice(key)
+            dtype = str(tensor_slice.get_dtype())
+            params = 1
+            for dim in tensor_slice.get_shape():
+                params *= int(dim)
+            dtype_counts[dtype] = dtype_counts.get(dtype, 0) + params
+    return {
+        "transformer": {
+            "file": str(path),
+            "bytes": path.stat().st_size,
             "tensors": tensor_count,
             "dtypes": dtype_counts,
         }
-    return summary
+    }

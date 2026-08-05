@@ -812,6 +812,8 @@ def run_flashvsr(
                 str(end_frame),
                 "--models_dir",
                 str(models_root),
+                "--int8_cache_dir",
+                str(base_dir / "FlashVSR_plus" / "models"),
             ]
             if fps > 0:
                 local_cmd.extend(["--fps", str(fps)])
@@ -910,11 +912,24 @@ def run_flashvsr(
             while True:
                 if cancel_event and cancel_event.is_set():
                     log("Cancellation requested - terminating FlashVSR process")
+                    # The venv python.exe launcher runs the real interpreter as a
+                    # child; snapshot descendants first so they can be reaped too.
+                    try:
+                        import psutil
+
+                        _descendants = psutil.Process(proc.pid).children(recursive=True)
+                    except Exception:
+                        _descendants = []
                     try:
                         proc.terminate()
                         proc.wait(timeout=5.0)
                     except Exception:
                         pass
+                    for _child in _descendants:
+                        try:
+                            _child.kill()
+                        except Exception:
+                            pass
                     if process_handle is not None:
                         process_handle["proc"] = None
                     return 1, "\n".join(output_lines), True

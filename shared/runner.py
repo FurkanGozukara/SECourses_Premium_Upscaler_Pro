@@ -281,35 +281,57 @@ class Runner:
                 self._canceled = False
                 return False
             self._canceled = True
-        
+
+        # Snapshot the full descendant tree BEFORE signaling anything. The venv
+        # python.exe is a launcher that runs the real interpreter as a child, and
+        # SeedVR2 spawns split-phase workers - killing only the Popen pid leaves
+        # those descendants alive holding VRAM, and once the parent is gone they
+        # are unreachable via taskkill /T.
+        descendants = []
+        try:
+            import psutil
+
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except Exception:
+            descendants = []
+
+        def _reap_descendants() -> None:
+            for child in descendants:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+
         try:
             if platform.system() == "Windows":
                 # Windows-specific graceful shutdown
                 try:
                     # First try CTRL_BREAK_EVENT (only works if CREATE_NEW_PROCESS_GROUP was used)
                     proc.send_signal(signal.CTRL_BREAK_EVENT)
-                    
+
                     # Wait briefly for graceful shutdown
                     try:
                         proc.wait(timeout=2.0)
+                        _reap_descendants()
                         return True  # Process exited gracefully
                     except subprocess.TimeoutExpired:
                         pass
                 except (OSError, AttributeError):
                     # CTRL_BREAK might not work, continue to terminate
                     pass
-                
+
                 # Try terminate
                 try:
                     proc.terminate()
                     try:
                         proc.wait(timeout=2.0)
+                        _reap_descendants()
                         return True
                     except subprocess.TimeoutExpired:
                         pass
                 except OSError:
                     pass
-                
+
                 # Force kill as last resort
                 try:
                     proc.kill()
@@ -328,6 +350,7 @@ class Runner:
                     )
                 except Exception:
                     pass
+                _reap_descendants()
                     
             else:
                 # Unix/Linux: SIGTERM then SIGKILL
@@ -335,19 +358,21 @@ class Runner:
                     proc.terminate()  # SIGTERM
                     try:
                         proc.wait(timeout=2.0)
+                        _reap_descendants()
                         return True
                     except subprocess.TimeoutExpired:
                         pass
                 except OSError:
                     pass
-                
+
                 # Force kill
                 try:
                     proc.kill()  # SIGKILL
                     proc.wait(timeout=1.0)
                 except Exception:
                     pass
-            
+                _reap_descendants()
+
             return True
             
         except Exception as e:

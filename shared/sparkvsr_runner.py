@@ -22,6 +22,7 @@ from .models.sparkvsr_meta import get_sparkvsr_metadata
 from .sparkvsr_constants import (
     SPARKVSR_BF16_MODEL_NAME,
     SPARKVSR_FP8_SCALED_MODEL_NAME,
+    SPARKVSR_INT8_CONVROT_CACHE_NAME,
     SPARKVSR_INT8_CONVROT_MODEL_NAME,
 )
 from .path_utils import (
@@ -140,7 +141,11 @@ def _resolve_model_path(base_dir: Path, settings: Dict[str, Any]) -> tuple[Optio
     if model_name == SPARKVSR_INT8_CONVROT_MODEL_NAME:
         bf16_source = models_dir / SPARKVSR_BF16_MODEL_NAME
         if bf16_source.exists():
-            return candidate, f"[SparkVSR] Using INT8 ConvRot cache path: {candidate} (generated from SparkVSR-bf16 if missing)"
+            cache_path = models_dir / SPARKVSR_INT8_CONVROT_CACHE_NAME
+            return cache_path, (
+                f"[SparkVSR] Using transformer-only INT8 ConvRot cache: {cache_path} "
+                "(generated from SparkVSR-bf16 if missing)"
+            )
     if candidate.exists():
         return candidate, f"[SparkVSR] Using local model directory: {candidate}"
     repo_hint = f" ({meta.repo_id})" if meta and meta.repo_id else ""
@@ -481,9 +486,20 @@ def run_sparkvsr(
                     log("VRAM threshold reached during probe - terminating SparkVSR process")
                 else:
                     log("Cancellation requested - terminating SparkVSR process")
+                # The venv python.exe launcher runs the real interpreter as a
+                # child (and split-stage mode spawns stage workers); snapshot
+                # descendants first so they can be reaped too.
+                _descendants = []
+                with suppress(Exception):
+                    import psutil
+
+                    _descendants = psutil.Process(proc.pid).children(recursive=True)
                 with suppress(Exception):
                     proc.terminate()
                     proc.wait(timeout=5.0)
+                for _child in _descendants:
+                    with suppress(Exception):
+                        _child.kill()
                 if process_handle is not None:
                     process_handle["proc"] = None
                 return SparkVSRResult(1, None, "\n".join(log_lines + ["[Cancelled by user]"]))

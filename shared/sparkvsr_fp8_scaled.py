@@ -18,6 +18,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import init_empty_weights
+
+from shared.torch_runtime_compat import configure_torch_runtime_compat
+
+configure_torch_runtime_compat()
+
 from diffusers import CogVideoXTransformer3DModel
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file

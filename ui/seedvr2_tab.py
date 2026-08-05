@@ -155,6 +155,7 @@ def seedvr2_tab(
                     str(model_name).strip()
                     for model_name in (models_list or [])
                     if str(model_name).strip().lower().startswith("seedvr2_")
+                    and not str(model_name).strip().lower().endswith("_int8_convrot.safetensors")
                 }
             )
             if not available_models:
@@ -526,7 +527,7 @@ def seedvr2_tab(
                 int8_convrot = gr.Checkbox(
                     label="INT8 ConvRot (DiT)",
                     value=bool(values[56]) if len(values) > 56 else False,
-                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
+                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. The DiT is cached as one safetensors file after first use. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
                     scale=1,
                 )
                 compile_backend = gr.Dropdown(
@@ -1092,7 +1093,7 @@ def seedvr2_tab(
         keep_only_output_files,
         # Split heavy phases into isolated subprocesses
         split_phase_subprocesses,
-        # INT8 ConvRot on-the-fly DiT quantization
+        # INT8 ConvRot persistent DiT cache
         int8_convrot,
     ]
     

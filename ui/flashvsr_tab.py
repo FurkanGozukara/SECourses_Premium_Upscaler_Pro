@@ -401,7 +401,7 @@ def flashvsr_tab(
                             if str(_value("precision", _value("dtype", "bf16"))) in set(FLASHVSR_PRECISION_OPTIONS)
                             else "bf16"
                         ),
-                        info="Default is `bf16`. Use `auto` to let backend fall back to fp16 when needed. `int8_convrot` = Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM with near-BF16 quality. Speed depends on GPU and resolution (FlashVSR is attention-bound, so expect VRAM savings rather than speedups)."
+                        info="Default is `bf16`. Use `auto` to let backend fall back to fp16 when needed. `int8_convrot` = Hadamard-rotated INT8 DiT weights cached as one safetensors file after first use: about half the DiT weight VRAM with near-BF16 quality. Speed depends on GPU and resolution (FlashVSR is attention-bound, so expect VRAM savings rather than speedups)."
                     )
                     
                     attention_mode = gr.Dropdown(

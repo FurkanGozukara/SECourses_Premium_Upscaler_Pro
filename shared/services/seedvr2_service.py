@@ -66,6 +66,7 @@ from shared.error_handling import (
     logger as error_logger,
 )
 from shared.video_fps_utils import apply_video_fps_override_preprocess, build_output_fps_summary
+from shared.services.autotune_search import frontier_bisect
 
 # Constants --------------------------------------------------------------------
 SEEDVR2_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
@@ -673,7 +674,7 @@ SEEDVR2_ORDER: List[str] = [
     "keep_only_output_files",
     # Isolate encode/upscale/decode into fresh child processes.
     "split_phase_subprocesses",
-    # INT8 ConvRot on-the-fly DiT quantization (safetensors models only).
+    # INT8 ConvRot persistent DiT cache (safetensors models only).
     "int8_convrot",
 ]
 
@@ -1046,8 +1047,18 @@ def _sample_peak_vram_gb(
     device_ids: List[int],
     interval_sec: float = 0.25,
     phase_state: Optional[Dict[str, Any]] = None,
+    probe_cancel_event: Optional[threading.Event] = None,
+    min_free_target_gb: Optional[float] = None,
+    total_vram_hint_gb: float = 0.0,
 ) -> None:
-    """Background sampler that tracks peak VRAM usage while a subprocess runs."""
+    """
+    Background sampler that tracks peak VRAM usage while a subprocess runs.
+
+    When `probe_cancel_event` and `min_free_target_gb` are provided, the probe
+    is flagged for early termination as soon as the whole-run peak already
+    violates the configured free-VRAM target (no point finishing a probe that
+    can only fail).
+    """
     peak_used = 0.0
     peak_phase2 = 0.0
     total_seen = 0.0
@@ -1070,6 +1081,25 @@ def _sample_peak_vram_gb(
                     phase2_samples += 1
                 if total_sum > 0:
                     total_seen = total_sum
+
+                result_box["max_used_gb"] = float(peak_used)
+                result_box["max_used_phase2_gb"] = float(peak_phase2)
+                result_box["samples"] = int(samples)
+                result_box["phase2_samples"] = int(phase2_samples)
+                result_box["total_gb"] = float(total_seen if total_seen > 0 else total_vram_hint_gb)
+                result_box["telemetry_ok"] = bool(telemetry_ok)
+
+                if (
+                    probe_cancel_event is not None
+                    and (not probe_cancel_event.is_set())
+                    and min_free_target_gb is not None
+                    and phase2_samples > 0
+                ):
+                    total_for_eval = float(total_seen if total_seen > 0 else total_vram_hint_gb)
+                    free_est = max(0.0, total_for_eval - peak_used) if total_for_eval > 0 else 0.0
+                    if total_for_eval > 0 and free_est < float(min_free_target_gb):
+                        result_box["early_stop_reason"] = "threshold_reached"
+                        probe_cancel_event.set()
         stop_event.wait(interval_sec)
     result_box["max_used_gb"] = float(peak_used)
     result_box["max_used_phase2_gb"] = float(peak_phase2)
@@ -1077,7 +1107,49 @@ def _sample_peak_vram_gb(
     result_box["phase2_samples"] = int(phase2_samples)
     if total_seen > 0:
         result_box["total_gb"] = float(total_seen)
+    elif float(total_vram_hint_gb) > 0:
+        result_box["total_gb"] = float(total_vram_hint_gb)
     result_box["telemetry_ok"] = bool(telemetry_ok)
+
+
+def _wait_for_probe_vram_drain(
+    telemetry_gpu_ids: List[int],
+    ambient_used_gb: float,
+    total_vram_gb: float,
+    append_log,
+    timeout_sec: float = 45.0,
+) -> None:
+    """
+    Block until GPU memory returns near the pre-autotune baseline.
+
+    A killed/aborted probe's VRAM can take several seconds to be released by the
+    driver; starting the next probe earlier folds that residue into its
+    whole-run peak and fakes a threshold failure.
+    """
+    try:
+        drain_target_gb = max(3.0, float(ambient_used_gb) + 1.5)
+        if float(total_vram_gb) > 0:
+            drain_target_gb = min(drain_target_gb, float(total_vram_gb) * 0.5)
+        deadline = time.time() + float(timeout_sec)
+        waited_sec = 0.0
+        while time.time() < deadline:
+            snap = _query_gpu_memory_snapshot_gb()
+            used = (
+                sum(float(snap[g][0]) for g in telemetry_gpu_ids if g in snap)
+                if snap
+                else 0.0
+            )
+            if used <= drain_target_gb:
+                break
+            time.sleep(1.0)
+            waited_sec += 1.0
+        if waited_sec >= 2.0 and callable(append_log):
+            append_log(
+                f"Waited {waited_sec:.0f}s for GPU memory to settle (<= {drain_target_gb:.1f}GB) "
+                "before the next probe."
+            )
+    except Exception:
+        pass
 
 
 def _resolve_autotune_eval_peak_gb(item: Dict[str, Any]) -> float:
@@ -3627,9 +3699,13 @@ def build_seedvr2_callbacks(
 
         Strategy:
         - Build a 201-frame demo clip from current input.
-        - Sweep batch sizes (4n+1) with blocks_to_swap=36.
-        - Keep configurable free VRAM headroom (`save_vram_gb`, default 2.0GB).
-        - If 201 passes, reduce blocks_to_swap by 2 for higher quality.
+        - Stage A: find the max passing batch size (4n+1) at blocks_to_swap=36
+          by probing batch=201 first and bisecting on failure (pass/fail is
+          monotone in batch size).
+        - Stage B: at the max passing batch, minimize blocks_to_swap by probing
+          blocks=0 first and bisecting (pure speed knob, runs for any batch).
+        - Probes abort early once free VRAM falls below the `save_vram_gb`
+          target (default 2.0GB) - a doomed probe never runs to completion.
         - Persist logs to vram_usages/ and reuse matching results later.
         """
         global_cfg = (
@@ -3807,6 +3883,15 @@ def build_seedvr2_callbacks(
                     show_indicator=False,
                 )
                 return
+            # Let leftovers from any previous run drain before measuring the
+            # ambient baseline, otherwise the drain gate inherits the residue.
+            _wait_for_probe_vram_drain(telemetry_gpu_ids, 1.5, float(total_vram_gb), _append_log, timeout_sec=30.0)
+            ambient_snap = _query_gpu_memory_snapshot_gb()
+            ambient_used_gb = (
+                sum(float(ambient_snap[g][0]) for g in telemetry_gpu_ids if g in ambient_snap)
+                if ambient_snap
+                else 0.0
+            )
 
             signature = _build_autotune_signature(
                 settings,
@@ -3839,6 +3924,8 @@ def build_seedvr2_callbacks(
                 except Exception:
                     free_gb = 1e9
                 if bool(item.get("oom", False)):
+                    return True
+                if str(item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
                     return True
                 if bool(item.get("telemetry_ok", False)) and free_gb < float(min_free_vram_target_gb):
                     return True
@@ -3969,7 +4056,12 @@ def build_seedvr2_callbacks(
                         and item["telemetry_ok"]
                         and (not item["oom"])
                         and float(item["estimated_free_gb"]) >= float(min_free_vram_target_gb)
+                        and str(item.get("probe_cancel_reason") or "").strip().lower() != "threshold_reached"
                     )
+                    if (not item["passed"]) and (not _history_boundary_fail(item)):
+                        # Indeterminate rows (crashes without a VRAM signature)
+                        # must not be replayed as settled results.
+                        continue
                     history_outcomes_by_key[_history_key_from_outcome(item)] = item
 
             history_tests = list(history_outcomes_by_key.values())
@@ -4144,7 +4236,9 @@ def build_seedvr2_callbacks(
             created_at = time.strftime("%Y-%m-%d %H:%M:%S")
             autotune_log_path: Optional[Path] = None
             run_counter = 0
-            total_estimated_runs = len(AUTOTUNE_BATCH_SEQUENCE) + 18
+            # Bisection worst case: ~log2(50 batch candidates) + log2(18 block
+            # candidates) + VAE-tile retries. Far below the old linear 68.
+            total_estimated_runs = 18
 
             if history_tests:
                 _append_log(
@@ -4229,6 +4323,8 @@ def build_seedvr2_callbacks(
                     decode_tile_value=int(probe_settings.get("vae_decode_tile_size") or 0),
                 )
 
+                _wait_for_probe_vram_drain(telemetry_gpu_ids, ambient_used_gb, float(total_vram_gb), _append_log)
+
                 phase_state: Dict[str, Any] = {"phase": "startup"}
                 probe_meta: Dict[str, Any] = {
                     "cli_batch_size": None,
@@ -4285,17 +4381,58 @@ def build_seedvr2_callbacks(
 
                 sampler_stop = threading.Event()
                 sampler_box: Dict[str, Any] = {}
+                threshold_cancel_event = threading.Event()
+                threshold_abort_box: Dict[str, Any] = {"hit": False}
                 sampler_thread = threading.Thread(
                     target=_sample_peak_vram_gb,
-                    args=(sampler_stop, sampler_box, telemetry_gpu_ids, 0.25, phase_state),
+                    args=(
+                        sampler_stop,
+                        sampler_box,
+                        telemetry_gpu_ids,
+                        0.25,
+                        phase_state,
+                        threshold_cancel_event,
+                        min_free_vram_target_gb,
+                        float(total_vram_gb),
+                    ),
                     daemon=True,
                 )
+
+                def _threshold_watchdog() -> None:
+                    while not stop_watchdog.is_set():
+                        if threshold_cancel_event.wait(timeout=0.2):
+                            break
+                    if stop_watchdog.is_set() or not threshold_cancel_event.is_set():
+                        return
+                    if runner.is_canceled():
+                        # A user cancel is already terminating the probe.
+                        return
+                    threshold_abort_box["hit"] = True
+                    try:
+                        runner.cancel()
+                    except Exception:
+                        pass
+
+                stop_watchdog = threading.Event()
+                watchdog_thread = threading.Thread(target=_threshold_watchdog, daemon=True)
                 sampler_thread.start()
+                watchdog_thread.start()
                 try:
                     result = runner.run_seedvr2(probe_settings, on_progress=_probe_progress, preview_only=False)
                 finally:
                     sampler_stop.set()
+                    stop_watchdog.set()
                     sampler_thread.join(timeout=2.0)
+                    watchdog_thread.join(timeout=2.0)
+
+                threshold_aborted = bool(threshold_abort_box.get("hit"))
+                if threshold_aborted:
+                    # The abort used the runner's global cancel channel; clear it so
+                    # the sweep does not read it as a user cancellation. A user cancel
+                    # racing this exact window is dropped and needs a second press.
+                    reset_probe_cancel = getattr(runner, "reset_cancel_state", None)
+                    if callable(reset_probe_cancel):
+                        reset_probe_cancel()
 
                 max_used_gb = float(sampler_box.get("max_used_gb", 0.0) or 0.0)
                 max_used_phase2_gb = float(sampler_box.get("max_used_phase2_gb", 0.0) or 0.0)
@@ -4321,6 +4458,10 @@ def build_seedvr2_callbacks(
                     elif phase_from_progress == "phase3":
                         oom_phase = "phase3_decode"
 
+                early_stop_reason = str(sampler_box.get("early_stop_reason") or "")
+                if threshold_aborted and not early_stop_reason:
+                    early_stop_reason = "threshold_reached"
+
                 outcome = {
                     "batch_size": int(test_batch),
                     "blocks_to_swap": int(test_blocks),
@@ -4339,6 +4480,7 @@ def build_seedvr2_callbacks(
                     "estimated_free_gb": round(free_gb, 3),
                     "telemetry_ok": bool(telemetry_ok),
                     "phase2_samples": int(phase2_samples),
+                    "probe_cancel_reason": str(early_stop_reason),
                     "cli_batch_size": probe_meta.get("cli_batch_size"),
                     "cli_load_cap": probe_meta.get("cli_load_cap"),
                     "encode_batches_total": int(probe_meta.get("encode_batches_total") or 0),
@@ -4348,19 +4490,48 @@ def build_seedvr2_callbacks(
                 }
                 return result, outcome
 
-            # Stage A: sweep batch size with max block swap.
+            # Stage A/B: top-first probing + bisection. VRAM demand is monotone
+            # in batch size and in resident DiT blocks (36 - blocks_to_swap), so
+            # the pass/fail frontier is located in O(log n) probes instead of the
+            # old linear walk (up to 50 + 18 full probes).
             status_reason = "completed"
-            reached_batch_201 = False
-            for batch_candidate in AUTOTUNE_BATCH_SEQUENCE:
-                if runner.is_canceled():
-                    status_reason = "cancelled"
-                    _append_log("Autotune cancelled before next test.")
-                    break
 
+            def _record_best(outcome: Dict[str, Any]) -> None:
+                nonlocal best_config
+                candidate = {
+                    "batch_size": int(outcome["batch_size"]),
+                    "blocks_to_swap": int(outcome["blocks_to_swap"]),
+                    "vae_encode_tiled": bool(working_settings.get("vae_encode_tiled", False)),
+                    "vae_decode_tiled": bool(working_settings.get("vae_decode_tiled", False)),
+                    "vae_encode_tile_size": int(working_settings.get("vae_encode_tile_size") or 0),
+                    "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
+                    "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
+                    "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
+                    "min_free_vram_target_gb": float(min_free_vram_target_gb),
+                    "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
+                    "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
+                }
+                cand_rank = _seed_rank(int(candidate["batch_size"]), int(candidate["blocks_to_swap"]))
+                cur_rank = -1
+                if isinstance(best_config, dict) and best_config:
+                    cur_rank = _seed_rank(
+                        int(best_config.get("batch_size") or 0),
+                        int(best_config.get("blocks_to_swap") or 36),
+                    )
+                if cand_rank > cur_rank:
+                    best_config = candidate
+
+            def _evaluate_candidate(test_batch: int, test_blocks: int):
+                """
+                Probe one (batch, blocks) point, reusing history and adapting VAE
+                tiles on encode/decode OOM. Returns (outcome, verdict) with
+                verdict in {"pass", "boundary_fail", "hard_fail", "cancelled"}.
+                """
+                hard_retry_used = False
                 while True:
                     probe_key = (
-                        int(batch_candidate),
-                        int(working_settings["blocks_to_swap"]),
+                        int(test_batch),
+                        int(test_blocks),
                         int(working_settings.get("vae_encode_tile_size") or 0),
                         int(working_settings.get("vae_decode_tile_size") or 0),
                         bool(working_settings.get("vae_encode_tiled", False)),
@@ -4375,12 +4546,13 @@ def build_seedvr2_callbacks(
                             "-> reusing prior VRAM result."
                         )
                     else:
-                        result, outcome = yield from _run_probe_once(batch_candidate, int(working_settings["blocks_to_swap"]))
+                        _result, outcome = yield from _run_probe_once(int(test_batch), int(test_blocks))
                         passed = (
                             outcome["returncode"] == 0
                             and bool(outcome.get("telemetry_ok", False))
                             and (not outcome["oom"])
                             and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
+                            and str(outcome.get("probe_cancel_reason") or "") != "threshold_reached"
                         )
                         outcome["passed"] = bool(passed)
                         tests.append(outcome)
@@ -4393,33 +4565,17 @@ def build_seedvr2_callbacks(
                             f"({outcome.get('peak_source','whole_run')}), "
                             f"free={outcome['estimated_free_gb']:.2f}GB, "
                             f"telemetry_ok={bool(outcome.get('telemetry_ok', False))}, "
+                            f"probe_stop={outcome.get('probe_cancel_reason') or 'none'}, "
                             f"cli_batch={outcome.get('cli_batch_size')}, cli_cap={outcome.get('cli_load_cap')}, "
                             f"upscale_batches={outcome.get('upscale_batches_total')}, "
                             f"seq_max={outcome.get('sequence_frames_max')}, passed={passed}"
                         )
 
                     if runner.is_canceled():
-                        status_reason = "cancelled"
-                        break
+                        return outcome, "cancelled"
 
                     if passed:
-                        best_config = {
-                            "batch_size": int(outcome["batch_size"]),
-                            "blocks_to_swap": int(outcome["blocks_to_swap"]),
-                            "vae_encode_tiled": bool(working_settings.get("vae_encode_tiled", False)),
-                            "vae_decode_tiled": bool(working_settings.get("vae_decode_tiled", False)),
-                            "vae_encode_tile_size": int(working_settings.get("vae_encode_tile_size") or 0),
-                            "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
-                            "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
-                            "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
-                            "min_free_vram_target_gb": float(min_free_vram_target_gb),
-                            "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
-                            "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
-                        }
-                        if int(batch_candidate) >= AUTOTUNE_TARGET_FRAMES:
-                            reached_batch_201 = True
-                        _persist_autotune_progress()
-                        break
+                        return outcome, "pass"
 
                     # OOM during VAE phases (encode/decode): halve tile sizes and retry same point.
                     if outcome["oom"] and outcome["oom_phase"] in {"phase1_encode", "phase3_decode"}:
@@ -4439,117 +4595,95 @@ def build_seedvr2_callbacks(
                                 f"{phase_label} OOM detected, reduced VAE tile sizes and retrying...",
                                 show_indicator=True,
                                 indicator_title="Auto Tune retry",
-                                batch_value=int(batch_candidate),
-                                blocks_value=int(working_settings["blocks_to_swap"]),
+                                batch_value=int(test_batch),
+                                blocks_value=int(test_blocks),
                                 encode_tile_value=int(working_settings.get("vae_encode_tile_size") or 0),
                                 decode_tile_value=int(working_settings.get("vae_decode_tile_size") or 0),
                             )
                             continue
 
-                    # Any other failure means threshold reached (or hard failure).
-                    if not bool(outcome.get("telemetry_ok", False)):
-                        status_reason = "failed"
-                    elif outcome["oom"] or (outcome["returncode"] == 0):
-                        status_reason = "threshold_reached"
-                    else:
-                        status_reason = "failed"
-                    break
+                    if bool(outcome.get("telemetry_ok", False)) and (
+                        bool(outcome.get("oom", False))
+                        or str(outcome.get("probe_cancel_reason") or "") == "threshold_reached"
+                        or int(outcome.get("returncode") or 1) == 0
+                    ):
+                        # rc==0 with insufficient free headroom is a clean VRAM boundary.
+                        return outcome, "boundary_fail"
+                    # Crash without a VRAM signature (or telemetry loss): retry the
+                    # same point once - transient failures otherwise abort the sweep.
+                    if (known_outcome is None) and (not hard_retry_used):
+                        hard_retry_used = True
+                        known_outcomes_by_key.pop(probe_key, None)
+                        _append_log(
+                            "Probe failed without a VRAM boundary signature "
+                            f"(rc={outcome.get('returncode')}); retrying once after GPU settles."
+                        )
+                        continue
+                    return outcome, "hard_fail"
 
-                if status_reason in {"cancelled", "threshold_reached", "failed"}:
-                    break
+            # Stage A: max passing batch size at blocks_to_swap=36.
+            batch_seq = [int(b) for b in AUTOTUNE_BATCH_SEQUENCE]
+            _append_log(
+                f"Stage A: probing batch={batch_seq[-1]} first, bisecting the "
+                f"{len(batch_seq)}-candidate batch grid on failure (blocks_to_swap=36)."
+            )
 
-            # Stage B: if 201 batch passed, reduce blocks_to_swap in steps of 2.
-            if status_reason == "completed" and reached_batch_201 and best_config:
-                for blocks_candidate in range(34, -2, -2):
-                    if blocks_candidate < 0:
-                        break
-                    if runner.is_canceled():
+            def _batch_probe(idx: int, _require_full: bool):
+                outcome, verdict = yield from _evaluate_candidate(
+                    int(batch_seq[int(idx)]), int(working_settings["blocks_to_swap"])
+                )
+                if verdict == "pass":
+                    _record_best(outcome)
+                    _persist_autotune_progress()
+                return {"outcome": verdict, "early_stopped_pass": False}
+
+            stage_a = yield from frontier_bisect(len(batch_seq), _batch_probe)
+            any_boundary_failed = bool(stage_a.get("boundary_failed"))
+            if stage_a.get("stopped") == "cancelled":
+                status_reason = "cancelled"
+                _append_log("Autotune cancelled during batch sweep.")
+            elif stage_a.get("stopped") == "hard_fail":
+                status_reason = "failed"
+
+            # Stage B: minimize blocks_to_swap at the best passing batch. This is
+            # a pure speed knob, so it now runs for ANY frontier batch - not only
+            # when batch 201 passed.
+            if status_reason == "completed" and isinstance(best_config, dict) and best_config:
+                stage_b_batch = int(best_config.get("batch_size") or 0)
+                blocks_seq = list(range(34, -1, -2))  # index n-1 = blocks 0 (most aggressive)
+                if stage_b_batch > 0 and int(best_config.get("blocks_to_swap") or 36) > 0:
+                    _append_log(
+                        f"Stage B: probing blocks_to_swap=0 first at batch={stage_b_batch}, "
+                        f"bisecting the {len(blocks_seq)}-candidate block grid on failure."
+                    )
+
+                    def _blocks_probe(idx: int, _require_full: bool):
+                        outcome, verdict = yield from _evaluate_candidate(
+                            stage_b_batch, int(blocks_seq[int(idx)])
+                        )
+                        if verdict == "pass":
+                            _record_best(outcome)
+                            _persist_autotune_progress()
+                        return {"outcome": verdict, "early_stopped_pass": False}
+
+                    stage_b = yield from frontier_bisect(len(blocks_seq), _blocks_probe)
+                    any_boundary_failed = any_boundary_failed or bool(stage_b.get("boundary_failed"))
+                    if stage_b.get("stopped") == "cancelled":
                         status_reason = "cancelled"
                         _append_log("Autotune cancelled during block-swap sweep.")
-                        break
+                    elif stage_b.get("stopped") == "hard_fail":
+                        status_reason = "failed"
 
-                    while True:
-                        probe_key = (
-                            int(AUTOTUNE_TARGET_FRAMES),
-                            int(blocks_candidate),
-                            int(working_settings.get("vae_encode_tile_size") or 0),
-                            int(working_settings.get("vae_decode_tile_size") or 0),
-                            bool(working_settings.get("vae_encode_tiled", False)),
-                            bool(working_settings.get("vae_decode_tiled", False)),
-                        )
-                        known_outcome = known_outcomes_by_key.get(probe_key)
-                        if isinstance(known_outcome, dict):
-                            outcome = dict(known_outcome)
-                            passed = bool(outcome.get("passed", False))
-                            _append_log(
-                                f"History hit batch={outcome.get('batch_size')} blocks={outcome.get('blocks_to_swap')} "
-                                "-> reusing prior VRAM result."
-                            )
-                        else:
-                            result, outcome = yield from _run_probe_once(AUTOTUNE_TARGET_FRAMES, blocks_candidate)
-                            passed = (
-                                outcome["returncode"] == 0
-                                and bool(outcome.get("telemetry_ok", False))
-                                and (not outcome["oom"])
-                                and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
-                            )
-                            outcome["passed"] = bool(passed)
-                            tests.append(outcome)
-                            known_outcomes_by_key[probe_key] = dict(outcome)
-                            _persist_autotune_progress()
-
-                            _append_log(
-                                f"Block sweep blocks={blocks_candidate} -> rc={outcome['returncode']}, "
-                                f"peak={outcome['max_vram_used_gb']:.2f}GB ({outcome.get('peak_source','whole_run')}), "
-                                f"free={outcome['estimated_free_gb']:.2f}GB, "
-                                f"telemetry_ok={bool(outcome.get('telemetry_ok', False))}, "
-                                f"upscale_batches={outcome.get('upscale_batches_total')}, "
-                                f"seq_max={outcome.get('sequence_frames_max')}, passed={passed}"
-                            )
-
-                        if runner.is_canceled():
-                            status_reason = "cancelled"
-                            break
-
-                        if passed:
-                            best_config = {
-                                "batch_size": AUTOTUNE_TARGET_FRAMES,
-                                "blocks_to_swap": int(blocks_candidate),
-                                "vae_encode_tiled": bool(working_settings.get("vae_encode_tiled", False)),
-                                "vae_decode_tiled": bool(working_settings.get("vae_decode_tiled", False)),
-                                "vae_encode_tile_size": int(working_settings.get("vae_encode_tile_size") or 0),
-                                "vae_encode_tile_overlap": int(working_settings.get("vae_encode_tile_overlap") or 0),
-                                "vae_decode_tile_size": int(working_settings.get("vae_decode_tile_size") or 0),
-                                "vae_decode_tile_overlap": int(working_settings.get("vae_decode_tile_overlap") or 0),
-                                "min_free_vram_target_gb": float(min_free_vram_target_gb),
-                                "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
-                                "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
-                            }
-                            _persist_autotune_progress()
-                            break
-
-                        if outcome["oom"] and outcome["oom_phase"] in {"phase1_encode", "phase3_decode"}:
-                            phase_label = "Phase 1" if outcome["oom_phase"] == "phase1_encode" else "Phase 3"
-                            if not bool(working_settings.get("vae_encode_tiled", False)):
-                                working_settings["vae_encode_tiled"] = True
-                                _append_log(f"Enabled VAE encode tiling after {phase_label} OOM.")
-                            if not bool(working_settings.get("vae_decode_tiled", False)):
-                                working_settings["vae_decode_tiled"] = True
-                                _append_log(f"Enabled VAE decode tiling after {phase_label} OOM.")
-                            changed, notes = _halve_vae_tile_sizes(working_settings)
-                            if changed:
-                                for note in notes:
-                                    _append_log(f"Adjusted tile settings: {note}")
-                                continue
-
-                        if not bool(outcome.get("telemetry_ok", False)):
-                            status_reason = "failed"
-                        else:
-                            status_reason = "threshold_reached"
-                        break
-
-                    if status_reason in {"cancelled", "threshold_reached", "failed"}:
-                        break
+            if status_reason == "completed":
+                if isinstance(best_config, dict) and best_config:
+                    top_reached = (
+                        int(best_config.get("batch_size") or 0) >= int(AUTOTUNE_TARGET_FRAMES)
+                        and int(best_config.get("blocks_to_swap") or 36) <= 0
+                    )
+                    if not top_reached:
+                        status_reason = "threshold_reached"
+                else:
+                    status_reason = "threshold_reached" if any_boundary_failed else "failed"
 
             # Persist final autotune status in the same log file.
             def _seed_quality_rank(batch_size_val: int, blocks_to_swap_val: int) -> int:
@@ -4562,6 +4696,8 @@ def build_seedvr2_callbacks(
                 except Exception:
                     free_gb = 1e9
                 if bool(test_item.get("oom", False)):
+                    return True
+                if str(test_item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
                     return True
                 if free_gb < float(min_free_vram_target_gb):
                     return True

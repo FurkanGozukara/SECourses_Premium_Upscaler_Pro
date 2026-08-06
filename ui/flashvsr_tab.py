@@ -2081,10 +2081,10 @@ def flashvsr_tab(
         if not status_text:
             return None
         status_lower = status_text.lower()
-        if "reused a matching cached result" in status_lower:
+        if ("reused a saved result" in status_lower) or ("reused a matching cached result" in status_lower):
             return (
-                "Auto Tune found a matching cached config and applied it instantly.\n"
-                "No new scan was needed for this input and GPU profile."
+                f"{status_text}\n"
+                "No new scan was needed - a previous Auto Tune already measured this input size and GPU."
             )
         state_payload = payload[-1] if isinstance(payload[-1], dict) else {}
         operation_status = str(state_payload.get("operation_status") or "").strip().lower()

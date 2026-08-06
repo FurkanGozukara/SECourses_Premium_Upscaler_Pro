@@ -36,6 +36,7 @@ def next_bisect_index(lo: int, hi: int) -> Optional[int]:
 def frontier_bisect(
     num_candidates: int,
     probe,
+    initial_index: Optional[int] = None,
 ) -> Generator[Any, Any, Dict[str, Any]]:
     """
     Find the highest-index passing candidate with top-first probing + bisection.
@@ -44,6 +45,11 @@ def frontier_bisect(
     so UI progress payloads flow through) returning a dict:
         {"outcome": "pass" | "boundary_fail" | "hard_fail" | "cancelled",
          "early_stopped_pass": bool}   # pass measured via early-success stop
+
+    `initial_index` seeds the first probe (e.g. a frontier predicted from
+    measured peaks in other logs). After a seeded first probe the immediate
+    NEIGHBOR is probed next, so an accurate prediction settles the frontier in
+    two probes; an inaccurate one simply falls back to normal bisection.
 
     A settled best whose pass came from an early-success stop is re-probed with
     require_full=True; if the full-length probe fails the candidate is demoted
@@ -61,22 +67,41 @@ def frontier_bisect(
     def _lo() -> int:
         return max(passes) if passes else -1
 
-    pending: Optional[int] = (num_candidates - 1) if num_candidates > 0 else None
+    seeded = (
+        initial_index is not None
+        and num_candidates > 0
+        and 0 <= int(initial_index) < num_candidates
+    )
+    pending: Optional[int] = (
+        int(initial_index) if seeded else ((num_candidates - 1) if num_candidates > 0 else None)
+    )
+    seed_neighbor: Optional[int] = None
+    first_probe_is_seeded = bool(seeded)
     while stopped is None:
         if pending is not None:
             res = yield from probe(int(pending), False)
             kind = str((res or {}).get("outcome") or "hard_fail")
             if kind == "pass":
                 passes[int(pending)] = bool((res or {}).get("early_stopped_pass", False))
+                if first_probe_is_seeded:
+                    seed_neighbor = int(pending) + 1
             elif kind == "boundary_fail":
                 boundary_failed = True
                 hi = min(hi, int(pending))
+                if first_probe_is_seeded:
+                    seed_neighbor = int(pending) - 1
             elif kind == "cancelled":
                 stopped = "cancelled"
                 break
             else:
                 stopped = "hard_fail"
                 break
+            first_probe_is_seeded = False
+            if seed_neighbor is not None and _lo() < seed_neighbor < hi:
+                pending = seed_neighbor
+                seed_neighbor = None
+                continue
+            seed_neighbor = None
             pending = next_bisect_index(_lo(), hi)
             continue
 
@@ -107,6 +132,45 @@ def frontier_bisect(
         "stopped": stopped,
         "boundary_failed": bool(boundary_failed),
     }
+
+
+def predict_frontier_index(
+    candidate_values: Sequence[Any],
+    measured_peaks_by_value: Dict[Any, float],
+    budget_gb: float,
+) -> Optional[int]:
+    """
+    Predict the pass/fail frontier from measured peaks recorded on a different
+    GPU (peak VRAM used by a config is largely hardware-portable).
+
+    candidate_values are ordered ascending by resource demand; budget_gb is
+    this machine's total VRAM minus the free-headroom target. Returns the
+    largest candidate index whose measured peak fits the budget, 0 when
+    measurements exist but none fit (seed a fast bottom check), or None when
+    no candidate has a measurement (no prediction possible).
+    """
+    try:
+        budget = float(budget_gb)
+    except Exception:
+        return None
+    best: Optional[int] = None
+    covered = False
+    for idx, value in enumerate(candidate_values):
+        try:
+            peak = measured_peaks_by_value.get(value)
+        except TypeError:
+            peak = None
+        if peak is None:
+            continue
+        covered = True
+        try:
+            if float(peak) > 0 and float(peak) <= budget:
+                best = idx
+        except Exception:
+            continue
+    if best is not None:
+        return best
+    return 0 if covered else None
 
 
 # --------------------------------------------------------------------------- #

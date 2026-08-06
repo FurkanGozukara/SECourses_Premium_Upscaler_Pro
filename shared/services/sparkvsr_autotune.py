@@ -33,7 +33,11 @@ from shared.path_utils import (
     normalize_path,
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
-from shared.services.autotune_search import dedupe_sparkvsr_tile_candidates, frontier_bisect
+from shared.services.autotune_search import (
+    dedupe_sparkvsr_tile_candidates,
+    frontier_bisect,
+    predict_frontier_index,
+)
 from shared.services.flashvsr_autotune import (
     _clamp_save_vram_target_gb,
     _create_autotune_demo_video,
@@ -739,16 +743,16 @@ def sparkvsr_auto_tune_action(
             spark_cfg["save_vram_gb"] = float(min_free_vram_target_gb)
             state["operation_status"] = "completed"
             cached_path = str(cached.get("_path") or "cached log")
-            _append_log(f"Matched completed SparkVSR Auto Tune result: {cached_path}")
             _append_log(
-                "Applied cached best config: "
-                f"chunk_len={spark_cfg['chunk_len']}, overlap_t={spark_cfg['overlap_t']}, "
-                f"tile={spark_cfg['tile_height']}x{spark_cfg['tile_width']}, "
-                f"spatial_overlap={spark_cfg['overlap_height']}x{spark_cfg['overlap_width']}, "
-                f"peak={float(best.get('measured_peak_vram_used_gb') or 0.0):.2f}GB, "
-                f"free={float(best.get('estimated_free_vram_gb') or 0.0):.2f}GB "
-                f"(target >= {min_free_vram_target_gb:.1f}GB), "
-                f"split_stage={'ON' if bool(settings.get('split_stage_subprocesses', True)) else 'OFF'}."
+                "A previous Auto Tune already found the best settings for this exact setup - "
+                f"no new tests needed (saved result: {cached_path})."
+            )
+            _append_log(
+                f"Applied: Chunk Length {spark_cfg['chunk_len']}, Temporal Overlap {spark_cfg['overlap_t']}, "
+                f"Spatial Tile {'full-frame' if int(spark_cfg['tile_height']) <= 0 else spark_cfg['tile_height']}, "
+                f"Spatial Overlap {spark_cfg['overlap_height']} "
+                f"(measured peak {float(best.get('measured_peak_vram_used_gb') or 0.0):.2f}GB, "
+                f"keeps {float(best.get('estimated_free_vram_gb') or 0.0):.2f}GB free)."
             )
             summary_md = (
                 "**SparkVSR Auto Tune Result (cached)**\n"
@@ -766,7 +770,11 @@ def sparkvsr_auto_tune_action(
                 f"- Log file: `{cached_path}`"
             )
             yield _payload(
-                "Auto Tune reused a matching cached result.",
+                (
+                    f"Auto Tune reused a saved result - applied Chunk Length {spark_cfg['chunk_len']}, "
+                    f"Spatial Tile {'full-frame' if int(spark_cfg['tile_height']) <= 0 else spark_cfg['tile_height']}, "
+                    f"Temporal Overlap {spark_cfg['overlap_t']}."
+                ),
                 show_indicator=False,
                 tile_value=int(spark_cfg["tile_height"]),
                 overlap_hw_value=int(spark_cfg["overlap_height"]),
@@ -782,6 +790,11 @@ def sparkvsr_auto_tune_action(
         # Auto Tune continues instead of starting from zero.
         history_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int, int], Dict[str, Any]] = {}
         history_sources: List[str] = []
+        # Cross-VRAM priors: clean measured peaks from same-settings/same-resolution
+        # logs recorded on a DIFFERENT GPU size; they predict this GPU's frontier
+        # and seed the search start (results are still verified locally).
+        prior_peaks_by_config: Dict[Tuple[int, int], float] = {}
+        prior_source_vrams: set = set()
         try:
             history_logs = (
                 sorted(logs_dir.glob(f"{AUTOTUNE_LOG_PREFIX}_*.json"), key=lambda p: p.stat().st_mtime)
@@ -798,6 +811,46 @@ def sparkvsr_auto_tune_action(
             if not isinstance(history_payload, dict):
                 continue
             if not _signature_matches(history_payload.get("signature"), signature):
+                # Same settings on a different GPU size cannot be reused directly,
+                # but their clean full-run peaks predict this GPU's frontier.
+                cand_sig = history_payload.get("signature")
+                if isinstance(cand_sig, dict) and str(cand_sig.get("exact_hash") or "") == str(
+                    signature.get("exact_hash") or ""
+                ):
+                    try:
+                        cand_px = float(cand_sig.get("target_pixels") or 0)
+                        exp_px = float(signature.get("target_pixels") or 0)
+                        pixels_close = (
+                            cand_px > 0
+                            and exp_px > 0
+                            and abs(cand_px - exp_px) / max(cand_px, exp_px) <= AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE
+                        )
+                    except Exception:
+                        pixels_close = False
+                    if pixels_close:
+                        for raw in history_payload.get("tests") or []:
+                            if not isinstance(raw, dict):
+                                continue
+                            try:
+                                if int(raw.get("returncode", 1)) != 0:
+                                    continue
+                                if (not bool(raw.get("telemetry_ok", False))) or bool(raw.get("oom", False)):
+                                    continue
+                                if str(raw.get("probe_cancel_reason") or "").strip():
+                                    continue
+                                peak = float(raw.get("max_vram_used_gb") or 0.0)
+                                if peak <= 0:
+                                    continue
+                                cfg_key = (int(raw.get("chunk_len") or 0), int(raw.get("tile_height") or 0))
+                            except Exception:
+                                continue
+                            prev = prior_peaks_by_config.get(cfg_key)
+                            if prev is None or peak < prev:
+                                prior_peaks_by_config[cfg_key] = peak
+                            with suppress(Exception):
+                                prior_source_vrams.add(
+                                    round(float(cand_sig.get("gpu_total_vram_gb") or 0.0), 1)
+                                )
                 continue
             tests_blob = history_payload.get("tests")
             if not isinstance(tests_blob, list):
@@ -1263,9 +1316,9 @@ def sparkvsr_auto_tune_action(
             if isinstance(known_outcome, dict):
                 outcome = dict(known_outcome)
                 _append_log(
-                    f"History hit chunk_len={outcome.get('chunk_len')} "
-                    f"tile={outcome.get('tile_height') or 'full-frame'} -> reusing prior VRAM result "
-                    f"(passed={bool(outcome.get('passed', False))})."
+                    f"Chunk {outcome.get('chunk_len')}, tile "
+                    f"{outcome.get('tile_height') or 'full-frame'}: already tested earlier - "
+                    f"reusing that measurement ({'fits' if bool(outcome.get('passed', False)) else 'does not fit'})."
                 )
                 tests.append(outcome)
                 _persist("running")
@@ -1287,15 +1340,20 @@ def sparkvsr_auto_tune_action(
             outcome = yield from _run_probe_once(candidate)
             tests.append(outcome)
             history_outcomes_by_key[history_key] = dict(outcome)
+            if bool(outcome.get("passed", False)):
+                verdict_note = "PASSED"
+            elif str(outcome.get("probe_cancel_reason") or "") == "threshold_reached":
+                verdict_note = "needs too much VRAM (test stopped early to save time)"
+            elif outcome.get("oom"):
+                verdict_note = "ran out of VRAM"
+            elif not bool(outcome.get("telemetry_ok", False)):
+                verdict_note = "failed (VRAM telemetry unavailable)"
+            else:
+                verdict_note = f"failed (exit code {outcome.get('returncode')})"
             _append_log(
-                f"Result chunk_len={outcome['chunk_len']} tile={outcome['tile_height'] or 'full-frame'} -> "
-                f"rc={outcome['returncode']}, peak={outcome['max_vram_used_gb']:.2f}GB, "
-                f"free={outcome['estimated_free_gb']:.2f}GB, telemetry_ok={outcome['telemetry_ok']}, "
-                f"oom={outcome['oom']}, stop={outcome.get('probe_cancel_reason') or 'none'}, "
-                f"chunks={outcome.get('chunks')}, tiles={outcome.get('tiles')}, "
-                f"split_stage={outcome.get('split_stage_subprocesses')}, "
-                f"cli_flag={outcome.get('split_stage_cli_flag')}, runtime_seen={outcome.get('split_stage_runtime_seen')}, "
-                f"passed={outcome['passed']}"
+                f"Tested Chunk {outcome['chunk_len']}, tile {outcome['tile_height'] or 'full-frame'}: "
+                f"peak {outcome['max_vram_used_gb']:.2f}GB, "
+                f"{outcome['estimated_free_gb']:.2f}GB left free - {verdict_note}."
             )
             _persist("running")
             return outcome
@@ -1326,10 +1384,28 @@ def sparkvsr_auto_tune_action(
             if first_outcome is not None and first_verdict == "pass":
                 _apply_passed_outcome(first_outcome)
                 if growth_candidates:
+                    vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
+                    growth_values = [int(c["chunk_len"]) for c in growth_candidates]
+                    growth_peaks = {
+                        int(chunk_k): float(peak)
+                        for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
+                        if int(tile_k) <= 0
+                    }
+                    growth_seed: Optional[int] = None
+                    pred = predict_frontier_index(growth_values, growth_peaks, vram_budget_gb)
+                    if pred is not None and pred < len(growth_values) - 1:
+                        growth_seed = int(pred)
+                        vram_list = ", ".join(
+                            f"{v:.0f}GB" for v in sorted(v for v in prior_source_vrams if v > 0)
+                        ) or "different-size"
+                        _append_log(
+                            f"Measurements from a {vram_list} GPU predict this {total_vram_gb:.0f}GB GPU "
+                            f"tops out near Chunk Length {growth_values[growth_seed]} - starting there "
+                            "(still verified with real probes)."
+                        )
                     _append_log(
-                        "Initial 65-frame probe passed. Bisecting larger temporal chunks "
-                        f"({[int(c['chunk_len']) for c in growth_candidates]}) - largest first - "
-                        "for faster long-video throughput."
+                        "The 65-frame baseline fits. Now finding the longest safe Temporal Chunk "
+                        f"(candidates {growth_values}; longer = better long-video consistency and speed)."
                     )
 
                     def _growth_probe(idx: int, _require_full: bool):
@@ -1339,7 +1415,9 @@ def sparkvsr_auto_tune_action(
                             _apply_passed_outcome(outcome)
                         return {"outcome": verdict, "early_stopped_pass": False}
 
-                    growth_res = yield from frontier_bisect(len(growth_candidates), _growth_probe)
+                    growth_res = yield from frontier_bisect(
+                        len(growth_candidates), _growth_probe, initial_index=growth_seed
+                    )
                     boundary_failed = boundary_failed or bool(growth_res.get("boundary_failed"))
                     if growth_res.get("stopped") == "hard_fail":
                         status_reason = "failed"
@@ -1353,6 +1431,7 @@ def sparkvsr_auto_tune_action(
                 remaining_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
                 for cand in candidates:
                     remaining_by_chunk.setdefault(int(cand["chunk_len"]), []).append(cand)
+                vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
                 for chunk_len in sorted(remaining_by_chunk.keys(), reverse=True):
                     chunk_cands = sorted(remaining_by_chunk[chunk_len], key=_quality_rank)
 
@@ -1363,11 +1442,28 @@ def sparkvsr_auto_tune_action(
                             _apply_passed_outcome(outcome)
                         return {"outcome": verdict, "early_stopped_pass": False}
 
+                    tile_values = [int(c["tile_height"]) for c in chunk_cands]
+                    tile_peaks = {
+                        int(tile_k): float(peak)
+                        for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
+                        if int(chunk_k) == int(chunk_len)
+                    }
+                    tile_seed: Optional[int] = None
+                    pred = predict_frontier_index(tile_values, tile_peaks, vram_budget_gb)
+                    if pred is not None and pred < len(tile_values) - 1:
+                        tile_seed = int(pred)
+                        _append_log(
+                            "Other-GPU measurements predict the best spatial tile near "
+                            f"{tile_values[tile_seed] if tile_values[tile_seed] > 0 else 'full-frame'} "
+                            f"at Chunk Length {chunk_len} - starting there."
+                        )
                     _append_log(
-                        f"Fallback search at chunk_len={chunk_len}: bisecting "
-                        f"{len(chunk_cands)} spatial candidate(s)."
+                        f"Trying Chunk Length {chunk_len}: looking for the best spatial tile "
+                        f"among {['full-frame' if t <= 0 else t for t in tile_values]}."
                     )
-                    chunk_res = yield from frontier_bisect(len(chunk_cands), _tile_probe)
+                    chunk_res = yield from frontier_bisect(
+                        len(chunk_cands), _tile_probe, initial_index=tile_seed
+                    )
                     boundary_failed = boundary_failed or bool(chunk_res.get("boundary_failed"))
                     if chunk_res.get("stopped") == "hard_fail":
                         status_reason = "failed"
@@ -1419,14 +1515,27 @@ def sparkvsr_auto_tune_action(
                 f"(target >= `{min_free_vram_target_gb:.1f} GB`)\n"
                 f"- Log file: `{str(autotune_log_path) if autotune_log_path else 'not saved'}`"
             )
+            applied_note = (
+                f"applied Chunk Length {spark_cfg['chunk_len']}, "
+                f"Spatial Tile {'full-frame' if int(spark_cfg['tile_height']) <= 0 else spark_cfg['tile_height']}, "
+                f"Temporal Overlap {spark_cfg['overlap_t']}"
+            )
             if status_reason == "completed":
-                final_status = "Auto Tune complete. Applied recommended config."
+                final_status = f"Auto Tune complete - {applied_note}."
             elif status_reason == "threshold_reached":
-                final_status = "Auto Tune reached VRAM threshold. Applied best-so-far config."
+                final_status = f"Auto Tune finished - {applied_note} (highest config that fits your VRAM)."
             elif status_reason == "cancelled":
-                final_status = "Auto Tune cancelled. Applied best-so-far config."
+                final_status = f"Auto Tune cancelled - {applied_note} (best found so far)."
             else:
-                final_status = "Auto Tune hit an error. Applied best-so-far config."
+                final_status = f"Auto Tune hit an error - {applied_note} (best found before the error)."
+            _append_log(
+                f"Result: Chunk Length {spark_cfg['chunk_len']}, "
+                f"Spatial Tile {'full-frame' if int(spark_cfg['tile_height']) <= 0 else spark_cfg['tile_height']}, "
+                f"Temporal Overlap {spark_cfg['overlap_t']} "
+                f"(measured peak {float(best_config.get('measured_peak_vram_used_gb') or 0.0):.2f}GB, "
+                f"keeps {float(best_config.get('estimated_free_vram_gb') or 0.0):.2f}GB of "
+                f"{total_vram_gb:.1f}GB free)."
+            )
             yield _payload(
                 final_status,
                 show_indicator=False,

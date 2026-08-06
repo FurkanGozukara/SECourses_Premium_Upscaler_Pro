@@ -7,6 +7,8 @@ from threading import Lock
 import time
 from typing import List, Tuple
 
+from shared.model_downloads import DOWNLOADABLE_GAN_MODELS
+
 
 GAN_MODEL_EXTS = (".pth", ".safetensors")
 _GAN_SCAN_CACHE_TTL_SEC = 20.0
@@ -62,7 +64,7 @@ def scan_gan_models(base_dir: Path) -> List[str]:
             if (now - ts) < _GAN_SCAN_CACHE_TTL_SEC and cached_fingerprint == fingerprint:
                 return list(cached_models)
 
-    choices: set[str] = set()
+    choices: set[str] = set(DOWNLOADABLE_GAN_MODELS)
     for models_dir in model_dirs:
         try:
             for f in models_dir.iterdir():

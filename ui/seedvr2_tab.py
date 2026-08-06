@@ -527,7 +527,7 @@ def seedvr2_tab(
                 int8_convrot = gr.Checkbox(
                     label="INT8 ConvRot (DiT)",
                     value=bool(values[56]) if len(values) > 56 else False,
-                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. The DiT is cached as one safetensors file after first use. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
+                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. The prebuilt cache downloads on first use; local generation remains the fallback. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
                     scale=1,
                 )
                 compile_backend = gr.Dropdown(

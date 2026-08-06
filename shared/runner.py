@@ -28,6 +28,7 @@ from .model_manager import get_model_manager, ModelType
 from .command_logger import get_command_logger
 from .video_codec_options import build_ffmpeg_video_encode_args
 from .processing_queue import queue_resource_keys_for_gpu_selection
+from .model_downloads import ensure_rife_model, ensure_seedvr2_model
 
 
 class RunResult:
@@ -433,6 +434,20 @@ class Runner:
         input_path = normalize_path(settings.get("input_path"))
         if not input_path:
             raise ValueError("Input path is required.")
+
+        selected_model = str(settings.get("dit_model") or "")
+        selected_path = self._resolve_seedvr2_model_file(selected_model, settings)
+        default_models_dir = (self.base_dir / "SeedVR2" / "models").resolve()
+        custom_model = bool(selected_path and selected_path.parent.resolve() != default_models_dir)
+        if not custom_model:
+            download_ok, download_error = ensure_seedvr2_model(
+                self.base_dir,
+                selected_model,
+                bool(settings.get("int8_convrot", False)),
+                on_progress,
+            )
+            if not download_ok:
+                return RunResult(1, None, f"SeedVR2 model download failed:\n{download_error}")
 
         output_format = settings.get("output_format") or "auto"
         format_for_cli = None if output_format == "auto" else output_format
@@ -2233,6 +2248,15 @@ class Runner:
         input_path = normalize_path(settings.get("input_path"))
         if not input_path:
             raise ValueError("Input path is required for RIFE.")
+
+        if not str(settings.get("model_dir") or "").strip():
+            download_ok, download_error = ensure_rife_model(
+                self.base_dir,
+                str(settings.get("model") or "4.26"),
+                on_progress,
+            )
+            if not download_ok:
+                return RunResult(1, None, f"RIFE model download failed:\n{download_error}")
 
         # FIXED: Pre-process video if skip_first_frames or load_cap is set
         # RIFE CLI doesn't support these natively, so we trim via ffmpeg first

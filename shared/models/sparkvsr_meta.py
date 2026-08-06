@@ -16,6 +16,7 @@ from shared.sparkvsr_constants import (
     SPARKVSR_INT8_CONVROT_CACHE_NAME,
     SPARKVSR_INT8_CONVROT_MODEL_NAME,
 )
+from shared.model_downloads import windows_int8_defaults_enabled
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,10 @@ _BUILTIN_MODELS: List[SparkVSRModel] = [
         estimated_vram_gb=20.0,
         default_dtype="bfloat16",
         default_scale=4,
-        notes="SparkVSR BF16 distribution. This is the default model used by the app.",
+        notes=(
+            "SparkVSR BF16 distribution. This remains the RunPod and Massed Compute default; "
+            "the Windows launcher defaults to INT8 ConvRot."
+        ),
     ),
     SparkVSRModel(
         name=SPARKVSR_FP8_SCALED_MODEL_NAME,
@@ -59,14 +63,15 @@ _BUILTIN_MODELS: List[SparkVSRModel] = [
     ),
     SparkVSRModel(
         name=SPARKVSR_INT8_CONVROT_MODEL_NAME,
-        repo_id="local-cache",
+        repo_id="MonsterMMORPG/Wan_GGUF",
         relative_path=SPARKVSR_INT8_CONVROT_CACHE_NAME,
         stage="Stage-2 transformer-only INT8 ConvRot cache",
         estimated_vram_gb=11.0,
         default_dtype="bfloat16",
         default_scale=4,
         notes=(
-            "Single-file transformer cache generated locally from SparkVSR-bf16 on first use. "
+            "Prebuilt transformer cache downloaded on first use; local generation from "
+            "SparkVSR-bf16 remains the fallback. "
             "The text encoder and VAE continue to load from the BF16 model. "
             "Better quality than FP8-scaled (Hadamard rotation + MSE-optimized scales) "
             "and faster than BF16 on RTX 2000 or newer GPUs via fused INT8 matmul."
@@ -167,6 +172,8 @@ def get_sparkvsr_model_names(base_dir: Optional[Path] = None) -> List[str]:
 
 
 def get_sparkvsr_default_model() -> str:
+    if windows_int8_defaults_enabled():
+        return SPARKVSR_INT8_CONVROT_MODEL_NAME
     return SPARKVSR_BF16_MODEL_NAME
 
 

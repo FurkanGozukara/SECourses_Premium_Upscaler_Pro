@@ -1038,7 +1038,8 @@ def sparkvsr_tab(
             #### SparkVSR Guide
 
             **Model defaults**
-            - `SparkVSR-bf16` is the default distributed model.
+            - `SparkVSR-bf16` remains the RunPod and Massed Compute default; the Windows launcher selects `SparkVSR-int8-convrot`.
+            - `SparkVSR-int8-convrot` downloads its prebuilt transformer cache on first use and keeps local generation as a fallback.
             - `SparkVSR-fp8-scaled` is optional and generated locally from `SparkVSR-bf16` on first use, then reused from cache.
             - Precision is selected by the SparkVSR model.
             - `sr_image` is selected by default. If `Local SR Reference Path` is blank, the input video is used automatically as the local reference source.

@@ -42,6 +42,7 @@ from shared.comparison_video_service import maybe_generate_input_vs_output_compa
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
+from shared.model_downloads import DOWNLOADABLE_GAN_MODELS
 
 
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
@@ -252,7 +253,7 @@ def _is_realesrgan_builtin(name: str) -> bool:
 def _scan_gan_models(base_dir: Path) -> List[str]:
     """Scan for GAN models with comprehensive metadata"""
     # Support both the legacy folder (`Image_Upscale_Models/`) and the current layout (`models/`).
-    models: set[str] = set()
+    models: set[str] = set(DOWNLOADABLE_GAN_MODELS)
     for folder_name in ("models", "Image_Upscale_Models"):
         models_dir = base_dir / folder_name
         if not models_dir.exists():
@@ -1407,7 +1408,7 @@ def build_gan_callbacks(
                                     break
                             if found:
                                 break
-                        if not found:
+                        if not found and builtin_key not in DOWNLOADABLE_GAN_MODELS:
                             return ("ERROR: Model weights not found", "\n".join(header_log + ["Missing model file."]), None, "", gr.update(value=None))
                     
                     # Add face restoration settings

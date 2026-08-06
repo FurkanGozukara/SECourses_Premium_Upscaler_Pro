@@ -56,6 +56,7 @@ from shared.global_rife import maybe_apply_global_rife, global_rife_enabled
 from shared.model_manager import get_model_manager, ModelType
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.models.rife_meta import get_rife_default_model
+from shared.model_downloads import windows_int8_defaults_enabled
 from shared.error_handling import (
     validate_input_path,
     validate_cuda_device as validate_cuda_spec,
@@ -431,7 +432,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "cache_dit": False,
         "cache_vae": False,
         "split_phase_subprocesses": True,
-        "int8_convrot": False,
+        "int8_convrot": windows_int8_defaults_enabled(),
         "debug": False,
         "resume_chunking": False,
         "resume_run_dir": "",

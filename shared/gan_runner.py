@@ -23,6 +23,7 @@ from .path_utils import (
 )
 from .face_restore import restore_image, restore_video
 from .command_logger import get_command_logger
+from .model_downloads import ensure_gan_model
 from .video_encoder import encode_video
 from .video_codec_options import build_ffmpeg_video_encode_args
 
@@ -350,6 +351,10 @@ def run_gan_upscale(
         input_path_obj = Path(normalize_path(input_path))
         if not input_path_obj.exists():
             return GanResult(1, None, f"Input file not found: {input_path}")
+
+        download_ok, download_error = ensure_gan_model(base_dir, model_name, on_progress)
+        if not download_ok:
+            return GanResult(1, None, f"GAN model download failed:\n{download_error}")
 
         # Get model metadata
         metadata = get_gan_model_metadata(model_name, base_dir)

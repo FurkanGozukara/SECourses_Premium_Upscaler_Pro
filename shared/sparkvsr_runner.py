@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .command_logger import get_command_logger
+from .model_downloads import ensure_sparkvsr_model
 from .models.sparkvsr_meta import get_sparkvsr_metadata
 from .sparkvsr_constants import (
     SPARKVSR_BF16_MODEL_NAME,
@@ -144,7 +145,7 @@ def _resolve_model_path(base_dir: Path, settings: Dict[str, Any]) -> tuple[Optio
             cache_path = models_dir / SPARKVSR_INT8_CONVROT_CACHE_NAME
             return cache_path, (
                 f"[SparkVSR] Using transformer-only INT8 ConvRot cache: {cache_path} "
-                "(generated from SparkVSR-bf16 if missing)"
+                "(downloaded on demand; generated from SparkVSR-bf16 only as fallback)"
             )
     if candidate.exists():
         return candidate, f"[SparkVSR] Using local model directory: {candidate}"
@@ -290,6 +291,16 @@ def run_sparkvsr(
         original_input_path = normalize_path(settings.get("_effective_input_path") or settings.get("input_path") or "")
         if not original_input_path or not Path(original_input_path).exists():
             return SparkVSRResult(1, None, f"SparkVSR input path not found: {original_input_path}")
+
+        selected_model = str(settings.get("model_name") or SPARKVSR_BF16_MODEL_NAME).strip()
+        if not normalize_path(settings.get("model_path") or ""):
+            download_ok, download_error = ensure_sparkvsr_model(
+                base_dir,
+                selected_model,
+                on_progress,
+            )
+            if not download_ok:
+                return SparkVSRResult(1, None, f"SparkVSR model download failed:\n{download_error}")
 
         model_path, model_msg = _resolve_model_path(base_dir, settings)
         log(model_msg)

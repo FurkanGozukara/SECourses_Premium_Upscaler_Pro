@@ -9,6 +9,8 @@ from threading import Lock
 import time
 from typing import Dict, List, Optional
 
+from shared.model_downloads import DOWNLOADABLE_RIFE_MODELS
+
 
 _RIFE_DISCOVERY_CACHE_TTL_SEC = 20.0
 _RIFE_DISCOVERY_CACHE_LOCK = Lock()
@@ -255,9 +257,9 @@ def _discover_rife_models_from_layout(base_dir: Path) -> List[str]:
 
 def get_rife_model_names(base_dir: Path = None) -> List[str]:
     """
-    Get locally installed RIFE model names.
+    Get installed and on-demand RIFE model names.
     
-    Scans supported local layouts and returns only discovered models.
+    Scans supported local layouts and adds models available from the downloader.
     
     Args:
         base_dir: Base directory of the application (to find RIFE/train_log)
@@ -265,10 +267,10 @@ def get_rife_model_names(base_dir: Path = None) -> List[str]:
     Returns:
         List of installed model names.
     """
-    # User requested behavior: list only installed local models.
     if base_dir:
-        return _discover_rife_models_from_layout(Path(base_dir))
-    return []
+        installed = _discover_rife_models_from_layout(Path(base_dir))
+        return sorted(set(installed).union(DOWNLOADABLE_RIFE_MODELS))
+    return list(DOWNLOADABLE_RIFE_MODELS)
 
 
 def get_rife_default_model() -> str:

@@ -8,6 +8,9 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict
 
+if "--windows-int8-defaults" in sys.argv:
+    os.environ["SECOURSES_WINDOWS_INT8_DEFAULTS"] = "1"
+
 # Hugging Face download transport:
 # - hf_transfer can improve download speed but can also cause issues on some Windows setups.
 # - Default to disabled unless the launcher/user explicitly enables it.
@@ -186,6 +189,7 @@ def _parse_launch_cli_args(argv=None):
     parser.add_argument("--share", action="store_true", help="Enable Gradio share link")
     parser.add_argument("--server", dest="server_name", type=str, default=None, help="Bind Gradio server host/IP")
     parser.add_argument("--port", dest="server_port", type=int, default=None, help="Bind Gradio server port")
+    parser.add_argument("--windows-int8-defaults", action="store_true", help="Use Windows INT8 model defaults")
     args, _unknown = parser.parse_known_args(list(argv) if argv is not None else sys.argv[1:])
     return args
 

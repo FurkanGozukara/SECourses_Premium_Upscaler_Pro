@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .command_logger import get_command_logger
+from .model_downloads import ensure_flashvsr_model
 from .models.flashvsr_meta import (
     flashvsr_internal_to_model_name,
     flashvsr_version_to_internal,
@@ -42,11 +43,8 @@ class FlashVSRResult:
     output_fps: float = 30.0
 
 
-_FLASHVSR_REQUIRED_FILES = (
-    "diffusion_pytorch_model_streaming_dmd.safetensors",
-    "LQ_proj_in.ckpt",
-    "TCDecoder.ckpt",
-)
+_FLASHVSR_REQUIRED_FILES = ("LQ_proj_in.ckpt", "TCDecoder.ckpt")
+_FLASHVSR_SOURCE_WEIGHT = "diffusion_pytorch_model_streaming_dmd.safetensors"
 _SINGLE_IMAGE_FAST_TARGET_PIXELS = 4_194_304  # 2048 x 2048
 _SINGLE_IMAGE_REPEAT_FRAMES = 21
 
@@ -141,11 +139,13 @@ def _expected_flashvsr_model_dir_name(version_internal: str) -> str:
     return "FlashVSR-v1.1" if str(version_internal) == "11" else "FlashVSR"
 
 
-def _missing_required_model_files(model_dir: Path) -> List[str]:
+def _missing_required_model_files(model_dir: Path, *, require_source: bool = True) -> List[str]:
     missing: List[str] = []
     for name in _FLASHVSR_REQUIRED_FILES:
         if not (model_dir / name).exists():
             missing.append(name)
+    if require_source and not (model_dir / _FLASHVSR_SOURCE_WEIGHT).exists():
+        missing.append(_FLASHVSR_SOURCE_WEIGHT)
     return missing
 
 
@@ -157,7 +157,11 @@ def _resolve_models_root(base_dir: Path, settings: Dict[str, Any]) -> Path:
 
 
 def _ensure_local_flashvsr_model_layout(
-    models_root: Path, version_internal: str
+    models_root: Path,
+    version_internal: str,
+    *,
+    int8_convrot: bool = False,
+    int8_cache_root: Optional[Path] = None,
 ) -> tuple[bool, str, Optional[Path]]:
     target_name = _expected_flashvsr_model_dir_name(version_internal)
     target_dir = models_root / target_name
@@ -172,7 +176,12 @@ def _ensure_local_flashvsr_model_layout(
             None,
         )
 
-    missing = _missing_required_model_files(target_dir)
+    missing = _missing_required_model_files(target_dir, require_source=not int8_convrot)
+    if int8_convrot:
+        cache_path = (int8_cache_root or models_root) / f"{target_name}_int8_convrot.safetensors"
+        source_path = target_dir / _FLASHVSR_SOURCE_WEIGHT
+        if not cache_path.is_file() and not source_path.is_file():
+            missing.append(f"{cache_path.name} or {_FLASHVSR_SOURCE_WEIGHT}")
     if missing:
         return (
             False,
@@ -237,9 +246,15 @@ def _sanitize_attention(value: Any) -> str:
 
 
 def _sanitize_vae_model(value: Any) -> str:
-    valid = {"wan2.1", "wan2.2", "lightvae_w2.1", "tae_w2.2", "lighttae_hy1.5"}
+    valid = {
+        "wan2.1": "Wan2.1",
+        "wan2.2": "Wan2.2",
+        "lightvae_w2.1": "LightVAE_W2.1",
+        "tae_w2.2": "TAE_W2.2",
+        "lighttae_hy1.5": "LightTAE_HY1.5",
+    }
     text = str(value or "Wan2.1").strip()
-    return text if text.lower() in valid else "Wan2.1"
+    return valid.get(text.lower(), "Wan2.1")
 
 
 def _parse_int(value: Any, default: int) -> int:
@@ -547,6 +562,23 @@ def run_flashvsr(
         attention_mode = _sanitize_attention(settings.get("attention_mode", settings.get("attention", "sparse_sage_attention")))
         device_arg, visible_gpu, gpu_note = _resolve_flashvsr_device(settings.get("device", "auto"))
 
+        models_root = _resolve_models_root(base_dir, settings)
+        default_models_root = (base_dir / "ComfyUI-FlashVSR_Stable" / "models").resolve()
+        if models_root.resolve() == default_models_root:
+            download_ok, download_error = ensure_flashvsr_model(
+                base_dir,
+                version_ui,
+                precision,
+                vae_model,
+                on_progress,
+            )
+            if not download_ok:
+                return FlashVSRResult(
+                    returncode=1,
+                    output_path=None,
+                    log=f"FlashVSR model download failed:\n{download_error}",
+                )
+
         color_fix = _bool(settings.get("color_fix", True), default=True)
         tiled_vae = _bool(settings.get("tiled_vae", True), default=True)
         tiled_dit = _bool(settings.get("tiled_dit", True), default=True)
@@ -659,8 +691,12 @@ def run_flashvsr(
             return FlashVSRResult(returncode=1, output_path=None, log="Failed to prepare input for FlashVSR CLI.")
         temp_input_dir = tmp_root
 
-        models_root = _resolve_models_root(base_dir, settings)
-        layout_ok, layout_msg, _ = _ensure_local_flashvsr_model_layout(models_root, version_internal)
+        layout_ok, layout_msg, _ = _ensure_local_flashvsr_model_layout(
+            models_root,
+            version_internal,
+            int8_convrot=precision == "int8_convrot",
+            int8_cache_root=base_dir / "FlashVSR_plus" / "models",
+        )
         log(layout_msg)
         if not layout_ok:
             return FlashVSRResult(returncode=1, output_path=None, log="\n".join(log_lines))

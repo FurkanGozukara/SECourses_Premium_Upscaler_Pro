@@ -252,7 +252,10 @@ def _sample_peak_vram_gb(
                 result_box["total_gb"] = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                 result_box["telemetry_ok"] = bool(telemetry_ok)
 
-                if probe_cancel_event is not None and (not probe_cancel_event.is_set()) and phase2_samples > 0:
+                threshold_gate_ready = bool(
+                    phase2_samples > 0 or bool((phase_state or {}).get("threshold_any_phase", False))
+                )
+                if probe_cancel_event is not None and (not probe_cancel_event.is_set()) and threshold_gate_ready:
                     total_for_eval = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                     free_est = (
                         max(0.0, total_for_eval - peak_used)
@@ -928,6 +931,14 @@ def flashvsr_auto_tune_action(
             AUTOTUNE_MIN_FREE_VRAM_GB,
         )
         settings["save_vram_gb"] = float(min_free_vram_target_gb)
+        try:
+            campaign_profile_min_peak_gb = max(
+                0.0,
+                float(os.environ.get("SECOURSES_AUTOTUNE_PROFILE_MIN_VRAM_GB", "0") or 0.0),
+            )
+        except Exception:
+            campaign_profile_min_peak_gb = 0.0
+        campaign_force_fresh = bool(campaign_profile_min_peak_gb > 0.0)
 
         input_path = _resolve_uploaded_path(uploaded_file) or normalize_path(settings.get("input_path"))
         if not input_path or not Path(input_path).exists():
@@ -1087,7 +1098,7 @@ def flashvsr_auto_tune_action(
             candidate_logs = sorted(
                 [p for p in logs_dir.glob("*.json") if p.is_file()],
                 key=lambda p: p.stat().st_mtime,
-            ) if logs_dir.exists() else []
+            ) if logs_dir.exists() and (not campaign_force_fresh) else []
         except Exception:
             candidate_logs = []
 
@@ -1539,6 +1550,7 @@ def flashvsr_auto_tune_action(
                 "phase2_gate_ready": False,
                 "early_pass_gate_ready": False,
                 "step_full_seen": False,
+                "threshold_any_phase": bool(campaign_force_fresh),
             }
             probe_cancel_event = threading.Event()
             sampler_stop = threading.Event()
@@ -1612,8 +1624,8 @@ def flashvsr_auto_tune_action(
                     probe_cancel_event,
                     min_free_vram_target_gb,
                     float(total_vram_gb),
-                    (AUTOTUNE_EARLY_PASS_MARGIN_GB if allow_early_pass else None),
-                    (AUTOTUNE_EARLY_PASS_STABLE_SEC if allow_early_pass else None),
+                    (AUTOTUNE_EARLY_PASS_MARGIN_GB if allow_early_pass and not campaign_force_fresh else None),
+                    (AUTOTUNE_EARLY_PASS_STABLE_SEC if allow_early_pass and not campaign_force_fresh else None),
                 ),
                 daemon=True,
             )
@@ -1959,6 +1971,60 @@ def flashvsr_auto_tune_action(
                     break
             if status_reason == "need_lower_chunk":
                 status_reason = "failed"
+
+        if campaign_force_fresh and status_reason != "cancelled":
+            low_tile = int(AUTOTUNE_FALLBACK_TILES[-1])
+            low_overlap = int(AUTOTUNE_FALLBACK_OVERLAP)
+            _append_log(
+                "Campaign profiling: the 2GB reserve cutoff remains active; continuing the low-memory "
+                f"ladder toward {campaign_profile_min_peak_gb:.1f}GB peak VRAM at "
+                f"Tile {low_tile}, Overlap {low_overlap}."
+            )
+            profile_floor_reached = False
+            for profile_chunk in AUTOTUNE_FRAME_CHUNK_SEQUENCE:
+                outcome, passed_flag = yield from _run_candidate_with_vae_retry(
+                    int(profile_chunk),
+                    low_tile,
+                    True,
+                    low_overlap,
+                    require_full=True,
+                )
+                if _cancel_requested():
+                    status_reason = "cancelled"
+                    break
+                if outcome is None:
+                    continue
+                if passed_flag:
+                    _consider_best(outcome)
+                peak_gb = float(outcome.get("max_vram_used_gb", 0.0) or 0.0)
+                clean_measurement = bool(
+                    int(outcome.get("returncode", 1)) == 0
+                    and bool(outcome.get("telemetry_ok", False))
+                    and (not bool(outcome.get("oom", False)))
+                    and (not str(outcome.get("probe_cancel_reason") or ""))
+                )
+                _persist_autotune_progress()
+                if clean_measurement and peak_gb <= float(campaign_profile_min_peak_gb):
+                    profile_floor_reached = True
+                    _append_log(
+                        f"Campaign profiling reached {peak_gb:.2f}GB peak at Frame Chunk "
+                        f"{int(profile_chunk)}, Tile {low_tile}."
+                    )
+                    break
+            if not profile_floor_reached and status_reason != "cancelled":
+                measured = [
+                    float(item.get("max_vram_used_gb", 0.0) or 0.0)
+                    for item in tests
+                    if bool(item.get("telemetry_ok", False))
+                    and int(item.get("returncode", 1)) == 0
+                    and (not bool(item.get("oom", False)))
+                    and float(item.get("max_vram_used_gb", 0.0) or 0.0) > 0
+                ]
+                floor_note = min(measured) if measured else 0.0
+                _append_log(
+                    "Campaign profiling exhausted the low-memory ladder; "
+                    f"lowest clean measured peak was {floor_note:.2f}GB."
+                )
 
         def _is_vram_boundary_failure(test_item: Dict[str, Any]) -> bool:
             try:

@@ -1089,11 +1089,14 @@ def _sample_peak_vram_gb(
                 result_box["total_gb"] = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                 result_box["telemetry_ok"] = bool(telemetry_ok)
 
+                threshold_gate_ready = bool(
+                    phase2_samples > 0 or bool((phase_state or {}).get("threshold_any_phase", False))
+                )
                 if (
                     probe_cancel_event is not None
                     and (not probe_cancel_event.is_set())
                     and min_free_target_gb is not None
-                    and phase2_samples > 0
+                    and threshold_gate_ready
                 ):
                     total_for_eval = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                     free_est = max(0.0, total_for_eval - peak_used) if total_for_eval > 0 else 0.0
@@ -3810,6 +3813,16 @@ def build_seedvr2_callbacks(
                 AUTOTUNE_MIN_FREE_VRAM_GB,
             )
             settings["save_vram_gb"] = float(min_free_vram_target_gb)
+            try:
+                import os as _os
+
+                campaign_profile_min_peak_gb = max(
+                    0.0,
+                    float(_os.environ.get("SECOURSES_AUTOTUNE_PROFILE_MIN_VRAM_GB", "0") or 0.0),
+                )
+            except Exception:
+                campaign_profile_min_peak_gb = 0.0
+            campaign_force_fresh = bool(campaign_profile_min_peak_gb > 0.0)
 
             if global_gpu_device == "cpu":
                 _append_log("Global GPU selector is set to CPU. Auto Tune requires CUDA GPU mode.")
@@ -3946,7 +3959,7 @@ def build_seedvr2_callbacks(
                 candidate_logs = sorted(
                     [p for p in logs_dir.glob("*.json") if p.is_file()],
                     key=lambda p: p.stat().st_mtime,
-                ) if logs_dir.exists() else []
+                ) if logs_dir.exists() and (not campaign_force_fresh) else []
             except Exception:
                 candidate_logs = []
 
@@ -4377,7 +4390,10 @@ def build_seedvr2_callbacks(
 
                 _wait_for_probe_vram_drain(telemetry_gpu_ids, ambient_used_gb, float(total_vram_gb), _append_log)
 
-                phase_state: Dict[str, Any] = {"phase": "startup"}
+                phase_state: Dict[str, Any] = {
+                    "phase": "startup",
+                    "threshold_any_phase": bool(campaign_force_fresh),
+                }
                 probe_meta: Dict[str, Any] = {
                     "cli_batch_size": None,
                     "cli_load_cap": None,
@@ -4762,6 +4778,52 @@ def build_seedvr2_callbacks(
                         _append_log("Autotune cancelled during block-swap sweep.")
                     elif stage_b.get("stopped") == "hard_fail":
                         status_reason = "failed"
+
+            if campaign_force_fresh and status_reason != "cancelled":
+                profile_batches = [201, 161, 121, 81, 49, 25, 13, 5]
+                profile_batches = [b for b in profile_batches if b in set(batch_seq)]
+                _append_log(
+                    "Campaign profiling: the 2GB reserve cutoff remains active; continuing the "
+                    f"Block Swap 36 ladder toward {campaign_profile_min_peak_gb:.1f}GB peak VRAM: "
+                    f"{profile_batches}."
+                )
+                profile_floor_reached = False
+                for profile_batch in profile_batches:
+                    outcome, verdict = yield from _evaluate_candidate(int(profile_batch), 36)
+                    if verdict == "cancelled":
+                        status_reason = "cancelled"
+                        break
+                    if verdict == "pass":
+                        _record_best(outcome)
+                    peak_gb = float(outcome.get("max_vram_used_gb", 0.0) or 0.0)
+                    clean_measurement = bool(
+                        int(outcome.get("returncode", 1)) == 0
+                        and bool(outcome.get("telemetry_ok", False))
+                        and (not bool(outcome.get("oom", False)))
+                        and (not str(outcome.get("probe_cancel_reason") or ""))
+                    )
+                    _persist_autotune_progress()
+                    if clean_measurement and peak_gb <= float(campaign_profile_min_peak_gb):
+                        profile_floor_reached = True
+                        _append_log(
+                            f"Campaign profiling reached {peak_gb:.2f}GB peak at Batch {profile_batch}, "
+                            "Blocks 36."
+                        )
+                        break
+                if not profile_floor_reached and status_reason != "cancelled":
+                    measured = [
+                        float(item.get("max_vram_used_gb", 0.0) or 0.0)
+                        for item in tests
+                        if bool(item.get("telemetry_ok", False))
+                        and int(item.get("returncode", 1)) == 0
+                        and (not bool(item.get("oom", False)))
+                        and float(item.get("max_vram_used_gb", 0.0) or 0.0) > 0
+                    ]
+                    floor_note = min(measured) if measured else 0.0
+                    _append_log(
+                        "Campaign profiling exhausted the low-memory ladder; "
+                        f"lowest clean measured peak was {floor_note:.2f}GB."
+                    )
 
             if status_reason == "completed":
                 if isinstance(best_config, dict) and best_config:

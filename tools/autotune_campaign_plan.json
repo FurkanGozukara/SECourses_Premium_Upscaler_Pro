@@ -1,0 +1,64 @@
+{
+  "source_dir": "C:/upgraded_upscaler_test",
+  "scale": 4,
+  "max_long_edge": 1920,
+  "max_target_pixels": 2073600,
+  "clips": [
+    {
+      "name": "aa_16x9_widescreen",
+      "source": "C:/upgraded_upscaler_test/aa_16x9_widescreen.mp4",
+      "campaign_input_width": 480,
+      "campaign_input_height": 270,
+      "target_width": 1920,
+      "target_height": 1080
+    },
+    {
+      "name": "aa_1x1_square",
+      "source": "C:/upgraded_upscaler_test/aa_1x1_square.mp4",
+      "campaign_input_width": 360,
+      "campaign_input_height": 360,
+      "target_width": 1440,
+      "target_height": 1440
+    },
+    {
+      "name": "aa_21x9_ultrawide",
+      "source": "C:/upgraded_upscaler_test/aa_21x9_ultrawide.mp4",
+      "campaign_input_width": 476,
+      "campaign_input_height": 204,
+      "target_width": 1904,
+      "target_height": 816
+    },
+    {
+      "name": "aa_3x2_semi-wide",
+      "source": "C:/upgraded_upscaler_test/aa_3x2_semi-wide.mp4",
+      "campaign_input_width": 438,
+      "campaign_input_height": 292,
+      "target_width": 1752,
+      "target_height": 1168
+    },
+    {
+      "name": "aa_4x3_old-pc",
+      "source": "C:/upgraded_upscaler_test/aa_4x3_old-pc.mp4",
+      "campaign_input_width": 408,
+      "campaign_input_height": 306,
+      "target_width": 1632,
+      "target_height": 1224
+    },
+    {
+      "name": "aa_5x2",
+      "source": "C:/upgraded_upscaler_test/aa_5x2.mp4",
+      "campaign_input_width": 480,
+      "campaign_input_height": 192,
+      "target_width": 1920,
+      "target_height": 768
+    },
+    {
+      "name": "aa_8x5",
+      "source": "C:/upgraded_upscaler_test/aa_8x5.mp4",
+      "campaign_input_width": 448,
+      "campaign_input_height": 280,
+      "target_width": 1792,
+      "target_height": 1120
+    }
+  ]
+}

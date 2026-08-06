@@ -589,6 +589,16 @@ def sparkvsr_auto_tune_action(
             AUTOTUNE_MIN_FREE_VRAM_GB,
         )
         settings["save_vram_gb"] = float(min_free_vram_target_gb)
+        try:
+            import os as _os
+
+            campaign_profile_min_peak_gb = max(
+                0.0,
+                float(_os.environ.get("SECOURSES_AUTOTUNE_PROFILE_MIN_VRAM_GB", "0") or 0.0),
+            )
+        except Exception:
+            campaign_profile_min_peak_gb = 0.0
+        campaign_force_fresh = bool(campaign_profile_min_peak_gb > 0.0)
         if global_gpu_device == "cpu":
             _append_log("Global GPU selector is set to CPU. Auto Tune requires CUDA GPU mode.")
             yield _payload("Auto Tune unavailable in CPU mode.", show_indicator=False)
@@ -725,7 +735,11 @@ def sparkvsr_auto_tune_action(
             allow_full_sequence=allow_full_sequence,
         )
         logs_dir = Path(base_dir) / "vram_usages"
-        cached = _find_cached_autotune_log(logs_dir, signature, min_free_vram_target_gb)
+        cached = (
+            None
+            if campaign_force_fresh
+            else _find_cached_autotune_log(logs_dir, signature, min_free_vram_target_gb)
+        )
         if cached and isinstance(cached.get("best_config"), dict):
             best = dict(cached["best_config"])
             spark_cfg = state.setdefault("seed_controls", {}).setdefault("sparkvsr_settings", {})
@@ -798,7 +812,7 @@ def sparkvsr_auto_tune_action(
         try:
             history_logs = (
                 sorted(logs_dir.glob(f"{AUTOTUNE_LOG_PREFIX}_*.json"), key=lambda p: p.stat().st_mtime)
-                if logs_dir.exists()
+                if logs_dir.exists() and (not campaign_force_fresh)
                 else []
             )
         except Exception:
@@ -1078,7 +1092,12 @@ def sparkvsr_auto_tune_action(
 
             _wait_for_vram_drain(telemetry_gpu_ids, ambient_used_gb, float(total_vram_gb), _append_log)
 
-            phase_state: Dict[str, Any] = {"phase": "startup", "chunks": 0, "tiles": 0}
+            phase_state: Dict[str, Any] = {
+                "phase": "startup",
+                "chunks": 0,
+                "tiles": 0,
+                "threshold_any_phase": bool(campaign_force_fresh),
+            }
             probe_cancel_event = threading.Event()
             setattr(probe_cancel_event, "sparkvsr_cancel_reason", "vram_threshold")
             sampler_stop = threading.Event()
@@ -1472,6 +1491,58 @@ def sparkvsr_auto_tune_action(
                         break
         except KeyboardInterrupt:
             status_reason = "cancelled"
+
+        if campaign_force_fresh and status_reason != "cancelled":
+            _append_log(
+                "Campaign profiling: the 2GB reserve cutoff remains active; continuing the "
+                f"lowest spatial-tile ladder toward {campaign_profile_min_peak_gb:.1f}GB peak VRAM."
+            )
+            profile_floor_reached = False
+            for profile_chunk in AUTOTUNE_TEMPORAL_CANDIDATES:
+                chunk_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if int(candidate.get("chunk_len") or 0) == int(profile_chunk)
+                    and int(candidate.get("tile_height") or 0) > 0
+                ]
+                if not chunk_candidates:
+                    continue
+                profile_candidate = min(
+                    chunk_candidates,
+                    key=lambda item: int(item.get("tile_height") or 0),
+                )
+                outcome = yield from _probe_candidate(profile_candidate)
+                if bool(outcome.get("passed", False)):
+                    _apply_passed_outcome(outcome)
+                peak_gb = float(outcome.get("max_vram_used_gb", 0.0) or 0.0)
+                clean_measurement = bool(
+                    int(outcome.get("returncode", 1)) == 0
+                    and bool(outcome.get("telemetry_ok", False))
+                    and (not bool(outcome.get("oom", False)))
+                    and (not str(outcome.get("probe_cancel_reason") or ""))
+                )
+                _persist("running")
+                if clean_measurement and peak_gb <= float(campaign_profile_min_peak_gb):
+                    profile_floor_reached = True
+                    _append_log(
+                        f"Campaign profiling reached {peak_gb:.2f}GB peak at Chunk Length "
+                        f"{int(profile_chunk)}, Spatial Tile {int(profile_candidate['tile_height'])}."
+                    )
+                    break
+            if not profile_floor_reached and status_reason != "cancelled":
+                measured = [
+                    float(item.get("max_vram_used_gb", 0.0) or 0.0)
+                    for item in tests
+                    if bool(item.get("telemetry_ok", False))
+                    and int(item.get("returncode", 1)) == 0
+                    and (not bool(item.get("oom", False)))
+                    and float(item.get("max_vram_used_gb", 0.0) or 0.0) > 0
+                ]
+                floor_note = min(measured) if measured else 0.0
+                _append_log(
+                    "Campaign profiling exhausted the low-memory ladder; "
+                    f"lowest clean measured peak was {floor_note:.2f}GB."
+                )
 
         frontier_ok = bool(best_config and (best_config.get("quality_rank") == top_rank or boundary_failed))
         _persist(status_reason, finalized=True, frontier_verified=frontier_ok)

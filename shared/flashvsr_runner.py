@@ -32,6 +32,7 @@ from .path_utils import (
     normalize_path,
     resolve_output_location,
 )
+from .process_control import terminate_process_tree
 
 
 @dataclass
@@ -47,6 +48,7 @@ _FLASHVSR_REQUIRED_FILES = ("LQ_proj_in.ckpt", "TCDecoder.ckpt")
 _FLASHVSR_SOURCE_WEIGHT = "diffusion_pytorch_model_streaming_dmd.safetensors"
 _SINGLE_IMAGE_FAST_TARGET_PIXELS = 4_194_304  # 2048 x 2048
 _SINGLE_IMAGE_REPEAT_FRAMES = 21
+FLASHVSR_MIN_TILED_DIT_TILE_SIZE = 128
 
 
 def _should_suppress_flashvsr_cli_line(line: str) -> bool:
@@ -599,12 +601,12 @@ def run_flashvsr(
 
         tile_size = max(32, min(1024, _parse_int(settings.get("tile_size"), 256)))
         overlap = max(8, min(512, _parse_int(settings.get("overlap", settings.get("tile_overlap")), 24)))
-        if tiled_dit and tile_size < 128:
+        if tiled_dit and tile_size < FLASHVSR_MIN_TILED_DIT_TILE_SIZE:
             log(
                 f"[FlashVSR] tile_size={tile_size} is too small for stable DiT tiling. "
-                "Using tile_size=128."
+                f"Using tile_size={FLASHVSR_MIN_TILED_DIT_TILE_SIZE}."
             )
-            tile_size = 128
+            tile_size = FLASHVSR_MIN_TILED_DIT_TILE_SIZE
         if overlap >= tile_size:
             overlap = max(8, tile_size - 8)
 
@@ -948,24 +950,7 @@ def run_flashvsr(
             while True:
                 if cancel_event and cancel_event.is_set():
                     log("Cancellation requested - terminating FlashVSR process")
-                    # The venv python.exe launcher runs the real interpreter as a
-                    # child; snapshot descendants first so they can be reaped too.
-                    try:
-                        import psutil
-
-                        _descendants = psutil.Process(proc.pid).children(recursive=True)
-                    except Exception:
-                        _descendants = []
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=5.0)
-                    except Exception:
-                        pass
-                    for _child in _descendants:
-                        try:
-                            _child.kill()
-                        except Exception:
-                            pass
+                    terminate_process_tree(proc)
                     if process_handle is not None:
                         process_handle["proc"] = None
                     return 1, "\n".join(output_lines), True

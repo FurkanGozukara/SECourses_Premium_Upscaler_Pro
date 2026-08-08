@@ -24,6 +24,7 @@ from .path_utils import (
     write_png_metadata,
     detect_input_type,
 )
+from .process_control import terminate_process_tree
 from .model_manager import get_model_manager, ModelType
 from .command_logger import get_command_logger
 from .video_codec_options import build_ffmpeg_video_encode_args
@@ -259,13 +260,17 @@ class Runner:
     # ------------------------------------------------------------------ #
     # Cancellation
     # ------------------------------------------------------------------ #
-    def cancel(self) -> bool:
+    def cancel(self, *, force: bool = False) -> bool:
         """
         Cancel the active subprocess.
         
         Handles platform-specific termination:
         - Windows: Uses CTRL_BREAK_EVENT then terminate/kill
         - Unix: Uses SIGTERM then SIGKILL
+
+        `force=True` is reserved for the Auto Tune VRAM watchdog: it stops the
+        full worker tree immediately instead of spending several seconds on a
+        graceful exit while memory pressure is still rising.
         
         Returns True if cancellation was attempted, False if no active process.
         """
@@ -304,6 +309,10 @@ class Runner:
                     pass
 
         try:
+            if force:
+                terminate_process_tree(proc, grace_sec=0.25)
+                return True
+
             if platform.system() == "Windows":
                 # Windows-specific graceful shutdown
                 try:

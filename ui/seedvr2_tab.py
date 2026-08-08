@@ -265,13 +265,11 @@ def seedvr2_tab(
             gr.Markdown(
                 (
                     "**Auto Tune (DiT-focused):** Creates a temporary 201-frame demo clip from your current input, "
-                    "tests increasing batch sizes with `Blocks to Swap = 36`, keeps your `Save VRAM (GB)` target free "
-                    "(default `2.0GB`), then optionally "
-                    "reduces block swap for higher quality if headroom remains. Results are cached in `vram_usages` "
-                    "for faster reuse. Cache reuse requires matching SeedVR2 settings/model, the active torch.compile lane "
-                    "(enabled vs disabled), plus similar output size "
-                    "(about +/-5% total pixels), similar effective input pixels (+/-5%), and similar total GPU VRAM "
-                    "(+/-5%). You can cancel anytime and keep the best-so-far config."
+                    "tests increasing batch sizes at the selected model's maximum useful BlockSwap setting, keeps your `Save VRAM (GB)` target free "
+                    "(default `2.0GB`), then reduces block swap for faster inference when headroom remains. "
+                    "Probes always start from the lowest-memory candidate and grow gradually. Results are cached in `vram_usages` "
+                    "for faster reuse. Only a completed run is reused, and it must match the model/settings, "
+                    "torch.compile lane, exact resolved output/model-input shape, selected GPU total VRAM, and VRAM reserve."
                 )
             )
             with gr.Row():
@@ -2034,6 +2032,10 @@ def seedvr2_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
             safe_state,
         )
 
@@ -2045,6 +2047,10 @@ def seedvr2_tab(
             gr.update(value=title),
             gr.update(value=subtitle),
             _queue_status_indicator(title, subtitle, spinning=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -2064,13 +2070,22 @@ def seedvr2_tab(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
             safe_state,
         )
 
     def _autotune_modal_message(payload) -> str | None:
         if not (isinstance(payload, tuple) and payload):
             return None
-        status_text = str(payload[0] or "").strip()
+        status_payload = payload[0]
+        if isinstance(status_payload, dict):
+            # Queue state merging wraps visible status text in a Gradio update.
+            # Unwrap it instead of rendering the update dictionary in the modal.
+            status_payload = status_payload.get("value", "")
+        status_text = str(status_payload or "").strip()
         if not status_text:
             return None
         status_lower = status_text.lower()
@@ -2223,8 +2238,12 @@ def seedvr2_tab(
             progress_indicator,
             batch_size,
             blocks_to_swap,
+            vae_encode_tiled,
             vae_encode_tile_size,
+            vae_encode_tile_overlap,
+            vae_decode_tiled,
             vae_decode_tile_size,
+            vae_decode_tile_overlap,
             shared_state,
             seed_autotune_notice_text,
             seed_autotune_notice_modal,

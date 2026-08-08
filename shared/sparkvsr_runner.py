@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import queue
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -35,6 +37,7 @@ from .path_utils import (
     normalize_path,
     resolve_output_location,
 )
+from .process_control import terminate_process_tree
 
 
 @dataclass
@@ -487,55 +490,104 @@ def run_sparkvsr(
             process_handle["proc"] = proc
 
         output_lines: List[str] = []
+        line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _read_output() -> None:
+            try:
+                if proc.stdout is None:
+                    return
+                token: List[str] = []
+                while True:
+                    char = proc.stdout.read(1)
+                    if char == "":
+                        break
+                    if char in ("\n", "\r"):
+                        line = "".join(token).strip()
+                        token = []
+                        if line:
+                            line_queue.put(line)
+                    else:
+                        token.append(char)
+                tail = "".join(token).strip()
+                if tail:
+                    line_queue.put(tail)
+            except Exception:
+                pass
+            finally:
+                line_queue.put(None)
+
+        output_reader = threading.Thread(target=_read_output, daemon=True)
+        output_reader.start()
+
         last_activity = time.time()
         proc_started = time.time()
         last_progress_text = ""
+        process_exit_seen_at: Optional[float] = None
+
+        def _record_output_line(line: str) -> None:
+            nonlocal last_activity, last_progress_text
+            text = str(line or "").strip()
+            if not text:
+                return
+            output_lines.append(text)
+            log(text)
+            last_progress_text = text
+            last_activity = time.time()
+
         while True:
             if cancel_event and cancel_event.is_set():
-                cancel_reason = str(getattr(cancel_event, "sparkvsr_cancel_reason", "") or "").strip().lower()
+                cancel_reason = str(
+                    getattr(cancel_event, "autotune_cancel_reason", "")
+                    or getattr(cancel_event, "sparkvsr_cancel_reason", "")
+                    or ""
+                ).strip().lower()
                 if cancel_reason == "vram_threshold":
                     log("VRAM threshold reached during probe - terminating SparkVSR process")
                 else:
                     log("Cancellation requested - terminating SparkVSR process")
-                # The venv python.exe launcher runs the real interpreter as a
-                # child (and split-stage mode spawns stage workers); snapshot
-                # descendants first so they can be reaped too.
-                _descendants = []
-                with suppress(Exception):
-                    import psutil
-
-                    _descendants = psutil.Process(proc.pid).children(recursive=True)
-                with suppress(Exception):
-                    proc.terminate()
-                    proc.wait(timeout=5.0)
-                for _child in _descendants:
-                    with suppress(Exception):
-                        _child.kill()
+                terminate_process_tree(proc)
                 if process_handle is not None:
                     process_handle["proc"] = None
-                return SparkVSRResult(1, None, "\n".join(log_lines + ["[Cancelled by user]"]))
+                cancel_note = (
+                    "[Stopped at Auto Tune VRAM threshold]"
+                    if cancel_reason == "vram_threshold"
+                    else "[Cancelled by user]"
+                )
+                return SparkVSRResult(1, None, "\n".join(log_lines + [cancel_note]))
 
-            line = proc.stdout.readline() if proc.stdout else ""
-            if line:
-                text = line.strip()
-                if text:
-                    output_lines.append(text)
-                    log(text)
-                    last_progress_text = text
-                    last_activity = time.time()
+            try:
+                item = line_queue.get(timeout=0.25)
+            except queue.Empty:
+                now = time.time()
+                if proc.poll() is not None:
+                    if process_exit_seen_at is None:
+                        process_exit_seen_at = now
+                    elif now - process_exit_seen_at >= 1.0:
+                        break
+                if now - last_activity > 10:
+                    elapsed = _format_duration(now - proc_started)
+                    if last_progress_text:
+                        heartbeat = f"[SparkVSR] still running | elapsed={elapsed} | last={last_progress_text[:180]}"
+                    else:
+                        heartbeat = f"[SparkVSR] still running | elapsed={elapsed} | waiting for first progress output"
+                    output_lines.append(heartbeat)
+                    log(heartbeat)
+                    last_activity = now
                 continue
-            if proc.poll() is not None:
+
+            if item is None:
+                if proc.poll() is not None:
+                    break
+                continue
+            _record_output_line(item)
+
+        while True:
+            try:
+                item = line_queue.get_nowait()
+            except queue.Empty:
                 break
-            if time.time() - last_activity > 10:
-                elapsed = _format_duration(time.time() - proc_started)
-                if last_progress_text:
-                    heartbeat = f"[SparkVSR] still running | elapsed={elapsed} | last={last_progress_text[:180]}"
-                else:
-                    heartbeat = f"[SparkVSR] still running | elapsed={elapsed} | waiting for first progress output"
-                output_lines.append(heartbeat)
-                log(heartbeat)
-                last_activity = time.time()
-            time.sleep(0.2)
+            if item is not None:
+                _record_output_line(item)
 
         returncode = int(proc.wait())
         if process_handle is not None:
@@ -547,7 +599,7 @@ def run_sparkvsr(
             returncode = 0
         if not output_path:
             log("No SparkVSR output file generated.")
-            result = SparkVSRResult(returncode or 1, None, "\n".join(log_lines + output_lines))
+            result = SparkVSRResult(returncode or 1, None, "\n".join(log_lines))
         else:
             log(f"Output saved: {output_path}")
             result = SparkVSRResult(

@@ -450,10 +450,10 @@ def flashvsr_tab(
                         "**Auto Tune (DiT-focused):** Creates a temporary 450-frame demo clip from your current input "
                         "(using current resize/output sizing), then runs fast VRAM probes to find the highest-quality "
                         "safe FlashVSR+ settings while keeping your `Save VRAM (GB)` target free (default `2.0GB`). "
-                        "It starts from `Frame Chunk Size = 450`, "
-                        "`DiT Tiling = ON`, `Tile = 256`, `Overlap = 48`, increases tile size in `+32` steps, and if `256` fails "
-                        "it falls back to `Overlap = 24` and lower tile/chunk tests. Results are cached in `vram_usages` and reused "
-                        "on future runs when settings + approximate target/effective pixels (+/-5%) + GPU VRAM (+/-5%) match. You can cancel anytime."
+                        "It starts safely at `Frame Chunk Size = 32`, `DiT Tiling = ON`, `Tile = 128`, `Overlap = 24`, "
+                        "then grows temporal context and tile quality in bounded steps before testing untiled DiT. "
+                        "Results are cached in `vram_usages`. Only a completed run is reused, and it must match the "
+                        "model/settings, exact resolved target/model-input shape, selected GPU total VRAM, and VRAM reserve."
                     )
                 )
 
@@ -2077,7 +2077,10 @@ def flashvsr_tab(
     def _autotune_modal_message(payload) -> str | None:
         if not (isinstance(payload, tuple) and payload):
             return None
-        status_text = str(payload[0] or "").strip()
+        status_payload = payload[0]
+        if isinstance(status_payload, dict):
+            status_payload = status_payload.get("value", "")
+        status_text = str(status_payload or "").strip()
         if not status_text:
             return None
         status_lower = status_text.lower()

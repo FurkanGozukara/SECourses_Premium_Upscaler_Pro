@@ -6,6 +6,7 @@ Handles all SeedVR2 processing logic, presets, and callbacks
 import html
 import hashlib
 import json
+import math
 import re
 import shutil
 import queue
@@ -54,7 +55,12 @@ from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, sho
 from shared.video_comparison import create_comparison_selector
 from shared.global_rife import maybe_apply_global_rife, global_rife_enabled
 from shared.model_manager import get_model_manager, ModelType
-from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
+from shared.gpu_utils import (
+    expand_cuda_device_spec,
+    get_global_gpu_override,
+    get_gpu_info,
+    validate_cuda_device_spec,
+)
 from shared.models.rife_meta import get_rife_default_model
 from shared.model_downloads import windows_int8_defaults_enabled
 from shared.error_handling import (
@@ -67,7 +73,21 @@ from shared.error_handling import (
     logger as error_logger,
 )
 from shared.video_fps_utils import apply_video_fps_override_preprocess, build_output_fps_summary
-from shared.services.autotune_search import frontier_bisect, predict_frontier_index
+from shared.services.autotune_search import (
+    ambient_adjusted_min_device_free_gb,
+    ambient_adjusted_peak_gb,
+    autotune_launch_headroom,
+    cached_best_has_headroom,
+    frontier_bisect,
+    is_verified_autotune_payload,
+    is_vram_boundary_outcome,
+    persisted_autotune_status,
+    predict_frontier_index,
+    resolution_signatures_compatible,
+    resolution_signatures_identical,
+    resume_frontier_hints,
+    vram_drain_target_gb,
+)
 
 # Constants --------------------------------------------------------------------
 SEEDVR2_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
@@ -834,6 +854,13 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
                 cfg["attention_mode"] = preferred_attention
                 _migrate_preset_values(cfg, defaults, silent=True)
 
+    max_blocks_to_swap = _autotune_max_blocks_for_model(model_name) if model_name else 36
+    requested_blocks = _autotune_int(
+        cfg.get("blocks_to_swap"),
+        _autotune_int(defaults.get("blocks_to_swap"), 0),
+    )
+    cfg["blocks_to_swap"] = max(0, min(requested_blocks, max_blocks_to_swap))
+
     # Apply resolution tab settings from shared state if available
     if state:
         seed_controls = state.get("seed_controls", {})
@@ -959,11 +986,15 @@ def _list_media_files(folder: str, video_exts: set, image_exts: set) -> List[str
 # Auto-tune helpers ------------------------------------------------------------
 AUTOTUNE_MODEL_ID = "seedvr2"
 AUTOTUNE_LOG_PREFIX = "seedvr2_autotune"
+AUTOTUNE_STRATEGY_VERSION = 8
 AUTOTUNE_TARGET_FRAMES = 201
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
+AUTOTUNE_EMERGENCY_FREE_VRAM_GB = 1.0
+AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC = 0.10
 AUTOTUNE_MIN_TILE_SIZE = 64
 AUTOTUNE_BATCH_SEQUENCE = tuple(range(5, AUTOTUNE_TARGET_FRAMES + 1, 4))
 AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
+AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE = 0.02
 
 
 def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VRAM_GB) -> float:
@@ -972,6 +1003,36 @@ def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VR
     except Exception:
         raw = float(default)
     return round(max(0.0, min(9.9, raw)), 1)
+
+
+def _autotune_int(value: Any, default: int) -> int:
+    """Parse an autotune integer without treating the valid value zero as missing."""
+    try:
+        return int(default if value is None else value)
+    except Exception:
+        return int(default)
+
+
+def _autotune_max_blocks_for_model(model_name: Any) -> int:
+    """Return the highest meaningful BlockSwap value for a SeedVR2 model."""
+    name = Path(str(model_name or "")).name
+    limit = 36
+    size = ""
+    try:
+        model_meta = model_meta_map().get(name)
+        if model_meta is not None:
+            limit = int(getattr(model_meta, "max_blocks_to_swap", limit) or limit)
+            size = str(getattr(model_meta, "size", "") or "").strip().lower()
+    except Exception:
+        pass
+
+    # The bundled architectures contain 32 blocks for 3B and 36 for 7B.
+    # Local/custom model metadata defaults to 36, so infer 3B from conventional
+    # filenames as a fallback. Mixed-block 7B metadata can still impose 35.
+    is_3b_name = bool(re.search(r"(?:^|[._-])3b(?:[._-]|$)", name, flags=re.IGNORECASE))
+    if size == "3b" or is_3b_name:
+        limit = min(limit, 32)
+    return max(0, min(36, int(limit)))
 
 
 def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
@@ -1066,6 +1127,7 @@ def _sample_peak_vram_gb(
     telemetry_ok = False
     samples = 0
     phase2_samples = 0
+    min_device_free_gb = float("inf")
     while not stop_event.is_set():
         snap = _query_gpu_memory_snapshot_gb()
         if snap:
@@ -1074,6 +1136,11 @@ def _sample_peak_vram_gb(
                 telemetry_ok = True
                 used_sum = sum(float(snap[d][0]) for d in selected)
                 total_sum = sum(float(snap[d][1]) for d in selected)
+                current_min_device_free_gb = min(
+                    max(0.0, float(snap[d][1]) - float(snap[d][0]))
+                    for d in selected
+                )
+                min_device_free_gb = min(min_device_free_gb, current_min_device_free_gb)
                 peak_used = max(peak_used, used_sum)
                 samples += 1
                 cur_phase = str((phase_state or {}).get("phase") or "").strip().lower()
@@ -1089,6 +1156,7 @@ def _sample_peak_vram_gb(
                 result_box["phase2_samples"] = int(phase2_samples)
                 result_box["total_gb"] = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                 result_box["telemetry_ok"] = bool(telemetry_ok)
+                result_box["min_device_free_gb"] = float(min_device_free_gb)
 
                 threshold_gate_ready = bool(
                     phase2_samples > 0 or bool((phase_state or {}).get("threshold_any_phase", False))
@@ -1101,7 +1169,8 @@ def _sample_peak_vram_gb(
                 ):
                     total_for_eval = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                     free_est = max(0.0, total_for_eval - peak_used) if total_for_eval > 0 else 0.0
-                    if total_for_eval > 0 and free_est < float(min_free_target_gb):
+                    free_for_threshold = min(free_est, current_min_device_free_gb)
+                    if total_for_eval > 0 and free_for_threshold < float(min_free_target_gb):
                         result_box["early_stop_reason"] = "threshold_reached"
                         probe_cancel_event.set()
         stop_event.wait(interval_sec)
@@ -1114,6 +1183,8 @@ def _sample_peak_vram_gb(
     elif float(total_vram_hint_gb) > 0:
         result_box["total_gb"] = float(total_vram_hint_gb)
     result_box["telemetry_ok"] = bool(telemetry_ok)
+    if math.isfinite(min_device_free_gb):
+        result_box["min_device_free_gb"] = float(min_device_free_gb)
 
 
 def _wait_for_probe_vram_drain(
@@ -1131,9 +1202,7 @@ def _wait_for_probe_vram_drain(
     whole-run peak and fakes a threshold failure.
     """
     try:
-        drain_target_gb = max(3.0, float(ambient_used_gb) + 1.5)
-        if float(total_vram_gb) > 0:
-            drain_target_gb = min(drain_target_gb, float(total_vram_gb) * 0.5)
+        drain_target_gb = vram_drain_target_gb(ambient_used_gb)
         deadline = time.time() + float(timeout_sec)
         waited_sec = 0.0
         while time.time() < deadline:
@@ -1238,14 +1307,21 @@ def _detect_oom_phase(log_text: str) -> str:
     return "unknown"
 
 
-def _halve_vae_tile_sizes(settings: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def _halve_vae_tile_sizes(
+    settings: Dict[str, Any],
+    *,
+    encode: bool = True,
+    decode: bool = True,
+) -> Tuple[bool, List[str]]:
     """Reduce VAE tile sizes by half with overlap safety guards."""
     changed = False
     notes: List[str] = []
-    for size_key, overlap_key in (
-        ("vae_encode_tile_size", "vae_encode_tile_overlap"),
-        ("vae_decode_tile_size", "vae_decode_tile_overlap"),
-    ):
+    tile_fields: List[Tuple[str, str]] = []
+    if encode:
+        tile_fields.append(("vae_encode_tile_size", "vae_encode_tile_overlap"))
+    if decode:
+        tile_fields.append(("vae_decode_tile_size", "vae_decode_tile_overlap"))
+    for size_key, overlap_key in tile_fields:
         try:
             cur_size = int(settings.get(size_key) or 0)
         except Exception:
@@ -1276,13 +1352,14 @@ def _build_autotune_signature(
     target_h: int,
     effective_in_w: int,
     effective_in_h: int,
-    global_gpu_device: str,
     total_vram_gb: float,
     min_free_target_gb: float,
 ) -> Dict[str, Any]:
     """Create a stable VRAM-impact signature for cache lookups."""
     exact_payload = {
         "autotune_model": AUTOTUNE_MODEL_ID,
+        "autotune_strategy_version": int(AUTOTUNE_STRATEGY_VERSION),
+        "input_kind": str(settings.get("_autotune_input_kind") or "video"),
         "dit_model": str(settings.get("dit_model") or ""),
         # INT8 ConvRot roughly halves DiT weight VRAM - it must never share a
         # cache lane with full-precision measurements.
@@ -1304,6 +1381,7 @@ def _build_autotune_signature(
         "tensor_offload_device": str(settings.get("tensor_offload_device") or "cpu"),
         "swap_io_components": bool(settings.get("swap_io_components", False)),
         "uniform_batch_size": bool(settings.get("uniform_batch_size", False)),
+        "prepend_frames": int(settings.get("prepend_frames") or 0),
         "vae_encode_tiled": bool(settings.get("vae_encode_tiled", False)),
         "vae_decode_tiled": bool(settings.get("vae_decode_tiled", False)),
         "vae_encode_tile_size": int(settings.get("vae_encode_tile_size") or 0),
@@ -1313,7 +1391,6 @@ def _build_autotune_signature(
         "upscale_factor": round(float(settings.get("upscale_factor") or 1.0), 4),
         "max_resolution": int(settings.get("max_resolution") or 0),
         "pre_downscale_then_upscale": bool(settings.get("pre_downscale_then_upscale", True)),
-        "global_gpu_device": str(global_gpu_device or ""),
         "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb),
     }
     exact_payload = _normalize_autotune_compile_exact_payload(exact_payload)
@@ -1371,9 +1448,10 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Route controls can differ while the resolved effective/target dimensions are identical.
     # Cache matching should prioritize actual processed resolution (tracked separately in signature dims).
     out.pop("max_resolution", None)
-    # Reserve target is dynamic and evaluated from historical VRAM usage;
-    # changing it should not invalidate cache matching.
-    out.pop("save_vram_gb", None)
+    # GPU selection is runtime routing. Reuse is keyed by the selected GPU's
+    # reported total VRAM below, not its index, name, or architecture.
+    out.pop("global_gpu_device", None)
+    out.pop("gpu_identity", None)
     return out
 
 
@@ -1447,19 +1525,48 @@ def _autotune_payload_status_rank(payload: Dict[str, Any]) -> int:
 
 
 def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
-    """Match cached signature against current request using output-target pixels as the size key."""
-    if not _autotune_signature_settings_match(candidate, expected, vram_tolerance=0.10):
+    """Match settings, GPU size, output shape, and effective model-input shape."""
+    if not _autotune_signature_settings_match(
+        candidate,
+        expected,
+        vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+    ):
         return False
-    pixel_diff, _aspect_diff, _dim_diff = _autotune_signature_resolution_distance(candidate, expected)
-    return pixel_diff <= 0.05
+    return resolution_signatures_identical(candidate, expected)
 
 
-def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _find_cached_autotune_log(
+    log_dir: Path,
+    expected_signature: Dict[str, Any],
+    min_free_vram_target_gb: float,
+    current_ambient_used_gb: float = 0.0,
+) -> Optional[Dict[str, Any]]:
     """Return newest matching autotune log that contains a usable best_config."""
     def _payload_has_frontier_proof(payload: Dict[str, Any]) -> bool:
         best = payload.get("best_config")
         tests = payload.get("tests")
-        if not isinstance(best, dict) or (not best) or (not isinstance(tests, list)):
+        search_results = payload.get("search_results")
+        if (
+            not isinstance(best, dict)
+            or not best
+            or not isinstance(tests, list)
+            or not isinstance(search_results, dict)
+        ):
+            return False
+        batch_result = search_results.get("batch")
+        blocks_result = search_results.get("blocks_to_swap")
+        if not isinstance(batch_result, dict) or not bool(batch_result.get("frontier_verified", False)):
+            return False
+        if batch_result.get("hard_failed_indices") or bool(batch_result.get("indeterminate_above_best", False)):
+            return False
+        if not isinstance(blocks_result, dict):
+            return False
+        blocks_verified = bool(blocks_result.get("frontier_verified", False)) or bool(
+            blocks_result.get("best_idx") is None
+            and blocks_result.get("boundary_failed", False)
+            and not blocks_result.get("hard_failed_indices")
+        )
+        if not blocks_verified or bool(blocks_result.get("indeterminate_above_best", False)):
             return False
         sig_exact = ((payload.get("signature") or {}).get("exact") or {})
         sig_target = _clamp_save_vram_target_gb(
@@ -1472,8 +1579,50 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
 
         best_rank = _rank(
             int(best.get("batch_size") or 0),
-            int(best.get("blocks_to_swap") or 36),
+            _autotune_int(best.get("blocks_to_swap"), 36),
         )
+        best_has_full_pass = False
+        for item in tests:
+            if not isinstance(item, dict) or not bool(item.get("passed", False)):
+                continue
+            try:
+                returncode_ok = int(item.get("returncode", 1)) == 0
+            except Exception:
+                returncode_ok = False
+            if (
+                not returncode_ok
+                or not bool(item.get("telemetry_ok", False))
+                or bool(item.get("oom", False))
+                or str(item.get("probe_cancel_reason") or "").strip()
+            ):
+                continue
+            if int(item.get("batch_size") or 0) != int(best.get("batch_size") or 0):
+                continue
+            if _autotune_int(item.get("blocks_to_swap"), 36) != _autotune_int(
+                best.get("blocks_to_swap"), 36
+            ):
+                continue
+            if int(item.get("vae_encode_tile_size") or 0) != int(best.get("vae_encode_tile_size") or 0):
+                continue
+            if int(item.get("vae_decode_tile_size") or 0) != int(best.get("vae_decode_tile_size") or 0):
+                continue
+            if _autotune_int(item.get("vae_encode_tile_overlap"), 0) != _autotune_int(
+                best.get("vae_encode_tile_overlap"), 0
+            ):
+                continue
+            if _autotune_int(item.get("vae_decode_tile_overlap"), 0) != _autotune_int(
+                best.get("vae_decode_tile_overlap"), 0
+            ):
+                continue
+            if bool(item.get("vae_encode_tiled", False)) != bool(best.get("vae_encode_tiled", False)):
+                continue
+            if bool(item.get("vae_decode_tiled", False)) != bool(best.get("vae_decode_tiled", False)):
+                continue
+            best_has_full_pass = True
+            break
+        if not best_has_full_pass:
+            return False
+
         for item in tests:
             if not isinstance(item, dict):
                 continue
@@ -1483,7 +1632,7 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
                 continue
             cand_rank = _rank(
                 int(item.get("batch_size") or 0),
-                int(item.get("blocks_to_swap") or 36),
+                _autotune_int(item.get("blocks_to_swap"), 36),
             )
             if cand_rank <= best_rank:
                 continue
@@ -1503,16 +1652,13 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         # Top-of-search candidate reached; no higher-quality candidate exists.
         if (
             int(best.get("batch_size") or 0) >= int(AUTOTUNE_TARGET_FRAMES)
-            and int(best.get("blocks_to_swap") or 36) <= 0
+            and _autotune_int(best.get("blocks_to_swap"), 36) <= 0
         ):
             return True
         return False
 
     def _is_finalized_and_frontier_verified(payload: Dict[str, Any]) -> bool:
-        status = str(payload.get("status") or "").strip().lower()
-        if status not in {"completed", "threshold_reached"}:
-            return False
-        if not bool(payload.get("finalized", False)):
+        if not is_verified_autotune_payload(payload):
             return False
         # Require actual frontier proof from saved tests; do not rely on legacy flags alone.
         if not _payload_has_frontier_proof(payload):
@@ -1550,9 +1696,30 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         if not _is_finalized_and_frontier_verified(payload):
             continue
         sig_blob = payload.get("signature")
-        if not _autotune_signature_settings_match(sig_blob, expected_signature, vram_tolerance=0.10):
+        if not _autotune_signature_settings_match(
+            sig_blob,
+            expected_signature,
+            vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+        ):
+            continue
+        try:
+            cached_reserve = float(((sig_blob or {}).get("exact") or {}).get("save_vram_gb"))
+        except Exception:
+            continue
+        if abs(cached_reserve - float(min_free_vram_target_gb)) > 0.05:
+            # A lower reserve may allow a higher frontier; a higher reserve may
+            # demote it. Resume the measurements instead of instant-reusing.
+            continue
+        if not cached_best_has_headroom(
+            payload,
+            expected_signature,
+            min_free_vram_target_gb,
+            current_ambient_used_gb=current_ambient_used_gb,
+        ):
             continue
         pixel_diff, aspect_diff, dim_diff = _autotune_signature_resolution_distance(sig_blob, expected_signature)
+        if not resolution_signatures_identical(sig_blob, expected_signature):
+            continue
         scored_matches.append(
             {
                 "payload": payload,
@@ -3708,11 +3875,12 @@ def build_seedvr2_callbacks(
 
         Strategy:
         - Build a 201-frame demo clip from current input.
-        - Stage A: find the max passing batch size (4n+1) at blocks_to_swap=36
-          by probing batch=201 first and bisecting on failure (pass/fail is
-          monotone in batch size).
-        - Stage B: at the max passing batch, minimize blocks_to_swap by probing
-          blocks=0 first and bisecting (pure speed knob, runs for any batch).
+        - Stage A: find the max passing batch size (4n+1) at the model's
+          maximum meaningful blocks_to_swap value
+          by growing from the safest batch in bounded steps, then bisecting a
+          measured pass/VRAM-fail bracket.
+        - Stage B: at the max passing batch, minimize blocks_to_swap with the
+          same bounded safe growth (pure speed knob, runs for any batch).
         - Probes abort early once free VRAM falls below the `save_vram_gb`
           target (default 2.0GB) - a doomed probe never runs to completion.
         - Persist logs to vram_usages/ and reuse matching results later.
@@ -3751,8 +3919,12 @@ def build_seedvr2_callbacks(
             indicator_title: str = "Auto Tune in progress...",
             batch_value: Optional[int] = None,
             blocks_value: Optional[int] = None,
+            encode_tiled_value: Optional[bool] = None,
             encode_tile_value: Optional[int] = None,
+            encode_overlap_value: Optional[int] = None,
+            decode_tiled_value: Optional[bool] = None,
             decode_tile_value: Optional[int] = None,
+            decode_overlap_value: Optional[int] = None,
         ):
             return (
                 str(status_text or ""),
@@ -3760,8 +3932,12 @@ def build_seedvr2_callbacks(
                 (_indicator(indicator_title, status_text) if show_indicator else gr.update(value="", visible=False)),
                 (gr.update(value=int(batch_value)) if batch_value is not None else gr.update()),
                 (gr.update(value=int(blocks_value)) if blocks_value is not None else gr.update()),
+                (gr.update(value=bool(encode_tiled_value)) if encode_tiled_value is not None else gr.update()),
                 (gr.update(value=int(encode_tile_value)) if encode_tile_value is not None else gr.update()),
+                (gr.update(value=int(encode_overlap_value)) if encode_overlap_value is not None else gr.update()),
+                (gr.update(value=bool(decode_tiled_value)) if decode_tiled_value is not None else gr.update()),
                 (gr.update(value=int(decode_tile_value)) if decode_tile_value is not None else gr.update()),
+                (gr.update(value=int(decode_overlap_value)) if decode_overlap_value is not None else gr.update()),
                 state,
             )
 
@@ -3805,14 +3981,22 @@ def build_seedvr2_callbacks(
                 _append_log("Input path is missing or does not exist.")
                 yield _payload("Auto Tune requires a valid input file/path.", show_indicator=False)
                 return
+            settings["_autotune_input_kind"] = detect_input_type(input_path)
 
             global_gpu_device = get_global_gpu_override(seed_controls, global_cfg)
             settings["cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
             settings = _enforce_seedvr2_guardrails(settings, defaults, state=state)
+            autotune_max_blocks = _autotune_max_blocks_for_model(settings.get("dit_model"))
             min_free_vram_target_gb = _clamp_save_vram_target_gb(
                 settings.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
                 AUTOTUNE_MIN_FREE_VRAM_GB,
             )
+            if min_free_vram_target_gb < float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB):
+                _append_log(
+                    f"Raised Auto Tune's effective VRAM reserve from {min_free_vram_target_gb:.1f}GB "
+                    f"to the {AUTOTUNE_EMERGENCY_FREE_VRAM_GB:.1f}GB emergency safety floor."
+                )
+                min_free_vram_target_gb = float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB)
             settings["save_vram_gb"] = float(min_free_vram_target_gb)
             try:
                 import os as _os
@@ -3888,7 +4072,6 @@ def build_seedvr2_callbacks(
                 _append_log("Could not detect total VRAM for selected GPU.")
                 yield _payload("Auto Tune failed to detect GPU VRAM.", show_indicator=False)
                 return
-
             telemetry_gpu_ids: List[int] = []
             if gpu_snapshot:
                 telemetry_gpu_ids = [idx for idx in selected_gpu_ids if idx in gpu_snapshot]
@@ -3902,15 +4085,46 @@ def build_seedvr2_callbacks(
                     show_indicator=False,
                 )
                 return
-            # Let leftovers from any previous run drain before measuring the
-            # ambient baseline, otherwise the drain gate inherits the residue.
-            _wait_for_probe_vram_drain(telemetry_gpu_ids, 1.5, float(total_vram_gb), _append_log, timeout_sec=30.0)
             ambient_snap = _query_gpu_memory_snapshot_gb()
+            if not ambient_snap:
+                ambient_snap = gpu_snapshot
             ambient_used_gb = (
                 sum(float(ambient_snap[g][0]) for g in telemetry_gpu_ids if g in ambient_snap)
                 if ambient_snap
                 else 0.0
             )
+            launch_ok, ambient_free_gb, launch_required_gb = autotune_launch_headroom(
+                total_vram_gb,
+                ambient_used_gb,
+                min_free_vram_target_gb,
+            )
+            per_device_free = [
+                max(0.0, float(ambient_snap[g][1]) - float(ambient_snap[g][0]))
+                for g in telemetry_gpu_ids
+                if g in ambient_snap
+            ]
+            if per_device_free:
+                ambient_free_gb = min(ambient_free_gb, min(per_device_free))
+                launch_ok = bool(launch_ok and ambient_free_gb >= launch_required_gb)
+            if not launch_ok:
+                state["operation_status"] = "error"
+                _append_log(
+                    f"Auto Tune stopped before launching a model: only {ambient_free_gb:.2f}GB "
+                    f"is currently free, but at least {launch_required_gb:.2f}GB is required "
+                    "for the reserve plus launch safety margin."
+                )
+                yield _payload(
+                    "Auto Tune did not start because the GPU is already too full. "
+                    "Stop other GPU jobs and try again.",
+                    show_indicator=False,
+                )
+                return
+            multi_gpu_autotune = len(telemetry_gpu_ids) > 1
+            if multi_gpu_autotune:
+                _append_log(
+                    "Multiple GPUs selected: enforcing per-GPU headroom and running fresh probes "
+                    "instead of reusing aggregate-memory history."
+                )
 
             signature = _build_autotune_signature(
                 settings,
@@ -3918,49 +4132,45 @@ def build_seedvr2_callbacks(
                 target_h=target_h,
                 effective_in_w=effective_in_w,
                 effective_in_h=effective_in_h,
-                global_gpu_device=str(global_gpu_device),
                 total_vram_gb=total_vram_gb,
                 min_free_target_gb=min_free_vram_target_gb,
             )
             logs_dir = Path(getattr(runner, "base_dir", Path.cwd())) / "vram_usages"
+            verified_cached_payload = (
+                None
+                if campaign_force_fresh or multi_gpu_autotune
+                else _find_cached_autotune_log(
+                    logs_dir,
+                    signature,
+                    min_free_vram_target_gb,
+                    ambient_used_gb,
+                )
+            )
             history_sources: List[str] = []
-            history_outcomes_by_key: Dict[Tuple[int, int, int, int, bool, bool], Dict[str, Any]] = {}
-            history_has_completed_frontier = False
-            # Cross-VRAM priors: clean measured peaks from same-settings/same-resolution
-            # logs recorded on a DIFFERENT GPU size. Peaks are hardware-portable, so
-            # they predict where this GPU's limit sits and seed the search start.
+            history_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int, bool, bool], Dict[str, Any]] = {}
+            # Capacity-shifted priors: clean peaks from otherwise identical logs
+            # can hint at the frontier, but never replace a live safety-first probe.
             prior_peaks_by_batch: Dict[int, float] = {}
             prior_peaks_by_blocks: Dict[Tuple[int, int], float] = {}
             prior_source_vrams: set = set()
 
-            def _history_key_from_outcome(item: Dict[str, Any]) -> Tuple[int, int, int, int, bool, bool]:
+            def _history_key_from_outcome(item: Dict[str, Any]) -> Tuple[int, int, int, int, int, int, bool, bool]:
                 return (
                     int(item.get("batch_size") or 0),
                     int(item.get("blocks_to_swap") or 0),
                     int(item.get("vae_encode_tile_size") or 0),
+                    int(item.get("vae_encode_tile_overlap") or 0),
                     int(item.get("vae_decode_tile_size") or 0),
+                    int(item.get("vae_decode_tile_overlap") or 0),
                     bool(item.get("vae_encode_tiled", False)),
                     bool(item.get("vae_decode_tiled", False)),
                 )
-
-            def _history_boundary_fail(item: Dict[str, Any]) -> bool:
-                try:
-                    free_gb = float(item.get("estimated_free_gb", 1e9) or 1e9)
-                except Exception:
-                    free_gb = 1e9
-                if bool(item.get("oom", False)):
-                    return True
-                if str(item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
-                    return True
-                if bool(item.get("telemetry_ok", False)) and free_gb < float(min_free_vram_target_gb):
-                    return True
-                return False
 
             try:
                 candidate_logs = sorted(
                     [p for p in logs_dir.glob("*.json") if p.is_file()],
                     key=lambda p: p.stat().st_mtime,
-                ) if logs_dir.exists() and (not campaign_force_fresh) else []
+                ) if logs_dir.exists() and (not campaign_force_fresh) and (not multi_gpu_autotune) else []
             except Exception:
                 candidate_logs = []
 
@@ -3979,12 +4189,19 @@ def build_seedvr2_callbacks(
                 if (not model_id) and (not is_seed_file):
                     continue
                 sig_blob = payload.get("signature")
-                if not _autotune_signature_settings_match(sig_blob, signature, vram_tolerance=0.10):
-                    # Same settings on a different GPU size cannot be reused directly,
-                    # but their clean full-run peaks predict this GPU's frontier.
+                if not _autotune_signature_settings_match(
+                    sig_blob,
+                    signature,
+                    vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+                ):
+                    # A materially different reported capacity cannot be reused
+                    # directly, but compatible full-run peaks can still be hints.
                     if _autotune_signature_settings_match(sig_blob, signature, vram_tolerance=1e9):
-                        p_diff, _pa, _pd = _autotune_signature_resolution_distance(sig_blob, signature)
-                        if p_diff <= AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE:
+                        if resolution_signatures_compatible(
+                            sig_blob or {},
+                            signature,
+                            max_pixel_diff=AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE,
+                        ):
                             for raw in payload.get("tests") or []:
                                 if not isinstance(raw, dict):
                                     continue
@@ -3995,14 +4212,18 @@ def build_seedvr2_callbacks(
                                         continue
                                     if str(raw.get("probe_cancel_reason") or "").strip():
                                         continue
-                                    peak = float(_resolve_autotune_eval_peak_gb(raw))
+                                    peak = ambient_adjusted_peak_gb(
+                                        _resolve_autotune_eval_peak_gb(raw),
+                                        payload,
+                                        ambient_used_gb,
+                                    )
                                     if peak <= 0:
                                         continue
                                     b_val = int(raw.get("batch_size") or 0)
-                                    s_val = int(raw.get("blocks_to_swap") or 36)
+                                    s_val = _autotune_int(raw.get("blocks_to_swap"), 36)
                                 except Exception:
                                     continue
-                                if s_val == 36:
+                                if s_val == autotune_max_blocks:
                                     prev = prior_peaks_by_batch.get(b_val)
                                     if prev is None or peak < prev:
                                         prior_peaks_by_batch[b_val] = peak
@@ -4044,8 +4265,11 @@ def build_seedvr2_callbacks(
                 selected_history_logs = [
                     row
                     for row in scored_history_logs
-                    if float(row.get("pixel_diff", 1e9)) <= float(AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE)
-                ][:12]
+                    if resolution_signatures_identical(
+                        (row.get("payload") or {}).get("signature") or {},
+                        signature,
+                    )
+                ]
                 _append_log(
                     f"Checked {len(candidate_logs)} saved Auto Tune log(s): "
                     f"{len(scored_history_logs)} match your current settings and GPU, "
@@ -4071,13 +4295,12 @@ def build_seedvr2_callbacks(
                 if not isinstance(payload, dict):
                     continue
                 history_sources.append(str(log_path))
-                status_raw = str(payload.get("status") or "").strip().lower()
-                if (
-                    bool(payload.get("finalized", False))
-                    and bool(payload.get("frontier_verified", False))
-                    and status_raw in {"completed", "threshold_reached"}
-                ):
-                    history_has_completed_frontier = True
+                try:
+                    recorded_target_gb = float(
+                        (((payload.get("signature") or {}).get("exact") or {}).get("save_vram_gb"))
+                    )
+                except Exception:
+                    recorded_target_gb = float("nan")
                 tests_blob = payload.get("tests")
                 if not isinstance(tests_blob, list):
                     continue
@@ -4088,12 +4311,20 @@ def build_seedvr2_callbacks(
                     item["batch_size"] = int(item.get("batch_size") or 0)
                     item["blocks_to_swap"] = int(item.get("blocks_to_swap") or 0)
                     item["vae_encode_tile_size"] = int(item.get("vae_encode_tile_size") or 0)
+                    item["vae_encode_tile_overlap"] = int(item.get("vae_encode_tile_overlap") or 0)
                     item["vae_decode_tile_size"] = int(item.get("vae_decode_tile_size") or 0)
+                    item["vae_decode_tile_overlap"] = int(item.get("vae_decode_tile_overlap") or 0)
                     item["vae_encode_tiled"] = bool(item.get("vae_encode_tiled", False))
                     item["vae_decode_tiled"] = bool(item.get("vae_decode_tiled", False))
                     item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                     item["oom"] = bool(item.get("oom", False))
-                    peak_used = _resolve_autotune_eval_peak_gb(item)
+                    item["recorded_min_free_vram_target_gb"] = recorded_target_gb
+                    original_peak_used = _resolve_autotune_eval_peak_gb(item)
+                    peak_used = ambient_adjusted_peak_gb(
+                        original_peak_used,
+                        payload,
+                        ambient_used_gb,
+                    )
                     item["max_vram_used_gb"] = float(peak_used)
                     item["peak_source"] = "whole_run" if float(item.get("whole_run_peak_vram_used_gb", 0.0) or 0.0) > 0 else str(item.get("peak_source") or "legacy")
                     try:
@@ -4102,7 +4333,20 @@ def build_seedvr2_callbacks(
                         historical_total = 0.0
                     total_for_eval = float(total_vram_gb if total_vram_gb > 0 else historical_total)
                     if peak_used > 0 and total_for_eval > 0:
-                        item["estimated_free_gb"] = max(0.0, total_for_eval - peak_used)
+                        aggregate_free_gb = max(0.0, total_for_eval - peak_used)
+                        if item.get("min_device_free_gb") is not None:
+                            item["min_device_free_gb"] = ambient_adjusted_min_device_free_gb(
+                                item.get("min_device_free_gb"),
+                                original_peak_used,
+                                peak_used,
+                                aggregate_free_gb,
+                            )
+                        else:
+                            item["min_device_free_gb"] = aggregate_free_gb
+                        item["estimated_free_gb"] = min(
+                            aggregate_free_gb,
+                            float(item["min_device_free_gb"]),
+                        )
                     else:
                         try:
                             item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
@@ -4117,12 +4361,8 @@ def build_seedvr2_callbacks(
                         and item["telemetry_ok"]
                         and (not item["oom"])
                         and float(item["estimated_free_gb"]) >= float(min_free_vram_target_gb)
-                        and str(item.get("probe_cancel_reason") or "").strip().lower() != "threshold_reached"
+                        and not str(item.get("probe_cancel_reason") or "").strip()
                     )
-                    if (not item["passed"]) and (not _history_boundary_fail(item)):
-                        # Indeterminate rows (crashes without a VRAM signature)
-                        # must not be replayed as settled results.
-                        continue
                     history_outcomes_by_key[_history_key_from_outcome(item)] = item
 
             history_tests = list(history_outcomes_by_key.values())
@@ -4130,88 +4370,52 @@ def build_seedvr2_callbacks(
             def _seed_rank(batch_val: int, blocks_val: int) -> int:
                 return int(batch_val) * 1000 + (200 - int(blocks_val))
 
-            history_best_safe: Optional[Dict[str, Any]] = None
-            history_best_rank = -1
-            for item in history_tests:
-                if not bool(item.get("passed", False)):
-                    continue
-                cfg = {
-                    "batch_size": int(item.get("batch_size") or 5),
-                    "blocks_to_swap": int(item.get("blocks_to_swap") or 36),
-                    "vae_encode_tiled": bool(item.get("vae_encode_tiled", True)),
-                    "vae_decode_tiled": bool(item.get("vae_decode_tiled", True)),
-                    "vae_encode_tile_size": int(item.get("vae_encode_tile_size") or 1024),
-                    "vae_encode_tile_overlap": int(item.get("vae_encode_tile_overlap") or 128),
-                    "vae_decode_tile_size": int(item.get("vae_decode_tile_size") or 1024),
-                    "vae_decode_tile_overlap": int(item.get("vae_decode_tile_overlap") or 128),
-                    "min_free_vram_target_gb": float(min_free_vram_target_gb),
-                    "measured_peak_vram_used_gb": float(item.get("max_vram_used_gb") or 0.0),
-                    "estimated_free_vram_gb": float(item.get("estimated_free_gb") or 0.0),
-                }
-                rank = _seed_rank(cfg["batch_size"], cfg["blocks_to_swap"])
-                if rank > history_best_rank:
-                    history_best_rank = rank
-                    history_best_safe = cfg
-
-            history_frontier_best: Optional[Dict[str, Any]] = None
-            if history_best_safe is not None:
-                if (
-                    int(history_best_safe.get("batch_size") or 0) >= int(AUTOTUNE_TARGET_FRAMES)
-                    and int(history_best_safe.get("blocks_to_swap") or 36) <= 0
-                ):
-                    history_frontier_best = dict(history_best_safe)
-                else:
-                    for item in history_tests:
-                        if bool(item.get("passed", False)):
-                            continue
-                        if not _history_boundary_fail(item):
-                            continue
-                        fail_rank = _seed_rank(
-                            int(item.get("batch_size") or 0),
-                            int(item.get("blocks_to_swap") or 36),
-                        )
-                        if fail_rank > history_best_rank:
-                            history_frontier_best = dict(history_best_safe)
-                            break
-
-            if history_has_completed_frontier and history_best_safe is None:
-                _append_log(
-                    "A previous Auto Tune already tested these settings on this GPU: every tested "
-                    f"configuration peaked too high to leave {min_free_vram_target_gb:.1f}GB VRAM free "
-                    f"(GPU total: {total_vram_gb:.1f}GB)."
-                )
-                state["operation_status"] = "error"
-                yield _payload(
-                    (
-                        f"No SeedVR2 configuration can keep {min_free_vram_target_gb:.1f}GB VRAM free with these settings. "
-                        "Lower 'Save VRAM (GB)', reduce the output resolution, or enable INT8 ConvRot, then run Auto Tune again."
-                    ),
-                    show_indicator=False,
-                )
-                return
-
-            if history_has_completed_frontier and history_frontier_best is None and history_best_safe is not None:
-                history_frontier_best = dict(history_best_safe)
-
-            if history_frontier_best:
+            cached_frontier_best = (
+                dict(verified_cached_payload.get("best_config") or {})
+                if isinstance(verified_cached_payload, dict)
+                else {}
+            )
+            if cached_frontier_best:
                 seed_cfg = state.setdefault("seed_controls", {}).setdefault("seedvr2_settings", {})
-                seed_cfg["batch_size"] = int(history_frontier_best.get("batch_size") or settings.get("batch_size") or 5)
-                seed_cfg["blocks_to_swap"] = int(
-                    history_frontier_best.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36
+                seed_cfg["batch_size"] = int(cached_frontier_best.get("batch_size") or settings.get("batch_size") or 5)
+                seed_cfg["blocks_to_swap"] = _autotune_int(
+                    cached_frontier_best.get("blocks_to_swap"),
+                    _autotune_int(settings.get("blocks_to_swap"), 36),
+                )
+                seed_cfg["vae_encode_tiled"] = bool(
+                    cached_frontier_best.get(
+                        "vae_encode_tiled",
+                        settings.get("vae_encode_tiled", False),
+                    )
                 )
                 seed_cfg["vae_encode_tile_size"] = int(
-                    history_frontier_best.get("vae_encode_tile_size")
+                    cached_frontier_best.get("vae_encode_tile_size")
                     or settings.get("vae_encode_tile_size")
                     or 1024
                 )
+                seed_cfg["vae_encode_tile_overlap"] = _autotune_int(
+                    cached_frontier_best.get("vae_encode_tile_overlap"),
+                    _autotune_int(settings.get("vae_encode_tile_overlap"), 128),
+                )
+                seed_cfg["vae_decode_tiled"] = bool(
+                    cached_frontier_best.get(
+                        "vae_decode_tiled",
+                        settings.get("vae_decode_tiled", False),
+                    )
+                )
                 seed_cfg["vae_decode_tile_size"] = int(
-                    history_frontier_best.get("vae_decode_tile_size")
+                    cached_frontier_best.get("vae_decode_tile_size")
                     or settings.get("vae_decode_tile_size")
                     or 1024
                 )
+                seed_cfg["vae_decode_tile_overlap"] = _autotune_int(
+                    cached_frontier_best.get("vae_decode_tile_overlap"),
+                    _autotune_int(settings.get("vae_decode_tile_overlap"), 128),
+                )
+                cached_path = str(verified_cached_payload.get("_log_path") or "verified cache")
                 _append_log(
-                    "A previous Auto Tune already found the best settings for this exact setup "
-                    f"({len(history_sources)} matching log(s)) - no new tests needed."
+                    "A previous completed and frontier-verified Auto Tune found the best settings "
+                    f"for this setup - no new tests needed ({cached_path})."
                 )
                 _append_log(
                     f"Applied: Batch Size {seed_cfg['batch_size']}, Blocks to Swap {seed_cfg['blocks_to_swap']}, "
@@ -4227,8 +4431,12 @@ def build_seedvr2_callbacks(
                     show_indicator=False,
                     batch_value=int(seed_cfg["batch_size"]),
                     blocks_value=int(seed_cfg["blocks_to_swap"]),
+                    encode_tiled_value=bool(seed_cfg["vae_encode_tiled"]),
                     encode_tile_value=int(seed_cfg["vae_encode_tile_size"]),
+                    encode_overlap_value=int(seed_cfg["vae_encode_tile_overlap"]),
+                    decode_tiled_value=bool(seed_cfg["vae_decode_tiled"]),
                     decode_tile_value=int(seed_cfg["vae_decode_tile_size"]),
+                    decode_overlap_value=int(seed_cfg["vae_decode_tile_overlap"]),
                 )
                 return
 
@@ -4287,7 +4495,7 @@ def build_seedvr2_callbacks(
                 or output_settings.get("seedvr2_use_10bit", False)
             ) and working_settings["video_backend"] == "ffmpeg"
 
-            working_settings["blocks_to_swap"] = 36
+            working_settings["blocks_to_swap"] = autotune_max_blocks
             working_settings.setdefault("vae_encode_tiled", True)
             working_settings.setdefault("vae_decode_tiled", True)
             working_settings.setdefault("vae_encode_tile_size", int(defaults.get("vae_encode_tile_size", 1024)))
@@ -4296,15 +4504,17 @@ def build_seedvr2_callbacks(
             working_settings.setdefault("vae_decode_tile_overlap", int(defaults.get("vae_decode_tile_overlap", 128)))
 
             tests: List[Dict[str, Any]] = list(history_tests)
-            known_outcomes_by_key: Dict[Tuple[int, int, int, int, bool, bool], Dict[str, Any]] = dict(history_outcomes_by_key)
-            best_config: Optional[Dict[str, Any]] = dict(history_best_safe) if isinstance(history_best_safe, dict) else None
+            known_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int, bool, bool], Dict[str, Any]] = dict(history_outcomes_by_key)
+            # Historical rows resume individual probes only. A partial log must
+            # never preselect its best row before both live search axes settle.
+            best_config: Optional[Dict[str, Any]] = None
             status_reason = "running"
             created_at = time.strftime("%Y-%m-%d %H:%M:%S")
             autotune_log_path: Optional[Path] = None
             run_counter = 0
-            # Bisection worst case: ~log2(50 batch candidates) + log2(18 block
-            # candidates) + VAE-tile retries. Far below the old linear 68.
-            total_estimated_runs = 18
+            search_results: Dict[str, Any] = {}
+            # Bounded growth plus final bisection across the two quality axes.
+            total_estimated_runs = 28
 
             if history_tests:
                 _append_log(
@@ -4319,11 +4529,17 @@ def build_seedvr2_callbacks(
                 frontier_verified: bool = False,
             ) -> None:
                 nonlocal autotune_log_path
+                result_reason = str(status_override or status_reason)
                 payload = {
                     "model": AUTOTUNE_MODEL_ID,
                     "created_at": created_at,
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": str(status_override or status_reason),
+                    "status": persisted_autotune_status(
+                        result_reason,
+                        finalized=finalized,
+                        frontier_verified=frontier_verified,
+                    ),
+                    "result_reason": result_reason,
                     "finalized": bool(finalized),
                     "frontier_verified": bool(frontier_verified),
                     "signature": signature,
@@ -4343,11 +4559,13 @@ def build_seedvr2_callbacks(
                         "selected_device": str(global_gpu_device),
                         "selected_ids": list(gpu_ids),
                         "total_vram_gb": float(total_vram_gb),
+                        "ambient_used_gb": float(ambient_used_gb),
                         "min_free_target_gb": float(min_free_vram_target_gb),
                     },
                     "demo_clip": dict(demo_meta) if isinstance(demo_meta, dict) else {},
                     "tests": list(tests),
                     "best_config": dict(best_config) if isinstance(best_config, dict) else {},
+                    "search_results": dict(search_results),
                 }
                 saved = _write_autotune_log(logs_dir, payload, existing_path=autotune_log_path)
                 if saved and autotune_log_path is None:
@@ -4393,7 +4611,7 @@ def build_seedvr2_callbacks(
 
                 phase_state: Dict[str, Any] = {
                     "phase": "startup",
-                    "threshold_any_phase": bool(campaign_force_fresh),
+                    "threshold_any_phase": True,
                 }
                 probe_meta: Dict[str, Any] = {
                     "cli_batch_size": None,
@@ -4458,7 +4676,7 @@ def build_seedvr2_callbacks(
                         sampler_stop,
                         sampler_box,
                         telemetry_gpu_ids,
-                        0.25,
+                        AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC,
                         phase_state,
                         threshold_cancel_event,
                         min_free_vram_target_gb,
@@ -4469,7 +4687,7 @@ def build_seedvr2_callbacks(
 
                 def _threshold_watchdog() -> None:
                     while not stop_watchdog.is_set():
-                        if threshold_cancel_event.wait(timeout=0.2):
+                        if threshold_cancel_event.wait(timeout=0.05):
                             break
                     if stop_watchdog.is_set() or not threshold_cancel_event.is_set():
                         return
@@ -4478,6 +4696,9 @@ def build_seedvr2_callbacks(
                         return
                     threshold_abort_box["hit"] = True
                     try:
+                        runner.cancel(force=True)
+                    except TypeError:
+                        # Backward-compatible fallback for injected/test runners.
                         runner.cancel()
                     except Exception:
                         pass
@@ -4514,7 +4735,16 @@ def build_seedvr2_callbacks(
                     total_for_eval = float(total_vram_gb)
                 peak_source = "whole_run"
                 selected_peak_gb = float(max_used_gb)
-                free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
+                aggregate_free_gb = (
+                    max(0.0, total_for_eval - selected_peak_gb)
+                    if total_for_eval > 0
+                    else 0.0
+                )
+                min_device_free_gb = float(
+                    sampler_box.get("min_device_free_gb", aggregate_free_gb)
+                    or 0.0
+                )
+                free_gb = min(aggregate_free_gb, min_device_free_gb)
 
                 oom = bool(_looks_like_oom(result.log))
                 oom_phase = _detect_oom_phase(result.log) if oom else ""
@@ -4537,7 +4767,9 @@ def build_seedvr2_callbacks(
                     "vae_encode_tiled": bool(probe_settings.get("vae_encode_tiled", False)),
                     "vae_decode_tiled": bool(probe_settings.get("vae_decode_tiled", False)),
                     "vae_encode_tile_size": int(probe_settings.get("vae_encode_tile_size") or 0),
+                    "vae_encode_tile_overlap": int(probe_settings.get("vae_encode_tile_overlap") or 0),
                     "vae_decode_tile_size": int(probe_settings.get("vae_decode_tile_size") or 0),
+                    "vae_decode_tile_overlap": int(probe_settings.get("vae_decode_tile_overlap") or 0),
                     "returncode": int(result.returncode),
                     "oom": bool(oom),
                     "oom_phase": str(oom_phase),
@@ -4547,9 +4779,11 @@ def build_seedvr2_callbacks(
                     "whole_run_peak_vram_used_gb": round(max_used_gb, 3),
                     "total_vram_gb": round(total_for_eval, 3),
                     "estimated_free_gb": round(free_gb, 3),
+                    "min_device_free_gb": round(min_device_free_gb, 3),
                     "telemetry_ok": bool(telemetry_ok),
                     "phase2_samples": int(phase2_samples),
                     "probe_cancel_reason": str(early_stop_reason),
+                    "probe_stop_phase": str(phase_state.get("phase") or "unknown"),
                     "cli_batch_size": probe_meta.get("cli_batch_size"),
                     "cli_load_cap": probe_meta.get("cli_load_cap"),
                     "encode_batches_total": int(probe_meta.get("encode_batches_total") or 0),
@@ -4559,11 +4793,14 @@ def build_seedvr2_callbacks(
                 }
                 return result, outcome
 
-            # Stage A/B: top-first probing + bisection. VRAM demand is monotone
-            # in batch size and in resident DiT blocks (36 - blocks_to_swap), so
-            # the pass/fail frontier is located in O(log n) probes instead of the
-            # old linear walk (up to 50 + 18 full probes).
+            # Stage A/B: safety-first bounded growth + bisection. VRAM demand is
+            # monotone in batch size and resident DiT blocks, but an unrelated
+            # process failure is only an indeterminate hole and does not become
+            # fake frontier proof.
             status_reason = "completed"
+            search_indeterminate = False
+            stage_a_frontier_verified = False
+            stage_b_frontier_verified = False
 
             def _record_best(outcome: Dict[str, Any]) -> None:
                 nonlocal best_config
@@ -4579,16 +4816,31 @@ def build_seedvr2_callbacks(
                     "min_free_vram_target_gb": float(min_free_vram_target_gb),
                     "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
                     "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
+                    "min_device_free_vram_gb": float(
+                        outcome.get("min_device_free_gb", outcome["estimated_free_gb"])
+                    ),
                 }
                 cand_rank = _seed_rank(int(candidate["batch_size"]), int(candidate["blocks_to_swap"]))
                 cur_rank = -1
                 if isinstance(best_config, dict) and best_config:
                     cur_rank = _seed_rank(
                         int(best_config.get("batch_size") or 0),
-                        int(best_config.get("blocks_to_swap") or 36),
+                        _autotune_int(best_config.get("blocks_to_swap"), autotune_max_blocks),
                     )
                 if cand_rank > cur_rank:
                     best_config = candidate
+
+            def _probe_key(test_batch: int, test_blocks: int) -> Tuple[int, int, int, int, int, int, bool, bool]:
+                return (
+                    int(test_batch),
+                    int(test_blocks),
+                    int(working_settings.get("vae_encode_tile_size") or 0),
+                    int(working_settings.get("vae_encode_tile_overlap") or 0),
+                    int(working_settings.get("vae_decode_tile_size") or 0),
+                    int(working_settings.get("vae_decode_tile_overlap") or 0),
+                    bool(working_settings.get("vae_encode_tiled", False)),
+                    bool(working_settings.get("vae_decode_tiled", False)),
+                )
 
             def _evaluate_candidate(test_batch: int, test_blocks: int):
                 """
@@ -4596,24 +4848,25 @@ def build_seedvr2_callbacks(
                 tiles on encode/decode OOM. Returns (outcome, verdict) with
                 verdict in {"pass", "boundary_fail", "hard_fail", "cancelled"}.
                 """
-                hard_retry_used = False
                 while True:
-                    probe_key = (
-                        int(test_batch),
-                        int(test_blocks),
-                        int(working_settings.get("vae_encode_tile_size") or 0),
-                        int(working_settings.get("vae_decode_tile_size") or 0),
-                        bool(working_settings.get("vae_encode_tiled", False)),
-                        bool(working_settings.get("vae_decode_tiled", False)),
-                    )
+                    probe_key = _probe_key(test_batch, test_blocks)
                     known_outcome = known_outcomes_by_key.get(probe_key)
                     if isinstance(known_outcome, dict):
                         outcome = dict(known_outcome)
+                        outcome["_autotune_reused"] = True
                         passed = bool(outcome.get("passed", False))
+                        prior_verdict = (
+                            "fits"
+                            if passed
+                            else (
+                                "is a saved VRAM boundary"
+                                if is_vram_boundary_outcome(outcome, min_free_vram_target_gb)
+                                else "was already attempted"
+                            )
+                        )
                         _append_log(
                             f"Batch {outcome.get('batch_size')}, Blocks {outcome.get('blocks_to_swap')}: "
-                            f"already tested earlier - reusing that measurement "
-                            f"({'fits' if passed else 'does not fit'})."
+                            f"already tested earlier - reusing that measurement ({prior_verdict})."
                         )
                     else:
                         _result, outcome = yield from _run_probe_once(int(test_batch), int(test_blocks))
@@ -4622,7 +4875,7 @@ def build_seedvr2_callbacks(
                             and bool(outcome.get("telemetry_ok", False))
                             and (not outcome["oom"])
                             and float(outcome["estimated_free_gb"]) >= min_free_vram_target_gb
-                            and str(outcome.get("probe_cancel_reason") or "") != "threshold_reached"
+                            and not str(outcome.get("probe_cancel_reason") or "").strip()
                         )
                         outcome["passed"] = bool(passed)
                         tests.append(outcome)
@@ -4651,51 +4904,58 @@ def build_seedvr2_callbacks(
                     if passed:
                         return outcome, "pass"
 
-                    # OOM during VAE phases (encode/decode): halve tile sizes and retry same point.
-                    if outcome["oom"] and outcome["oom_phase"] in {"phase1_encode", "phase3_decode"}:
-                        phase_label = "Phase 1" if outcome["oom_phase"] == "phase1_encode" else "Phase 3"
-                        if not bool(working_settings.get("vae_encode_tiled", False)):
+                    # A VAE OOM or watchdog threshold can be recovered safely by
+                    # reducing VAE tiles before changing the batch frontier.
+                    resource_phase = str(outcome.get("oom_phase") or "")
+                    if not bool(outcome.get("oom", False)):
+                        resource_phase = str(outcome.get("probe_stop_phase") or "")
+                    vram_stop = bool(
+                        outcome.get("oom", False)
+                        or str(outcome.get("probe_cancel_reason") or "") == "threshold_reached"
+                    )
+                    if vram_stop and resource_phase in {"phase1", "phase1_encode", "phase3", "phase3_decode"}:
+                        encode_phase = resource_phase in {"phase1", "phase1_encode"}
+                        phase_label = "Phase 1" if encode_phase else "Phase 3"
+                        tiling_changed = False
+                        if encode_phase and not bool(working_settings.get("vae_encode_tiled", False)):
                             working_settings["vae_encode_tiled"] = True
-                            _append_log(f"Enabled VAE encode tiling after {phase_label} OOM.")
-                        if not bool(working_settings.get("vae_decode_tiled", False)):
+                            _append_log(f"Enabled VAE encode tiling after the {phase_label} VRAM limit.")
+                            tiling_changed = True
+                        if (not encode_phase) and not bool(working_settings.get("vae_decode_tiled", False)):
                             working_settings["vae_decode_tiled"] = True
-                            _append_log(f"Enabled VAE decode tiling after {phase_label} OOM.")
+                            _append_log(f"Enabled VAE decode tiling after the {phase_label} VRAM limit.")
+                            tiling_changed = True
 
-                        changed, notes = _halve_vae_tile_sizes(working_settings)
+                        changed, notes = _halve_vae_tile_sizes(
+                            working_settings,
+                            encode=encode_phase,
+                            decode=not encode_phase,
+                        )
+                        changed = bool(changed or tiling_changed)
                         if changed:
                             for note in notes:
                                 _append_log(f"Adjusted tile settings: {note}")
                             yield _payload(
-                                f"{phase_label} OOM detected, reduced VAE tile sizes and retrying...",
+                                f"{phase_label} VRAM limit detected, reduced VAE tile sizes and retrying...",
                                 show_indicator=True,
                                 indicator_title="Auto Tune retry",
                                 batch_value=int(test_batch),
                                 blocks_value=int(test_blocks),
+                                encode_tiled_value=bool(working_settings.get("vae_encode_tiled", False)),
                                 encode_tile_value=int(working_settings.get("vae_encode_tile_size") or 0),
+                                encode_overlap_value=int(working_settings.get("vae_encode_tile_overlap") or 0),
+                                decode_tiled_value=bool(working_settings.get("vae_decode_tiled", False)),
                                 decode_tile_value=int(working_settings.get("vae_decode_tile_size") or 0),
+                                decode_overlap_value=int(working_settings.get("vae_decode_tile_overlap") or 0),
                             )
                             continue
 
-                    if bool(outcome.get("telemetry_ok", False)) and (
-                        bool(outcome.get("oom", False))
-                        or str(outcome.get("probe_cancel_reason") or "") == "threshold_reached"
-                        or int(outcome.get("returncode") or 1) == 0
-                    ):
-                        # rc==0 with insufficient free headroom is a clean VRAM boundary.
+                    if is_vram_boundary_outcome(outcome, min_free_vram_target_gb):
                         return outcome, "boundary_fail"
-                    # Crash without a VRAM signature (or telemetry loss): retry the
-                    # same point once - transient failures otherwise abort the sweep.
-                    if (known_outcome is None) and (not hard_retry_used):
-                        hard_retry_used = True
-                        known_outcomes_by_key.pop(probe_key, None)
-                        _append_log(
-                            "Probe failed without a VRAM boundary signature "
-                            f"(rc={outcome.get('returncode')}); retrying once after GPU settles."
-                        )
-                        continue
                     return outcome, "hard_fail"
 
-            # Stage A: max passing batch size at blocks_to_swap=36.
+            # Stage A: max passing batch size at the safest meaningful
+            # BlockSwap value for the selected architecture.
             batch_seq = [int(b) for b in AUTOTUNE_BATCH_SEQUENCE]
             vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
             stage_a_start: Optional[int] = None
@@ -4708,14 +4968,13 @@ def build_seedvr2_callbacks(
                 _append_log(
                     f"Found measurements for these exact settings from a {vram_list} GPU. "
                     f"Their peaks predict this {total_vram_gb:.0f}GB GPU tops out near "
-                    f"Batch Size {batch_seq[stage_a_start]} - starting the search there "
-                    "(every result is still verified on your GPU)."
+                    f"Batch Size {batch_seq[stage_a_start]}. This is only a hint; the live "
+                    f"search still starts safely at Batch Size {batch_seq[0]} and grows in bounded steps."
                 )
             _append_log(
                 "Step 1/2: finding the highest safe Batch Size "
-                f"(higher = better temporal consistency; starting at "
-                f"{batch_seq[stage_a_start] if stage_a_start is not None else batch_seq[-1]}, "
-                "then narrowing by halving)."
+                f"(higher = better temporal consistency; starting at {batch_seq[0]}, "
+                "then growing gradually and bisecting only after a VRAM boundary is measured)."
             )
 
             def _batch_probe(idx: int, _require_full: bool):
@@ -4725,9 +4984,44 @@ def build_seedvr2_callbacks(
                 if verdict == "pass":
                     _record_best(outcome)
                     _persist_autotune_progress()
-                return {"outcome": verdict, "early_stopped_pass": False}
+                return {
+                    "outcome": verdict,
+                    "early_stopped_pass": False,
+                    "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+                }
 
-            stage_a = yield from frontier_bisect(len(batch_seq), _batch_probe, initial_index=stage_a_start)
+            stage_a_saved_pass, stage_a_saved_boundary = resume_frontier_hints(
+                [
+                    known_outcomes_by_key.get(
+                        _probe_key(batch_value, int(working_settings["blocks_to_swap"]))
+                    )
+                    for batch_value in batch_seq
+                ],
+                min_free_vram_target_gb,
+            )
+
+            stage_a = yield from frontier_bisect(
+                len(batch_seq),
+                _batch_probe,
+                initial_index=stage_a_start,
+                max_growth_step=4,
+                trusted_pass_index=stage_a_saved_pass,
+                known_boundary_index=stage_a_saved_boundary,
+            )
+            search_results["batch"] = dict(stage_a)
+            stage_a_frontier_verified = bool(stage_a.get("frontier_verified", False))
+            search_indeterminate = bool(
+                stage_a.get("indeterminate_above_best", False)
+                or (
+                    stage_a.get("hard_failed_indices")
+                    and not stage_a.get("frontier_verified", False)
+                )
+            )
+            if stage_a.get("hard_failed_indices"):
+                _append_log(
+                    "Ignored persistent non-VRAM failures at Batch candidate indices "
+                    f"{stage_a['hard_failed_indices']} and continued searching."
+                )
             any_boundary_failed = bool(stage_a.get("boundary_failed"))
             if stage_a.get("stopped") == "cancelled":
                 status_reason = "cancelled"
@@ -4740,8 +5034,17 @@ def build_seedvr2_callbacks(
             # when batch 201 passed.
             if status_reason == "completed" and isinstance(best_config, dict) and best_config:
                 stage_b_batch = int(best_config.get("batch_size") or 0)
-                blocks_seq = list(range(34, -1, -2))  # index n-1 = blocks 0 (most aggressive)
-                if stage_b_batch > 0 and int(best_config.get("blocks_to_swap") or 36) > 0:
+                blocks_seq = list(range(max(0, autotune_max_blocks - 2), -1, -2))
+                if 0 not in blocks_seq:
+                    blocks_seq.append(0)
+                if _autotune_int(best_config.get("blocks_to_swap"), autotune_max_blocks) <= 0:
+                    stage_b_frontier_verified = True
+                if (
+                    stage_b_batch > 0
+                    and _autotune_int(
+                        best_config.get("blocks_to_swap"), autotune_max_blocks
+                    ) > 0
+                ):
                     blocks_prior_map = {
                         int(blocks_val): float(peak)
                         for (b_val, blocks_val), peak in prior_peaks_by_blocks.items()
@@ -4752,13 +5055,14 @@ def build_seedvr2_callbacks(
                     if prior_b_idx is not None and prior_b_idx < len(blocks_seq) - 1:
                         stage_b_start = int(prior_b_idx)
                         _append_log(
-                            "Other-GPU measurements predict Blocks to Swap around "
-                            f"{blocks_seq[stage_b_start]} at this batch - starting there."
+                            "Compatible historical measurements predict Blocks to Swap around "
+                            f"{blocks_seq[stage_b_start]} at this batch; it will be used as a hint "
+                            "after the safest live probe."
                         )
                     _append_log(
                         f"Step 2/2: minimizing Blocks to Swap at Batch Size {stage_b_batch} "
-                        "(lower = faster inference, same quality; starting at "
-                        f"{blocks_seq[stage_b_start] if stage_b_start is not None else 0})."
+                        f"(lower = faster inference, same quality; starting safely at {blocks_seq[0]} "
+                        "and reducing it in bounded steps)."
                     )
 
                     def _blocks_probe(idx: int, _require_full: bool):
@@ -4768,11 +5072,52 @@ def build_seedvr2_callbacks(
                         if verdict == "pass":
                             _record_best(outcome)
                             _persist_autotune_progress()
-                        return {"outcome": verdict, "early_stopped_pass": False}
+                        return {
+                            "outcome": verdict,
+                            "early_stopped_pass": False,
+                            "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+                        }
+
+                    stage_b_saved_pass, stage_b_saved_boundary = resume_frontier_hints(
+                        [
+                            known_outcomes_by_key.get(
+                                _probe_key(stage_b_batch, blocks_value)
+                            )
+                            for blocks_value in blocks_seq
+                        ],
+                        min_free_vram_target_gb,
+                    )
 
                     stage_b = yield from frontier_bisect(
-                        len(blocks_seq), _blocks_probe, initial_index=stage_b_start
+                        len(blocks_seq),
+                        _blocks_probe,
+                        initial_index=stage_b_start,
+                        max_growth_step=3,
+                        trusted_pass_index=stage_b_saved_pass,
+                        known_boundary_index=stage_b_saved_boundary,
                     )
+                    search_results["blocks_to_swap"] = dict(stage_b)
+                    stage_b_frontier_verified = bool(
+                        stage_b.get("frontier_verified", False)
+                        or (
+                            stage_b.get("best_idx") is None
+                            and stage_b.get("boundary_failed", False)
+                            and not stage_b.get("hard_failed_indices")
+                        )
+                    )
+                    search_indeterminate = bool(
+                        search_indeterminate
+                        or stage_b.get("indeterminate_above_best", False)
+                        or (
+                            stage_b.get("hard_failed_indices")
+                            and not stage_b.get("frontier_verified", False)
+                        )
+                    )
+                    if stage_b.get("hard_failed_indices"):
+                        _append_log(
+                            "Ignored persistent non-VRAM failures at Block Swap candidate indices "
+                            f"{stage_b['hard_failed_indices']} and continued searching."
+                        )
                     any_boundary_failed = any_boundary_failed or bool(stage_b.get("boundary_failed"))
                     if stage_b.get("stopped") == "cancelled":
                         status_reason = "cancelled"
@@ -4781,16 +5126,22 @@ def build_seedvr2_callbacks(
                         status_reason = "failed"
 
             if campaign_force_fresh and status_reason != "cancelled":
-                profile_batches = [201, 161, 121, 81, 49, 25, 13, 5]
-                profile_batches = [b for b in profile_batches if b in set(batch_seq)]
+                # Profiling is still subject to the same safety contract as the
+                # interactive tuner: establish the minimum-memory point first.
+                profile_batches = sorted(
+                    b for b in (201, 161, 121, 81, 49, 25, 13, 5) if b in set(batch_seq)
+                )
                 _append_log(
                     "Campaign profiling: the 2GB reserve cutoff remains active; continuing the "
-                    f"Block Swap 36 ladder toward {campaign_profile_min_peak_gb:.1f}GB peak VRAM: "
+                    f"Block Swap {autotune_max_blocks} ladder toward "
+                    f"{campaign_profile_min_peak_gb:.1f}GB peak VRAM: "
                     f"{profile_batches}."
                 )
                 profile_floor_reached = False
                 for profile_batch in profile_batches:
-                    outcome, verdict = yield from _evaluate_candidate(int(profile_batch), 36)
+                    outcome, verdict = yield from _evaluate_candidate(
+                        int(profile_batch), autotune_max_blocks
+                    )
                     if verdict == "cancelled":
                         status_reason = "cancelled"
                         break
@@ -4808,7 +5159,14 @@ def build_seedvr2_callbacks(
                         profile_floor_reached = True
                         _append_log(
                             f"Campaign profiling reached {peak_gb:.2f}GB peak at Batch {profile_batch}, "
-                            "Blocks 36."
+                            f"Blocks {autotune_max_blocks}."
+                        )
+                        break
+                    if clean_measurement:
+                        _append_log(
+                            f"The safest Batch {profile_batch} already peaks at {peak_gb:.2f}GB, "
+                            f"above the {campaign_profile_min_peak_gb:.1f}GB profiling target. "
+                            "Larger batches cannot lower the memory floor, so profiling stopped safely."
                         )
                         break
                 if not profile_floor_reached and status_reason != "cancelled":
@@ -4826,65 +5184,62 @@ def build_seedvr2_callbacks(
                         f"lowest clean measured peak was {floor_note:.2f}GB."
                     )
 
+            if search_indeterminate and best_config and status_reason != "cancelled":
+                status_reason = "failed"
+
             if status_reason == "completed":
                 if isinstance(best_config, dict) and best_config:
                     top_reached = (
                         int(best_config.get("batch_size") or 0) >= int(AUTOTUNE_TARGET_FRAMES)
-                        and int(best_config.get("blocks_to_swap") or 36) <= 0
+                        and _autotune_int(
+                            best_config.get("blocks_to_swap"), autotune_max_blocks
+                        ) <= 0
                     )
                     if not top_reached:
                         status_reason = "threshold_reached"
                 else:
                     status_reason = "threshold_reached" if any_boundary_failed else "failed"
 
-            # Persist final autotune status in the same log file.
-            def _seed_quality_rank(batch_size_val: int, blocks_to_swap_val: int) -> int:
-                # Higher batch and lower blocks_to_swap both mean higher quality/VRAM demand.
-                return int(batch_size_val) * 1000 + (200 - int(blocks_to_swap_val))
-
-            def _is_vram_boundary_failure(test_item: Dict[str, Any]) -> bool:
-                try:
-                    free_gb = float(test_item.get("estimated_free_gb", 1e9) or 1e9)
-                except Exception:
-                    free_gb = 1e9
-                if bool(test_item.get("oom", False)):
-                    return True
-                if str(test_item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
-                    return True
-                if free_gb < float(min_free_vram_target_gb):
-                    return True
-                return False
-
-            def _frontier_verified() -> bool:
-                if not isinstance(best_config, dict) or (not best_config):
-                    return False
-                best_batch = int(best_config.get("batch_size") or 0)
-                best_blocks = int(best_config.get("blocks_to_swap") or 36)
-                best_rank = _seed_quality_rank(best_batch, best_blocks)
-                for item in tests:
-                    if not isinstance(item, dict):
-                        continue
-                    if bool(item.get("passed", False)):
-                        continue
-                    if not bool(item.get("telemetry_ok", False)):
-                        continue
-                    cand_batch = int(item.get("batch_size") or 0)
-                    cand_blocks = int(item.get("blocks_to_swap") or 36)
-                    cand_rank = _seed_quality_rank(cand_batch, cand_blocks)
-                    if cand_rank <= best_rank:
-                        continue
-                    if _is_vram_boundary_failure(item):
-                        return True
-                # Top-of-search candidate reached; no higher-quality candidate remains.
-                if best_batch >= int(AUTOTUNE_TARGET_FRAMES) and best_blocks <= 0:
-                    return True
-                return False
-
-            frontier_ok = bool(_frontier_verified())
+            # Persist final autotune status in the same log file. Both axes must
+            # have independently settled; a single higher failure is not enough
+            # to infer a two-dimensional frontier.
+            frontier_ok = bool(
+                best_config
+                and stage_a_frontier_verified
+                and stage_b_frontier_verified
+                and not search_indeterminate
+                and status_reason in {"completed", "threshold_reached"}
+            )
             if best_config and (not frontier_ok):
                 _append_log(
-                    "Boundary validation incomplete: no higher-quality VRAM-boundary failure was observed. "
+                    "Boundary validation incomplete: a higher candidate was indeterminate or no "
+                    "higher-quality VRAM-boundary failure was observed. "
                     "This run will not be reused from cache."
+                )
+
+            if isinstance(best_config, dict) and best_config:
+                # VAE recovery can change tiling controls during the sweep. Save
+                # the final signature so pressing Auto Tune again with the
+                # applied controls reuses this verified result instead of
+                # entering a different cache lane and scanning again.
+                final_signature_settings = dict(settings)
+                for key in (
+                    "vae_encode_tiled",
+                    "vae_encode_tile_size",
+                    "vae_encode_tile_overlap",
+                    "vae_decode_tiled",
+                    "vae_decode_tile_size",
+                    "vae_decode_tile_overlap",
+                ):
+                    final_signature_settings[key] = best_config.get(key)
+                signature = _build_autotune_signature(
+                    final_signature_settings,
+                    target_w=target_w,
+                    target_h=target_h,
+                    effective_in_w=effective_in_w,
+                    effective_in_h=effective_in_h,
+                    total_vram_gb=total_vram_gb,
+                    min_free_target_gb=min_free_vram_target_gb,
                 )
 
             _persist_autotune_progress(
@@ -4909,12 +5264,25 @@ def build_seedvr2_callbacks(
             if best_config:
                 seed_cfg = state.setdefault("seed_controls", {}).setdefault("seedvr2_settings", {})
                 seed_cfg["batch_size"] = int(best_config.get("batch_size") or settings.get("batch_size") or 5)
-                seed_cfg["blocks_to_swap"] = int(best_config.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36)
+                seed_cfg["blocks_to_swap"] = _autotune_int(
+                    best_config.get("blocks_to_swap"),
+                    _autotune_int(settings.get("blocks_to_swap"), 36),
+                )
+                seed_cfg["vae_encode_tiled"] = bool(best_config.get("vae_encode_tiled", False))
                 seed_cfg["vae_encode_tile_size"] = int(
                     best_config.get("vae_encode_tile_size") or working_settings.get("vae_encode_tile_size") or 1024
                 )
+                seed_cfg["vae_encode_tile_overlap"] = _autotune_int(
+                    best_config.get("vae_encode_tile_overlap"),
+                    _autotune_int(working_settings.get("vae_encode_tile_overlap"), 128),
+                )
+                seed_cfg["vae_decode_tiled"] = bool(best_config.get("vae_decode_tiled", False))
                 seed_cfg["vae_decode_tile_size"] = int(
                     best_config.get("vae_decode_tile_size") or working_settings.get("vae_decode_tile_size") or 1024
+                )
+                seed_cfg["vae_decode_tile_overlap"] = _autotune_int(
+                    best_config.get("vae_decode_tile_overlap"),
+                    _autotune_int(working_settings.get("vae_decode_tile_overlap"), 128),
                 )
                 applied_note = (
                     f"applied Batch Size {best_config['batch_size']}, "
@@ -4941,9 +5309,22 @@ def build_seedvr2_callbacks(
                     final_status,
                     show_indicator=False,
                     batch_value=int(best_config.get("batch_size") or settings.get("batch_size") or 5),
-                    blocks_value=int(best_config.get("blocks_to_swap") or settings.get("blocks_to_swap") or 36),
+                    blocks_value=_autotune_int(
+                        best_config.get("blocks_to_swap"),
+                        _autotune_int(settings.get("blocks_to_swap"), 36),
+                    ),
+                    encode_tiled_value=bool(best_config.get("vae_encode_tiled", False)),
                     encode_tile_value=int(best_config.get("vae_encode_tile_size") or working_settings.get("vae_encode_tile_size") or 1024),
+                    encode_overlap_value=_autotune_int(
+                        best_config.get("vae_encode_tile_overlap"),
+                        _autotune_int(working_settings.get("vae_encode_tile_overlap"), 128),
+                    ),
+                    decode_tiled_value=bool(best_config.get("vae_decode_tiled", False)),
                     decode_tile_value=int(best_config.get("vae_decode_tile_size") or working_settings.get("vae_decode_tile_size") or 1024),
+                    decode_overlap_value=_autotune_int(
+                        best_config.get("vae_decode_tile_overlap"),
+                        _autotune_int(working_settings.get("vae_decode_tile_overlap"), 128),
+                    ),
                 )
                 return
 

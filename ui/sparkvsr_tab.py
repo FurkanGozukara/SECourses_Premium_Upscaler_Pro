@@ -512,7 +512,8 @@ def sparkvsr_tab(
                     (
                         "**Auto Tune:** Runs a short SparkVSR probe clip, measures live GPU VRAM, and applies the highest-quality "
                         "spatial tile / temporal chunk settings that keep the selected free-VRAM headroom. "
-                        "Default temporal chunk length is 65 frames."
+                        "It begins at a 17-frame chunk with the smallest spatial tile, then grows in bounded steps. "
+                        "Only completed results matching the exact model, processed shape, selected GPU total VRAM, and reserve are reused."
                     )
                 )
 
@@ -2213,7 +2214,10 @@ def sparkvsr_tab(
     def _autotune_modal_message(payload) -> str | None:
         if not (isinstance(payload, tuple) and payload):
             return None
-        status_text = str(payload[0] or "").strip()
+        status_payload = payload[0]
+        if isinstance(status_payload, dict):
+            status_payload = status_payload.get("value", "")
+        status_text = str(status_payload or "").strip()
         if not status_text:
             return None
         status_lower = status_text.lower()

@@ -5,6 +5,7 @@ FlashVSR+ runtime auto-tune implementation.
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -17,24 +18,42 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gradio as gr
 
-from shared.flashvsr_runner import FlashVSRResult, run_flashvsr
-from shared.gpu_utils import get_global_gpu_override
+from shared.flashvsr_runner import (
+    FLASHVSR_MIN_TILED_DIT_TILE_SIZE,
+    FlashVSRResult,
+    run_flashvsr,
+)
+from shared.gpu_utils import get_global_gpu_override, get_gpu_info
 from shared.oom_alert import clear_vram_oom_alert
 from shared.path_utils import IMAGE_EXTENSIONS, detect_input_type, get_media_dimensions, normalize_path
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.services.autotune_search import (
+    ambient_adjusted_min_device_free_gb,
+    ambient_adjusted_peak_gb,
+    autotune_launch_headroom,
+    cached_best_has_headroom,
     dedupe_flashvsr_tile_candidates,
     frontier_bisect,
+    is_verified_autotune_payload,
+    is_vram_boundary_outcome,
+    persisted_autotune_status,
     predict_frontier_index,
+    resolution_signatures_compatible,
+    resolution_signatures_identical,
+    resume_frontier_hints,
+    vram_drain_target_gb,
 )
 
 
 AUTOTUNE_MODEL_ID = "flashvsrplus"
 AUTOTUNE_LOG_PREFIX = "flashvsrplus_autotune"
+AUTOTUNE_STRATEGY_VERSION = 9
 AUTOTUNE_TARGET_FRAMES = 450
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
+AUTOTUNE_EMERGENCY_FREE_VRAM_GB = 1.0
+AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC = 0.10
 AUTOTUNE_BASE_TILE_SIZE = 256
-AUTOTUNE_FALLBACK_TILES = (128, 64)
+AUTOTUNE_FALLBACK_TILES = (FLASHVSR_MIN_TILED_DIT_TILE_SIZE,)
 AUTOTUNE_TILE_STEP = 32
 AUTOTUNE_TILE_MAX = 1024
 AUTOTUNE_PRIMARY_OVERLAP = 48
@@ -42,13 +61,7 @@ AUTOTUNE_FALLBACK_OVERLAP = 24
 AUTOTUNE_FRAME_CHUNK_SEQUENCE = (450, 350, 250, 150, 100, 64, 48, 32)
 AUTOTUNE_PHASE2_MIN_ITER_FOR_GATE = 3
 AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
-# Early-success stop for clearly-safe tiled probes: requires the first DiT tile
-# to be fully processed, a stable whole-run peak, and this much free headroom
-# BEYOND the save-VRAM target. A best config whose pass came from an early stop
-# is always re-validated with a full-length probe before being applied.
-AUTOTUNE_EARLY_PASS_MARGIN_GB = 1.5
-AUTOTUNE_EARLY_PASS_STABLE_SEC = 8.0
-AUTOTUNE_EARLY_PASS_PEAK_EPSILON_GB = 0.05
+AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE = 0.02
 
 
 def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VRAM_GB) -> float:
@@ -57,6 +70,13 @@ def _clamp_save_vram_target_gb(value: Any, default: float = AUTOTUNE_MIN_FREE_VR
     except Exception:
         raw = float(default)
     return round(max(0.0, min(9.9, raw)), 1)
+
+
+def _stream_decode_forces_untiled(settings: Dict[str, Any]) -> bool:
+    return bool(
+        settings.get("stream_decode", False)
+        and str(settings.get("mode") or "").strip().lower() in {"tiny", "tiny-long"}
+    )
 
 
 def _within_ratio(lhs: float, rhs: float, tolerance: float) -> bool:
@@ -121,9 +141,8 @@ def _exact_payload_for_cache_lookup(signature: Dict[str, Any]) -> Dict[str, Any]
     # Cache matching should prioritize actual processed resolution (tracked separately in signature dims).
     out.pop("max_target_resolution", None)
     out.pop("use_resolution_tab", None)
-    # Reserve target is dynamic and evaluated from historical VRAM usage;
-    # changing it should not invalidate cache matching.
-    out.pop("save_vram_gb", None)
+    out.pop("global_gpu_device", None)
+    out.pop("gpu_identity", None)
     return out
 
 
@@ -201,27 +220,15 @@ def _sample_peak_vram_gb(
     probe_cancel_event: Optional[threading.Event] = None,
     min_free_target_gb: Optional[float] = None,
     total_vram_hint_gb: float = 0.0,
-    early_pass_margin_gb: Optional[float] = None,
-    early_pass_stable_sec: Optional[float] = None,
 ) -> None:
-    """
-    Track peak VRAM and optionally stop probe early.
-
-    Probe cancellation is triggered by:
-    - "threshold_reached": the whole-run peak already violates the configured
-      free-VRAM target (the probe can only fail, so finishing it wastes time);
-    - "stable_pass" (only when `early_pass_margin_gb`/`early_pass_stable_sec`
-      are provided): the probe-side gate `phase_state["early_pass_gate_ready"]`
-      is set, the peak has been stable for `early_pass_stable_sec` seconds, and
-      free headroom clears the target by at least `early_pass_margin_gb`.
-    """
+    """Track peak VRAM and stop once the configured free-VRAM floor is crossed."""
     peak_used = 0.0
     peak_phase2 = 0.0
     total_seen = 0.0
     telemetry_ok = False
     samples = 0
     phase2_samples = 0
-    last_peak_bump_ts = time.monotonic()
+    min_device_free_gb = float("inf")
 
     while not stop_event.is_set():
         snap = _query_gpu_memory_snapshot_gb()
@@ -231,8 +238,11 @@ def _sample_peak_vram_gb(
                 telemetry_ok = True
                 used_sum = sum(float(snap[d][0]) for d in selected)
                 total_sum = sum(float(snap[d][1]) for d in selected)
-                if used_sum > peak_used + float(AUTOTUNE_EARLY_PASS_PEAK_EPSILON_GB):
-                    last_peak_bump_ts = time.monotonic()
+                current_min_device_free_gb = min(
+                    max(0.0, float(snap[d][1]) - float(snap[d][0]))
+                    for d in selected
+                )
+                min_device_free_gb = min(min_device_free_gb, current_min_device_free_gb)
                 peak_used = max(peak_used, used_sum)
                 samples += 1
 
@@ -251,6 +261,7 @@ def _sample_peak_vram_gb(
                 result_box["phase2_samples"] = int(phase2_samples)
                 result_box["total_gb"] = float(total_seen if total_seen > 0 else total_vram_hint_gb)
                 result_box["telemetry_ok"] = bool(telemetry_ok)
+                result_box["min_device_free_gb"] = float(min_device_free_gb)
 
                 threshold_gate_ready = bool(
                     phase2_samples > 0 or bool((phase_state or {}).get("threshold_any_phase", False))
@@ -263,19 +274,11 @@ def _sample_peak_vram_gb(
                         else max(0.0, float(total_vram_hint_gb) - peak_used)
                     )
 
-                    if min_free_target_gb is not None and free_est < float(min_free_target_gb):
+                    free_for_threshold = min(free_est, current_min_device_free_gb)
+                    if min_free_target_gb is not None and free_for_threshold < float(min_free_target_gb):
                         result_box["early_stop_reason"] = "threshold_reached"
-                        probe_cancel_event.set()
-                    elif (
-                        early_pass_margin_gb is not None
-                        and early_pass_stable_sec is not None
-                        and min_free_target_gb is not None
-                        and total_for_eval > 0
-                        and bool((phase_state or {}).get("early_pass_gate_ready", False))
-                        and (time.monotonic() - last_peak_bump_ts) >= float(early_pass_stable_sec)
-                        and free_est >= float(min_free_target_gb) + float(early_pass_margin_gb)
-                    ):
-                        result_box["early_stop_reason"] = "stable_pass"
+                        with suppress(Exception):
+                            setattr(probe_cancel_event, "autotune_cancel_reason", "vram_threshold")
                         probe_cancel_event.set()
 
         stop_event.wait(max(0.05, float(interval_sec)))
@@ -289,6 +292,8 @@ def _sample_peak_vram_gb(
     elif float(total_vram_hint_gb) > 0:
         result_box["total_gb"] = float(total_vram_hint_gb)
     result_box["telemetry_ok"] = bool(telemetry_ok)
+    if math.isfinite(min_device_free_gb):
+        result_box["min_device_free_gb"] = float(min_device_free_gb)
 
 
 def _looks_like_oom(log_text: str) -> bool:
@@ -318,9 +323,7 @@ def _wait_for_vram_drain(
     whole-run peak and fakes a threshold failure.
     """
     try:
-        drain_target_gb = max(3.0, float(ambient_used_gb) + 1.5)
-        if float(total_vram_gb) > 0:
-            drain_target_gb = min(drain_target_gb, float(total_vram_gb) * 0.5)
+        drain_target_gb = vram_drain_target_gb(ambient_used_gb)
         deadline = time.time() + float(timeout_sec)
         waited_sec = 0.0
         while time.time() < deadline:
@@ -374,12 +377,13 @@ def _build_autotune_signature(
     target_h: int,
     effective_in_w: int,
     effective_in_h: int,
-    global_gpu_device: str,
     total_vram_gb: float,
     min_free_target_gb: float,
 ) -> Dict[str, Any]:
     exact_payload = {
         "autotune_model": AUTOTUNE_MODEL_ID,
+        "autotune_strategy_version": int(AUTOTUNE_STRATEGY_VERSION),
+        "input_kind": str(settings.get("_autotune_input_kind") or "video"),
         "version": str(settings.get("version") or "1.1"),
         "mode": str(settings.get("mode") or "full"),
         "scale": int(settings.get("scale") or 4),
@@ -400,7 +404,6 @@ def _build_autotune_signature(
         "max_target_resolution": int(settings.get("max_target_resolution") or 0),
         "pre_downscale_then_upscale": bool(settings.get("pre_downscale_then_upscale", True)),
         "use_resolution_tab": bool(settings.get("use_resolution_tab", True)),
-        "global_gpu_device": str(global_gpu_device or ""),
         "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb),
         "test_target_frames": int(AUTOTUNE_TARGET_FRAMES),
         "test_overlap_primary": int(AUTOTUNE_PRIMARY_OVERLAP),
@@ -421,10 +424,13 @@ def _build_autotune_signature(
 
 
 def _autotune_signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> bool:
-    if not _autotune_signature_settings_match(candidate, expected, vram_tolerance=0.10):
+    if not _autotune_signature_settings_match(
+        candidate,
+        expected,
+        vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+    ):
         return False
-    pixel_diff, _aspect_diff, _dim_diff = _autotune_signature_resolution_distance(candidate, expected)
-    return pixel_diff <= 0.05
+    return resolution_signatures_identical(candidate, expected)
 
 
 def _ratio_diff(lhs: Any, rhs: Any) -> float:
@@ -496,13 +502,52 @@ def _autotune_payload_status_rank(payload: Dict[str, Any]) -> int:
     return 3
 
 
-def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _find_cached_autotune_log(
+    log_dir: Path,
+    expected_signature: Dict[str, Any],
+    min_free_vram_target_gb: float,
+    current_ambient_used_gb: float = 0.0,
+) -> Optional[Dict[str, Any]]:
     def _payload_has_frontier_proof(payload: Dict[str, Any]) -> bool:
         best = payload.get("best_config")
         tests = payload.get("tests")
-        if not isinstance(best, dict) or (not best) or (not isinstance(tests, list)):
+        search_results = payload.get("search_results")
+        if (
+            not isinstance(best, dict)
+            or not best
+            or not isinstance(tests, list)
+            or not isinstance(search_results, dict)
+        ):
             return False
         sig_exact = ((payload.get("signature") or {}).get("exact") or {})
+        stream_forces_untiled = _stream_decode_forces_untiled(sig_exact)
+        temporal_result = search_results.get("temporal")
+        if not isinstance(temporal_result, dict) or not bool(temporal_result.get("frontier_verified", False)):
+            return False
+        if temporal_result.get("hard_failed_indices") or bool(
+            temporal_result.get("indeterminate_above_best", False)
+        ):
+            return False
+        if not stream_forces_untiled:
+            fallback_result = search_results.get("spatial_fallback")
+            primary_result = search_results.get("spatial_primary")
+            if not isinstance(fallback_result, dict) or not bool(
+                fallback_result.get("frontier_verified", False)
+            ):
+                return False
+            if fallback_result.get("hard_failed_indices") or bool(
+                fallback_result.get("indeterminate_above_best", False)
+            ):
+                return False
+            if not isinstance(primary_result, dict):
+                return False
+            primary_verified = bool(primary_result.get("frontier_verified", False)) or bool(
+                primary_result.get("best_tile") is None
+                and primary_result.get("boundary_failed", False)
+                and not primary_result.get("hard_failed_indices")
+            )
+            if not primary_verified or bool(primary_result.get("indeterminate_above_best", False)):
+                return False
         sig_target = _clamp_save_vram_target_gb(
             sig_exact.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
             AUTOTUNE_MIN_FREE_VRAM_GB,
@@ -513,9 +558,10 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
             tile = int(cfg.get("tile_size") or 0)
             overlap_val = int(cfg.get("overlap") or 0)
             tiled_dit_val = bool(cfg.get("tiled_dit", True))
+            temporal = chunk * 1_000_000
             if not tiled_dit_val:
-                return 1_000_000_000 + (chunk * 10_000) - overlap_val
-            return (chunk * 10_000) + (tile * 10) - overlap_val
+                return temporal + 200_000
+            return temporal + (tile * 100) + overlap_val
 
         best_rank = _rank(best)
         for item in tests:
@@ -553,17 +599,17 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
         # Top-of-search candidate reached; no higher-quality candidate exists.
         if (
             int(best.get("frame_chunk_size") or 0) >= int(AUTOTUNE_FRAME_CHUNK_SEQUENCE[0])
-            and int(best.get("tile_size") or 0) >= int(AUTOTUNE_TILE_MAX)
             and (not bool(best.get("tiled_dit", True)))
+            and (
+                stream_forces_untiled
+                or int(best.get("tile_size") or 0) >= int(AUTOTUNE_TILE_MAX)
+            )
         ):
             return True
         return False
 
     def _is_finalized_and_frontier_verified(payload: Dict[str, Any]) -> bool:
-        status = str(payload.get("status") or "").strip().lower()
-        if status not in {"completed", "threshold_reached"}:
-            return False
-        if not bool(payload.get("finalized", False)):
+        if not is_verified_autotune_payload(payload):
             return False
         # Require actual frontier proof from saved tests; do not rely on legacy flags alone.
         if not _payload_has_frontier_proof(payload):
@@ -572,17 +618,37 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
 
     def _has_strict_phase2_validation(payload: Dict[str, Any]) -> bool:
         tests = payload.get("tests")
-        if not isinstance(tests, list):
+        best = payload.get("best_config")
+        if not isinstance(tests, list) or not isinstance(best, dict):
             return False
         for item in tests:
             if not isinstance(item, dict):
                 continue
             if not bool(item.get("passed", False)):
                 continue
+            if str(item.get("probe_cancel_reason") or "").strip():
+                continue
+            try:
+                if int(item.get("returncode", 1)) != 0:
+                    continue
+            except Exception:
+                continue
+            if not bool(item.get("telemetry_ok", False)):
+                continue
+            if bool(item.get("oom", False)):
+                continue
+            if int(item.get("frame_chunk_size") or 0) != int(best.get("frame_chunk_size") or 0):
+                continue
+            if int(item.get("tile_size") or 0) != int(best.get("tile_size") or 0):
+                continue
+            if int(item.get("overlap") or 0) != int(best.get("overlap") or 0):
+                continue
+            if bool(item.get("tiled_dit", True)) != bool(best.get("tiled_dit", True)):
+                continue
             # New strict probe quality markers (added after initial implementation).
             if not bool(item.get("phase2_gate_ready", False)):
                 continue
-            if int(item.get("tile_idx_max", 0) or 0) < 1:
+            if bool(item.get("tiled_dit", True)) and int(item.get("tile_idx_max", 0) or 0) < 1:
                 continue
             iter_idx = int(item.get("iter_idx_max", 0) or 0)
             if iter_idx < int(AUTOTUNE_PHASE2_MIN_ITER_FOR_GATE):
@@ -624,9 +690,28 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any])
             # Ignore stale cache logs produced before strict DiT-phase validation.
             continue
         sig_blob = payload.get("signature")
-        if not _autotune_signature_settings_match(sig_blob, expected_signature, vram_tolerance=0.10):
+        if not _autotune_signature_settings_match(
+            sig_blob,
+            expected_signature,
+            vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+        ):
+            continue
+        try:
+            cached_reserve = float(((sig_blob or {}).get("exact") or {}).get("save_vram_gb"))
+        except Exception:
+            continue
+        if abs(cached_reserve - float(min_free_vram_target_gb)) > 0.05:
+            continue
+        if not cached_best_has_headroom(
+            payload,
+            expected_signature,
+            min_free_vram_target_gb,
+            current_ambient_used_gb=current_ambient_used_gb,
+        ):
             continue
         pixel_diff, aspect_diff, dim_diff = _autotune_signature_resolution_distance(sig_blob, expected_signature)
+        if not resolution_signatures_identical(sig_blob, expected_signature):
+            continue
         scored_matches.append(
             {
                 "payload": payload,
@@ -896,9 +981,13 @@ def flashvsr_auto_tune_action(
         tile = int(cfg.get("tile_size") or 0)
         overlap_val = int(cfg.get("overlap") or 0)
         tiled_dit_val = bool(cfg.get("tiled_dit", True))
+        # Temporal context is the primary quality/speed axis. Within the same
+        # chunk, larger tiles and overlap reduce stitching artifacts; untiled
+        # DiT is the final spatial step rather than outranking every chunk size.
+        temporal = chunk * 1_000_000
         if not tiled_dit_val:
-            return 1_000_000_000 + (chunk * 10_000) - overlap_val
-        return (chunk * 10_000) + (tile * 10) - overlap_val
+            return temporal + 200_000
+        return temporal + (tile * 100) + overlap_val
 
     session_dir: Optional[Path] = None
     autotune_log_path: Optional[Path] = None
@@ -930,6 +1019,12 @@ def flashvsr_auto_tune_action(
             settings.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
             AUTOTUNE_MIN_FREE_VRAM_GB,
         )
+        if min_free_vram_target_gb < float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB):
+            _append_log(
+                f"Raised Auto Tune's effective VRAM reserve from {min_free_vram_target_gb:.1f}GB "
+                f"to the {AUTOTUNE_EMERGENCY_FREE_VRAM_GB:.1f}GB emergency safety floor."
+            )
+            min_free_vram_target_gb = float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB)
         settings["save_vram_gb"] = float(min_free_vram_target_gb)
         try:
             campaign_profile_min_peak_gb = max(
@@ -945,6 +1040,7 @@ def flashvsr_auto_tune_action(
             _append_log("Input path is missing or does not exist.")
             yield _payload("Auto Tune requires a valid input file/path.", show_indicator=False)
             return
+        settings["_autotune_input_kind"] = detect_input_type(input_path)
 
         global_gpu_device = get_global_gpu_override(seed_controls, global_cfg)
         settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
@@ -1013,8 +1109,6 @@ def flashvsr_auto_tune_action(
             total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in selected_gpu_ids if g in gpu_snapshot)
         if total_vram_gb <= 0:
             try:
-                from shared.gpu_utils import get_gpu_info
-
                 gpus = get_gpu_info()
             except Exception:
                 gpus = []
@@ -1032,7 +1126,6 @@ def flashvsr_auto_tune_action(
             _append_log("Could not detect total VRAM for selected GPU.")
             yield _payload("Auto Tune failed to detect GPU VRAM.", show_indicator=False)
             return
-
         telemetry_gpu_ids: List[int] = []
         if gpu_snapshot:
             telemetry_gpu_ids = [idx for idx in selected_gpu_ids if idx in gpu_snapshot]
@@ -1043,15 +1136,46 @@ def flashvsr_auto_tune_action(
             )
             yield _payload("Auto Tune requires live VRAM telemetry from nvidia-smi.", show_indicator=False)
             return
-        # Let leftovers from any previous run drain before measuring the ambient
-        # baseline, otherwise the drain gate inherits the residue.
-        _wait_for_vram_drain(telemetry_gpu_ids, 1.5, float(total_vram_gb), _append_log, timeout_sec=30.0)
         ambient_snap = _query_gpu_memory_snapshot_gb()
+        if not ambient_snap:
+            ambient_snap = gpu_snapshot
         ambient_used_gb = (
             sum(float(ambient_snap[g][0]) for g in telemetry_gpu_ids if g in ambient_snap)
             if ambient_snap
             else 0.0
         )
+        launch_ok, ambient_free_gb, launch_required_gb = autotune_launch_headroom(
+            total_vram_gb,
+            ambient_used_gb,
+            min_free_vram_target_gb,
+        )
+        per_device_free = [
+            max(0.0, float(ambient_snap[g][1]) - float(ambient_snap[g][0]))
+            for g in telemetry_gpu_ids
+            if g in ambient_snap
+        ]
+        if per_device_free:
+            ambient_free_gb = min(ambient_free_gb, min(per_device_free))
+            launch_ok = bool(launch_ok and ambient_free_gb >= launch_required_gb)
+        if not launch_ok:
+            state["operation_status"] = "error"
+            _append_log(
+                f"Auto Tune stopped before launching a model: only {ambient_free_gb:.2f}GB "
+                f"is currently free, but at least {launch_required_gb:.2f}GB is required "
+                "for the reserve plus launch safety margin."
+            )
+            yield _payload(
+                "Auto Tune did not start because the GPU is already too full. "
+                "Stop other GPU jobs and try again.",
+                show_indicator=False,
+            )
+            return
+        multi_gpu_autotune = len(telemetry_gpu_ids) > 1
+        if multi_gpu_autotune:
+            _append_log(
+                "Multiple GPUs selected: enforcing per-GPU headroom and running fresh probes "
+                "instead of reusing aggregate-memory history."
+            )
 
         signature = _build_autotune_signature(
             settings,
@@ -1059,17 +1183,24 @@ def flashvsr_auto_tune_action(
             target_h=target_h,
             effective_in_w=effective_in_w,
             effective_in_h=effective_in_h,
-            global_gpu_device=str(global_gpu_device),
             total_vram_gb=total_vram_gb,
             min_free_target_gb=min_free_vram_target_gb,
         )
         logs_dir = Path(getattr(runner, "base_dir", Path.cwd())) / "vram_usages"
+        verified_cached_payload = (
+            None
+            if campaign_force_fresh or multi_gpu_autotune
+            else _find_cached_autotune_log(
+                logs_dir,
+                signature,
+                min_free_vram_target_gb,
+                ambient_used_gb,
+            )
+        )
         history_sources: List[str] = []
         history_outcomes_by_key: Dict[Tuple[int, int, int, bool], Dict[str, Any]] = {}
-        history_has_completed_frontier = False
-        # Cross-VRAM priors: clean measured peaks from same-settings/same-resolution
-        # logs recorded on a DIFFERENT GPU size; they predict this GPU's frontier
-        # and seed the search start (results are still verified locally).
+        # Capacity-shifted priors can hint at the frontier, but never replace a
+        # live safety-first probe on the selected GPU.
         prior_peaks_by_config: Dict[Tuple[int, int, int, bool], float] = {}
         prior_source_vrams: set = set()
 
@@ -1081,24 +1212,11 @@ def flashvsr_auto_tune_action(
                 bool(item.get("tiled_dit", True)),
             )
 
-        def _history_boundary_fail(item: Dict[str, Any]) -> bool:
-            try:
-                free_gb = float(item.get("estimated_free_gb", 1e9) or 1e9)
-            except Exception:
-                free_gb = 1e9
-            if bool(item.get("oom", False)):
-                return True
-            if str(item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
-                return True
-            if bool(item.get("telemetry_ok", False)) and free_gb < float(min_free_vram_target_gb):
-                return True
-            return False
-
         try:
             candidate_logs = sorted(
                 [p for p in logs_dir.glob("*.json") if p.is_file()],
                 key=lambda p: p.stat().st_mtime,
-            ) if logs_dir.exists() and (not campaign_force_fresh) else []
+            ) if logs_dir.exists() and (not campaign_force_fresh) and (not multi_gpu_autotune) else []
         except Exception:
             candidate_logs = []
 
@@ -1117,12 +1235,19 @@ def flashvsr_auto_tune_action(
             if (not model_id) and (not is_flash_file):
                 continue
             sig_blob = payload.get("signature")
-            if not _autotune_signature_settings_match(sig_blob, signature, vram_tolerance=0.10):
-                # Same settings on a different GPU size cannot be reused directly,
-                # but their clean full-run peaks predict this GPU's frontier.
+            if not _autotune_signature_settings_match(
+                sig_blob,
+                signature,
+                vram_tolerance=AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE,
+            ):
+                # A materially different reported capacity cannot be reused
+                # directly, but compatible full-run peaks can still be hints.
                 if _autotune_signature_settings_match(sig_blob, signature, vram_tolerance=1e9):
-                    p_diff, _pa, _pd = _autotune_signature_resolution_distance(sig_blob, signature)
-                    if p_diff <= AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE:
+                    if resolution_signatures_compatible(
+                        sig_blob or {},
+                        signature,
+                        max_pixel_diff=AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE,
+                    ):
                         for raw in payload.get("tests") or []:
                             if not isinstance(raw, dict):
                                 continue
@@ -1133,7 +1258,11 @@ def flashvsr_auto_tune_action(
                                     continue
                                 if str(raw.get("probe_cancel_reason") or "").strip():
                                     continue
-                                peak = float(_resolve_autotune_eval_peak_gb(raw))
+                                peak = ambient_adjusted_peak_gb(
+                                    _resolve_autotune_eval_peak_gb(raw),
+                                    payload,
+                                    ambient_used_gb,
+                                )
                                 if peak <= 0:
                                     continue
                                 cfg_key = (
@@ -1180,8 +1309,11 @@ def flashvsr_auto_tune_action(
             selected_history_logs = [
                 row
                 for row in scored_history_logs
-                if float(row.get("pixel_diff", 1e9)) <= float(AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE)
-            ][:12]
+                if resolution_signatures_identical(
+                    (row.get("payload") or {}).get("signature") or {},
+                    signature,
+                )
+            ]
             _append_log(
                 f"Checked {len(candidate_logs)} saved Auto Tune log(s): "
                 f"{len(scored_history_logs)} match your current settings and GPU, "
@@ -1207,13 +1339,12 @@ def flashvsr_auto_tune_action(
             if not isinstance(payload, dict):
                 continue
             history_sources.append(str(log_path))
-            status_raw = str(payload.get("status") or "").strip().lower()
-            if (
-                bool(payload.get("finalized", False))
-                and bool(payload.get("frontier_verified", False))
-                and status_raw in {"completed", "threshold_reached"}
-            ):
-                history_has_completed_frontier = True
+            try:
+                recorded_target_gb = float(
+                    (((payload.get("signature") or {}).get("exact") or {}).get("save_vram_gb"))
+                )
+            except Exception:
+                recorded_target_gb = float("nan")
             tests_blob = payload.get("tests")
             if not isinstance(tests_blob, list):
                 continue
@@ -1227,7 +1358,13 @@ def flashvsr_auto_tune_action(
                 item["tiled_dit"] = bool(item.get("tiled_dit", True))
                 item["telemetry_ok"] = bool(item.get("telemetry_ok", False))
                 item["oom"] = bool(item.get("oom", False))
-                peak_used = _resolve_autotune_eval_peak_gb(item)
+                item["recorded_min_free_vram_target_gb"] = recorded_target_gb
+                original_peak_used = _resolve_autotune_eval_peak_gb(item)
+                peak_used = ambient_adjusted_peak_gb(
+                    original_peak_used,
+                    payload,
+                    ambient_used_gb,
+                )
                 item["max_vram_used_gb"] = float(peak_used)
                 item["peak_source"] = "whole_run" if float(item.get("whole_run_peak_vram_used_gb", 0.0) or 0.0) > 0 else str(item.get("peak_source") or "legacy")
                 try:
@@ -1236,7 +1373,20 @@ def flashvsr_auto_tune_action(
                     historical_total = 0.0
                 total_for_eval = float(total_vram_gb if total_vram_gb > 0 else historical_total)
                 if peak_used > 0 and total_for_eval > 0:
-                    item["estimated_free_gb"] = max(0.0, total_for_eval - peak_used)
+                    aggregate_free_gb = max(0.0, total_for_eval - peak_used)
+                    if item.get("min_device_free_gb") is not None:
+                        item["min_device_free_gb"] = ambient_adjusted_min_device_free_gb(
+                            item.get("min_device_free_gb"),
+                            original_peak_used,
+                            peak_used,
+                            aggregate_free_gb,
+                        )
+                    else:
+                        item["min_device_free_gb"] = aggregate_free_gb
+                    item["estimated_free_gb"] = min(
+                        aggregate_free_gb,
+                        float(item["min_device_free_gb"]),
+                    )
                 else:
                     try:
                         item["estimated_free_gb"] = float(item.get("estimated_free_gb", 0.0) or 0.0)
@@ -1246,109 +1396,35 @@ def flashvsr_auto_tune_action(
                     returncode_ok = int(item.get("returncode", 1)) == 0
                 except Exception:
                     returncode_ok = False
-                fast_probe_ok = bool(item.get("fast_probe_stop", False))
                 probe_stop = str(item.get("probe_cancel_reason") or "").strip().lower()
-                if probe_stop == "enough_phase2_samples":
-                    # Legacy v3.x early-stop rows only measured a partial peak;
-                    # neither a trustworthy pass nor a boundary failure.
-                    continue
-                stable_pass_ok = probe_stop == "stable_pass"
                 item["passed"] = bool(
-                    (returncode_ok or fast_probe_ok or stable_pass_ok)
+                    returncode_ok
                     and item["telemetry_ok"]
                     and (not item["oom"])
                     and float(item["estimated_free_gb"]) >= float(min_free_vram_target_gb)
-                    and probe_stop != "threshold_reached"
+                    and not probe_stop
                 )
-                if (not item["passed"]) and (not _history_boundary_fail(item)):
-                    # Indeterminate rows (crashes without a VRAM signature)
-                    # must not be replayed as settled results.
-                    continue
                 history_outcomes_by_key[_history_key_from_outcome(item)] = item
 
         history_tests = list(history_outcomes_by_key.values())
-        history_best_safe: Optional[Dict[str, Any]] = None
-        history_best_rank = -1
-        for item in history_tests:
-            if not bool(item.get("passed", False)):
-                continue
-            if str(item.get("probe_cancel_reason") or "").strip().lower() == "stable_pass":
-                # Early-stopped passes carry a partial peak. They may seed the
-                # resumed search (which revalidates the final pick at full
-                # length), but must never feed the instant-reuse shortcut.
-                continue
-            candidate_cfg = {
-                "tile_size": int(item.get("tile_size") or AUTOTUNE_BASE_TILE_SIZE),
-                "overlap": int(item.get("overlap") or AUTOTUNE_PRIMARY_OVERLAP),
-                "frame_chunk_size": int(item.get("frame_chunk_size") or AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]),
-                "tiled_dit": bool(item.get("tiled_dit", True)),
-                "min_free_vram_target_gb": float(min_free_vram_target_gb),
-                "measured_peak_vram_used_gb": float(item.get("max_vram_used_gb") or 0.0),
-                "estimated_free_vram_gb": float(item.get("estimated_free_gb") or 0.0),
-            }
-            rank = _quality_rank(candidate_cfg)
-            if rank > history_best_rank:
-                history_best_rank = rank
-                history_best_safe = candidate_cfg
 
-        history_frontier_best: Optional[Dict[str, Any]] = None
-        if history_best_safe is not None:
-            if (
-                int(history_best_safe.get("frame_chunk_size") or 0) >= int(AUTOTUNE_FRAME_CHUNK_SEQUENCE[0])
-                and int(history_best_safe.get("tile_size") or 0) >= int(AUTOTUNE_TILE_MAX)
-                and (not bool(history_best_safe.get("tiled_dit", True)))
-            ):
-                history_frontier_best = dict(history_best_safe)
-            else:
-                for item in history_tests:
-                    if bool(item.get("passed", False)):
-                        continue
-                    if not _history_boundary_fail(item):
-                        continue
-                    fail_rank = _quality_rank(
-                        {
-                            "frame_chunk_size": int(item.get("frame_chunk_size") or 0),
-                            "tile_size": int(item.get("tile_size") or 0),
-                            "overlap": int(item.get("overlap") or 0),
-                            "tiled_dit": bool(item.get("tiled_dit", True)),
-                        }
-                    )
-                    if fail_rank > history_best_rank:
-                        history_frontier_best = dict(history_best_safe)
-                        break
-
-        if history_has_completed_frontier and history_best_safe is None:
-            _append_log(
-                "A previous Auto Tune already tested these settings on this GPU: every tested "
-                f"configuration peaked too high to leave {min_free_vram_target_gb:.1f}GB VRAM free "
-                f"(GPU total: {total_vram_gb:.1f}GB)."
-            )
-            state["operation_status"] = "error"
-            yield _payload(
-                (
-                    f"No FlashVSR configuration can keep {min_free_vram_target_gb:.1f}GB VRAM free with these settings. "
-                    "Lower 'Save VRAM (GB)', reduce the output resolution, or switch to a lighter mode/precision, "
-                    "then run Auto Tune again."
-                ),
-                show_indicator=False,
-            )
-            return
-
-        if history_has_completed_frontier and history_frontier_best is None and history_best_safe is not None:
-            history_frontier_best = dict(history_best_safe)
-
-        if history_frontier_best:
+        cached_frontier_best = (
+            dict(verified_cached_payload.get("best_config") or {})
+            if isinstance(verified_cached_payload, dict)
+            else {}
+        )
+        if cached_frontier_best:
             flash_cfg = state.setdefault("seed_controls", {}).setdefault("flashvsr_settings", {})
-            flash_cfg["tile_size"] = int(history_frontier_best.get("tile_size") or AUTOTUNE_BASE_TILE_SIZE)
-            flash_cfg["overlap"] = int(history_frontier_best.get("overlap") or AUTOTUNE_PRIMARY_OVERLAP)
+            flash_cfg["tile_size"] = int(cached_frontier_best.get("tile_size") or AUTOTUNE_BASE_TILE_SIZE)
+            flash_cfg["overlap"] = int(cached_frontier_best.get("overlap") or AUTOTUNE_PRIMARY_OVERLAP)
             flash_cfg["frame_chunk_size"] = int(
-                history_frontier_best.get("frame_chunk_size") or AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]
+                cached_frontier_best.get("frame_chunk_size") or AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]
             )
-            flash_cfg["tiled_dit"] = bool(history_frontier_best.get("tiled_dit", True))
-            source_hint = history_sources[-1] if history_sources else "(matched logs)"
+            flash_cfg["tiled_dit"] = bool(cached_frontier_best.get("tiled_dit", True))
+            source_hint = str(verified_cached_payload.get("_log_path") or "verified cache")
             _append_log(
-                "A previous Auto Tune already found the best settings for this exact setup "
-                f"({len(history_sources)} matching log(s)) - no new tests needed."
+                "A previous completed and frontier-verified Auto Tune found the best settings "
+                f"for this setup - no new tests needed ({source_hint})."
             )
             _append_log(
                 f"Applied: Tile Size {flash_cfg['tile_size']}, Overlap {flash_cfg['overlap']}, "
@@ -1400,7 +1476,7 @@ def flashvsr_auto_tune_action(
             tile_value=int(settings.get("tile_size") or AUTOTUNE_BASE_TILE_SIZE),
             overlap_value=int(AUTOTUNE_PRIMARY_OVERLAP),
             chunk_value=AUTOTUNE_FRAME_CHUNK_SEQUENCE[0],
-            tiled_dit_value=True,
+            tiled_dit_value=not _stream_decode_forces_untiled(settings),
         )
 
         demo_meta = _create_autotune_demo_video(
@@ -1427,23 +1503,25 @@ def flashvsr_auto_tune_action(
         working_settings["save_metadata"] = False
         working_settings["face_restore_after_upscale"] = False
         working_settings["output_override"] = ""
-        working_settings["stream_decode"] = False
+        working_settings["stream_decode"] = bool(settings.get("stream_decode", False))
         working_settings["tile_size"] = AUTOTUNE_BASE_TILE_SIZE
         working_settings["overlap"] = AUTOTUNE_PRIMARY_OVERLAP
-        working_settings["tiled_dit"] = True
+        working_settings["tiled_dit"] = not _stream_decode_forces_untiled(working_settings)
         working_settings["frame_chunk_size"] = AUTOTUNE_FRAME_CHUNK_SEQUENCE[0]
         working_settings["device"] = settings.get("device", "")
 
         tests: List[Dict[str, Any]] = list(history_tests)
         known_outcomes_by_key: Dict[Tuple[int, int, int, bool], Dict[str, Any]] = dict(history_outcomes_by_key)
-        best_config: Optional[Dict[str, Any]] = dict(history_best_safe) if isinstance(history_best_safe, dict) else None
-        best_rank = _quality_rank(best_config) if isinstance(best_config, dict) else -1
+        # Historical rows resume individual probes only. A partial log must not
+        # preselect a result before the temporal and spatial searches settle.
+        best_config: Optional[Dict[str, Any]] = None
+        best_rank = -1
         status_reason = "running"
         created_at = time.strftime("%Y-%m-%d %H:%M:%S")
         run_counter = 0
-        # Bisection worst case across distinct tile grids + overlap fallback +
-        # chunk descent; far below the old linear 96 estimate.
-        total_estimated_runs = 28
+        search_results: Dict[str, Any] = {}
+        # Conservative temporal growth, spatial frontier search, and overlap fallback.
+        total_estimated_runs = 56
 
         if history_tests:
             _append_log(
@@ -1458,11 +1536,17 @@ def flashvsr_auto_tune_action(
             frontier_verified: bool = False,
         ) -> None:
             nonlocal autotune_log_path
+            result_reason = str(status_override or status_reason)
             payload = {
                 "model": AUTOTUNE_MODEL_ID,
                 "created_at": created_at,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "status": str(status_override or status_reason),
+                "status": persisted_autotune_status(
+                    result_reason,
+                    finalized=finalized,
+                    frontier_verified=frontier_verified,
+                ),
+                "result_reason": result_reason,
                 "finalized": bool(finalized),
                 "frontier_verified": bool(frontier_verified),
                 "signature": signature,
@@ -1482,11 +1566,13 @@ def flashvsr_auto_tune_action(
                     "selected_device": str(global_gpu_device),
                     "selected_ids": list(gpu_ids),
                     "total_vram_gb": float(total_vram_gb),
+                    "ambient_used_gb": float(ambient_used_gb),
                     "min_free_target_gb": float(min_free_vram_target_gb),
                 },
                 "demo_clip": dict(demo_meta) if isinstance(demo_meta, dict) else {},
                 "tests": list(tests),
                 "best_config": dict(best_config) if isinstance(best_config, dict) else {},
+                "search_results": dict(search_results),
             }
             saved = _write_autotune_log(logs_dir, payload, existing_path=autotune_log_path)
             if saved and autotune_log_path is None:
@@ -1500,7 +1586,6 @@ def flashvsr_auto_tune_action(
             test_tile: int,
             test_overlap: int,
             test_tiled_dit: bool,
-            allow_early_pass: bool = True,
         ) -> Tuple[FlashVSRResult, Dict[str, Any]]:
             nonlocal run_counter
             run_counter += 1
@@ -1509,7 +1594,6 @@ def flashvsr_auto_tune_action(
             probe_settings["tile_size"] = int(test_tile)
             probe_settings["overlap"] = int(test_overlap)
             probe_settings["tiled_dit"] = bool(test_tiled_dit)
-            probe_settings["stream_decode"] = False
             probe_settings["output_override"] = str(
                 session_dir
                 / (
@@ -1548,9 +1632,8 @@ def flashvsr_auto_tune_action(
                 "iter_idx_max": 0,
                 "iter_total_max": 0,
                 "phase2_gate_ready": False,
-                "early_pass_gate_ready": False,
                 "step_full_seen": False,
-                "threshold_any_phase": bool(campaign_force_fresh),
+                "threshold_any_phase": True,
             }
             probe_cancel_event = threading.Event()
             sampler_stop = threading.Event()
@@ -1603,13 +1686,6 @@ def flashvsr_auto_tune_action(
                     if int(phase_state.get("iter_idx_max") or 0) >= int(AUTOTUNE_PHASE2_MIN_ITER_FOR_GATE):
                         phase_state["phase2_gate_ready"] = True
 
-                # Early-success gate: tiled probes only, and only once the first
-                # DiT tile has been fully processed (decode included) so every
-                # per-tile phase's steady-state peak has been observed. Later
-                # tiles repeat the same memory profile.
-                if bool(test_tiled_dit) and int(phase_state.get("tile_idx_max") or 0) >= 2:
-                    phase_state["early_pass_gate_ready"] = True
-
                 if _cancel_requested():
                     probe_cancel_event.set()
 
@@ -1619,13 +1695,11 @@ def flashvsr_auto_tune_action(
                     sampler_stop,
                     sampler_box,
                     telemetry_gpu_ids,
-                    0.20,
+                    AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC,
                     phase_state,
                     probe_cancel_event,
                     min_free_vram_target_gb,
                     float(total_vram_gb),
-                    (AUTOTUNE_EARLY_PASS_MARGIN_GB if allow_early_pass and not campaign_force_fresh else None),
-                    (AUTOTUNE_EARLY_PASS_STABLE_SEC if allow_early_pass and not campaign_force_fresh else None),
                 ),
                 daemon=True,
             )
@@ -1662,23 +1736,28 @@ def flashvsr_auto_tune_action(
             total_for_eval = measured_total if measured_total > 0 else float(total_vram_gb)
             peak_source = "whole_run"
             selected_peak_gb = float(max_used_gb)
-            free_gb = max(0.0, total_for_eval - selected_peak_gb) if total_for_eval > 0 else 0.0
+            aggregate_free_gb = (
+                max(0.0, total_for_eval - selected_peak_gb)
+                if total_for_eval > 0
+                else 0.0
+            )
+            min_device_free_gb = float(
+                sampler_box.get("min_device_free_gb", aggregate_free_gb)
+                or 0.0
+            )
+            free_gb = min(aggregate_free_gb, min_device_free_gb)
 
             canceled_by_user = _cancel_requested()
             oom = bool(_looks_like_oom(result.log))
             oom_phase = _detect_flashvsr_oom_phase(result.log) if oom else ""
             fast_probe_stop = bool(early_stop_reason == "threshold_reached")
-            stable_pass_stop = bool(early_stop_reason == "stable_pass")
-            return_ok = bool(result.returncode == 0) or (
-                (fast_probe_stop or stable_pass_stop) and (not canceled_by_user) and (not oom)
-            )
             passed = bool(
                 telemetry_ok
-                and return_ok
+                and int(result.returncode) == 0
                 and (not oom)
                 and (not canceled_by_user)
                 and float(free_gb) >= float(min_free_vram_target_gb)
-                and early_stop_reason != "threshold_reached"
+                and not early_stop_reason
             )
 
             outcome = {
@@ -1695,6 +1774,7 @@ def flashvsr_auto_tune_action(
                 "whole_run_peak_vram_used_gb": round(max_used_gb, 3),
                 "total_vram_gb": round(total_for_eval, 3),
                 "estimated_free_gb": round(free_gb, 3),
+                "min_device_free_gb": round(min_device_free_gb, 3),
                 "telemetry_ok": bool(telemetry_ok),
                 "phase2_samples": int(phase2_samples),
                 "phase2_gate_ready": bool(phase2_gate_ready),
@@ -1720,22 +1800,35 @@ def flashvsr_auto_tune_action(
                 "min_free_vram_target_gb": float(min_free_vram_target_gb),
                 "measured_peak_vram_used_gb": float(outcome.get("max_vram_used_gb") or 0.0),
                 "estimated_free_vram_gb": float(outcome.get("estimated_free_gb") or 0.0),
+                "min_device_free_vram_gb": float(
+                    outcome.get("min_device_free_gb", outcome.get("estimated_free_gb") or 0.0)
+                ),
             }
             rank = _quality_rank(candidate)
-            # >= so a full-length re-measurement of the same config replaces the
-            # partial peak recorded by an early-stopped pass.
-            if rank >= best_rank:
+            if rank > best_rank:
                 best_rank = rank
                 best_config = candidate
 
-        def _run_candidate_with_vae_retry(
+        def _outcome_key(
+            chunk_candidate: int,
+            tile_candidate: int,
+            overlap_candidate: int,
+            tiled_dit_candidate: bool,
+        ) -> Tuple[int, int, int, bool]:
+            min_tile = AUTOTUNE_FALLBACK_TILES[-1] if tiled_dit_candidate else 32
+            return (
+                int(chunk_candidate),
+                max(int(min_tile), int(tile_candidate)),
+                int(overlap_candidate),
+                bool(tiled_dit_candidate),
+            )
+
+        def _run_candidate(
             chunk_candidate: int,
             tile_candidate: int,
             tiled_dit_candidate: bool,
             overlap_candidate: int,
-            require_full: bool = False,
         ) -> Tuple[Optional[Dict[str, Any]], bool]:
-            attempted: set[int] = set()
             cur_tile = int(tile_candidate)
             run_overlap = int(overlap_candidate)
             if tiled_dit_candidate:
@@ -1743,91 +1836,96 @@ def flashvsr_auto_tune_action(
             else:
                 cur_tile = max(32, cur_tile)
 
-            while True:
-                if _cancel_requested():
-                    return None, False
-                if cur_tile in attempted:
-                    return None, False
-                attempted.add(cur_tile)
-                outcome_key = (
+            if _cancel_requested():
+                return None, False
+            outcome_key = _outcome_key(
+                chunk_candidate,
+                cur_tile,
+                run_overlap,
+                tiled_dit_candidate,
+            )
+            known_outcome = known_outcomes_by_key.get(outcome_key)
+            if isinstance(known_outcome, dict):
+                outcome = dict(known_outcome)
+                outcome["_autotune_reused"] = True
+                saved_verdict = (
+                    "fits"
+                    if bool(outcome.get("passed", False))
+                    else (
+                        "is a saved VRAM boundary"
+                        if is_vram_boundary_outcome(outcome, min_free_vram_target_gb)
+                        else "was already attempted"
+                    )
+                )
+                _append_log(
+                    f"Tile {outcome['tile_size']} at chunk {outcome['frame_chunk_size']}: "
+                    f"already tested earlier - reusing that measurement ({saved_verdict})."
+                )
+            else:
+                _result, outcome = yield from _run_probe_once(
                     int(chunk_candidate),
                     int(cur_tile),
                     int(run_overlap),
                     bool(tiled_dit_candidate),
                 )
-                known_outcome = known_outcomes_by_key.get(outcome_key)
-                if (
-                    isinstance(known_outcome, dict)
-                    and require_full
-                    and bool(known_outcome.get("passed", False))
-                    and str(known_outcome.get("probe_cancel_reason") or "") == "stable_pass"
-                ):
-                    # An early-stopped pass only measured a partial peak; the
-                    # config being applied must be validated at full length.
-                    known_outcome = None
-                if isinstance(known_outcome, dict):
-                    outcome = dict(known_outcome)
-                    _append_log(
-                        f"Tile {outcome['tile_size']} at chunk {outcome['frame_chunk_size']}: "
-                        f"already tested earlier - reusing that measurement "
-                        f"({'fits' if bool(outcome.get('passed', False)) else 'does not fit'})."
-                    )
-                else:
-                    _result, outcome = yield from _run_probe_once(
-                        int(chunk_candidate),
-                        int(cur_tile),
-                        int(run_overlap),
-                        bool(tiled_dit_candidate),
-                        allow_early_pass=(not require_full),
-                    )
-                    tests.append(outcome)
-                    known_outcomes_by_key[outcome_key] = dict(outcome)
-                    _persist_autotune_progress()
-                    probe_stop = str(outcome.get("probe_cancel_reason") or "")
-                    if bool(outcome.get("passed", False)):
-                        verdict_note = (
-                            "PASSED (stopped early - VRAM clearly safe)"
-                            if probe_stop == "stable_pass"
-                            else "PASSED (full run)"
-                        )
-                    elif probe_stop == "threshold_reached":
-                        verdict_note = "needs too much VRAM (test stopped early to save time)"
-                    elif outcome.get("oom"):
-                        verdict_note = "ran out of VRAM"
-                    elif not bool(outcome.get("telemetry_ok", False)):
-                        verdict_note = "failed (VRAM telemetry unavailable)"
-                    else:
-                        verdict_note = f"failed (exit code {outcome.get('returncode')})"
-                    dit_note = "DiT tiling ON" if bool(outcome.get("tiled_dit", True)) else "DiT tiling OFF (max quality)"
-                    _append_log(
-                        f"Tested Tile {outcome['tile_size']}, chunk {outcome['frame_chunk_size']}, {dit_note}: "
-                        f"peak {outcome['max_vram_used_gb']:.2f}GB, "
-                        f"{outcome['estimated_free_gb']:.2f}GB left free - {verdict_note}."
-                    )
-
+                tests.append(outcome)
+                known_outcomes_by_key[outcome_key] = dict(outcome)
+                _persist_autotune_progress()
+                probe_stop = str(outcome.get("probe_cancel_reason") or "")
                 if bool(outcome.get("passed", False)):
-                    _consider_best(outcome)
-                    _persist_autotune_progress()
-                    return outcome, True
+                    verdict_note = "PASSED (full run)"
+                elif probe_stop == "threshold_reached":
+                    verdict_note = "needs too much VRAM (test stopped early to save time)"
+                elif outcome.get("oom"):
+                    verdict_note = "ran out of VRAM"
+                elif not bool(outcome.get("telemetry_ok", False)):
+                    verdict_note = "failed (VRAM telemetry unavailable)"
+                else:
+                    verdict_note = f"failed (exit code {outcome.get('returncode')})"
+                dit_note = "DiT tiling ON" if bool(outcome.get("tiled_dit", True)) else "DiT tiling OFF (max quality)"
+                _append_log(
+                    f"Tested Tile {outcome['tile_size']}, chunk {outcome['frame_chunk_size']}, {dit_note}: "
+                    f"peak {outcome['max_vram_used_gb']:.2f}GB, "
+                    f"{outcome['estimated_free_gb']:.2f}GB left free - {verdict_note}."
+                )
 
-                if bool(outcome.get("oom")) and str(outcome.get("oom_phase")) in {"phase1_encode", "phase3_decode"}:
-                    if not tiled_dit_candidate:
-                        return outcome, False
-                    reduced_tile = max(AUTOTUNE_FALLBACK_TILES[-1], int(cur_tile // 2))
-                    if reduced_tile < cur_tile and reduced_tile not in attempted:
-                        phase_label = "VAE encode" if outcome.get("oom_phase") == "phase1_encode" else "VAE decode"
-                        _append_log(f"{phase_label} OOM at tile={cur_tile}. Retrying with tile={reduced_tile}.")
-                        cur_tile = reduced_tile
-                        continue
-
-                return outcome, False
+            if bool(outcome.get("passed", False)):
+                _consider_best(outcome)
+                _persist_autotune_progress()
+                return outcome, True
+            return outcome, False
 
         primary_chunk = int(AUTOTUNE_FRAME_CHUNK_SEQUENCE[0])
-        passed_primary = False
-        active_overlap = int(AUTOTUNE_PRIMARY_OVERLAP)
+        active_overlap = int(AUTOTUNE_FALLBACK_OVERLAP)
+        stream_forces_untiled = _stream_decode_forces_untiled(working_settings)
+        search_indeterminate = False
+        temporal_frontier_verified = False
+        spatial_frontier_verified = False
+        untiled_frontier_verified = True
+
+        def _record_search_health(result: Dict[str, Any], label: str) -> None:
+            nonlocal search_indeterminate
+            search_indeterminate = bool(
+                search_indeterminate
+                or result.get("indeterminate_above_best", False)
+                or result.get("stopped") == "hard_fail"
+                or (
+                    result.get("hard_failed_indices")
+                    and not result.get("frontier_verified", False)
+                )
+            )
+            if result.get("hard_failed_indices"):
+                _append_log(
+                    f"{label}: ignored persistent non-VRAM failures at candidate indices "
+                    f"{result['hard_failed_indices']} and continued searching."
+                )
 
         raw_tile_candidates = list(
-            range(int(AUTOTUNE_BASE_TILE_SIZE), int(AUTOTUNE_TILE_MAX) + 1, int(AUTOTUNE_TILE_STEP))
+            range(
+                int(min(AUTOTUNE_FALLBACK_TILES)),
+                int(AUTOTUNE_TILE_MAX) + 1,
+                int(AUTOTUNE_TILE_STEP),
+            )
         )
 
         def _distinct_tiles_for(overlap_val: int, extra_low: Tuple[int, ...] = ()) -> List[int]:
@@ -1840,7 +1938,7 @@ def flashvsr_auto_tune_action(
         vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
 
         def _prior_tile_start(chunk_val: int, overlap_val: int, tiles_list: List[int]) -> Optional[int]:
-            """Seed index predicted from other-GPU measured peaks (same settings/resolution)."""
+            """Seed index predicted from compatible historical measured peaks."""
             peaks_by_tile = {
                 int(tile): float(peak)
                 for (chunk_k, tile, overlap_k, dit_k), peak in prior_peaks_by_config.items()
@@ -1856,121 +1954,265 @@ def flashvsr_auto_tune_action(
             ) or "different-size"
             _append_log(
                 f"Measurements from a {vram_list} GPU predict this {total_vram_gb:.0f}GB GPU tops out near "
-                f"Tile {tiles_list[int(pred)]} - starting the search there (still verified with real probes)."
+                f"Tile {tiles_list[int(pred)]}. The prediction is only a hint; this GPU still starts "
+                "at the safest tile and grows in bounded steps."
             )
             return int(pred)
 
         def _max_tile_search(chunk_val: int, overlap_val: int, tiles_list: List[int]):
-            """Largest passing DiT tile at (chunk, overlap): top-first + bisection."""
+            """Largest passing DiT tile via bounded safe growth + bisection."""
             seed_idx = _prior_tile_start(chunk_val, overlap_val, tiles_list)
 
-            def _tile_probe(idx: int, require_full: bool):
+            def _tile_probe(idx: int, _require_full: bool):
                 if _cancel_requested():
                     return {"outcome": "cancelled", "early_stopped_pass": False}
-                outcome, passed_flag = yield from _run_candidate_with_vae_retry(
+                outcome, passed_flag = yield from _run_candidate(
                     int(chunk_val),
                     int(tiles_list[int(idx)]),
                     True,
                     int(overlap_val),
-                    require_full=bool(require_full),
                 )
                 if _cancel_requested() or outcome is None:
                     return {"outcome": "cancelled", "early_stopped_pass": False}
                 if passed_flag:
-                    return {
-                        "outcome": "pass",
-                        "early_stopped_pass": str(outcome.get("probe_cancel_reason") or "") == "stable_pass",
-                    }
-                if not bool(outcome.get("telemetry_ok", False)):
-                    return {"outcome": "hard_fail", "early_stopped_pass": False}
-                return {"outcome": "boundary_fail", "early_stopped_pass": False}
+                    return {"outcome": "pass", "early_stopped_pass": False}
+                verdict = (
+                    "boundary_fail"
+                    if is_vram_boundary_outcome(outcome, min_free_vram_target_gb)
+                    else "hard_fail"
+                )
+                return {
+                    "outcome": verdict,
+                    "early_stopped_pass": False,
+                    "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+                }
 
-            res = yield from frontier_bisect(len(tiles_list), _tile_probe, initial_index=seed_idx)
+            saved_pass, saved_boundary = resume_frontier_hints(
+                [
+                    known_outcomes_by_key.get(
+                        _outcome_key(chunk_val, tile_value, overlap_val, True)
+                    )
+                    for tile_value in tiles_list
+                ],
+                min_free_vram_target_gb,
+            )
+            res = yield from frontier_bisect(
+                len(tiles_list),
+                _tile_probe,
+                initial_index=seed_idx,
+                max_growth_step=2,
+                trusted_pass_index=saved_pass,
+                known_boundary_index=saved_boundary,
+            )
             best_idx = res.get("best_idx")
             return {
                 "best_tile": (int(tiles_list[int(best_idx)]) if best_idx is not None else None),
                 "stopped": res.get("stopped"),
                 "boundary_failed": bool(res.get("boundary_failed")),
+                "frontier_verified": bool(res.get("frontier_verified")),
+                "hard_failed_indices": list(res.get("hard_failed_indices") or []),
+                "indeterminate_above_best": bool(res.get("indeterminate_above_best", False)),
             }
 
-        primary_tiles = _distinct_tiles_for(active_overlap)
-        _append_log(
-            f"Finding the largest safe DiT tile at Frame Chunk {primary_chunk} (bigger tile = fewer seams). "
-            f"For {effective_in_w}x{effective_in_h} input, {len(raw_tile_candidates)} tile sizes reduce to "
-            f"{len(primary_tiles)} that actually behave differently: {primary_tiles}."
+        fallback_tiles = _distinct_tiles_for(
+            AUTOTUNE_FALLBACK_OVERLAP,
+            extra_low=AUTOTUNE_FALLBACK_TILES,
         )
-        primary_res = yield from _max_tile_search(primary_chunk, active_overlap, primary_tiles)
-        passed_primary = primary_res["best_tile"] is not None
-        if primary_res["stopped"] == "cancelled":
+        safest_tile = int(min(fallback_tiles))
+        temporal_chunks = sorted(int(value) for value in AUTOTUNE_FRAME_CHUNK_SEQUENCE)
+        temporal_peaks = {
+            int(chunk_k): float(peak)
+            for (chunk_k, tile_k, overlap_k, dit_k), peak in prior_peaks_by_config.items()
+            if int(tile_k) == safest_tile
+            and int(overlap_k) == int(AUTOTUNE_FALLBACK_OVERLAP)
+            and bool(dit_k) == (not stream_forces_untiled)
+        }
+        temporal_seed = predict_frontier_index(temporal_chunks, temporal_peaks, vram_budget_gb)
+        if temporal_seed is not None:
+            vram_list = ", ".join(
+                f"{v:.0f}GB" for v in sorted(v for v in prior_source_vrams if v > 0)
+            ) or "different-size"
+            _append_log(
+                f"Measurements from a {vram_list} GPU predict a Frame Chunk frontier near "
+                f"{temporal_chunks[int(temporal_seed)]}. This GPU will still begin at Chunk "
+                f"{temporal_chunks[0]}, Tile {safest_tile}, Overlap {AUTOTUNE_FALLBACK_OVERLAP}."
+            )
+        _append_log(
+            "Safety-first search: finding the longest safe Frame Chunk at the smallest tile "
+            f"(chunks {temporal_chunks}, Tile {safest_tile}, Overlap {AUTOTUNE_FALLBACK_OVERLAP}, "
+            f"DiT tiling {'OFF because stream decode requires it' if stream_forces_untiled else 'ON'})."
+        )
+
+        def _temporal_probe(idx: int, _require_full: bool):
+            if _cancel_requested():
+                return {"outcome": "cancelled", "early_stopped_pass": False}
+            outcome, passed_flag = yield from _run_candidate(
+                int(temporal_chunks[int(idx)]),
+                safest_tile,
+                not stream_forces_untiled,
+                int(AUTOTUNE_FALLBACK_OVERLAP),
+            )
+            if _cancel_requested() or outcome is None:
+                return {"outcome": "cancelled", "early_stopped_pass": False}
+            if passed_flag:
+                return {"outcome": "pass", "early_stopped_pass": False}
+            verdict = (
+                "boundary_fail"
+                if is_vram_boundary_outcome(outcome, min_free_vram_target_gb)
+                else "hard_fail"
+            )
+            return {
+                "outcome": verdict,
+                "early_stopped_pass": False,
+                "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+            }
+
+        temporal_saved_pass, temporal_saved_boundary = resume_frontier_hints(
+            [
+                known_outcomes_by_key.get(
+                    _outcome_key(
+                        chunk_value,
+                        safest_tile,
+                        AUTOTUNE_FALLBACK_OVERLAP,
+                        not stream_forces_untiled,
+                    )
+                )
+                for chunk_value in temporal_chunks
+            ],
+            min_free_vram_target_gb,
+        )
+        temporal_res = yield from frontier_bisect(
+            len(temporal_chunks),
+            _temporal_probe,
+            initial_index=temporal_seed,
+            max_growth_step=1,
+            trusted_pass_index=temporal_saved_pass,
+            known_boundary_index=temporal_saved_boundary,
+        )
+        search_results["temporal"] = dict(temporal_res)
+        _record_search_health(temporal_res, "Temporal search")
+        temporal_frontier_verified = bool(temporal_res.get("frontier_verified", False))
+        temporal_best_idx = temporal_res.get("best_idx")
+        if temporal_res.get("stopped") == "cancelled":
             status_reason = "cancelled"
-        elif primary_res["stopped"] == "hard_fail":
+        elif temporal_best_idx is None:
             status_reason = "failed"
 
-        if status_reason == "running" and (not passed_primary):
-            # Nothing passed at overlap=48: retry the ladder (plus the small
-            # fallback tiles) with the lighter overlap=24.
-            active_overlap = int(AUTOTUNE_FALLBACK_OVERLAP)
-            fallback_tiles = _distinct_tiles_for(active_overlap, extra_low=AUTOTUNE_FALLBACK_TILES)
+        active_best_tile: Optional[int] = None
+        selected_chunk = 0
+        if (
+            status_reason == "running"
+            and temporal_best_idx is not None
+            and stream_forces_untiled
+        ):
+            selected_chunk = int(temporal_chunks[int(temporal_best_idx)])
+            spatial_frontier_verified = True
+            untiled_frontier_verified = True
             _append_log(
-                f"No tile size fits with Overlap {AUTOTUNE_PRIMARY_OVERLAP}. Retrying with the lighter "
-                f"Overlap {active_overlap} and smaller tiles: {fallback_tiles}."
+                f"Temporal frontier settled at Frame Chunk {selected_chunk}. Stream Decode "
+                "requires DiT tiling OFF, so tile and overlap sweeps are correctly skipped."
             )
-            fb_res = yield from _max_tile_search(primary_chunk, active_overlap, fallback_tiles)
-            if fb_res["stopped"] == "cancelled":
-                status_reason = "cancelled"
-            elif fb_res["stopped"] == "hard_fail":
-                status_reason = "failed"
-            elif fb_res["best_tile"] is not None:
-                passed_primary = True
-                if int(fb_res["best_tile"]) < int(AUTOTUNE_BASE_TILE_SIZE):
-                    status_reason = "threshold_reached"
-            else:
-                status_reason = "need_lower_chunk"
-
-        if status_reason == "running":
-            status_reason = "completed" if passed_primary else "need_lower_chunk"
 
         if (
-            status_reason in {"completed", "threshold_reached"}
-            and best_config
-            and int(best_config.get("frame_chunk_size") or 0) == primary_chunk
-            and int(best_config.get("tile_size") or 0) >= int(AUTOTUNE_TILE_MAX)
+            status_reason == "running"
+            and temporal_best_idx is not None
+            and not stream_forces_untiled
         ):
+            selected_chunk = int(temporal_chunks[int(temporal_best_idx)])
             _append_log(
-                "The largest tile fits - testing whether DiT tiling can be turned OFF entirely "
-                "(highest possible quality)..."
+                f"Temporal frontier settled at Frame Chunk {selected_chunk}. First maximizing "
+                f"the fast, low-memory Overlap {AUTOTUNE_FALLBACK_OVERLAP} tile grid: {fallback_tiles}."
             )
-            _outcome_nt, _passed_nt = yield from _run_candidate_with_vae_retry(
-                primary_chunk,
+            fallback_res = yield from _max_tile_search(
+                selected_chunk,
+                int(AUTOTUNE_FALLBACK_OVERLAP),
+                fallback_tiles,
+            )
+            search_results["spatial_fallback"] = dict(fallback_res)
+            _record_search_health(fallback_res, "Low-overlap spatial search")
+            fallback_axis_verified = bool(fallback_res.get("frontier_verified", False))
+            if fallback_res.get("stopped") == "cancelled":
+                status_reason = "cancelled"
+            elif fallback_res.get("best_tile") is None:
+                status_reason = "failed"
+
+            primary_tiles = _distinct_tiles_for(
+                AUTOTUNE_PRIMARY_OVERLAP,
+                extra_low=AUTOTUNE_FALLBACK_TILES,
+            )
+            primary_axis_verified = False
+            if status_reason == "running":
+                _append_log(
+                    f"Now checking the higher-quality Overlap {AUTOTUNE_PRIMARY_OVERLAP} frontier. "
+                    f"For {effective_in_w}x{effective_in_h}, {len(raw_tile_candidates)} raw tile "
+                    f"settings reduce to {len(primary_tiles)} distinct grids: {primary_tiles}."
+                )
+                primary_res = yield from _max_tile_search(
+                    selected_chunk,
+                    int(AUTOTUNE_PRIMARY_OVERLAP),
+                    primary_tiles,
+                )
+                search_results["spatial_primary"] = dict(primary_res)
+                _record_search_health(primary_res, "Primary-overlap spatial search")
+                if primary_res.get("stopped") == "cancelled":
+                    status_reason = "cancelled"
+                elif primary_res.get("best_tile") is not None:
+                    primary_axis_verified = bool(primary_res.get("frontier_verified", False))
+                else:
+                    primary_axis_verified = bool(
+                        primary_res.get("boundary_failed", False)
+                        and not primary_res.get("hard_failed_indices")
+                    )
+
+            spatial_frontier_verified = bool(
+                fallback_axis_verified and primary_axis_verified
+            )
+            if (
+                status_reason == "running"
+                and isinstance(best_config, dict)
+                and int(best_config.get("frame_chunk_size") or 0) == selected_chunk
+                and bool(best_config.get("tiled_dit", True))
+            ):
+                active_best_tile = int(best_config.get("tile_size") or 0)
+                active_overlap = int(
+                    best_config.get("overlap") or AUTOTUNE_FALLBACK_OVERLAP
+                )
+
+        if (
+            status_reason == "running"
+            and active_best_tile is not None
+            and active_best_tile >= int(AUTOTUNE_TILE_MAX)
+        ):
+            untiled_frontier_verified = False
+            _append_log(
+                "The largest tile fits. Testing the final spatial step, DiT tiling OFF, "
+                "only after the tiled search established a safe baseline."
+            )
+            outcome_nt, passed_nt = yield from _run_candidate(
+                selected_chunk,
                 int(AUTOTUNE_TILE_MAX),
                 False,
                 active_overlap,
             )
-
-        if status_reason == "need_lower_chunk":
-            if int(active_overlap) != int(AUTOTUNE_FALLBACK_OVERLAP):
-                active_overlap = int(AUTOTUNE_FALLBACK_OVERLAP)
-            descent_tiles = _distinct_tiles_for(active_overlap, extra_low=AUTOTUNE_FALLBACK_TILES)
-            for chunk_candidate in AUTOTUNE_FRAME_CHUNK_SEQUENCE[1:]:
-                if _cancel_requested():
-                    status_reason = "cancelled"
-                    break
+            if _cancel_requested() or outcome_nt is None:
+                status_reason = "cancelled"
+            elif passed_nt or is_vram_boundary_outcome(outcome_nt, min_free_vram_target_gb):
+                untiled_frontier_verified = True
+            else:
+                search_indeterminate = True
                 _append_log(
-                    f"Still no configuration fits. Lowering Frame Chunk to {int(chunk_candidate)} "
-                    "and looking for the largest tile that works there."
+                    "DiT tiling OFF failed without a VRAM-boundary signature. The best tiled "
+                    "result remains usable, but this run will not be cached as final."
                 )
-                res = yield from _max_tile_search(int(chunk_candidate), active_overlap, descent_tiles)
-                if res["stopped"] == "cancelled":
-                    status_reason = "cancelled"
-                    break
-                if res["stopped"] == "hard_fail":
-                    status_reason = "failed"
-                    break
-                if res["best_tile"] is not None:
-                    status_reason = "threshold_reached"
-                    break
-            if status_reason == "need_lower_chunk":
-                status_reason = "failed"
+
+        if status_reason == "running":
+            status_reason = "completed" if (
+                best_config
+                and int(best_config.get("frame_chunk_size") or 0) >= primary_chunk
+                and not bool(best_config.get("tiled_dit", True))
+            ) else "threshold_reached"
+        if search_indeterminate and best_config and status_reason != "cancelled":
+            status_reason = "failed"
 
         if campaign_force_fresh and status_reason != "cancelled":
             low_tile = int(AUTOTUNE_FALLBACK_TILES[-1])
@@ -1981,13 +2223,12 @@ def flashvsr_auto_tune_action(
                 f"Tile {low_tile}, Overlap {low_overlap}."
             )
             profile_floor_reached = False
-            for profile_chunk in AUTOTUNE_FRAME_CHUNK_SEQUENCE:
-                outcome, passed_flag = yield from _run_candidate_with_vae_retry(
+            for profile_chunk in sorted(AUTOTUNE_FRAME_CHUNK_SEQUENCE):
+                outcome, passed_flag = yield from _run_candidate(
                     int(profile_chunk),
                     low_tile,
-                    True,
+                    not stream_forces_untiled,
                     low_overlap,
-                    require_full=True,
                 )
                 if _cancel_requested():
                     status_reason = "cancelled"
@@ -2011,6 +2252,13 @@ def flashvsr_auto_tune_action(
                         f"{int(profile_chunk)}, Tile {low_tile}."
                     )
                     break
+                if clean_measurement:
+                    _append_log(
+                        f"The safest Frame Chunk {int(profile_chunk)} already peaks at {peak_gb:.2f}GB, "
+                        f"above the {campaign_profile_min_peak_gb:.1f}GB profiling target. "
+                        "Larger chunks cannot lower the memory floor, so profiling stopped safely."
+                    )
+                    break
             if not profile_floor_reached and status_reason != "cancelled":
                 measured = [
                     float(item.get("max_vram_used_gb", 0.0) or 0.0)
@@ -2026,55 +2274,18 @@ def flashvsr_auto_tune_action(
                     f"lowest clean measured peak was {floor_note:.2f}GB."
                 )
 
-        def _is_vram_boundary_failure(test_item: Dict[str, Any]) -> bool:
-            try:
-                free_gb = float(test_item.get("estimated_free_gb", 1e9) or 1e9)
-            except Exception:
-                free_gb = 1e9
-            if bool(test_item.get("oom", False)):
-                return True
-            if str(test_item.get("probe_cancel_reason") or "").strip().lower() == "threshold_reached":
-                return True
-            if free_gb < float(min_free_vram_target_gb):
-                return True
-            return False
-
-        def _frontier_verified() -> bool:
-            if not isinstance(best_config, dict) or (not best_config):
-                return False
-            best_rank_local = _quality_rank(best_config)
-            for item in tests:
-                if not isinstance(item, dict):
-                    continue
-                if bool(item.get("passed", False)):
-                    continue
-                if not bool(item.get("telemetry_ok", False)):
-                    continue
-                candidate_rank = _quality_rank(
-                    {
-                        "frame_chunk_size": int(item.get("frame_chunk_size") or 0),
-                        "tile_size": int(item.get("tile_size") or 0),
-                        "overlap": int(item.get("overlap") or 0),
-                        "tiled_dit": bool(item.get("tiled_dit", True)),
-                    }
-                )
-                if candidate_rank <= best_rank_local:
-                    continue
-                if _is_vram_boundary_failure(item):
-                    return True
-            # If no higher-quality candidate exists in this sweep space, frontier is inherently verified.
-            if (
-                int(best_config.get("frame_chunk_size") or 0) >= int(AUTOTUNE_FRAME_CHUNK_SEQUENCE[0])
-                and int(best_config.get("tile_size") or 0) >= int(AUTOTUNE_TILE_MAX)
-                and (not bool(best_config.get("tiled_dit", True)))
-            ):
-                return True
-            return False
-
-        frontier_ok = bool(_frontier_verified())
+        frontier_ok = bool(
+            best_config
+            and temporal_frontier_verified
+            and spatial_frontier_verified
+            and untiled_frontier_verified
+            and not search_indeterminate
+            and status_reason in {"completed", "threshold_reached"}
+        )
         if best_config and (not frontier_ok):
             _append_log(
-                "Boundary validation incomplete: no higher-quality VRAM-boundary failure was observed. "
+                "Boundary validation incomplete: a higher candidate was indeterminate or no "
+                "higher-quality VRAM-boundary failure was observed. "
                 "This run will not be reused from cache."
             )
 

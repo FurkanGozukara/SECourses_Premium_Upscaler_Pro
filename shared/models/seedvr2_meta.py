@@ -59,14 +59,14 @@ def _built_ins() -> List[SeedVR2Model]:
             name="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             size="3B", precision="fp8_e4m3fn", variant="standard",
             preferred_attention="flash_attn", supports_multi_gpu=True,
-            estimated_vram_gb=6.0, max_resolution=4096,
+            estimated_vram_gb=6.0, max_resolution=4096, max_blocks_to_swap=32,
             notes="Lightweight 3B model with fp8 quantization. Good balance of speed and quality."
         ),
         SeedVR2Model(
             name="seedvr2_ema_3b_fp16.safetensors",
             size="3B", precision="fp16", variant="standard",
             preferred_attention="flash_attn", supports_multi_gpu=True,
-            estimated_vram_gb=8.0, max_resolution=4096,
+            estimated_vram_gb=8.0, max_resolution=4096, max_blocks_to_swap=32,
             notes="Standard 3B model with fp16 precision. Recommended for 8GB+ VRAM."
         ),
         # GGUF 3B models - quantized, limited features
@@ -75,7 +75,7 @@ def _built_ins() -> List[SeedVR2Model]:
             size="3B", precision="Q8_0", variant="standard",
             compile_compatible=False, supports_multi_gpu=False,
             supports_cache_dit=False, supports_cache_vae=False,
-            estimated_vram_gb=4.0, max_resolution=2160,
+            estimated_vram_gb=4.0, max_resolution=2160, max_blocks_to_swap=32,
             notes="GGUF Q8_0 quantized. Low VRAM but no torch.compile or multi-GPU support."
         ),
         SeedVR2Model(
@@ -83,7 +83,7 @@ def _built_ins() -> List[SeedVR2Model]:
             size="3B", precision="Q4_K_M", variant="standard",
             compile_compatible=False, supports_multi_gpu=False,
             supports_cache_dit=False, supports_cache_vae=False,
-            estimated_vram_gb=3.0, max_resolution=2160,
+            estimated_vram_gb=3.0, max_resolution=2160, max_blocks_to_swap=32,
             notes="GGUF Q4 quantized. Minimal VRAM, quality trade-offs. No compile/multi-GPU."
         ),
         # 7B models - higher quality, more VRAM

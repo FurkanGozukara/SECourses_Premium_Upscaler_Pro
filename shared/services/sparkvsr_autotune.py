@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gradio as gr
 
-from shared.gpu_utils import get_global_gpu_override
+from shared.gpu_utils import get_global_gpu_override, get_gpu_info
 from shared.oom_alert import clear_vram_oom_alert
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
@@ -34,9 +34,19 @@ from shared.path_utils import (
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.services.autotune_search import (
+    ambient_adjusted_min_device_free_gb,
+    ambient_adjusted_peak_gb,
+    autotune_launch_headroom,
+    cached_best_has_headroom,
     dedupe_sparkvsr_tile_candidates,
     frontier_bisect,
+    is_verified_autotune_payload,
+    is_vram_boundary_outcome,
+    persisted_autotune_status,
     predict_frontier_index,
+    resolution_signatures_compatible,
+    resolution_signatures_identical,
+    resume_frontier_hints,
 )
 from shared.services.flashvsr_autotune import (
     _clamp_save_vram_target_gb,
@@ -52,17 +62,19 @@ from shared.sparkvsr_runner import SparkVSRResult, run_sparkvsr
 
 AUTOTUNE_MODEL_ID = "sparkvsr"
 AUTOTUNE_LOG_PREFIX = "sparkvsr_autotune"
-AUTOTUNE_STRATEGY_VERSION = 5
+AUTOTUNE_STRATEGY_VERSION = 16
 AUTOTUNE_TARGET_FRAMES = 65
 AUTOTUNE_MAX_PROBE_FRAMES = 129
 AUTOTUNE_INITIAL_PROBE_FRAMES = AUTOTUNE_TARGET_FRAMES
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
+AUTOTUNE_EMERGENCY_FREE_VRAM_GB = 1.0
 AUTOTUNE_TEMPORAL_CANDIDATES = (65, 49, 33, 17)
 AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES = tuple(range(AUTOTUNE_TARGET_FRAMES + 8, AUTOTUNE_MAX_PROBE_FRAMES + 1, 8))
 AUTOTUNE_SPATIAL_CANDIDATES = (0, 1024, 768, 512, 384, 256)
 AUTOTUNE_TEMPORAL_OVERLAP = 8
 AUTOTUNE_SPATIAL_OVERLAP = 32
 AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE = 0.05
+AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE = 0.02
 AUTOTUNE_FULL_SEQUENCE_FRAME_LIMIT = AUTOTUNE_TARGET_FRAMES
 AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC = 0.10
 AUTOTUNE_UI_UPDATE_INTERVAL_SEC = 0.50
@@ -141,6 +153,25 @@ def _estimate_input_frame_count(input_path: str) -> Tuple[Optional[int], str]:
     return None, "unknown"
 
 
+def _autotune_reference_count(settings: Dict[str, Any]) -> int:
+    """Number of reference latents the SparkVSR probe must keep resident."""
+    ref_mode = str(settings.get("ref_mode") or "sr_image").strip().lower()
+    if ref_mode == "no_ref":
+        return 0
+    if bool(settings.get("auto_reference_prepass", False)):
+        # The prepass produces one local reference for each temporal chunk.
+        return 1
+    values: set[int] = set()
+    for part in str(settings.get("ref_indices") or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        with suppress(Exception):
+            values.add(int(float(part)))
+    # SparkVSR auto-selects first/middle/last when the field is empty.
+    return len(values) if values else 3
+
+
 def _build_autotune_signature(
     settings: Dict[str, Any],
     *,
@@ -148,10 +179,10 @@ def _build_autotune_signature(
     target_h: int,
     effective_in_w: int,
     effective_in_h: int,
-    global_gpu_device: str,
     total_vram_gb: float,
     min_free_target_gb: float,
     allow_full_sequence: bool,
+    growth_probe_frames: int,
 ) -> Dict[str, Any]:
     ref_mode = str(settings.get("ref_mode") or "sr_image").strip().lower()
     if bool(settings.get("auto_reference_prepass", False)) and ref_mode != "no_ref":
@@ -161,11 +192,15 @@ def _build_autotune_signature(
     exact_payload = {
         "autotune_model": AUTOTUNE_MODEL_ID,
         "autotune_strategy_version": int(AUTOTUNE_STRATEGY_VERSION),
+        "input_kind": str(settings.get("_autotune_input_kind") or "video"),
         "autotune_target_frames": int(AUTOTUNE_TARGET_FRAMES),
         "autotune_initial_probe_frames": int(AUTOTUNE_INITIAL_PROBE_FRAMES),
         "autotune_max_probe_frames": int(AUTOTUNE_MAX_PROBE_FRAMES),
+        "growth_probe_frames": int(growth_probe_frames),
         "autotune_growth_candidates": list(AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES),
         "model_name": str(settings.get("model_name") or ""),
+        "model_path": str(settings.get("model_path") or ""),
+        "lora_path": str(settings.get("lora_path") or ""),
         "precision": str(settings.get("precision") or "bfloat16"),
         "scale": str(settings.get("scale") or "4"),
         "upscale_mode": str(settings.get("upscale_mode") or "bilinear"),
@@ -173,10 +208,17 @@ def _build_autotune_signature(
         "sr_noise_step": int(settings.get("sr_noise_step") or 399),
         "cpu_offload": bool(settings.get("cpu_offload", True)),
         "vae_tiling": bool(settings.get("vae_tiling", True)),
+        "group_offload": bool(settings.get("group_offload", False)),
+        "num_blocks_per_group": (
+            int(settings.get("num_blocks_per_group") or 1)
+            if bool(settings.get("group_offload", False))
+            else 0
+        ),
+        "force_offload": bool(settings.get("force_offload", True)),
         "ref_mode": ref_mode,
+        "reference_count": int(_autotune_reference_count(settings)),
         "ref_guidance_scale": round(float(settings.get("ref_guidance_scale") or 1.0), 4),
         "save_format": str(settings.get("save_format") or "yuv444p"),
-        "global_gpu_device": str(global_gpu_device or ""),
         "save_vram_gb": _clamp_save_vram_target_gb(min_free_target_gb, AUTOTUNE_MIN_FREE_VRAM_GB),
         "split_stage_subprocesses": bool(settings.get("split_stage_subprocesses", True)),
         "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
@@ -200,24 +242,90 @@ def _signature_matches(candidate: Dict[str, Any], expected: Dict[str, Any]) -> b
     if not isinstance(candidate, dict) or not isinstance(expected, dict):
         return False
     if candidate.get("exact_hash") != expected.get("exact_hash"):
-        return False
-    try:
-        cand_pixels = float(candidate.get("target_pixels") or 0)
-        exp_pixels = float(expected.get("target_pixels") or 0)
-        if cand_pixels <= 0 or exp_pixels <= 0:
+        cand_exact = candidate.get("exact")
+        exp_exact = expected.get("exact")
+        if not isinstance(cand_exact, dict) or not isinstance(exp_exact, dict):
             return False
-        if abs(cand_pixels - exp_pixels) / max(cand_pixels, exp_pixels) > AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE:
+        cand_exact = dict(cand_exact)
+        exp_exact = dict(exp_exact)
+        for key in ("global_gpu_device", "gpu_identity"):
+            cand_exact.pop(key, None)
+            exp_exact.pop(key, None)
+        if cand_exact != exp_exact:
+            return False
+    try:
+        if not resolution_signatures_identical(candidate, expected):
             return False
         cand_vram = float(candidate.get("gpu_total_vram_gb") or 0)
         exp_vram = float(expected.get("gpu_total_vram_gb") or 0)
-        if cand_vram > 0 and exp_vram > 0 and abs(cand_vram - exp_vram) / max(cand_vram, exp_vram) > 0.10:
+        if (
+            cand_vram > 0
+            and exp_vram > 0
+            and abs(cand_vram - exp_vram) / max(cand_vram, exp_vram)
+            > AUTOTUNE_MAX_VRAM_DIFF_FOR_REUSE
+        ):
             return False
     except Exception:
         return False
     return True
 
 
-def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any], min_free_vram_target_gb: float) -> Optional[Dict[str, Any]]:
+def _find_cached_autotune_log(
+    log_dir: Path,
+    expected_signature: Dict[str, Any],
+    min_free_vram_target_gb: float,
+    current_ambient_used_gb: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    def _has_strict_search_proof(payload: Dict[str, Any]) -> bool:
+        results = payload.get("search_results")
+        best = payload.get("best_config")
+        tests = payload.get("tests")
+        if not isinstance(results, dict) or not isinstance(best, dict) or not isinstance(tests, list):
+            return False
+        for axis in ("temporal", "spatial"):
+            result = results.get(axis)
+            if not isinstance(result, dict) or not bool(result.get("frontier_verified", False)):
+                return False
+            if bool(result.get("indeterminate_above_best", False)) or result.get("hard_failed_indices"):
+                return False
+        for item in tests:
+            if not isinstance(item, dict) or not bool(item.get("passed", False)):
+                continue
+            if str(item.get("probe_cancel_reason") or "").strip():
+                continue
+            try:
+                returncode_ok = int(item.get("returncode", 1)) == 0
+            except Exception:
+                returncode_ok = False
+            if not bool(item.get("telemetry_ok", False)) or not returncode_ok:
+                continue
+            if bool(item.get("oom", False)):
+                continue
+            if int(item.get("chunk_len") or 0) != int(best.get("chunk_len") or 0):
+                continue
+            if int(item.get("tile_height") or 0) != int(best.get("tile_height") or 0):
+                continue
+            if int(item.get("tile_width") or 0) != int(best.get("tile_width") or 0):
+                continue
+            if int(item.get("overlap_t") or 0) != int(best.get("overlap_t") or 0):
+                continue
+            if int(item.get("overlap_height") or 0) != int(best.get("overlap_height") or 0):
+                continue
+            if int(item.get("overlap_width") or 0) != int(best.get("overlap_width") or 0):
+                continue
+            best_probe_frames = int(best.get("probe_frames") or 0)
+            if best_probe_frames > 0 and int(item.get("probe_frames") or 0) != best_probe_frames:
+                continue
+            sig_exact = ((payload.get("signature") or {}).get("exact") or {})
+            if bool(sig_exact.get("split_stage_subprocesses", True)) and not bool(
+                item.get("split_stage_validation_ok", False)
+            ):
+                continue
+            if int(item.get("reference_count") or 0) != int(sig_exact.get("reference_count") or 0):
+                continue
+            return True
+        return False
+
     if not log_dir.exists():
         return None
     candidates: List[Tuple[float, Dict[str, Any]]] = []
@@ -226,19 +334,28 @@ def _find_cached_autotune_log(log_dir: Path, expected_signature: Dict[str, Any],
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
+        if not is_verified_autotune_payload(payload):
+            continue
+        if not _has_strict_search_proof(payload):
+            continue
         signature = payload.get("signature")
         best = payload.get("best_config")
         if not isinstance(signature, dict) or not isinstance(best, dict):
             continue
         if not _signature_matches(signature, expected_signature):
             continue
-        if not bool(payload.get("frontier_verified", False)):
-            continue
         try:
-            free_gb = float(best.get("estimated_free_vram_gb") or 0.0)
+            cached_reserve = float(((signature or {}).get("exact") or {}).get("save_vram_gb"))
         except Exception:
-            free_gb = 0.0
-        if free_gb < float(min_free_vram_target_gb):
+            continue
+        if abs(cached_reserve - float(min_free_vram_target_gb)) > 0.05:
+            continue
+        if not cached_best_has_headroom(
+            payload,
+            expected_signature,
+            min_free_vram_target_gb,
+            current_ambient_used_gb=current_ambient_used_gb,
+        ):
             continue
         candidates.append((float(path.stat().st_mtime), {**payload, "_path": str(path)}))
     if not candidates:
@@ -393,9 +510,17 @@ def _candidate_settings(
 
 def _growth_candidate_settings(probe_frames: int) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for chunk_len in AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES:
-        if int(chunk_len) <= AUTOTUNE_TARGET_FRAMES or int(chunk_len) > int(probe_frames):
-            continue
+    upper = min(int(AUTOTUNE_MAX_PROBE_FRAMES), max(0, int(probe_frames)))
+    chunk_values = {
+        int(chunk_len)
+        for chunk_len in AUTOTUNE_TEMPORAL_GROWTH_CANDIDATES
+        if int(AUTOTUNE_TARGET_FRAMES) < int(chunk_len) <= upper
+    }
+    # Include the exact bounded clip length. Otherwise a 72- or 100-frame
+    # source stops at 65 or 97 even when the whole bounded sequence would fit.
+    if int(AUTOTUNE_TARGET_FRAMES) < upper:
+        chunk_values.add(upper)
+    for chunk_len in sorted(chunk_values):
         out.append(
             {
                 "chunk_len": int(chunk_len),
@@ -412,8 +537,11 @@ def _growth_candidate_settings(probe_frames: int) -> List[Dict[str, Any]]:
 def _quality_rank(cfg: Dict[str, Any]) -> int:
     chunk_len = int(cfg.get("chunk_len") or 0)
     tile = int(cfg.get("tile_height") or cfg.get("tile_width") or 0)
-    temporal = 1_000_000 if chunk_len <= 0 else int(chunk_len) * 10_000
-    spatial = 100_000 if tile <= 0 else int(tile) * 50
+    # Lexicographic quality: every extra temporal frame must outrank every
+    # possible spatial improvement. The previous coefficients allowed a
+    # full-frame 73-frame candidate to outrank an 81-frame tiled candidate.
+    temporal = 1_000_000_000 if chunk_len <= 0 else int(chunk_len) * 1_000_000
+    spatial = 200_000 if tile <= 0 else int(tile) * 100
     return temporal + spatial
 
 
@@ -580,6 +708,7 @@ def sparkvsr_auto_tune_action(
             _append_log("Input path is missing or does not exist.")
             yield _payload("Auto Tune requires a valid input file/path.", show_indicator=False)
             return
+        settings["_autotune_input_kind"] = detect_input_type(input_path)
 
         global_gpu_device = get_global_gpu_override(seed_controls, global_cfg)
         settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
@@ -588,6 +717,12 @@ def sparkvsr_auto_tune_action(
             settings.get("save_vram_gb", AUTOTUNE_MIN_FREE_VRAM_GB),
             AUTOTUNE_MIN_FREE_VRAM_GB,
         )
+        if min_free_vram_target_gb < float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB):
+            _append_log(
+                f"Raised Auto Tune's effective VRAM reserve from {min_free_vram_target_gb:.1f}GB "
+                f"to the {AUTOTUNE_EMERGENCY_FREE_VRAM_GB:.1f}GB emergency safety floor."
+            )
+            min_free_vram_target_gb = float(AUTOTUNE_EMERGENCY_FREE_VRAM_GB)
         settings["save_vram_gb"] = float(min_free_vram_target_gb)
         try:
             import os as _os
@@ -624,6 +759,14 @@ def sparkvsr_auto_tune_action(
             return
         input_w, input_h = int(dims[0]), int(dims[1])
         source_frame_count, frame_count_source = _estimate_input_frame_count(input_path)
+        growth_probe_frames = (
+            int(AUTOTUNE_MAX_PROBE_FRAMES)
+            if source_frame_count is None
+            else max(
+                int(AUTOTUNE_INITIAL_PROBE_FRAMES),
+                min(int(AUTOTUNE_MAX_PROBE_FRAMES), int(source_frame_count)),
+            )
+        )
         allow_full_sequence = False
         if source_frame_count is None:
             _append_log(
@@ -691,8 +834,6 @@ def sparkvsr_auto_tune_action(
             total_vram_gb = sum(float(gpu_snapshot[g][1]) for g in selected_gpu_ids if g in gpu_snapshot)
         if total_vram_gb <= 0:
             try:
-                from shared.gpu_utils import get_gpu_info
-
                 gpus = get_gpu_info()
             except Exception:
                 gpus = []
@@ -713,15 +854,46 @@ def sparkvsr_auto_tune_action(
             _append_log("Live VRAM telemetry is unavailable. Auto Tune requires nvidia-smi memory query support.")
             yield _payload("Auto Tune requires live VRAM telemetry from nvidia-smi.", show_indicator=False)
             return
-        # Let leftovers from any previous run drain before measuring the ambient
-        # baseline, otherwise the drain gate inherits the residue.
-        _wait_for_vram_drain(telemetry_gpu_ids, 1.5, float(total_vram_gb), _append_log, timeout_sec=30.0)
+        multi_gpu_autotune = len(telemetry_gpu_ids) > 1
+        if multi_gpu_autotune:
+            _append_log(
+                "Multiple GPUs selected: enforcing per-GPU headroom and running fresh probes "
+                "instead of reusing aggregate-memory history."
+            )
         ambient_snap = _query_gpu_memory_snapshot_gb()
+        if not ambient_snap:
+            ambient_snap = gpu_snapshot
         ambient_used_gb = (
             sum(float(ambient_snap[g][0]) for g in telemetry_gpu_ids if g in ambient_snap)
             if ambient_snap
             else 0.0
         )
+        launch_ok, ambient_free_gb, launch_required_gb = autotune_launch_headroom(
+            total_vram_gb,
+            ambient_used_gb,
+            min_free_vram_target_gb,
+        )
+        per_device_free = [
+            max(0.0, float(ambient_snap[g][1]) - float(ambient_snap[g][0]))
+            for g in telemetry_gpu_ids
+            if g in ambient_snap
+        ]
+        if per_device_free:
+            ambient_free_gb = min(ambient_free_gb, min(per_device_free))
+            launch_ok = bool(launch_ok and ambient_free_gb >= launch_required_gb)
+        if not launch_ok:
+            state["operation_status"] = "error"
+            _append_log(
+                f"Auto Tune stopped before launching a model: only {ambient_free_gb:.2f}GB "
+                f"is currently free, but at least {launch_required_gb:.2f}GB is required "
+                "for the reserve plus launch safety margin."
+            )
+            yield _payload(
+                "Auto Tune did not start because the GPU is already too full. "
+                "Stop other GPU jobs and try again.",
+                show_indicator=False,
+            )
+            return
 
         signature = _build_autotune_signature(
             settings,
@@ -729,16 +901,21 @@ def sparkvsr_auto_tune_action(
             target_h=target_h,
             effective_in_w=effective_in_w,
             effective_in_h=effective_in_h,
-            global_gpu_device=str(global_gpu_device),
             total_vram_gb=total_vram_gb,
             min_free_target_gb=min_free_vram_target_gb,
             allow_full_sequence=allow_full_sequence,
+            growth_probe_frames=growth_probe_frames,
         )
         logs_dir = Path(base_dir) / "vram_usages"
         cached = (
             None
-            if campaign_force_fresh
-            else _find_cached_autotune_log(logs_dir, signature, min_free_vram_target_gb)
+            if campaign_force_fresh or multi_gpu_autotune
+            else _find_cached_autotune_log(
+                logs_dir,
+                signature,
+                min_free_vram_target_gb,
+                ambient_used_gb,
+            )
         )
         if cached and isinstance(cached.get("best_config"), dict):
             best = dict(cached["best_config"])
@@ -802,17 +979,16 @@ def sparkvsr_auto_tune_action(
         # Per-test history resume: reuse individual probe outcomes from earlier
         # (possibly interrupted) runs with a matching signature so a restarted
         # Auto Tune continues instead of starting from zero.
-        history_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int, int], Dict[str, Any]] = {}
+        history_outcomes_by_key: Dict[Tuple[int, int, int, int, int, int], Dict[str, Any]] = {}
         history_sources: List[str] = []
-        # Cross-VRAM priors: clean measured peaks from same-settings/same-resolution
-        # logs recorded on a DIFFERENT GPU size; they predict this GPU's frontier
-        # and seed the search start (results are still verified locally).
+        # Capacity-shifted priors can hint at the frontier, but never replace a
+        # live safety-first probe on the selected GPU.
         prior_peaks_by_config: Dict[Tuple[int, int], float] = {}
         prior_source_vrams: set = set()
         try:
             history_logs = (
                 sorted(logs_dir.glob(f"{AUTOTUNE_LOG_PREFIX}_*.json"), key=lambda p: p.stat().st_mtime)
-                if logs_dir.exists() and (not campaign_force_fresh)
+                if logs_dir.exists() and (not campaign_force_fresh) and (not multi_gpu_autotune)
                 else []
             )
         except Exception:
@@ -825,23 +1001,23 @@ def sparkvsr_auto_tune_action(
             if not isinstance(history_payload, dict):
                 continue
             if not _signature_matches(history_payload.get("signature"), signature):
-                # Same settings on a different GPU size cannot be reused directly,
-                # but their clean full-run peaks predict this GPU's frontier.
+                # A materially different reported capacity cannot be reused
+                # directly, but compatible full-run peaks can still be hints.
                 cand_sig = history_payload.get("signature")
-                if isinstance(cand_sig, dict) and str(cand_sig.get("exact_hash") or "") == str(
-                    signature.get("exact_hash") or ""
-                ):
-                    try:
-                        cand_px = float(cand_sig.get("target_pixels") or 0)
-                        exp_px = float(signature.get("target_pixels") or 0)
-                        pixels_close = (
-                            cand_px > 0
-                            and exp_px > 0
-                            and abs(cand_px - exp_px) / max(cand_px, exp_px) <= AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE
-                        )
-                    except Exception:
-                        pixels_close = False
-                    if pixels_close:
+                if isinstance(cand_sig, dict):
+                    cand_exact = dict(cand_sig.get("exact") or {})
+                    current_exact = dict(signature.get("exact") or {})
+                    cand_exact.pop("save_vram_gb", None)
+                    current_exact.pop("save_vram_gb", None)
+                else:
+                    cand_exact = {}
+                    current_exact = {}
+                if cand_exact and cand_exact == current_exact:
+                    if resolution_signatures_compatible(
+                        cand_sig,
+                        signature,
+                        max_pixel_diff=AUTOTUNE_MAX_PIXEL_DIFF_FOR_REUSE,
+                    ):
                         for raw in history_payload.get("tests") or []:
                             if not isinstance(raw, dict):
                                 continue
@@ -852,7 +1028,11 @@ def sparkvsr_auto_tune_action(
                                     continue
                                 if str(raw.get("probe_cancel_reason") or "").strip():
                                     continue
-                                peak = float(raw.get("max_vram_used_gb") or 0.0)
+                                peak = ambient_adjusted_peak_gb(
+                                    raw.get("max_vram_used_gb"),
+                                    history_payload,
+                                    ambient_used_gb,
+                                )
                                 if peak <= 0:
                                     continue
                                 cfg_key = (int(raw.get("chunk_len") or 0), int(raw.get("tile_height") or 0))
@@ -869,6 +1049,12 @@ def sparkvsr_auto_tune_action(
             tests_blob = history_payload.get("tests")
             if not isinstance(tests_blob, list):
                 continue
+            try:
+                recorded_target_gb = float(
+                    (((history_payload.get("signature") or {}).get("exact") or {}).get("save_vram_gb"))
+                )
+            except Exception:
+                recorded_target_gb = float("nan")
             matched_any = False
             for raw in tests_blob:
                 if not isinstance(raw, dict):
@@ -876,39 +1062,59 @@ def sparkvsr_auto_tune_action(
                 item = dict(raw)
                 probe_stop = str(item.get("probe_cancel_reason") or "").strip().lower()
                 try:
-                    peak = float(item.get("max_vram_used_gb") or 0.0)
+                    original_peak = float(item.get("max_vram_used_gb") or 0.0)
+                    peak = ambient_adjusted_peak_gb(
+                        original_peak,
+                        history_payload,
+                        ambient_used_gb,
+                    )
                 except Exception:
+                    original_peak = 0.0
                     peak = 0.0
+                item["max_vram_used_gb"] = round(float(peak), 3)
+                item["recorded_min_free_vram_target_gb"] = recorded_target_gb
                 try:
                     total_hist = float(item.get("total_vram_gb") or 0.0)
                 except Exception:
                     total_hist = 0.0
                 total_for_eval = float(total_vram_gb if total_vram_gb > 0 else total_hist)
                 if peak > 0 and total_for_eval > 0:
-                    item["estimated_free_gb"] = max(0.0, total_for_eval - peak)
+                    aggregate_free_gb = max(0.0, total_for_eval - peak)
+                    if item.get("min_device_free_gb") is not None:
+                        item["min_device_free_gb"] = ambient_adjusted_min_device_free_gb(
+                            item.get("min_device_free_gb"),
+                            original_peak,
+                            peak,
+                            aggregate_free_gb,
+                        )
+                    else:
+                        item["min_device_free_gb"] = aggregate_free_gb
+                    item["estimated_free_gb"] = min(
+                        aggregate_free_gb,
+                        float(item["min_device_free_gb"]),
+                    )
                 try:
                     returncode_ok = int(item.get("returncode", 1)) == 0
                 except Exception:
                     returncode_ok = False
+                split_expected = bool(
+                    (((history_payload.get("signature") or {}).get("exact") or {}).get(
+                        "split_stage_subprocesses",
+                        True,
+                    ))
+                )
+                split_validation_ok = bool(
+                    (not split_expected)
+                    or item.get("split_stage_validation_ok", False)
+                )
                 item["passed"] = bool(
                     returncode_ok
                     and bool(item.get("telemetry_ok", False))
                     and (not bool(item.get("oom", False)))
+                    and split_validation_ok
                     and float(item.get("estimated_free_gb") or 0.0) >= float(min_free_vram_target_gb)
-                    and probe_stop != "threshold_reached"
+                    and not probe_stop
                 )
-                is_boundary_fail = bool(
-                    bool(item.get("oom", False))
-                    or probe_stop == "threshold_reached"
-                    or (
-                        bool(item.get("telemetry_ok", False))
-                        and float(item.get("estimated_free_gb") or 1e9) < float(min_free_vram_target_gb)
-                    )
-                )
-                if (not item["passed"]) and (not is_boundary_fail):
-                    # Indeterminate rows (crashes without a VRAM signature)
-                    # must not be replayed as settled results.
-                    continue
                 history_key = (
                     int(item.get("chunk_len") or 0),
                     int(item.get("tile_height") or 0),
@@ -916,7 +1122,6 @@ def sparkvsr_auto_tune_action(
                     int(item.get("overlap_t") or 0),
                     int(item.get("overlap_height") or 0),
                     int(item.get("overlap_width") or 0),
-                    int(item.get("probe_frames") or 0),
                 )
                 history_outcomes_by_key[history_key] = item
                 matched_any = True
@@ -927,15 +1132,9 @@ def sparkvsr_auto_tune_action(
                 f"Loaded {len(history_outcomes_by_key)} matching historical probe result(s) from "
                 f"{len(history_sources)} log(s). Auto Tune will continue from previous progress."
             )
+        tests[:] = list(history_outcomes_by_key.values())
 
         initial_probe_frames = int(AUTOTUNE_INITIAL_PROBE_FRAMES)
-        if source_frame_count is None:
-            growth_probe_frames = int(AUTOTUNE_MAX_PROBE_FRAMES)
-        else:
-            growth_probe_frames = max(
-                initial_probe_frames,
-                min(int(AUTOTUNE_MAX_PROBE_FRAMES), int(source_frame_count)),
-            )
         probe_target_frames = initial_probe_frames
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -977,6 +1176,12 @@ def sparkvsr_auto_tune_action(
             "probe_target_frames": int(probe_target_frames),
             "initial_probe_frames": int(initial_probe_frames),
             "growth_probe_frames": int(growth_probe_frames),
+            "gpu": {
+                "selected_ids": list(selected_gpu_ids),
+                "total_vram_gb": float(total_vram_gb),
+                "ambient_used_gb": float(ambient_used_gb),
+                "min_free_target_gb": float(min_free_vram_target_gb),
+            },
             "tests": tests,
             "best_config": None,
             "frontier_verified": False,
@@ -985,9 +1190,15 @@ def sparkvsr_auto_tune_action(
 
         def _persist(status_override: Optional[str] = None, finalized: bool = False, frontier_verified: bool = False) -> None:
             nonlocal autotune_log_path
+            result_reason = str(status_override or status_reason)
             autotune_payload.update(
                 {
-                    "status": status_override or status_reason,
+                    "status": persisted_autotune_status(
+                        result_reason,
+                        finalized=finalized,
+                        frontier_verified=frontier_verified,
+                    ),
+                    "result_reason": result_reason,
                     "tests": list(tests),
                     "best_config": best_config,
                     "frontier_verified": bool(frontier_verified),
@@ -1009,15 +1220,52 @@ def sparkvsr_auto_tune_action(
             effective_w=int(effective_in_w),
         )
         growth_candidates = _growth_candidate_settings(growth_probe_frames)
-        spatial_per_chunk = sorted({int(c["tile_height"]) for c in candidates})
+        spatial_templates = sorted(
+            [
+                dict(candidate)
+                for candidate in candidates
+                if int(candidate["chunk_len"]) == min(AUTOTUNE_TEMPORAL_CANDIDATES)
+            ],
+            key=_quality_rank,
+        )
+        if not spatial_templates:
+            raise RuntimeError("SparkVSR Auto Tune could not build a safe spatial candidate.")
+        safest_spatial = dict(spatial_templates[0])
+        safest_tile = int(safest_spatial["tile_height"])
+        temporal_values = sorted(
+            {
+                *[int(value) for value in AUTOTUNE_TEMPORAL_CANDIDATES if int(value) > 0],
+                *[int(candidate["chunk_len"]) for candidate in growth_candidates],
+            }
+        )
+        temporal_candidates = [
+            {
+                **safest_spatial,
+                "chunk_len": int(chunk_len),
+            }
+            for chunk_len in temporal_values
+        ]
+        spatial_per_chunk = [int(candidate["tile_height"]) for candidate in spatial_templates]
         _append_log(
             f"Spatial candidates deduped for {effective_in_w}x{effective_in_h}: "
             f"{list(AUTOTUNE_SPATIAL_CANDIDATES)} -> {spatial_per_chunk} "
             "(tiles covering the whole frame equal full-frame and are skipped)."
         )
-        # Bisection probes far fewer points than the full candidate grid.
-        total_estimated_runs = max(1, min(12, len(candidates) + len(growth_candidates)))
-        top_rank = max(_quality_rank(c) for c in [*candidates, *growth_candidates])
+        _append_log(
+            "Safety-first search: establish a low-memory baseline at "
+            f"Chunk Length {temporal_values[0]}, Spatial Tile "
+            f"{'full-frame' if safest_tile <= 0 else safest_tile}; then grow temporal context "
+            "and spatial quality in bounded steps."
+        )
+        # Temporal context dominates SparkVSR's quality ranking. Find its safe
+        # frontier at the smallest tile first, then maximize the tile at that
+        # chunk length. This covers the same quality grid without top-first OOMs.
+        total_estimated_runs = max(1, min(24, len(temporal_candidates) + len(spatial_templates) + 2))
+        max_temporal = int(temporal_values[-1])
+        top_rank = max(
+            _quality_rank({**template, "chunk_len": max_temporal})
+            for template in spatial_templates
+        )
 
         def _ensure_growth_demo():
             nonlocal growth_demo_meta
@@ -1049,7 +1297,9 @@ def sparkvsr_auto_tune_action(
             )
             _persist("running")
 
-        def _run_probe_once(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        def _run_probe_once(
+            candidate: Dict[str, Any],
+        ) -> Dict[str, Any]:
             nonlocal run_counter
             run_counter += 1
             tile = int(candidate["tile_height"])
@@ -1075,11 +1325,15 @@ def sparkvsr_auto_tune_action(
             probe_settings["vae_tiling"] = True
             probe_ref_mode = _normalize_probe_ref_mode(settings)
             probe_settings["ref_mode"] = probe_ref_mode
+            probe_reference_count = int(_autotune_reference_count(settings))
             if probe_ref_mode == "sr_image" and active_demo_ref_path.exists():
                 probe_settings["ref_source_path"] = str(active_demo_ref_path)
-                probe_settings["ref_indices"] = "0"
+                probe_settings["ref_indices"] = ",".join(
+                    str(index * 4) for index in range(max(1, probe_reference_count))
+                )
             elif probe_ref_mode == "no_ref":
                 probe_settings["ref_source_path"] = ""
+                probe_settings["ref_indices"] = ""
 
             label = f"Test {run_counter}: chunk_len={chunk_len}, tile={tile if tile > 0 else 'full-frame'}"
             split_stage_requested = bool(probe_settings.get("split_stage_subprocesses", True))
@@ -1096,7 +1350,7 @@ def sparkvsr_auto_tune_action(
                 "phase": "startup",
                 "chunks": 0,
                 "tiles": 0,
-                "threshold_any_phase": bool(campaign_force_fresh),
+                "threshold_any_phase": True,
             }
             probe_cancel_event = threading.Event()
             setattr(probe_cancel_event, "sparkvsr_cancel_reason", "vram_threshold")
@@ -1144,9 +1398,6 @@ def sparkvsr_auto_tune_action(
                 except Exception as exc:
                     result_box["result"] = SparkVSRResult(1, None, f"SparkVSR probe error: {exc}")
 
-            # Threshold-abort only - no early-success stop for SparkVSR: its VAE
-            # decode runs after ALL transformer work, so a peak that looks stable
-            # mid-transformer cannot cover the decode spike.
             sampler_thread = threading.Thread(
                 target=_sample_peak_vram_gb,
                 args=(
@@ -1240,11 +1491,19 @@ def sparkvsr_auto_tune_action(
             telemetry_ok = bool(sampler_box.get("telemetry_ok", False))
             early_stop_reason = str(sampler_box.get("early_stop_reason") or "")
             total_for_eval = measured_total if measured_total > 0 else float(total_vram_gb)
-            free_gb = max(0.0, total_for_eval - max_used_gb) if total_for_eval > 0 else 0.0
+            aggregate_free_gb = (
+                max(0.0, total_for_eval - max_used_gb)
+                if total_for_eval > 0
+                else 0.0
+            )
+            min_device_free_gb = float(
+                sampler_box.get("min_device_free_gb", aggregate_free_gb)
+                or 0.0
+            )
+            free_gb = min(aggregate_free_gb, min_device_free_gb)
             oom = bool(_looks_like_oom(result.log))
             oom_phase = _detect_sparkvsr_oom_phase(result.log) if oom else ""
             canceled_by_user = bool(cancel_event.is_set())
-            fast_probe_stop = bool(early_stop_reason == "threshold_reached")
             result_log = str(result.log or "")
             result_log_lc = result_log.lower()
             split_cli_flag = bool("--split_stage_subprocesses" in result_log)
@@ -1252,14 +1511,21 @@ def sparkvsr_auto_tune_action(
                 "stage subprocess isolation enabled" in result_log_lc
                 or "[sparkvsr split] internal stage started" in result_log_lc
             )
+            split_validation_ok = bool(
+                (not split_stage_requested)
+                or (split_cli_flag and split_runtime_seen)
+            )
             if split_stage_requested and not split_cli_flag:
                 _append_log(f"{label} warning: split-stage was requested but the CLI flag was not found in the runner log.")
+            elif split_stage_requested and not split_runtime_seen:
+                _append_log(f"{label} warning: split-stage workers were not observed in the runner log.")
             passed = bool(
                 int(result.returncode) == 0
                 and telemetry_ok
                 and (not oom)
                 and (not canceled_by_user)
-                and (not fast_probe_stop)
+                and not early_stop_reason
+                and split_validation_ok
                 and free_gb >= float(min_free_vram_target_gb)
             )
             return {
@@ -1275,6 +1541,7 @@ def sparkvsr_auto_tune_action(
                 "max_vram_used_gb": round(max_used_gb, 3),
                 "total_vram_gb": round(total_for_eval, 3),
                 "estimated_free_gb": round(free_gb, 3),
+                "min_device_free_gb": round(min_device_free_gb, 3),
                 "telemetry_ok": bool(telemetry_ok),
                 "samples": int(sampler_box.get("samples", 0) or 0),
                 "phase2_samples": int(sampler_box.get("phase2_samples", 0) or 0),
@@ -1282,7 +1549,9 @@ def sparkvsr_auto_tune_action(
                 "split_stage_subprocesses": bool(split_stage_requested),
                 "split_stage_cli_flag": bool(split_cli_flag),
                 "split_stage_runtime_seen": bool(split_runtime_seen),
+                "split_stage_validation_ok": bool(split_validation_ok),
                 "probe_frames": int(active_demo_meta.get("written_frames") or 0),
+                "reference_count": int(probe_reference_count),
                 "passed": bool(passed),
                 "quality_rank": int(_quality_rank(candidate)),
                 "frames": int(phase_state.get("frames") or 0),
@@ -1292,6 +1561,9 @@ def sparkvsr_auto_tune_action(
 
         def _apply_passed_outcome(outcome: Dict[str, Any]) -> None:
             nonlocal best_config, status_reason
+            candidate_rank = int(outcome["quality_rank"])
+            if best_config is not None and candidate_rank < int(best_config.get("quality_rank") or 0):
+                return
             best_config = {
                 "chunk_len": int(outcome["chunk_len"]),
                 "overlap_t": int(outcome["overlap_t"]),
@@ -1303,28 +1575,35 @@ def sparkvsr_auto_tune_action(
                 "min_free_vram_target_gb": float(min_free_vram_target_gb),
                 "measured_peak_vram_used_gb": float(outcome["max_vram_used_gb"]),
                 "estimated_free_vram_gb": float(outcome["estimated_free_gb"]),
-                "quality_rank": int(outcome["quality_rank"]),
+                "min_device_free_vram_gb": float(
+                    outcome.get("min_device_free_gb", outcome["estimated_free_gb"])
+                ),
+                "quality_rank": candidate_rank,
                 "temporal_policy": "full_sequence_allowed" if allow_full_sequence else "bounded_chunks_required",
                 "source_frame_count": int(source_frame_count) if source_frame_count is not None else None,
                 "split_stage_subprocesses": bool(outcome.get("split_stage_subprocesses", True)),
                 "probe_frames": int(outcome.get("probe_frames") or 0),
             }
-            status_reason = "completed" if int(outcome["quality_rank"]) >= int(top_rank) else "threshold_reached"
+            status_reason = "completed" if candidate_rank >= int(top_rank) else "threshold_reached"
 
-        def _candidate_history_key(candidate: Dict[str, Any]) -> Tuple[int, int, int, int, int, int, int]:
-            chunk_len = int(candidate["chunk_len"])
-            expected_frames = int(
-                growth_probe_frames if chunk_len > int(initial_probe_frames) else initial_probe_frames
-            )
+        def _candidate_history_key(candidate: Dict[str, Any]) -> Tuple[int, int, int, int, int, int]:
             return (
-                chunk_len,
+                int(candidate["chunk_len"]),
                 int(candidate["tile_height"]),
                 int(candidate["tile_width"]),
                 int(candidate["overlap_t"]),
                 int(candidate["overlap_height"]),
                 int(candidate["overlap_width"]),
-                expected_frames,
             )
+
+        def _classify_outcome(outcome: Optional[Dict[str, Any]]) -> str:
+            if outcome is None:
+                return "hard_fail"
+            if bool(outcome.get("passed", False)):
+                return "pass"
+            if is_vram_boundary_outcome(outcome, min_free_vram_target_gb):
+                return "boundary_fail"
+            return "hard_fail"
 
         def _probe_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
             if cancel_event.is_set():
@@ -1334,13 +1613,21 @@ def sparkvsr_auto_tune_action(
             known_outcome = history_outcomes_by_key.get(history_key)
             if isinstance(known_outcome, dict):
                 outcome = dict(known_outcome)
+                outcome["_autotune_reused"] = True
+                saved_verdict = (
+                    "fits"
+                    if bool(outcome.get("passed", False))
+                    else (
+                        "is a saved VRAM boundary"
+                        if is_vram_boundary_outcome(outcome, min_free_vram_target_gb)
+                        else "was already attempted"
+                    )
+                )
                 _append_log(
                     f"Chunk {outcome.get('chunk_len')}, tile "
                     f"{outcome.get('tile_height') or 'full-frame'}: already tested earlier - "
-                    f"reusing that measurement ({'fits' if bool(outcome.get('passed', False)) else 'does not fit'})."
+                    f"reusing that measurement ({saved_verdict})."
                 )
-                tests.append(outcome)
-                _persist("running")
                 return outcome
             if int(candidate["chunk_len"]) > int(initial_probe_frames):
                 yield from _ensure_growth_demo()
@@ -1357,13 +1644,15 @@ def sparkvsr_auto_tune_action(
                 vae_tiling_value=True,
             )
             outcome = yield from _run_probe_once(candidate)
+            outcome["autotune_attempt"] = 1
             tests.append(outcome)
             history_outcomes_by_key[history_key] = dict(outcome)
-            if bool(outcome.get("passed", False)):
-                verdict_note = "PASSED"
-            elif str(outcome.get("probe_cancel_reason") or "") == "threshold_reached":
+            verdict = _classify_outcome(outcome)
+            if verdict == "pass":
+                verdict_note = "PASSED (full run)"
+            elif verdict == "boundary_fail" and str(outcome.get("probe_cancel_reason") or "") == "threshold_reached":
                 verdict_note = "needs too much VRAM (test stopped early to save time)"
-            elif outcome.get("oom"):
+            elif verdict == "boundary_fail" and outcome.get("oom"):
                 verdict_note = "ran out of VRAM"
             elif not bool(outcome.get("telemetry_ok", False)):
                 verdict_note = "failed (VRAM telemetry unavailable)"
@@ -1377,118 +1666,146 @@ def sparkvsr_auto_tune_action(
             _persist("running")
             return outcome
 
-        boundary_failed = False
+        temporal_frontier_verified = False
+        spatial_frontier_verified = False
+        search_indeterminate = False
+        search_results: Dict[str, Any] = {}
 
-        def _classify_outcome(outcome: Optional[Dict[str, Any]]) -> str:
-            if outcome is None:
-                return "hard_fail"
-            if bool(outcome.get("passed", False)):
-                return "pass"
-            if not bool(outcome.get("telemetry_ok", False)):
-                return "hard_fail"
-            # OOM, threshold abort, nonzero exit, or clean-but-low-headroom runs
-            # all mark the VRAM boundary (matches the previous walk's semantics).
-            return "boundary_fail"
+        def _record_search_health(label: str, result: Dict[str, Any]) -> None:
+            nonlocal search_indeterminate
+            hard_indices = list(result.get("hard_failed_indices") or [])
+            if hard_indices:
+                _append_log(
+                    f"{label} search saw persistent non-VRAM failures at candidate indices "
+                    f"{hard_indices}; they were not treated as OOM boundaries."
+                )
+            if bool(
+                result.get("indeterminate_above_best", False)
+                or (hard_indices and not result.get("frontier_verified", False))
+            ):
+                search_indeterminate = True
+                _append_log(
+                    f"{label} search could not prove every setting above the selected result. "
+                    "The best measured setting can be applied, but this run will not be cached as final."
+                )
 
         try:
-            first_candidate = candidates[0] if candidates else None
-            first_outcome: Optional[Dict[str, Any]] = None
-            if first_candidate is not None:
-                first_outcome = yield from _probe_candidate(first_candidate)
+            vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
+            temporal_peaks = {
+                int(chunk_k): float(peak)
+                for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
+                if int(tile_k) == int(safest_tile)
+            }
+            temporal_seed = predict_frontier_index(temporal_values, temporal_peaks, vram_budget_gb)
+            if temporal_seed is not None:
+                vram_list = ", ".join(
+                    f"{v:.0f}GB" for v in sorted(v for v in prior_source_vrams if v > 0)
+                ) or "different-size"
+                _append_log(
+                    f"Measurements from a {vram_list} GPU predict a temporal frontier near "
+                    f"Chunk Length {temporal_values[int(temporal_seed)]}. The prediction is only a "
+                    "hint; this GPU still starts at the safest candidate and grows gradually."
+                )
+            _append_log(
+                "Finding the longest safe Temporal Chunk at the smallest spatial tile "
+                f"(candidates {temporal_values}; longer improves consistency and usually speed)."
+            )
 
-            first_verdict = _classify_outcome(first_outcome) if first_outcome is not None else "hard_fail"
-            if first_outcome is not None and first_verdict == "boundary_fail":
-                boundary_failed = True
+            def _temporal_probe(idx: int, _require_full: bool):
+                outcome = yield from _probe_candidate(temporal_candidates[int(idx)])
+                verdict = "cancelled" if cancel_event.is_set() else _classify_outcome(outcome)
+                if verdict == "pass":
+                    _apply_passed_outcome(outcome)
+                return {
+                    "outcome": verdict,
+                    "early_stopped_pass": False,
+                    "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+                }
 
-            if first_outcome is not None and first_verdict == "pass":
-                _apply_passed_outcome(first_outcome)
-                if growth_candidates:
-                    vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
-                    growth_values = [int(c["chunk_len"]) for c in growth_candidates]
-                    growth_peaks = {
-                        int(chunk_k): float(peak)
-                        for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
-                        if int(tile_k) <= 0
-                    }
-                    growth_seed: Optional[int] = None
-                    pred = predict_frontier_index(growth_values, growth_peaks, vram_budget_gb)
-                    if pred is not None and pred < len(growth_values) - 1:
-                        growth_seed = int(pred)
-                        vram_list = ", ".join(
-                            f"{v:.0f}GB" for v in sorted(v for v in prior_source_vrams if v > 0)
-                        ) or "different-size"
-                        _append_log(
-                            f"Measurements from a {vram_list} GPU predict this {total_vram_gb:.0f}GB GPU "
-                            f"tops out near Chunk Length {growth_values[growth_seed]} - starting there "
-                            "(still verified with real probes)."
-                        )
-                    _append_log(
-                        "The 65-frame baseline fits. Now finding the longest safe Temporal Chunk "
-                        f"(candidates {growth_values}; longer = better long-video consistency and speed)."
-                    )
+            temporal_saved_pass, temporal_saved_boundary = resume_frontier_hints(
+                [
+                    history_outcomes_by_key.get(_candidate_history_key(candidate))
+                    for candidate in temporal_candidates
+                ],
+                min_free_vram_target_gb,
+            )
+            temporal_res = yield from frontier_bisect(
+                len(temporal_candidates),
+                _temporal_probe,
+                initial_index=temporal_seed,
+                max_growth_step=1,
+                trusted_pass_index=temporal_saved_pass,
+                known_boundary_index=temporal_saved_boundary,
+            )
+            search_results["temporal"] = dict(temporal_res)
+            _record_search_health("Temporal", temporal_res)
+            temporal_frontier_verified = bool(temporal_res.get("frontier_verified", False))
 
-                    def _growth_probe(idx: int, _require_full: bool):
-                        outcome = yield from _probe_candidate(growth_candidates[int(idx)])
-                        verdict = _classify_outcome(outcome)
-                        if verdict == "pass":
-                            _apply_passed_outcome(outcome)
-                        return {"outcome": verdict, "early_stopped_pass": False}
-
-                    growth_res = yield from frontier_bisect(
-                        len(growth_candidates), _growth_probe, initial_index=growth_seed
-                    )
-                    boundary_failed = boundary_failed or bool(growth_res.get("boundary_failed"))
-                    if growth_res.get("stopped") == "hard_fail":
-                        status_reason = "failed"
-            elif first_verdict == "hard_fail" and first_outcome is not None:
+            temporal_best_idx = temporal_res.get("best_idx")
+            if temporal_res.get("stopped") == "cancelled":
+                status_reason = "cancelled"
+            elif temporal_best_idx is None:
                 status_reason = "failed"
-            elif first_outcome is not None:
-                # Fallback: highest chunk first; within each chunk level bisect the
-                # spatial candidates (ascending memory: small tiles -> full-frame).
-                # The first chunk level with any pass wins, since chunk length
-                # dominates the quality ranking.
-                remaining_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
-                for cand in candidates:
-                    remaining_by_chunk.setdefault(int(cand["chunk_len"]), []).append(cand)
-                vram_budget_gb = float(total_vram_gb) - float(min_free_vram_target_gb)
-                for chunk_len in sorted(remaining_by_chunk.keys(), reverse=True):
-                    chunk_cands = sorted(remaining_by_chunk[chunk_len], key=_quality_rank)
-
-                    def _tile_probe(idx: int, _require_full: bool, _cands=chunk_cands):
-                        outcome = yield from _probe_candidate(_cands[int(idx)])
-                        verdict = _classify_outcome(outcome)
-                        if verdict == "pass":
-                            _apply_passed_outcome(outcome)
-                        return {"outcome": verdict, "early_stopped_pass": False}
-
-                    tile_values = [int(c["tile_height"]) for c in chunk_cands]
-                    tile_peaks = {
-                        int(tile_k): float(peak)
-                        for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
-                        if int(chunk_k) == int(chunk_len)
-                    }
-                    tile_seed: Optional[int] = None
-                    pred = predict_frontier_index(tile_values, tile_peaks, vram_budget_gb)
-                    if pred is not None and pred < len(tile_values) - 1:
-                        tile_seed = int(pred)
-                        _append_log(
-                            "Other-GPU measurements predict the best spatial tile near "
-                            f"{tile_values[tile_seed] if tile_values[tile_seed] > 0 else 'full-frame'} "
-                            f"at Chunk Length {chunk_len} - starting there."
-                        )
+            else:
+                selected_chunk = int(temporal_candidates[int(temporal_best_idx)]["chunk_len"])
+                spatial_candidates = [
+                    {**template, "chunk_len": selected_chunk}
+                    for template in spatial_templates
+                ]
+                tile_values = [int(candidate["tile_height"]) for candidate in spatial_candidates]
+                tile_peaks = {
+                    int(tile_k): float(peak)
+                    for (chunk_k, tile_k), peak in prior_peaks_by_config.items()
+                    if int(chunk_k) == selected_chunk
+                }
+                tile_seed = predict_frontier_index(tile_values, tile_peaks, vram_budget_gb)
+                if tile_seed is not None:
                     _append_log(
-                        f"Trying Chunk Length {chunk_len}: looking for the best spatial tile "
-                        f"among {['full-frame' if t <= 0 else t for t in tile_values]}."
+                        "Compatible historical measurements predict the spatial frontier near "
+                        f"{tile_values[int(tile_seed)] if tile_values[int(tile_seed)] > 0 else 'full-frame'} "
+                        f"at Chunk Length {selected_chunk}. Safe bounded growth will verify it locally."
                     )
-                    chunk_res = yield from frontier_bisect(
-                        len(chunk_cands), _tile_probe, initial_index=tile_seed
-                    )
-                    boundary_failed = boundary_failed or bool(chunk_res.get("boundary_failed"))
-                    if chunk_res.get("stopped") == "hard_fail":
-                        status_reason = "failed"
-                        break
-                    if chunk_res.get("best_idx") is not None:
-                        break
+                _append_log(
+                    f"Temporal frontier settled at Chunk Length {selected_chunk}. Now maximizing "
+                    f"the spatial tile among {['full-frame' if t <= 0 else t for t in tile_values]}."
+                )
+
+                def _spatial_probe(idx: int, _require_full: bool):
+                    outcome = yield from _probe_candidate(spatial_candidates[int(idx)])
+                    verdict = "cancelled" if cancel_event.is_set() else _classify_outcome(outcome)
+                    if verdict == "pass":
+                        _apply_passed_outcome(outcome)
+                    return {
+                        "outcome": verdict,
+                        "early_stopped_pass": False,
+                        "reused_outcome": bool(outcome.get("_autotune_reused", False)),
+                    }
+
+                spatial_saved_pass, spatial_saved_boundary = resume_frontier_hints(
+                    [
+                        history_outcomes_by_key.get(_candidate_history_key(candidate))
+                        for candidate in spatial_candidates
+                    ],
+                    min_free_vram_target_gb,
+                )
+                spatial_res = yield from frontier_bisect(
+                    len(spatial_candidates),
+                    _spatial_probe,
+                    initial_index=tile_seed,
+                    max_growth_step=1,
+                    trusted_pass_index=spatial_saved_pass,
+                    known_boundary_index=spatial_saved_boundary,
+                )
+                search_results["spatial"] = dict(spatial_res)
+                _record_search_health("Spatial", spatial_res)
+                spatial_frontier_verified = bool(spatial_res.get("frontier_verified", False))
+                if spatial_res.get("stopped") == "cancelled":
+                    status_reason = "cancelled"
+                elif spatial_res.get("best_idx") is None:
+                    status_reason = "failed"
+
+            if search_indeterminate and best_config is not None and status_reason != "cancelled":
+                status_reason = "failed"
         except KeyboardInterrupt:
             status_reason = "cancelled"
 
@@ -1498,7 +1815,7 @@ def sparkvsr_auto_tune_action(
                 f"lowest spatial-tile ladder toward {campaign_profile_min_peak_gb:.1f}GB peak VRAM."
             )
             profile_floor_reached = False
-            for profile_chunk in AUTOTUNE_TEMPORAL_CANDIDATES:
+            for profile_chunk in sorted(AUTOTUNE_TEMPORAL_CANDIDATES):
                 chunk_candidates = [
                     candidate
                     for candidate in candidates
@@ -1529,6 +1846,13 @@ def sparkvsr_auto_tune_action(
                         f"{int(profile_chunk)}, Spatial Tile {int(profile_candidate['tile_height'])}."
                     )
                     break
+                if clean_measurement:
+                    _append_log(
+                        f"The safest Chunk Length {int(profile_chunk)} already peaks at {peak_gb:.2f}GB, "
+                        f"above the {campaign_profile_min_peak_gb:.1f}GB profiling target. "
+                        "Larger chunks cannot lower the memory floor, so profiling stopped safely."
+                    )
+                    break
             if not profile_floor_reached and status_reason != "cancelled":
                 measured = [
                     float(item.get("max_vram_used_gb", 0.0) or 0.0)
@@ -1544,7 +1868,14 @@ def sparkvsr_auto_tune_action(
                     f"lowest clean measured peak was {floor_note:.2f}GB."
                 )
 
-        frontier_ok = bool(best_config and (best_config.get("quality_rank") == top_rank or boundary_failed))
+        autotune_payload["search_results"] = dict(search_results)
+        frontier_ok = bool(
+            best_config
+            and temporal_frontier_verified
+            and spatial_frontier_verified
+            and not search_indeterminate
+            and status_reason in {"completed", "threshold_reached"}
+        )
         _persist(status_reason, finalized=True, frontier_verified=frontier_ok)
         if autotune_log_path:
             _append_log(f"Saved autotune log: {autotune_log_path}")

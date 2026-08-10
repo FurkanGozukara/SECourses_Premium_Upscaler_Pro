@@ -2635,18 +2635,19 @@ def chunk_and_process(
             return f"{m}m {s:02d}s"
         return f"{s}s"
 
-    def _emit_progress_line(line: str) -> None:
+    def _emit_progress_line(line: str, console: bool = True) -> None:
         nonlocal inline_frame_progress_active, inline_frame_progress_width
         payload = str(line or "").rstrip("\r\n")
         if not payload:
             return
         try:
-            inline_payload = (
+            if not console:
+                pass
+            elif (
                 payload.startswith("FRAME_PROGRESS ")
                 or payload.startswith("SparkVSR Progress:")
                 or payload.startswith("COMPARISON_PROGRESS")
-            )
-            if inline_payload:
+            ):
                 padded = payload
                 if inline_frame_progress_width > len(payload):
                     padded = payload + (" " * (inline_frame_progress_width - len(payload)))
@@ -3434,7 +3435,9 @@ def chunk_and_process(
             # Replace chunk-local FRAME_PROGRESS with overall progress to keep UI/CMD consistent.
             if stripped.startswith("FRAME_PROGRESS "):
                 return
-            _emit_progress_line(text)
+            # FlashVSR's runner (and its model downloader) already echo every line
+            # to the console themselves; skip the local echo to avoid double printing.
+            _emit_progress_line(text, console=(model_type != "flashvsr"))
         
         # Use provided processing function or select based on model type
         if process_func:

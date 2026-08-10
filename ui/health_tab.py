@@ -18,6 +18,7 @@ _CHECK_LABELS = {
     "ffmpeg": "FFmpeg",
     "cuda": "CUDA + GPUs",
     "nvidia_driver": "NVIDIA Driver Version",
+    "nvidia_vfx": "NVIDIA VFX / RTX Super Resolution",
     "vs_build_tools": "Visual Studio Build Tools",
     "temp_dir": "Temp Directory Access",
     "output_dir": "Output Directory Access",

@@ -444,7 +444,7 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "ref_indices": "0",
         "ref_guidance_scale": 1.0,
         "ref_source_path": "",
-        "auto_reference_prepass": True,
+        "auto_reference_prepass": False,
         "auto_reference_upscaler": "SeedVR2",
         "ref_pisa_cache_dir": "",
         "pisa_python_executable": "",
@@ -618,10 +618,15 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
         cfg["tile_width"] = 0
     cfg["overlap_height"] = max(0, min(1024, _to_int(cfg.get("overlap_height"), 32)))
     cfg["overlap_width"] = max(0, min(1024, _to_int(cfg.get("overlap_width"), 32)))
+    if cfg["tile_height"] > 0:
+        cfg["tile_height"] = max(16, (cfg["tile_height"] // 16) * 16)
+        cfg["tile_width"] = max(16, (cfg["tile_width"] // 16) * 16)
+        cfg["overlap_height"] = (cfg["overlap_height"] // 16) * 16
+        cfg["overlap_width"] = (cfg["overlap_width"] // 16) * 16
     if cfg["tile_height"] > 0 and cfg["overlap_height"] >= cfg["tile_height"]:
-        cfg["overlap_height"] = max(0, cfg["tile_height"] - 8)
+        cfg["overlap_height"] = max(0, cfg["tile_height"] - 16)
     if cfg["tile_width"] > 0 and cfg["overlap_width"] >= cfg["tile_width"]:
-        cfg["overlap_width"] = max(0, cfg["tile_width"] - 8)
+        cfg["overlap_width"] = max(0, cfg["tile_width"] - 16)
     cfg["chunk_len"] = max(0, min(100000, _to_int(cfg.get("chunk_len"), 0)))
     cfg["overlap_t"] = max(0, min(10000, _to_int(cfg.get("overlap_t"), 8)))
     if cfg["chunk_len"] > 0 and cfg["overlap_t"] >= cfg["chunk_len"]:
@@ -638,7 +643,7 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["ref_guidance_scale"] = max(0.0, min(100.0, _to_float(cfg.get("ref_guidance_scale"), 1.0)))
     cfg["auto_reference_prepass"] = _to_bool(
         cfg.get("auto_reference_prepass"),
-        _to_bool(defaults.get("auto_reference_prepass", True), True),
+        _to_bool(defaults.get("auto_reference_prepass", False), False),
     )
     auto_ref_upscaler = str(
         cfg.get("auto_reference_upscaler", defaults.get("auto_reference_upscaler", "SeedVR2")) or "SeedVR2"

@@ -2361,6 +2361,19 @@ class Runner:
             settings,
             on_progress=on_progress,
         )
+
+        compat_wrapper = self.base_dir / "tools" / "rife_inference_wrapper.py"
+        if self._active_mode == "subprocess":
+            if not compat_wrapper.is_file():
+                return RunResult(
+                    1,
+                    None,
+                    f"RIFE compatibility wrapper not found: {compat_wrapper}",
+                )
+            # NumPy 2 removed binary np.fromstring(), which the upstream
+            # skvideo reader still calls. Keep the upstream checkout intact and
+            # apply the compatibility shim in its child process instead.
+            cmd.insert(1, str(compat_wrapper))
         
         # Wrap with vcvars for C++ toolchain support (Windows only, best-effort)
         # FIXED: Pass on_progress for transparent warning surfacing
@@ -2372,6 +2385,9 @@ class Runner:
             buf = io.StringIO()
             rc = 0
             try:
+                from tools.rife_inference_wrapper import install_numpy_binary_fromstring_compat
+
+                install_numpy_binary_fromstring_compat()
                 with redirect_stdout(buf), redirect_stderr(buf):
                     sys.argv = cmd[1:]
                     runpy.run_path(str(cli_path), run_name="__main__")

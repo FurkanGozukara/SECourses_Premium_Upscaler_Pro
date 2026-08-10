@@ -589,12 +589,19 @@ def main(argv=None):
       position: fixed !important;
       inset: 0;
       z-index: 3000;
-      display: flex;
       align-items: center;
       justify-content: center;
       padding: 22px;
       background: rgba(2, 6, 23, 0.58);
       backdrop-filter: blur(2px);
+    }
+    .autotune-modal-overlay:not(.hide):not([hidden]):not([data-dismissed="true"]) {
+      display: flex !important;
+    }
+    .autotune-modal-overlay.hide,
+    .autotune-modal-overlay[hidden],
+    .autotune-modal-overlay[data-dismissed="true"] {
+      display: none !important;
     }
     .autotune-modal-card {
       width: min(560px, 94vw);

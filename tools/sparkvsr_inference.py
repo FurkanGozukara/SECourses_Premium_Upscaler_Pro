@@ -5,6 +5,7 @@ import gc
 import glob
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -68,6 +69,7 @@ SPLIT_STAGE_REQUEST_KIND = "sparkvsr_split_stage_request_v1"
 SPLIT_STAGE_STATE_KIND = "sparkvsr_split_stage_state_v1"
 PROMPT_EMBEDDING_KEY = "prompt_embedding"
 EMPTY_PROMPT_SHA256 = hashlib.sha256(b"").hexdigest()
+SPARKVSR_SPATIAL_MULTIPLE = 16
 
 
 def release_torch_memory() -> None:
@@ -231,6 +233,22 @@ def remove_padding_and_extra_frames(video: torch.Tensor, pad_f: int, pad_h: int,
     return video
 
 
+def pad_video_spatial_to_multiple(
+    video: torch.Tensor,
+    multiple: int = SPARKVSR_SPATIAL_MULTIPLE,
+) -> Tuple[torch.Tensor, int, int]:
+    """Replicate-pad the spatial edges for VAE (8x) and transformer patch (2x) grids."""
+    if video.ndim not in {4, 5}:
+        raise ValueError(f"Expected a 4D or 5D video tensor, got shape={tuple(video.shape)}")
+    multiple = max(1, int(multiple))
+    height, width = int(video.shape[-2]), int(video.shape[-1])
+    pad_h = (multiple - height % multiple) % multiple
+    pad_w = (multiple - width % multiple) % multiple
+    if pad_h or pad_w:
+        video = torch.nn.functional.pad(video, (0, pad_w, 0, pad_h), mode="replicate")
+    return video, pad_h, pad_w
+
+
 def pad_video_chunk_to_vae_grid(video_chunk: torch.Tensor) -> Tuple[torch.Tensor, int]:
     if video_chunk.ndim != 5:
         raise ValueError(f"Expected video chunk tensor [B,C,F,H,W], got shape={tuple(video_chunk.shape)}")
@@ -300,15 +318,13 @@ def make_spatial_tiles(height: int, width: int, tile_size_hw: Tuple[int, int], o
     def tile_starts(length: int, tile: int, stride: int) -> List[int]:
         if length <= tile:
             return [0]
-        starts = [0]
-        while starts[-1] + tile < length:
-            next_start = starts[-1] + stride
-            if next_start + tile >= length:
-                if next_start < length and next_start != starts[-1]:
-                    starts.append(next_start)
-                break
-            starts.append(next_start)
-        return sorted(set(max(0, min(int(s), max(0, length - 1))) for s in starts))
+        last_start = length - tile
+        interval_count = max(1, int(math.ceil(last_start / float(stride))))
+        # Spread the starts evenly so the final tile is full-sized without creating
+        # a nearly duplicate edge tile when only a few pixels remain.
+        return sorted(
+            set(int(round((idx * last_start) / interval_count)) for idx in range(interval_count + 1))
+        )
 
     h_tiles = tile_starts(height, tile_h, stride_h)
     w_tiles = tile_starts(width, tile_w, stride_w)
@@ -1827,13 +1843,14 @@ def main() -> int:
             total=len(video_files),
             started_at=run_started_at,
         )
-        video, pad_f, pad_h, pad_w, original_shape = preprocess_video_match(
+        video, pad_f, _input_pad_h, _input_pad_w, original_shape = preprocess_video_match(
             video_path,
             start_frame=args.start_frame,
             end_frame=args.end_frame,
             is_match=True,
         )
-        h_orig, w_orig = int(video.shape[2]), int(video.shape[3])
+        h_orig, w_orig = int(original_shape[1]), int(original_shape[2])
+        video_source = video[:, :, :h_orig, :w_orig].contiguous()
         emit_progress(
             video_pct(0.07),
             "prepare_input",
@@ -1849,14 +1866,11 @@ def main() -> int:
             scaled_h = int(h_orig * scale_factor)
             scaled_w = int(w_orig * scale_factor)
             print(f"Output resolution mode: {target_h}x{target_w}", flush=True)
-            video_up = interpolate_2d(video, (scaled_h, scaled_w), args.upscale_mode)
+            video_up = interpolate_2d(video_source, (scaled_h, scaled_w), args.upscale_mode)
             crop_top = max(0, (scaled_h - target_h) // 2)
             crop_left = max(0, (scaled_w - target_w) // 2)
             video_up = video_up[:, :, crop_top : crop_top + target_h, crop_left : crop_left + target_w]
-            pad_h_extra = (8 - target_h % 8) % 8
-            pad_w_extra = (8 - target_w % 8) % 8
-            if pad_h_extra > 0 or pad_w_extra > 0:
-                video_up = torch.nn.functional.pad(video_up, (0, pad_w_extra, 0, pad_h_extra))
+            desired_output_h, desired_output_w = target_h, target_w
             effective_upscale = 1
             emit_progress(
                 video_pct(0.11),
@@ -1868,7 +1882,13 @@ def main() -> int:
             )
         else:
             effective_upscale = max(1, int(args.upscale or 4))
-            video_up = interpolate_2d(video, (h_orig * effective_upscale, w_orig * effective_upscale), args.upscale_mode)
+            desired_output_h = h_orig * effective_upscale
+            desired_output_w = w_orig * effective_upscale
+            video_up = interpolate_2d(
+                video_source,
+                (desired_output_h, desired_output_w),
+                args.upscale_mode,
+            )
             emit_progress(
                 video_pct(0.11),
                 "resize_input",
@@ -1878,7 +1898,17 @@ def main() -> int:
                 started_at=run_started_at,
             )
 
-        video_lr = video
+        video_up, model_pad_h, model_pad_w = pad_video_spatial_to_multiple(video_up)
+        if model_pad_h or model_pad_w:
+            print(
+                "[SparkVSR] Spatial model-grid padding: "
+                f"{desired_output_w}x{desired_output_h} -> "
+                f"{int(video_up.shape[-1])}x{int(video_up.shape[-2])}; "
+                "the saved output will be cropped back to the requested size.",
+                flush=True,
+            )
+
+        video_lr = video_source
         video = (video_up / 255.0 * 2.0) - 1.0
         video = video.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
 
@@ -2084,9 +2114,10 @@ def main() -> int:
         video_generate = remove_padding_and_extra_frames(
             output_video,
             pad_f,
-            pad_h * int(effective_upscale),
-            pad_w * int(effective_upscale),
+            0,
+            0,
         )
+        video_generate = video_generate[:, :, :, :desired_output_h, :desired_output_w].contiguous()
 
         if args.output_file:
             out_file_path = Path(args.output_file)

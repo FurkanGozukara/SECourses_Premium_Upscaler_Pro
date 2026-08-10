@@ -1,4 +1,4 @@
-"""
+r"""
 Run a resumable multi-scenario FlashVSR VRAM campaign.
 
 This wraps `tools/flashvsr_vram_sweep.py` so long campaigns can be resumed

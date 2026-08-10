@@ -1,4 +1,4 @@
-"""
+r"""
 Systematic FlashVSR VRAM sweep with resume support.
 
 Default target (strict profiling):

@@ -231,6 +231,32 @@ def _sanitize_precision(value: Any) -> str:
     return precision if precision in {"auto", "fp16", "bf16", "int8_convrot"} else "auto"
 
 
+def _flashvsr_cli_source(cli_path: Path) -> str:
+    try:
+        return cli_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _flashvsr_cli_supports_option(cli_path: Path, option: str) -> bool:
+    return str(option or "").strip() in _flashvsr_cli_source(cli_path)
+
+
+def _resolve_flashvsr_cli_precision(requested: str, cli_path: Path) -> tuple[str, Optional[str]]:
+    """Avoid passing the app's ConvRot mode to an older upstream CLI that cannot load it."""
+    precision = _sanitize_precision(requested)
+    if precision != "int8_convrot":
+        return precision, None
+    source = _flashvsr_cli_source(cli_path)
+    if "int8_convrot" in source and "--int8_cache_dir" in source:
+        return precision, None
+    return (
+        "bf16",
+        "[FlashVSR] The installed FlashVSR CLI does not support INT8 ConvRot. "
+        "Using bf16 instead of launching it with unsupported command-line arguments.",
+    )
+
+
 def _sanitize_attention(value: Any) -> str:
     raw = str(value or "sparse_sage_attention").strip().lower()
     mapping = {
@@ -559,10 +585,23 @@ def run_flashvsr(
         version_ui = flashvsr_version_to_ui(raw_version)
         model_name = flashvsr_internal_to_model_name(version_internal)
         mode = _sanitize_mode(settings.get("mode", "tiny"))
-        precision = _sanitize_precision(settings.get("precision", settings.get("dtype", "auto")))
+        requested_precision = _sanitize_precision(settings.get("precision", settings.get("dtype", "auto")))
         vae_model = _sanitize_vae_model(settings.get("vae_model", "Wan2.1"))
         attention_mode = _sanitize_attention(settings.get("attention_mode", settings.get("attention", "sparse_sage_attention")))
         device_arg, visible_gpu, gpu_note = _resolve_flashvsr_device(settings.get("device", "auto"))
+
+        flashvsr_root = _resolve_flashvsr_root(base_dir)
+        flashvsr_script = flashvsr_root / "cli_main.py"
+        if not flashvsr_script.exists():
+            return FlashVSRResult(
+                returncode=1,
+                output_path=None,
+                log=f"FlashVSR stable CLI not found at {flashvsr_script}",
+            )
+        precision, precision_note = _resolve_flashvsr_cli_precision(requested_precision, flashvsr_script)
+        if precision_note:
+            log(precision_note)
+        cli_supports_int8_cache_dir = _flashvsr_cli_supports_option(flashvsr_script, "--int8_cache_dir")
 
         models_root = _resolve_models_root(base_dir, settings)
         default_models_root = (base_dir / "ComfyUI-FlashVSR_Stable" / "models").resolve()
@@ -589,6 +628,17 @@ def run_flashvsr(
         keep_models_on_cpu = _bool(settings.get("keep_models_on_cpu", True), default=True)
         force_offload = _bool(settings.get("force_offload", True), default=True)
         enable_debug = _bool(settings.get("enable_debug", False), default=False)
+
+        # The current tiny pipelines move the wrapped DiT to CPU directly when
+        # unload_dit is enabled. Without the matching keep-on-CPU lifecycle, the
+        # wrapper still believes its modules are on CUDA and the next spatial tile
+        # fails with a CPU-weight/CUDA-input dtype error.
+        if mode in {"tiny", "tiny-long"} and tiled_dit and unload_dit and not keep_models_on_cpu:
+            unload_dit = False
+            log(
+                "[FlashVSR] Disabled unload_dit for tiled tiny mode because Keep Models on CPU is off. "
+                "This avoids CPU weights being reused by the next CUDA tile."
+            )
 
         # Runtime guardrail: full mode + tiled_vae can produce severe color/noise corruption.
         if mode == "full" and tiled_vae:
@@ -735,15 +785,6 @@ def run_flashvsr(
         explicit_output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file = explicit_output_file
 
-        flashvsr_root = _resolve_flashvsr_root(base_dir)
-        flashvsr_script = flashvsr_root / "cli_main.py"
-        if not flashvsr_script.exists():
-            return FlashVSRResult(
-                returncode=1,
-                output_path=None,
-                log=f"FlashVSR stable CLI not found at {flashvsr_script}",
-            )
-
         python_exe = _resolve_python_executable(base_dir)
         if python_exe != sys.executable:
             log(f"[FlashVSR] Using venv python: {python_exe}")
@@ -850,9 +891,11 @@ def run_flashvsr(
                 str(end_frame),
                 "--models_dir",
                 str(models_root),
-                "--int8_cache_dir",
-                str(base_dir / "FlashVSR_plus" / "models"),
             ]
+            if run_precision == "int8_convrot" and cli_supports_int8_cache_dir:
+                local_cmd.extend(
+                    ["--int8_cache_dir", str(base_dir / "FlashVSR_plus" / "models")]
+                )
             if fps > 0:
                 local_cmd.extend(["--fps", str(fps)])
             local_cmd.append("--color_fix" if color_fix else "--no_color_fix")

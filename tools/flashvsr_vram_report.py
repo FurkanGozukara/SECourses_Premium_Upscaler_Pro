@@ -1,4 +1,4 @@
-"""
+r"""
 Generate a parameter-to-VRAM relationship report from FlashVSR sweep CSV data.
 
 Usage:

@@ -33,6 +33,11 @@ from ui.universal_preset_section import (
 )
 from shared.universal_preset import dict_to_values
 from ui.media_preview import preview_updates
+from ui.shared_components import (
+    autotune_modal_dismiss_js,
+    autotune_modal_reset_js,
+    warn_cancel_confirmation,
+)
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
@@ -725,7 +730,11 @@ def flashvsr_tab(
             gr.Markdown("####  Output & Actions")
             status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
             progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
-            with gr.Group(visible=False, elem_classes=["autotune-modal-overlay"]) as flash_autotune_notice_modal:
+            with gr.Group(
+                visible=False,
+                elem_id="flash-autotune-notice-modal",
+                elem_classes=["autotune-modal-overlay"],
+            ) as flash_autotune_notice_modal:
                 with gr.Group(elem_classes=["autotune-modal-card"]):
                     with gr.Row(elem_classes=["autotune-modal-header"]):
                         gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
@@ -2330,6 +2339,7 @@ def flashvsr_tab(
         concurrency_limit=32,
         concurrency_id="app_processing_queue",
         trigger_mode="multiple",
+        js=autotune_modal_reset_js("flash-autotune-notice-modal"),
     )
     autotune_evt.then(
         fn=refresh_tile_count,
@@ -2348,12 +2358,14 @@ def flashvsr_tab(
         outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
         queue=False,
         show_progress="hidden",
+        js=autotune_modal_dismiss_js("flash-autotune-notice-modal"),
     )
     flash_autotune_notice_close_btn.click(
         fn=_dismiss_flash_autotune_notice,
         outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
         queue=False,
         show_progress="hidden",
+        js=autotune_modal_dismiss_js("flash-autotune-notice-modal"),
     )
 
     shared_scale_sync_evt = shared_state.change(
@@ -2438,7 +2450,8 @@ def flashvsr_tab(
         if ok:
             status_upd, log_msg = service["cancel_action"]()
             return status_upd, log_msg, gr.update(value=False)
-        return gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), "", gr.update(value=False)
+        message = warn_cancel_confirmation()
+        return gr.update(value=f"WARNING: {message}", visible=True), message, gr.update(value=False)
 
     cancel_btn.click(
         fn=_cancel_with_confirmation_reset,

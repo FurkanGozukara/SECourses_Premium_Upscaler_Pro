@@ -759,6 +759,14 @@ class PresetManager:
         if preset_path.exists():
             try:
                 preset_path.unlink()
+                try:
+                    last_used_path = self._last_used_preset_path()
+                    if last_used_path.exists():
+                        last_used = last_used_path.read_text(encoding="utf-8").strip()
+                        if _sanitize_name(last_used) == _sanitize_name(preset_name):
+                            last_used_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 self._invalidate_universal_presets_cache()
                 return True
             except Exception:

@@ -39,6 +39,11 @@ from ui.universal_preset_section import (
 )
 from shared.universal_preset import dict_to_values
 from ui.media_preview import preview_updates
+from ui.shared_components import (
+    autotune_modal_dismiss_js,
+    autotune_modal_reset_js,
+    warn_cancel_confirmation,
+)
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
@@ -672,10 +677,11 @@ def sparkvsr_tab(
                 with gr.Row():
                     auto_reference_prepass = gr.Checkbox(
                         label="Auto Upscale First Frame per Chunk",
-                        value=bool(_value("auto_reference_prepass", True)),
+                        value=bool(_value("auto_reference_prepass", False)),
                         info=(
-                            "Before SparkVSR starts, upscale the first frame of each Temporal Chunk Length section "
-                            "and use the matching image as sr_image for that temporal chunk."
+                            "Optional prepass: before SparkVSR starts, run the selected reference upscaler "
+                            "(SeedVR2 by default) on each temporal chunk's first frame. Leave this off to run "
+                            "SparkVSR directly."
                         ),
                         scale=1,
                     )
@@ -817,14 +823,18 @@ def sparkvsr_tab(
             gr.Markdown("####  Output & Actions")
             status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
             progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
-            with gr.Group(visible=False, elem_classes=["autotune-modal-overlay"]) as flash_autotune_notice_modal:
+            with gr.Group(
+                visible=False,
+                elem_id="spark-autotune-notice-modal",
+                elem_classes=["autotune-modal-overlay"],
+            ) as spark_autotune_notice_modal:
                 with gr.Group(elem_classes=["autotune-modal-card"]):
                     with gr.Row(elem_classes=["autotune-modal-header"]):
                         gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
-                        flash_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
-                    flash_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
+                        spark_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
+                    spark_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
                     with gr.Row(elem_classes=["autotune-modal-actions"]):
-                        flash_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
+                        spark_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
 
             with gr.Group():
                 _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
@@ -2464,12 +2474,13 @@ def sparkvsr_tab(
             vae_tiling,
             optimize_summary,
             shared_state,
-            flash_autotune_notice_text,
-            flash_autotune_notice_modal,
+            spark_autotune_notice_text,
+            spark_autotune_notice_modal,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",
         trigger_mode="multiple",
+        js=autotune_modal_reset_js("spark-autotune-notice-modal"),
     )
     autotune_evt.then(
         fn=refresh_tile_count,
@@ -2480,20 +2491,22 @@ def sparkvsr_tab(
         trigger_mode="always_last",
     )
 
-    def _dismiss_flash_autotune_notice():
+    def _dismiss_spark_autotune_notice():
         return gr.update(value=""), gr.update(visible=False)
 
-    flash_autotune_notice_ok_btn.click(
-        fn=_dismiss_flash_autotune_notice,
-        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
+    spark_autotune_notice_ok_btn.click(
+        fn=_dismiss_spark_autotune_notice,
+        outputs=[spark_autotune_notice_text, spark_autotune_notice_modal],
         queue=False,
         show_progress="hidden",
+        js=autotune_modal_dismiss_js("spark-autotune-notice-modal"),
     )
-    flash_autotune_notice_close_btn.click(
-        fn=_dismiss_flash_autotune_notice,
-        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
+    spark_autotune_notice_close_btn.click(
+        fn=_dismiss_spark_autotune_notice,
+        outputs=[spark_autotune_notice_text, spark_autotune_notice_modal],
         queue=False,
         show_progress="hidden",
+        js=autotune_modal_dismiss_js("spark-autotune-notice-modal"),
     )
 
     shared_scale_sync_evt = shared_state.change(
@@ -2561,7 +2574,8 @@ def sparkvsr_tab(
         if ok:
             status_upd, log_msg = service["cancel_action"]()
             return status_upd, log_msg, gr.update(value=False)
-        return gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), "", gr.update(value=False)
+        message = warn_cancel_confirmation()
+        return gr.update(value=f"WARNING: {message}", visible=True), message, gr.update(value=False)
 
     cancel_btn.click(
         fn=_cancel_with_confirmation_reset,

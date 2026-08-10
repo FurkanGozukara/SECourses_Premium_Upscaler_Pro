@@ -234,11 +234,20 @@ def run_rife_interpolation(
         # Build RIFE command
         rife_script = base_dir / "RIFE" / "inference_video.py"
         
+        compat_wrapper = base_dir / "tools" / "rife_inference_wrapper.py"
+        if not compat_wrapper.is_file():
+            return RifeResult(
+                returncode=1,
+                output_path=None,
+                log=f"RIFE compatibility wrapper not found: {compat_wrapper}",
+            )
+
         if input_type == "image" and settings.get("img_mode", False):
             # Image interpolation mode
             rife_script = base_dir / "RIFE" / "inference_img.py"
             cmd = [
                 sys.executable,
+                str(compat_wrapper),
                 str(rife_script),
                 "--img", input_path,
             ]
@@ -246,6 +255,7 @@ def run_rife_interpolation(
             # Video interpolation
             cmd = [
                 sys.executable,
+                str(compat_wrapper),
                 str(rife_script),
                 "--video", input_path,
             ]

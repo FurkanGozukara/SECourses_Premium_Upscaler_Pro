@@ -1,6 +1,46 @@
 import gradio as gr
 
 
+CANCEL_CONFIRMATION_MESSAGE = (
+    "Cancellation was not sent. Enable the 'Confirm cancel' checkbox first, "
+    "then click Cancel again."
+)
+
+
+def warn_cancel_confirmation() -> str:
+    """Show an explicit warning when Cancel is clicked without confirmation."""
+    gr.Warning(CANCEL_CONFIRMATION_MESSAGE, title="Cancel confirmation required")
+    return CANCEL_CONFIRMATION_MESSAGE
+
+
+def autotune_modal_dismiss_js(elem_id: str) -> str:
+    """Hide a terminal Auto Tune notice immediately, even while a queued event settles."""
+    return f"""
+() => {{
+  const modal = document.getElementById({elem_id!r});
+  if (modal) {{
+    modal.dataset.dismissed = "true";
+    modal.style.setProperty("display", "none", "important");
+  }}
+  return [];
+}}
+"""
+
+
+def autotune_modal_reset_js(elem_id: str) -> str:
+    """Allow a newly started Auto Tune run to show its own terminal notice."""
+    return f"""
+(...args) => {{
+  const modal = document.getElementById({elem_id!r});
+  if (modal) {{
+    delete modal.dataset.dismissed;
+    modal.style.removeProperty("display");
+  }}
+  return args;
+}}
+"""
+
+
 def mode_banner(text: str):
     """Reusable mode / health banner."""
     return gr.Markdown(text)

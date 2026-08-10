@@ -312,7 +312,10 @@ def run_rtx_superres(
             return RTXSuperResResult(
                 returncode=1,
                 output_path=None,
-                log=f"RTX Super Resolution dependencies missing: {import_err}",
+                log=(
+                    "RTX Super Resolution dependency is missing. Install it in this app's venv with "
+                    f"'python -m pip install nvidia-vfx==0.1.0.1'. Details: {import_err}"
+                ),
                 elapsed_seconds=max(0.0, time.time() - start_ts),
             )
 

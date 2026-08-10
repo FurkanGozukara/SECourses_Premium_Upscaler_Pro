@@ -427,12 +427,34 @@ def _check_gradio() -> Dict[str, Optional[str]]:
         return {"status": "error", "detail": f"Gradio check failed: {str(e)}"}
 
 
+def _check_nvidia_vfx() -> Dict[str, Optional[str]]:
+    """Verify the runtime required by the RTX Super Resolution tab."""
+    if platform.system() != "Windows":
+        return {"status": "skipped", "detail": "RTX Super Resolution is available on Windows only"}
+    try:
+        from nvvfx import VideoSuperRes  # type: ignore
+
+        presets = getattr(VideoSuperRes, "QualityLevel", None)
+        if presets is None:
+            return {"status": "error", "detail": "nvidia-vfx loaded, but VideoSuperRes.QualityLevel is unavailable"}
+        return {"status": "ok", "detail": "NVIDIA VFX Python runtime is available for RTX Super Resolution"}
+    except Exception as exc:
+        return {
+            "status": "missing",
+            "detail": (
+                "RTX Super Resolution runtime is missing. Install nvidia-vfx==0.1.0.1 "
+                f"in the app venv. Details: {exc}"
+            ),
+        }
+
+
 def collect_health_report(temp_dir: Path, output_dir: Path) -> Dict[str, Dict[str, Optional[str]]]:
     report = {
         "gradio": _check_gradio(),  # Check Gradio FIRST (critical for UI)
         "ffmpeg": _check_ffmpeg(),
         "cuda": _check_cuda(),
         "nvidia_driver": _check_nvidia_driver(),
+        "nvidia_vfx": _check_nvidia_vfx(),
         "vs_build_tools": _check_vs_build_tools(),
         "temp_dir": _check_writable(temp_dir),
         "output_dir": _check_writable(output_dir),

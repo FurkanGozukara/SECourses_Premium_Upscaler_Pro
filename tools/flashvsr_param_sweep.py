@@ -1,4 +1,4 @@
-"""
+r"""
 Run a fixed 10-case FlashVSR parameter sweep on example0.mp4 (first 1 second).
 
 Usage:

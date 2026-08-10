@@ -26,6 +26,7 @@ from shared.services.rtx_super_resolution_service import RTX_ORDER, build_rtx_su
 from shared.video_fps_utils import build_output_fps_summary
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
+from ui.shared_components import warn_cancel_confirmation
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
 
@@ -1659,8 +1660,14 @@ def rtx_super_resolution_tab(
         outputs=[quality_preset, auto_tune_status, shared_state],
     ).then(fn=lambda: gr.update(visible=True), outputs=[auto_tune_status])
 
+    def _cancel_with_confirmation(ok, state):
+        if ok:
+            return service["cancel_action"](state)
+        message = warn_cancel_confirmation()
+        return gr.update(value=f"WARNING: {message}", visible=True), message, state
+
     cancel_btn.click(
-        fn=lambda ok, state: service["cancel_action"](state) if ok else (gr.update(value="Enable confirm cancel first."), "", state),
+        fn=_cancel_with_confirmation,
         inputs=[cancel_confirm, shared_state],
         outputs=[status_box, log_box, shared_state],
     )

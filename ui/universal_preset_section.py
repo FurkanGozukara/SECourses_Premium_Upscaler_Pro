@@ -258,6 +258,8 @@ def create_universal_preset_callbacks(
             if preset_manager.delete_universal_preset(preset_name):
                 presets = get_presets_list()
                 selected = presets[-1] if presets else None
+                if selected:
+                    preset_manager.set_last_used_universal_preset(selected)
                 return gr.update(choices=presets, value=selected), f"✅ Deleted preset '{preset_name}'"
             else:
                 return gr.update(), f"⚠️ Could not delete preset '{preset_name}'"

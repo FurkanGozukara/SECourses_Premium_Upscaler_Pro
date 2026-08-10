@@ -19,6 +19,7 @@ from ui.universal_preset_section import (
 )
 from shared.universal_preset import dict_to_values
 from ui.media_preview import preview_updates
+from ui.shared_components import warn_cancel_confirmation
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
@@ -819,8 +820,14 @@ def rife_tab(
         trigger_mode="multiple",
     )
 
+    def _cancel_with_confirmation(ok, state):
+        if ok:
+            return *service["cancel_action"](), state
+        message = warn_cancel_confirmation()
+        return gr.update(value=f"WARNING: {message}", visible=True), message, state
+
     cancel_btn.click(
-        fn=lambda ok, state: (*service["cancel_action"](), state) if ok else (gr.update(value="WARNING: Enable 'Confirm cancel' to stop."), "", state),
+        fn=_cancel_with_confirmation,
         inputs=[cancel_confirm, shared_state],
         outputs=[status_box, log_box, shared_state]
     )

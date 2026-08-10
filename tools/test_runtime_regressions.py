@@ -21,7 +21,13 @@ from shared.services.sparkvsr_service import (
     sparkvsr_defaults,
 )
 from shared.preset_manager import PresetManager
-from tools.sparkvsr_inference import make_spatial_tiles, pad_video_spatial_to_multiple
+from tools.sparkvsr_inference import (
+    _cogvideox_untiled_decode_needs_spatial_tiling,
+    _vae_decode_to_cpu_low_vram,
+    make_spatial_tiles,
+    pad_video_chunk_to_vae_grid,
+    pad_video_spatial_to_multiple,
+)
 from tools.rife_inference_wrapper import install_numpy_binary_fromstring_compat
 from ui import shared_components
 
@@ -99,6 +105,82 @@ class SparkVSRSpatialRegressionTests(unittest.TestCase):
         self.assertEqual(guarded["tile_width"] % 16, 0)
         self.assertEqual(guarded["overlap_height"] % 16, 0)
         self.assertEqual(guarded["overlap_width"] % 16, 0)
+
+
+class SparkVSRTemporalDecodeRegressionTests(unittest.TestCase):
+    def test_65_frame_chunks_stay_on_the_cogvideox_vae_grid(self):
+        source = torch.arange(65, dtype=torch.float32).reshape(1, 1, 65, 1, 1)
+        padded, pad_t = pad_video_chunk_to_vae_grid(source)
+        self.assertEqual(pad_t, 0)
+        self.assertIs(padded, source)
+
+        tail = source[:, :, :58]
+        padded_tail, pad_t = pad_video_chunk_to_vae_grid(tail)
+        self.assertEqual(pad_t, 7)
+        self.assertEqual(tuple(padded_tail.shape), (1, 1, 65, 1, 1))
+        torch.testing.assert_close(padded_tail[:, :, -1], tail[:, :, -1])
+
+    def test_real_diffusers_shape_probe_detects_the_1080p_safeconv_failure(self):
+        class Config:
+            block_out_channels = (128, 256, 256, 512)
+
+        class Vae:
+            config = Config()
+            num_latent_frames_batch_size = 2
+
+        full_hd_latents = torch.empty((1, 16, 17, 136, 240), device="meta")
+        small_latents = torch.empty((1, 16, 17, 60, 80), device="meta")
+        self.assertTrue(_cogvideox_untiled_decode_needs_spatial_tiling(Vae(), full_hd_latents))
+        self.assertFalse(_cogvideox_untiled_decode_needs_spatial_tiling(Vae(), small_latents))
+
+    def test_split_decode_retries_the_exact_temporal_kernel_error_with_tiles(self):
+        class DecodeResult:
+            def __init__(self, sample):
+                self.sample = sample
+
+        class FakeVae:
+            use_tiling = False
+            tile_latent_min_height = 2
+            tile_latent_min_width = 2
+            tile_sample_min_height = 16
+            tile_sample_min_width = 16
+            tile_overlap_factor_height = 0.5
+            tile_overlap_factor_width = 0.5
+
+            def __init__(self):
+                self.decode_shapes = []
+
+            def decode(self, value):
+                self.decode_shapes.append(tuple(value.shape))
+                if value.shape[-2:] == (4, 4):
+                    raise RuntimeError(
+                        "Calculated padded input size per channel: (2 x 34 x 34). "
+                        "Kernel size: (3 x 3 x 3). Kernel size can't be greater than actual input size"
+                    )
+                sample = torch.ones(
+                    (value.shape[0], 3, value.shape[2], value.shape[3] * 8, value.shape[4] * 8),
+                    dtype=value.dtype,
+                )
+                return DecodeResult(sample)
+
+            @staticmethod
+            def blend_v(_above, current, _extent):
+                return current
+
+            @staticmethod
+            def blend_h(_left, current, _extent):
+                return current
+
+        class Pipe:
+            def __init__(self):
+                self.vae = FakeVae()
+
+        pipe = Pipe()
+        decoded = _vae_decode_to_cpu_low_vram(pipe, torch.zeros((1, 16, 2, 4, 4)))
+        self.assertEqual(pipe.vae.decode_shapes[0][-2:], (4, 4))
+        self.assertTrue(all(shape[-2] <= 2 and shape[-1] <= 2 for shape in pipe.vae.decode_shapes[1:]))
+        self.assertEqual(tuple(decoded.shape), (1, 3, 2, 32, 32))
+        self.assertFalse(pipe.vae.use_tiling)
 
 
 class RIFECompatibilityTests(unittest.TestCase):

@@ -540,29 +540,84 @@ def _profile_cuda_memory(label: str, *, reset_peak: bool = False) -> None:
         torch.cuda.reset_peak_memory_stats(device_index)
 
 
-def _vae_decode_to_cpu_low_vram(pipe: CogVideoXImageToVideoPipeline, z: torch.Tensor) -> torch.Tensor:
-    vae = pipe.vae
-    if vae is None:
-        raise RuntimeError("SparkVSR split decode requires a VAE")
-
-    use_tiling = bool(
-        getattr(vae, "use_tiling", False)
-        and (z.shape[-1] > int(getattr(vae, "tile_latent_min_width", 0) or 0) or z.shape[-2] > int(getattr(vae, "tile_latent_min_height", 0) or 0))
+def _is_short_temporal_conv_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "kernel size can't be greater than actual input size" in message
+        and "padded input size per channel" in message
+        and "kernel size: (3 x 3 x 3)" in message
     )
-    if not use_tiling:
-        decoded = vae.decode(z).sample.detach().cpu()
-        release_torch_memory()
-        return decoded
 
+
+def _cogvideox_untiled_decode_needs_spatial_tiling(vae: object, z: torch.Tensor) -> bool:
+    """Probe the installed Diffusers SafeConv implementation for the known 1080p split bug."""
+    if not isinstance(z, torch.Tensor) or z.ndim != 5:
+        return False
+
+    try:
+        from diffusers.models.autoencoders.autoencoder_kl_cogvideox import CogVideoXSafeConv3d
+
+        block_channels = tuple(int(value) for value in vae.config.block_out_channels)
+        if len(block_channels) < 2:
+            return False
+
+        latent_batch_size = max(1, int(getattr(vae, "num_latent_frames_batch_size", 2) or 2))
+        latent_frames = int(z.shape[2])
+        first_batch_frames = min(latent_frames, latent_batch_size + (latent_frames % latent_batch_size))
+        if first_batch_frames <= 0:
+            return False
+
+        spatial_scale = 2 ** (len(block_channels) - 1)
+        sample_height = int(z.shape[-2]) * spatial_scale
+        sample_width = int(z.shape[-1]) * spatial_scale
+
+        # At the final decoder scale, CogVideoX has block_out_channels[-2]
+        # channels and X+8 causal-convolution input frames for an X-frame
+        # latent batch. A meta tensor exercises shape splitting without
+        # allocating the multi-gigabyte activation.
+        activation_channels = block_channels[-2]
+        activation_frames = first_batch_frames + 8
+        with torch.device("meta"):
+            probe = CogVideoXSafeConv3d(
+                activation_channels,
+                1,
+                kernel_size=3,
+                padding=(0, 1, 1),
+                dtype=torch.float16,
+            )
+            activation = torch.empty(
+                (1, activation_channels, activation_frames, sample_height, sample_width),
+                dtype=torch.float16,
+            )
+            probe(activation)
+    except RuntimeError as exc:
+        return _is_short_temporal_conv_error(exc)
+    except Exception:
+        # The probe is an optimization. The guarded real-decode retry below
+        # remains the fallback for older/newer Diffusers layouts.
+        return False
+    return False
+
+
+def _is_retryable_untiled_vae_decode_error(exc: BaseException) -> bool:
+    if _is_short_temporal_conv_error(exc):
+        return True
+    out_of_memory_type = getattr(torch, "OutOfMemoryError", None)
+    if out_of_memory_type is not None and isinstance(exc, out_of_memory_type):
+        return True
+    return "cuda out of memory" in str(exc).lower()
+
+
+def _vae_decode_spatial_tiles_to_cpu(vae: object, z: torch.Tensor) -> torch.Tensor:
     _, _, _, height, width = z.shape
-    tile_latent_h = int(vae.tile_latent_min_height)
-    tile_latent_w = int(vae.tile_latent_min_width)
+    tile_latent_h = max(1, int(vae.tile_latent_min_height))
+    tile_latent_w = max(1, int(vae.tile_latent_min_width))
     overlap_h = max(1, int(tile_latent_h * (1 - float(vae.tile_overlap_factor_height))))
     overlap_w = max(1, int(tile_latent_w * (1 - float(vae.tile_overlap_factor_width))))
     blend_extent_h = int(vae.tile_sample_min_height * float(vae.tile_overlap_factor_height))
     blend_extent_w = int(vae.tile_sample_min_width * float(vae.tile_overlap_factor_width))
-    row_limit_h = int(vae.tile_sample_min_height) - blend_extent_h
-    row_limit_w = int(vae.tile_sample_min_width) - blend_extent_w
+    row_limit_h = max(1, int(vae.tile_sample_min_height) - blend_extent_h)
+    row_limit_w = max(1, int(vae.tile_sample_min_width) - blend_extent_w)
 
     rows: List[List[torch.Tensor]] = []
     old_use_tiling = bool(getattr(vae, "use_tiling", False))
@@ -594,6 +649,41 @@ def _vae_decode_to_cpu_low_vram(pipe: CogVideoXImageToVideoPipeline, z: torch.Te
     decoded = torch.cat(result_rows, dim=3)
     release_torch_memory()
     return decoded
+
+
+def _vae_decode_to_cpu_low_vram(pipe: CogVideoXImageToVideoPipeline, z: torch.Tensor) -> torch.Tensor:
+    vae = pipe.vae
+    if vae is None:
+        raise RuntimeError("SparkVSR decode requires a VAE")
+
+    use_tiling = bool(
+        getattr(vae, "use_tiling", False)
+        and (z.shape[-1] > int(getattr(vae, "tile_latent_min_width", 0) or 0) or z.shape[-2] > int(getattr(vae, "tile_latent_min_height", 0) or 0))
+    )
+    if not use_tiling and _cogvideox_untiled_decode_needs_spatial_tiling(vae, z):
+        use_tiling = True
+        print(
+            "[SparkVSR] decode: automatically enabling spatial VAE tiling because the installed "
+            "CogVideoX SafeConv would split a 3-frame convolution into 2-frame inputs",
+            flush=True,
+        )
+
+    if not use_tiling:
+        try:
+            decoded = vae.decode(z).sample.detach().cpu()
+            release_torch_memory()
+            return decoded
+        except RuntimeError as exc:
+            if not _is_retryable_untiled_vae_decode_error(exc):
+                raise
+            print(
+                "[SparkVSR] decode: untiled VAE decode was unsafe; retrying with automatic spatial tiling "
+                f"({type(exc).__name__}: {exc})",
+                flush=True,
+            )
+            release_torch_memory()
+
+    return _vae_decode_spatial_tiles_to_cpu(vae, z)
 
 
 def _max_text_seq_length_for_model(model_path: Path) -> int:
@@ -904,7 +994,10 @@ def process_video_ref_i2v(
     release_torch_memory()
 
     mark(0.88, "decoding output video tile")
-    video_generate = pipe.vae.decode(latent_generate / pipe.vae.config.scaling_factor).sample
+    video_generate = _vae_decode_to_cpu_low_vram(
+        pipe,
+        latent_generate / pipe.vae.config.scaling_factor,
+    )
     latent_generate = None
     release_torch_memory()
     mark(1.0, "tile complete")

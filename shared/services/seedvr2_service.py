@@ -73,6 +73,7 @@ from shared.error_handling import (
     logger as error_logger,
 )
 from shared.video_fps_utils import apply_video_fps_override_preprocess, build_output_fps_summary
+from shared.ui_validators import SEEDVR2_MAX_BATCH_SIZE
 from shared.services.autotune_search import (
     ambient_adjusted_min_device_free_gb,
     ambient_adjusted_peak_gb,
@@ -881,6 +882,12 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
 
     # Batch size must be 4n+1 using centralized validation
     bs = int(cfg.get("batch_size", defaults["batch_size"]))
+    if bs > SEEDVR2_MAX_BATCH_SIZE:
+        error_logger.warning(
+            f"Batch size {bs} exceeds the supported maximum; correcting to {SEEDVR2_MAX_BATCH_SIZE}"
+        )
+        bs = SEEDVR2_MAX_BATCH_SIZE
+        cfg["batch_size"] = bs
     is_valid, error_msg = validate_batch_size(bs, must_be_4n_plus_1=True)
     if not is_valid:
         error_logger.warning(f"Invalid batch size {bs}, correcting: {error_msg}")
@@ -986,8 +993,8 @@ def _list_media_files(folder: str, video_exts: set, image_exts: set) -> List[str
 # Auto-tune helpers ------------------------------------------------------------
 AUTOTUNE_MODEL_ID = "seedvr2"
 AUTOTUNE_LOG_PREFIX = "seedvr2_autotune"
-AUTOTUNE_STRATEGY_VERSION = 8
-AUTOTUNE_TARGET_FRAMES = 201
+AUTOTUNE_STRATEGY_VERSION = 9
+AUTOTUNE_TARGET_FRAMES = SEEDVR2_MAX_BATCH_SIZE
 AUTOTUNE_MIN_FREE_VRAM_GB = 2.0
 AUTOTUNE_EMERGENCY_FREE_VRAM_GB = 1.0
 AUTOTUNE_VRAM_SAMPLE_INTERVAL_SEC = 0.10
@@ -1777,7 +1784,7 @@ def _create_autotune_demo_video(
     resize_to: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """
-    Build a deterministic 201-frame demo clip for autotune.
+    Build a deterministic max-batch demo clip for autotune.
 
     The clip reuses user input content while enforcing a fixed frame count so
     batch-size sweeps stay stable and fast.
@@ -3874,7 +3881,7 @@ def build_seedvr2_callbacks(
         SeedVR2 DiT-oriented VRAM autotune sweep.
 
         Strategy:
-        - Build a 201-frame demo clip from current input.
+        - Build a max-batch demo clip from current input.
         - Stage A: find the max passing batch size (4n+1) at the model's
           maximum meaningful blocks_to_swap value
           by growing from the safest batch in bounded steps, then bisecting a
@@ -4444,15 +4451,17 @@ def build_seedvr2_callbacks(
             session_tag = time.strftime("%Y%m%d_%H%M%S")
             session_dir = live_temp_dir / "seedvr2_autotune" / session_tag
             session_dir.mkdir(parents=True, exist_ok=True)
-            demo_video_path = session_dir / "seedvr2_autotune_demo_201f.mp4"
+            demo_video_path = session_dir / f"seedvr2_autotune_demo_{AUTOTUNE_TARGET_FRAMES}f.mp4"
 
             _append_log(
                 f"Input: {input_path} ({input_w}x{input_h}) | "
                 f"target: {target_w}x{target_h} | GPU total VRAM: {total_vram_gb:.2f}GB"
             )
-            _append_log("Creating 201-frame demo clip for deterministic VRAM testing...")
+            _append_log(
+                f"Creating {AUTOTUNE_TARGET_FRAMES}-frame demo clip for deterministic VRAM testing..."
+            )
             yield _payload(
-                "Preparing 201-frame demo clip...",
+                f"Preparing {AUTOTUNE_TARGET_FRAMES}-frame demo clip...",
                 show_indicator=True,
                 indicator_title="Auto Tune setup",
             )
@@ -5031,7 +5040,7 @@ def build_seedvr2_callbacks(
 
             # Stage B: minimize blocks_to_swap at the best passing batch. This is
             # a pure speed knob, so it now runs for ANY frontier batch - not only
-            # when batch 201 passed.
+            # when the maximum batch passed.
             if status_reason == "completed" and isinstance(best_config, dict) and best_config:
                 stage_b_batch = int(best_config.get("batch_size") or 0)
                 blocks_seq = list(range(max(0, autotune_max_blocks - 2), -1, -2))
@@ -5128,9 +5137,8 @@ def build_seedvr2_callbacks(
             if campaign_force_fresh and status_reason != "cancelled":
                 # Profiling is still subject to the same safety contract as the
                 # interactive tuner: establish the minimum-memory point first.
-                profile_batches = sorted(
-                    b for b in (201, 161, 121, 81, 49, 25, 13, 5) if b in set(batch_seq)
-                )
+                profile_ladder = (601, 481, 361, 281, 201, 161, 121, 81, 49, 25, 13, 5)
+                profile_batches = sorted(b for b in profile_ladder if b in set(batch_seq))
                 _append_log(
                     "Campaign profiling: the 2GB reserve cutoff remains active; continuing the "
                     f"Block Swap {autotune_max_blocks} ladder toward "

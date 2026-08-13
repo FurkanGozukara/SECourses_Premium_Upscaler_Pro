@@ -16,6 +16,9 @@ from typing import Tuple, Optional
 import re
 
 
+SEEDVR2_MAX_BATCH_SIZE = 601
+
+
 def validate_batch_size_seedvr2(batch_size: int) -> Tuple[bool, Optional[str], Optional[int]]:
     """
     Validate and correct batch size for SeedVR2 (must be 4n+1).
@@ -32,8 +35,12 @@ def validate_batch_size_seedvr2(batch_size: int) -> Tuple[bool, Optional[str], O
         if bs < 1:
             return False, "Batch size must be at least 1", 5
         
-        if bs > 201:
-            return False, "Batch size too large (max 201)", 201
+        if bs > SEEDVR2_MAX_BATCH_SIZE:
+            return (
+                False,
+                f"Batch size too large (max {SEEDVR2_MAX_BATCH_SIZE})",
+                SEEDVR2_MAX_BATCH_SIZE,
+            )
         
         # Check if it's 4n+1
         if (bs - 1) % 4 != 0:

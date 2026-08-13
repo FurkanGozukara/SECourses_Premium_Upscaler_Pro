@@ -4,7 +4,10 @@ RTX Super Resolution runner backed by NVIDIA Maxine nvvfx Python bindings.
 
 from __future__ import annotations
 
+import platform
 import re
+import shutil
+import subprocess
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -216,14 +219,17 @@ def _build_dimensions_plan(
     # Cap must always be enforced:
     # - ON: pre-downscale input first, then run model at requested scale.
     # - OFF: keep input as-is, reduce model scale to effective scale.
-    use_pre_down = bool(pre_downscale_then_upscale and cap_ratio < 0.999999)
+    use_pre_down = bool(
+        pre_downscale_then_upscale
+        and cap_ratio < 0.999999
+        and requested_scale <= 4.0
+    )
     preprocess_scale = cap_ratio if use_pre_down else 1.0
-    model_scale = requested_scale if use_pre_down else effective_scale
     preprocess_w = max(1, int(round(in_w * preprocess_scale)))
     preprocess_h = max(1, int(round(in_h * preprocess_scale)))
 
-    out_w = max(1, int(round(preprocess_w * model_scale)))
-    out_h = max(1, int(round(preprocess_h * model_scale)))
+    out_w = max(1, int(round(in_w * effective_scale)))
+    out_h = max(1, int(round(in_h * effective_scale)))
 
     # Keep encoded video dimensions codec-friendly.
     out_w = max(2, int(out_w))
@@ -244,6 +250,34 @@ def _build_dimensions_plan(
     preprocess_w = max(2, preprocess_w)
     preprocess_h = max(2, preprocess_h)
 
+    # The NVIDIA binding supports up to 4x per inference call. Keep the AI
+    # pass inside that contract and perform only the residual resize afterward.
+    # If a max-edge cap requests an output smaller than the source, preprocess
+    # to the final size instead of asking VSR to downscale.
+    if out_w < preprocess_w or out_h < preprocess_h:
+        preprocess_w = out_w
+        preprocess_h = out_h
+    native_scale = max(
+        float(out_w) / float(max(1, preprocess_w)),
+        float(out_h) / float(max(1, preprocess_h)),
+    )
+    if native_scale > 4.0:
+        model_out_w = min(out_w, max(2, int(round(preprocess_w * 4.0))))
+        model_out_h = min(out_h, max(2, int(round(preprocess_h * 4.0))))
+    else:
+        model_out_w = out_w
+        model_out_h = out_h
+    if model_out_w % 2:
+        model_out_w -= 1
+    if model_out_h % 2:
+        model_out_h -= 1
+    model_out_w = max(2, model_out_w)
+    model_out_h = max(2, model_out_h)
+    model_scale = max(
+        float(model_out_w) / float(max(1, preprocess_w)),
+        float(model_out_h) / float(max(1, preprocess_h)),
+    )
+
     return {
         "input_width": in_w,
         "input_height": in_h,
@@ -254,6 +288,9 @@ def _build_dimensions_plan(
         "same_res_mode": same_res_mode,
         "preprocess_width": preprocess_w,
         "preprocess_height": preprocess_h,
+        "model_output_width": model_out_w,
+        "model_output_height": model_out_h,
+        "post_resize_required": bool(model_out_w != out_w or model_out_h != out_h),
         "output_width": out_w,
         "output_height": out_h,
     }
@@ -273,6 +310,10 @@ def run_rtx_superres(
     output_fps = 30.0
     inline_progress_active = False
     inline_progress_width = 0
+    sr = None
+    cap = None
+    video_writer = None
+    ffmpeg_writer = None
 
     def log(msg: str) -> None:
         nonlocal inline_progress_active, inline_progress_width
@@ -313,8 +354,10 @@ def run_rtx_superres(
                 returncode=1,
                 output_path=None,
                 log=(
-                    "RTX Super Resolution dependency is missing. Install it in this app's venv with "
-                    f"'python -m pip install nvidia-vfx==0.1.0.1'. Details: {import_err}"
+                    "RTX Super Resolution runtime could not be loaded. The app requirements install "
+                    "nvidia-vfx==0.1.0.1 on both Windows and Linux. Re-run the installer in this "
+                    f"app's venv and verify the NVIDIA driver. Platform={platform.system()}. "
+                    f"Details: {import_err}"
                 ),
                 elapsed_seconds=max(0.0, time.time() - start_ts),
             )
@@ -358,7 +401,31 @@ def run_rtx_superres(
                 log="CUDA is not available. RTX Super Resolution requires CUDA.",
                 elapsed_seconds=max(0.0, time.time() - start_ts),
             )
+        device_count = int(torch.cuda.device_count())
+        if device_idx < 0 or device_idx >= device_count:
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log=(
+                    f"CUDA device {device_idx} is unavailable; detected {device_count} CUDA device(s). "
+                    "Select a valid RTX GPU in Global Settings."
+                ),
+                elapsed_seconds=max(0.0, time.time() - start_ts),
+            )
         torch.cuda.set_device(device_idx)
+        props = torch.cuda.get_device_properties(device_idx)
+        capability = (int(getattr(props, "major", 0)), int(getattr(props, "minor", 0)))
+        if capability < (7, 5):
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log=(
+                    f"GPU '{getattr(props, 'name', device_idx)}' has CUDA capability "
+                    f"{capability[0]}.{capability[1]}. nvidia-vfx requires a Tensor Core GPU "
+                    "from NVIDIA Turing/RTX 2000 or newer."
+                ),
+                elapsed_seconds=max(0.0, time.time() - start_ts),
+            )
 
         quality_name = str(settings.get("quality_preset", "ULTRA") or "ULTRA").strip().upper()
         if quality_name not in VideoSuperRes.QualityLevel.__members__:
@@ -419,6 +486,8 @@ def run_rtx_superres(
         )
         preprocess_w = int(plan["preprocess_width"])
         preprocess_h = int(plan["preprocess_height"])
+        model_out_w = int(plan["model_output_width"])
+        model_out_h = int(plan["model_output_height"])
         out_w = int(plan["output_width"])
         out_h = int(plan["output_height"])
 
@@ -442,6 +511,11 @@ def run_rtx_superres(
             log(
                 f"[RTX] Sizing plan: input {in_w}x{in_h} -> preprocess {preprocess_w}x{preprocess_h} -> output {out_w}x{out_h} "
                 f"(requested {upscale_factor:g}x, effective {float(plan.get('effective_scale', 1.0)):.3f}x)."
+            )
+        if bool(plan.get("post_resize_required")):
+            log(
+                f"[RTX] Native VFX pass is capped at 4x ({model_out_w}x{model_out_h}); "
+                f"a final Lanczos resize will produce the exact {out_w}x{out_h} target."
             )
 
         output_path: Optional[str] = None
@@ -487,10 +561,23 @@ def run_rtx_superres(
         if output_fps <= 0:
             output_fps = input_fps
 
-        sr = VideoSuperRes(device=device_idx, quality=quality_enum)
-        sr.output_width = out_w
-        sr.output_height = out_h
-        sr.load()
+        try:
+            sr = VideoSuperRes(device=device_idx, quality=quality_enum)
+            sr.output_width = model_out_w
+            sr.output_height = model_out_h
+            sr.load()
+        except Exception as load_err:
+            linux_driver_hint = (
+                " Linux VSR requires a supported NVIDIA driver branch (570.190+, 580.82+, or 590.44+)."
+                if platform.system() == "Linux"
+                else " Windows VSR requires NVIDIA driver 570.65 or newer."
+            )
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log=f"NVIDIA VFX failed to initialize on cuda:{device_idx}: {load_err}.{linux_driver_hint}",
+                elapsed_seconds=max(0.0, time.time() - start_ts),
+            )
 
         log(
             f"[RTX] Runtime ready: quality={quality_name}, non_blocking={bool(non_blocking)}, "
@@ -525,10 +612,17 @@ def run_rtx_superres(
                 .cpu()
                 .numpy()
             )
-            return cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+            out_bgr = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+            if int(out_bgr.shape[1]) != out_w or int(out_bgr.shape[0]) != out_h:
+                interpolation = (
+                    cv2.INTER_LANCZOS4
+                    if out_w > int(out_bgr.shape[1]) or out_h > int(out_bgr.shape[0])
+                    else cv2.INTER_AREA
+                )
+                out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=interpolation)
+            return out_bgr
 
         # Build frame source.
-        cap = None
         frame_paths: List[Path] = []
         single_image = None
         try:
@@ -572,17 +666,69 @@ def run_rtx_superres(
             )
 
         # Build sink.
-        video_writer = None
         if output_path and Path(output_path).suffix.lower() in VIDEO_EXTENSIONS:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             video_writer = cv2.VideoWriter(str(output_path), fourcc, float(output_fps), (out_w, out_h))
             if not video_writer.isOpened():
-                return RTXSuperResResult(
-                    returncode=1,
-                    output_path=None,
-                    log=f"Failed to create output video writer: {output_path}",
-                    elapsed_seconds=max(0.0, time.time() - start_ts),
-                )
+                with suppress(Exception):
+                    video_writer.release()
+                video_writer = None
+                with suppress(Exception):
+                    Path(output_path).unlink(missing_ok=True)
+                ffmpeg_exe = shutil.which("ffmpeg")
+                if ffmpeg_exe:
+                    ffmpeg_cmd = [
+                        ffmpeg_exe,
+                        "-y",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "bgr24",
+                        "-s:v",
+                        f"{out_w}x{out_h}",
+                        "-r",
+                        f"{float(output_fps):.8f}",
+                        "-i",
+                        "-",
+                        "-an",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "fast",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-movflags",
+                        "+faststart",
+                        str(output_path),
+                    ]
+                    ffmpeg_writer = subprocess.Popen(
+                        ffmpeg_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    log("[RTX] OpenCV MP4 writer unavailable; using the cross-platform FFmpeg fallback.")
+                else:
+                    return RTXSuperResResult(
+                        returncode=1,
+                        output_path=None,
+                        log=(
+                            f"Failed to create an MP4 writer for {output_path}. "
+                            "OpenCV video encoding is unavailable and ffmpeg was not found in PATH."
+                        ),
+                        elapsed_seconds=max(0.0, time.time() - start_ts),
+                    )
+
+        def write_video_frame(frame_bgr) -> None:
+            if video_writer is not None:
+                video_writer.write(frame_bgr)
+                return
+            if ffmpeg_writer is not None and ffmpeg_writer.stdin is not None:
+                ffmpeg_writer.stdin.write(frame_bgr.tobytes())
+                return
+            raise RuntimeError("RTX video output writer is not initialized")
 
         ema_frame_sec: Optional[float] = None
         log_eta_interval = 0.8
@@ -647,7 +793,9 @@ def run_rtx_superres(
             out_path = Path(output_path or "")
             out_path.parent.mkdir(parents=True, exist_ok=True)
             if video_writer is not None:
-                video_writer.write(out_frame)
+                write_video_frame(out_frame)
+            elif ffmpeg_writer is not None:
+                write_video_frame(out_frame)
             else:
                 save_params: List[int] = []
                 if out_path.suffix.lower() in {".jpg", ".jpeg"}:
@@ -694,9 +842,22 @@ def run_rtx_superres(
                     frame_file = frame_paths[frame_idx]
                     frame_bgr = cv2.imread(str(frame_file), cv2.IMREAD_COLOR)
                     if frame_bgr is None:
-                        log(f"[RTX] Skipping unreadable frame: {frame_file.name}")
-                        frame_idx += 1
-                        continue
+                        return RTXSuperResResult(
+                            returncode=1,
+                            output_path=None,
+                            log="\n".join(
+                                logs
+                                + [
+                                    f"Unreadable input frame: {frame_file}. "
+                                    "Processing stopped to prevent a frame-count/timing mismatch."
+                                ]
+                            ),
+                            input_fps=input_fps,
+                            output_fps=output_fps,
+                            frames_processed=frame_idx,
+                            total_frames=total_frames,
+                            elapsed_seconds=max(0.0, time.time() - start_ts),
+                        )
 
                 out_frame = run_frame(frame_bgr)
                 if out_frame is None:
@@ -715,15 +876,75 @@ def run_rtx_superres(
                 emit_progress(next_idx, total_frames if total_frames > 0 else max(next_idx, 1))
 
                 if video_writer is not None:
-                    video_writer.write(out_frame)
+                    write_video_frame(out_frame)
+                elif ffmpeg_writer is not None:
+                    write_video_frame(out_frame)
                 elif output_dir_path is not None:
                     frame_name = f"{Path(input_path).stem}_{next_idx:06d}.png"
                     out_file = output_dir_path / frame_name
-                    cv2.imwrite(str(out_file), out_frame)
+                    if not cv2.imwrite(str(out_file), out_frame):
+                        return RTXSuperResResult(
+                            returncode=1,
+                            output_path=None,
+                            log="\n".join(logs + [f"Failed to save output frame: {out_file}"]),
+                            input_fps=input_fps,
+                            output_fps=output_fps,
+                            frames_processed=frame_idx,
+                            total_frames=total_frames,
+                            elapsed_seconds=max(0.0, time.time() - start_ts),
+                        )
                 frame_idx = next_idx
+
+        if video_writer is not None:
+            video_writer.release()
+            video_writer = None
+        if ffmpeg_writer is not None:
+            if ffmpeg_writer.stdin is not None:
+                ffmpeg_writer.stdin.close()
+            ffmpeg_returncode = ffmpeg_writer.wait(timeout=120)
+            ffmpeg_writer = None
+            if ffmpeg_returncode != 0:
+                return RTXSuperResResult(
+                    returncode=1,
+                    output_path=None,
+                    log="\n".join(logs + [f"FFmpeg video encoding failed with code {ffmpeg_returncode}."]),
+                    input_fps=input_fps,
+                    output_fps=output_fps,
+                    frames_processed=frame_idx,
+                    total_frames=total_frames,
+                    elapsed_seconds=max(0.0, time.time() - start_ts),
+                )
 
         processed = frame_idx
         elapsed = max(0.0, time.time() - start_ts)
+        if processed <= 0:
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(logs + ["No input frames were decoded; RTX output is incomplete."]),
+                input_fps=float(input_fps),
+                output_fps=float(output_fps),
+                frames_processed=0,
+                total_frames=int(total_frames),
+                elapsed_seconds=float(elapsed),
+            )
+        if input_kind == "video" and total_frames > 0 and processed + 1 < total_frames:
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(
+                    logs
+                    + [
+                        f"Input decoding stopped early at {processed}/{total_frames} frames. "
+                        "Processing failed instead of returning a truncated video."
+                    ]
+                ),
+                input_fps=float(input_fps),
+                output_fps=float(output_fps),
+                frames_processed=int(processed),
+                total_frames=int(total_frames),
+                elapsed_seconds=float(elapsed),
+            )
         fps_proc = (float(processed) / elapsed) if elapsed > 0 else 0.0
         log(
             f"[RTX] Complete: {processed} frame(s) processed in {_format_seconds(elapsed)} "
@@ -733,6 +954,29 @@ def run_rtx_superres(
         final_output = output_path
         if output_dir_path is not None:
             final_output = str(output_dir_path)
+        final_path = Path(final_output) if final_output else None
+        if not final_path or not final_path.exists():
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(logs + ["RTX processing ended without creating the expected output."]),
+                input_fps=float(input_fps),
+                output_fps=float(output_fps),
+                frames_processed=int(processed),
+                total_frames=int(total_frames),
+                elapsed_seconds=float(elapsed),
+            )
+        if final_path.is_file() and final_path.stat().st_size <= 0:
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(logs + [f"RTX output file is empty: {final_path}"]),
+                input_fps=float(input_fps),
+                output_fps=float(output_fps),
+                frames_processed=int(processed),
+                total_frames=int(total_frames),
+                elapsed_seconds=float(elapsed),
+            )
 
         return RTXSuperResResult(
             returncode=0,
@@ -769,3 +1013,15 @@ def run_rtx_superres(
         with suppress(Exception):
             if "video_writer" in locals() and video_writer is not None:
                 video_writer.release()
+        with suppress(Exception):
+            if ffmpeg_writer is not None:
+                if ffmpeg_writer.stdin is not None:
+                    ffmpeg_writer.stdin.close()
+                if ffmpeg_writer.poll() is None:
+                    ffmpeg_writer.terminate()
+                ffmpeg_writer.wait(timeout=5)
+        with suppress(Exception):
+            if sr is not None:
+                close_fn = getattr(sr, "close", None)
+                if callable(close_fn):
+                    close_fn()

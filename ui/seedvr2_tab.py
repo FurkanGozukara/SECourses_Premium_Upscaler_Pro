@@ -20,7 +20,7 @@ from shared.services.seedvr2_service import (
 )
 from shared.models.seedvr2_meta import get_seedvr2_model_names
 from shared.video_comparison_slider import get_video_comparison_js_on_load
-from shared.ui_validators import validate_batch_size_seedvr2
+from shared.ui_validators import SEEDVR2_MAX_BATCH_SIZE, validate_batch_size_seedvr2
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -243,7 +243,7 @@ def seedvr2_tab(
                 batch_size = gr.Slider(
                     label="Batch Size (must be 4n+1: 5, 9, 13, 17...)",
                     minimum=5,
-                    maximum=201,
+                    maximum=SEEDVR2_MAX_BATCH_SIZE,
                     step=4,
                     value=values[11],  # Was 14, now 11 (shift -3)
                     info="SeedVR2 requires batch size to follow 4n+1 formula (5, 9, 13, 17, 21...)",
@@ -269,7 +269,7 @@ def seedvr2_tab(
                     )
             gr.Markdown(
                 (
-                    "**Auto Tune (DiT-focused):** Creates a temporary 201-frame demo clip from your current input, "
+                    f"**Auto Tune (DiT-focused):** Creates a temporary {SEEDVR2_MAX_BATCH_SIZE}-frame demo clip from your current input, "
                     "tests increasing batch sizes at the selected model's maximum useful BlockSwap setting, keeps your `Save VRAM (GB)` target free "
                     "(default `2.0GB`), then reduces block swap for faster inference when headroom remains. "
                     "Probes always start from the lowest-memory candidate and grow gradually. Results are cached in `vram_usages` "

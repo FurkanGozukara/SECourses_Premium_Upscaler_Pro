@@ -2,11 +2,198 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
 SPARKVSR_TEMPORAL_REF_MANIFEST_NAME = "sparkvsr_temporal_references.json"
+
+PISA_RUNTIME_KEYS = (
+    "pisa_python_executable",
+    "pisa_script_path",
+    "pisa_sd_model_path",
+    "pisa_chkpt_path",
+)
+
+_PISA_ENV_KEYS = {
+    "pisa_python_executable": ("SEC_PISA_PYTHON_EXECUTABLE", "PISA_PYTHON_EXECUTABLE"),
+    "pisa_script_path": ("SEC_PISA_SCRIPT_PATH", "PISA_SCRIPT_PATH"),
+    "pisa_sd_model_path": ("SEC_PISA_SD_MODEL_PATH", "PISA_SD_MODEL_PATH"),
+    "pisa_chkpt_path": ("SEC_PISA_CHKPT_PATH", "PISA_CHKPT_PATH"),
+}
+
+
+def _unique_paths(values: List[Path]) -> List[Path]:
+    unique: List[Path] = []
+    seen = set()
+    for value in values:
+        try:
+            candidate = Path(value).expanduser().resolve()
+        except Exception:
+            continue
+        token = os.path.normcase(str(candidate))
+        if token not in seen:
+            seen.add(token)
+            unique.append(candidate)
+    return unique
+
+
+def _resolve_candidate(value: Any, base_dir: Path) -> Optional[Path]:
+    raw = os.path.expandvars(os.path.expanduser(str(value or "").strip()))
+    if not raw:
+        return None
+    try:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        return candidate.resolve()
+    except Exception:
+        return None
+
+
+def _valid_pisa_candidate(key: str, value: Any, base_dir: Path) -> Optional[str]:
+    if key == "pisa_python_executable":
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        resolved_command = shutil.which(raw)
+        if resolved_command:
+            return str(Path(resolved_command).resolve())
+        candidate = _resolve_candidate(raw, base_dir)
+        if candidate and candidate.is_file():
+            return str(candidate)
+        return None
+
+    candidate = _resolve_candidate(value, base_dir)
+    if not candidate or not candidate.exists():
+        return None
+    if key in {"pisa_script_path", "pisa_chkpt_path"} and not candidate.is_file():
+        return None
+    if key == "pisa_sd_model_path" and not candidate.is_dir():
+        return None
+    return str(candidate)
+
+
+def discover_pisa_runtime(settings: Optional[Dict[str, Any]], base_dir: Path) -> Dict[str, str]:
+    """Find a usable PiSA-SR installation without depending on the process CWD."""
+    base_dir = Path(base_dir).expanduser().resolve()
+    settings = settings if isinstance(settings, dict) else {}
+
+    roots: List[Path] = []
+    explicit_script = _resolve_candidate(settings.get("pisa_script_path"), base_dir)
+    if explicit_script:
+        roots.append(explicit_script.parent)
+    for env_key in ("SEC_PISA_ROOT", "PISA_ROOT"):
+        env_root = _resolve_candidate(os.environ.get(env_key), base_dir)
+        if env_root:
+            roots.append(env_root)
+    roots.extend(
+        [
+            base_dir / "PiSA-SR",
+            base_dir / "pisasr",
+            base_dir / "external" / "PiSA-SR",
+            base_dir.parent / "PiSA-SR",
+            Path.cwd() / "PiSA-SR",
+        ]
+    )
+    roots = _unique_paths(roots)
+
+    candidates: Dict[str, List[Any]] = {key: [settings.get(key)] for key in PISA_RUNTIME_KEYS}
+    for key, env_keys in _PISA_ENV_KEYS.items():
+        candidates[key].extend(os.environ.get(env_key) for env_key in env_keys)
+
+    for root in roots:
+        candidates["pisa_script_path"].append(root / "test_pisasr.py")
+        candidates["pisa_sd_model_path"].extend(
+            [
+                root / "preset" / "models" / "stable-diffusion-2-1-base",
+                root / "models" / "stable-diffusion-2-1-base",
+            ]
+        )
+        candidates["pisa_chkpt_path"].extend(
+            [
+                root / "preset" / "models" / "pisa_sr.pkl",
+                root / "models" / "pisa_sr.pkl",
+            ]
+        )
+        for env_name in ("venv", ".venv", "env"):
+            env_root = root / env_name
+            candidates["pisa_python_executable"].append(
+                env_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            )
+
+    home = Path.home()
+    for conda_home in (home / "miniconda3", home / "anaconda3", home / "miniforge3"):
+        for env_name in ("PiSA-SR", "pisa-sr", "pisasr"):
+            env_root = conda_home / "envs" / env_name
+            candidates["pisa_python_executable"].append(
+                env_root / ("python.exe" if os.name == "nt" else "bin/python")
+            )
+
+    # PiSA can also be installed into SEC's environment. Keep this behind all
+    # dedicated-environment candidates because the official project recommends
+    # a separate Python 3.10 environment.
+    candidates["pisa_python_executable"].extend(
+        [
+            base_dir / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"),
+            sys.executable,
+        ]
+    )
+
+    resolved: Dict[str, str] = {}
+    for key in PISA_RUNTIME_KEYS:
+        for candidate in candidates[key]:
+            valid = _valid_pisa_candidate(key, candidate, base_dir)
+            if valid:
+                resolved[key] = valid
+                break
+    return resolved
+
+
+def resolve_pisa_runtime(
+    settings: Dict[str, Any],
+    base_dir: Path,
+) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+    """Resolve and validate every path needed by the PiSA-SR reference mode."""
+    merged = dict(settings or {})
+    if str(merged.get("ref_mode") or "").strip().lower() != "pisasr":
+        return merged, None, []
+
+    discovered = discover_pisa_runtime(merged, Path(base_dir))
+    notes: List[str] = []
+    missing: List[str] = []
+    labels = {
+        "pisa_python_executable": "PiSA Python executable",
+        "pisa_script_path": "PiSA test_pisasr.py script",
+        "pisa_sd_model_path": "Stable Diffusion 2.1 base model directory",
+        "pisa_chkpt_path": "PiSA pisa_sr.pkl checkpoint",
+    }
+    for key in PISA_RUNTIME_KEYS:
+        original = str(merged.get(key) or "").strip()
+        resolved = discovered.get(key, "")
+        if not resolved:
+            missing.append(labels[key])
+            continue
+        merged[key] = resolved
+        if not original or os.path.normcase(original) != os.path.normcase(resolved):
+            notes.append(f"[SparkVSR] Auto-resolved {labels[key]}: {resolved}")
+
+    if missing:
+        standard_root = Path(base_dir).expanduser().resolve() / "PiSA-SR"
+        error = (
+            "PiSA-SR reference mode is not fully configured. Missing or invalid: "
+            + ", ".join(missing)
+            + ". Install PiSA-SR under "
+            + str(standard_root)
+            + " (with test_pisasr.py, preset/models/stable-diffusion-2-1-base, "
+            "preset/models/pisa_sr.pkl, and a venv/.venv), fill the four PiSA fields in "
+            "SparkVSR Advanced Reference Controls, or set SEC_PISA_PYTHON_EXECUTABLE, "
+            "SEC_PISA_SCRIPT_PATH, SEC_PISA_SD_MODEL_PATH, and SEC_PISA_CHKPT_PATH."
+        )
+        return merged, error, notes
+    return merged, None, notes
 
 
 def temporal_padding_to_vae_grid(frame_count: int, period: int = 8) -> int:

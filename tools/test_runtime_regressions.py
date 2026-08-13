@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,9 @@ from shared.services.sparkvsr_service import (
     sparkvsr_defaults,
 )
 from shared.preset_manager import PresetManager
+from shared.rtx_superres_runner import _build_dimensions_plan
+from shared.sparkvsr_ref_utils import resolve_pisa_runtime
+from shared.ui_validators import SEEDVR2_MAX_BATCH_SIZE, validate_batch_size_seedvr2
 from tools.sparkvsr_inference import (
     _cogvideox_untiled_decode_needs_spatial_tiling,
     _vae_decode_to_cpu_low_vram,
@@ -105,6 +109,107 @@ class SparkVSRSpatialRegressionTests(unittest.TestCase):
         self.assertEqual(guarded["tile_width"] % 16, 0)
         self.assertEqual(guarded["overlap_height"] % 16, 0)
         self.assertEqual(guarded["overlap_width"] % 16, 0)
+
+
+class PiSAIntegrationRegressionTests(unittest.TestCase):
+    def test_standard_install_is_auto_resolved_before_sparkvsr_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pisa = base / "PiSA-SR"
+            script = pisa / "test_pisasr.py"
+            sd_model = pisa / "preset" / "models" / "stable-diffusion-2-1-base"
+            checkpoint = pisa / "preset" / "models" / "pisa_sr.pkl"
+            python_exe = pisa / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+            for directory in (script.parent, sd_model, checkpoint.parent, python_exe.parent):
+                directory.mkdir(parents=True, exist_ok=True)
+            script.write_text("print('pisa')", encoding="utf-8")
+            checkpoint.write_bytes(b"checkpoint")
+            python_exe.write_bytes(b"python")
+
+            resolved, error, notes = resolve_pisa_runtime({"ref_mode": "pisasr"}, base)
+
+            self.assertIsNone(error)
+            self.assertEqual(Path(resolved["pisa_script_path"]), script.resolve())
+            self.assertEqual(Path(resolved["pisa_sd_model_path"]), sd_model.resolve())
+            self.assertEqual(Path(resolved["pisa_chkpt_path"]), checkpoint.resolve())
+            self.assertEqual(Path(resolved["pisa_python_executable"]), python_exe.resolve())
+            self.assertEqual(len(notes), 4)
+
+    def test_missing_install_fails_preflight_with_actionable_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _resolved, error, _notes = resolve_pisa_runtime({"ref_mode": "pisasr"}, Path(tmp))
+        self.assertIsNotNone(error)
+        self.assertIn("test_pisasr.py", error)
+        self.assertIn("stable-diffusion-2-1-base", error)
+        self.assertIn("pisa_sr.pkl", error)
+        self.assertIn("SEC_PISA_SCRIPT_PATH", error)
+
+
+class SeedVR2BatchLimitRegressionTests(unittest.TestCase):
+    def test_601_is_the_supported_seedvr2_maximum(self):
+        self.assertEqual(SEEDVR2_MAX_BATCH_SIZE, 601)
+        self.assertEqual(validate_batch_size_seedvr2(601), (True, None, 601))
+        valid, message, corrected = validate_batch_size_seedvr2(605)
+        self.assertFalse(valid)
+        self.assertIn("max 601", str(message))
+        self.assertEqual(corrected, 601)
+
+        from shared.services.seedvr2_service import _enforce_seedvr2_guardrails, seedvr2_defaults
+
+        seed_defaults = seedvr2_defaults()
+        guarded = _enforce_seedvr2_guardrails(
+            {**seed_defaults, "batch_size": 1001},
+            seed_defaults,
+            silent_migration=True,
+        )
+        self.assertEqual(guarded["batch_size"], 601)
+
+
+class RTXSuperResolutionRegressionTests(unittest.TestCase):
+    def test_denoise_and_deblur_modes_are_always_same_resolution(self):
+        for quality in ("DENOISE_ULTRA", "DEBLUR_HIGH"):
+            plan = _build_dimensions_plan(
+                input_width=1920,
+                input_height=1080,
+                upscale_factor=4.0,
+                max_edge=8192,
+                pre_downscale_then_upscale=True,
+                quality_name=quality,
+            )
+            self.assertEqual((plan["output_width"], plan["output_height"]), (1920, 1080))
+
+    def test_large_requested_scale_keeps_native_vfx_pass_at_or_below_4x(self):
+        plan = _build_dimensions_plan(
+            input_width=640,
+            input_height=360,
+            upscale_factor=9.9,
+            max_edge=0,
+            pre_downscale_then_upscale=True,
+            quality_name="HIGHBITRATE_ULTRA",
+        )
+        self.assertTrue(plan["post_resize_required"])
+        self.assertLessEqual(plan["model_scale"], 4.0)
+        self.assertEqual((plan["output_width"], plan["output_height"]), (6336, 3564))
+
+    def test_linux_health_check_uses_installed_nvvfx_instead_of_skipping(self):
+        from shared import health
+
+        fake_module = types.ModuleType("nvvfx")
+
+        class FakeVideoSuperRes:
+            QualityLevel = object()
+
+        fake_module.VideoSuperRes = FakeVideoSuperRes
+        with mock.patch.dict(sys.modules, {"nvvfx": fake_module}), mock.patch.object(
+            health.platform, "system", return_value="Linux"
+        ):
+            result = health._check_nvidia_vfx()
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("Linux", str(result["detail"]))
+
+    def test_installer_requirements_include_nvidia_vfx(self):
+        requirements = (ROOT.parent / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("nvidia-vfx==0.1.0.1", requirements)
 
 
 class SparkVSRTemporalDecodeRegressionTests(unittest.TestCase):

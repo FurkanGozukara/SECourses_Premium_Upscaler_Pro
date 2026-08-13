@@ -828,6 +828,7 @@ class SeedVaeRecoveryTests(unittest.TestCase):
 
     def test_seed_cache_requires_a_full_pass_matching_the_best(self):
         from shared.services.seedvr2_service import (
+            AUTOTUNE_TARGET_FRAMES,
             _build_autotune_signature,
             _find_cached_autotune_log,
         )
@@ -849,7 +850,7 @@ class SeedVaeRecoveryTests(unittest.TestCase):
             min_free_target_gb=2.0,
         )
         best = {
-            "batch_size": 201,
+            "batch_size": AUTOTUNE_TARGET_FRAMES,
             "blocks_to_swap": 0,
             "vae_encode_tiled": True,
             "vae_decode_tiled": True,

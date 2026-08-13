@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,35 @@ SPLIT_STAGE_STATE_KIND = "sparkvsr_split_stage_state_v1"
 PROMPT_EMBEDDING_KEY = "prompt_embedding"
 EMPTY_PROMPT_SHA256 = hashlib.sha256(b"").hexdigest()
 SPARKVSR_SPATIAL_MULTIPLE = 16
+
+
+def _validate_pisa_runtime_args(args: argparse.Namespace) -> None:
+    python_raw = str(getattr(args, "pisa_python_executable", "") or "").strip()
+    python_resolved = shutil.which(python_raw) if python_raw else None
+    if not python_resolved and python_raw:
+        candidate = Path(python_raw).expanduser()
+        if candidate.is_file():
+            python_resolved = str(candidate.resolve())
+    if python_resolved:
+        args.pisa_python_executable = str(Path(python_resolved).resolve())
+
+    checks = (
+        ("pisa_python_executable", "PiSA Python executable", "file"),
+        ("pisa_script_path", "PiSA test_pisasr.py script", "file"),
+        ("pisa_sd_model_path", "Stable Diffusion 2.1 base model directory", "directory"),
+        ("pisa_chkpt_path", "PiSA pisa_sr.pkl checkpoint", "file"),
+    )
+    invalid: List[str] = []
+    for key, label, expected_kind in checks:
+        raw = str(getattr(args, key, "") or "").strip()
+        path = Path(raw).expanduser() if raw else None
+        valid = bool(path and (path.is_file() if expected_kind == "file" else path.is_dir()))
+        if not valid:
+            invalid.append(f"{label} ({raw or 'not set'})")
+        elif key != "pisa_python_executable":
+            setattr(args, key, str(path.resolve()))
+    if invalid:
+        raise ValueError("PiSA-SR configuration is missing or invalid: " + ", ".join(invalid))
 
 
 def release_torch_memory() -> None:
@@ -1730,9 +1760,7 @@ def build_ref_frames(
     if args.ref_mode == "pisasr":
         cache_dir = Path(args.ref_pisa_cache_dir or Path(args.output_path) / "ref_pisasr_cache") / Path(video_name).stem
         cache_dir.mkdir(parents=True, exist_ok=True)
-        required = [args.pisa_python_executable, args.pisa_script_path, args.pisa_sd_model_path, args.pisa_chkpt_path]
-        if not all(required):
-            raise ValueError("PiSA-SR mode requires pisa_python_executable, pisa_script_path, pisa_sd_model_path, and pisa_chkpt_path.")
+        _validate_pisa_runtime_args(args)
         for idx in ref_indices:
             frame_path = cache_dir / f"{Path(video_name).stem}_frame_{idx:05d}.png"
             if not frame_path.exists():
@@ -1764,7 +1792,18 @@ def build_ref_frames(
                     ]
                     env = os.environ.copy()
                     env["CUDA_VISIBLE_DEVICES"] = str(args.pisa_gpu or "0")
-                    subprocess.run(cmd, env=env, check=True, cwd=str(Path(args.pisa_script_path).parent))
+                    try:
+                        subprocess.run(
+                            cmd,
+                            env=env,
+                            check=True,
+                            cwd=str(Path(args.pisa_script_path).parent),
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        raise RuntimeError(
+                            f"PiSA-SR reference generation failed for frame {idx} "
+                            f"with exit code {exc.returncode}. Review the PiSA environment/model paths above."
+                        ) from exc
                     generated = out_dir / "input_frame.png"
                     if generated.exists():
                         frame_path.write_bytes(generated.read_bytes())
@@ -1774,8 +1813,10 @@ def build_ref_frames(
                     t_img = interpolate_2d(t_img.unsqueeze(0), (target_h, target_w), "bilinear").squeeze(0)
                 ref_frames_list.append(t_img)
             else:
-                print(f"Warning: PiSA-SR frame {idx} not generated. Using LQ frame.", flush=True)
-                ref_frames_list.append(video[0, :, idx])
+                raise RuntimeError(
+                    f"PiSA-SR completed without generating the expected reference frame: {frame_path}. "
+                    "SparkVSR stopped instead of silently substituting the low-quality input frame."
+                )
         return ref_indices, ref_frames_list
 
     raise ValueError(f"Unsupported ref_mode: {args.ref_mode}")

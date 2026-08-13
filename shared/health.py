@@ -429,21 +429,26 @@ def _check_gradio() -> Dict[str, Optional[str]]:
 
 def _check_nvidia_vfx() -> Dict[str, Optional[str]]:
     """Verify the runtime required by the RTX Super Resolution tab."""
-    if platform.system() != "Windows":
-        return {"status": "skipped", "detail": "RTX Super Resolution is available on Windows only"}
     try:
         from nvvfx import VideoSuperRes  # type: ignore
 
         presets = getattr(VideoSuperRes, "QualityLevel", None)
         if presets is None:
             return {"status": "error", "detail": "nvidia-vfx loaded, but VideoSuperRes.QualityLevel is unavailable"}
-        return {"status": "ok", "detail": "NVIDIA VFX Python runtime is available for RTX Super Resolution"}
+        return {
+            "status": "ok",
+            "detail": (
+                "NVIDIA VFX Python runtime is available for RTX Super Resolution "
+                f"on {platform.system()}"
+            ),
+        }
     except Exception as exc:
         return {
             "status": "missing",
             "detail": (
                 "RTX Super Resolution runtime is missing. Install nvidia-vfx==0.1.0.1 "
-                f"in the app venv. Details: {exc}"
+                "in the app venv (supported on Windows and Linux). "
+                f"Details: {exc}"
             ),
         }
 

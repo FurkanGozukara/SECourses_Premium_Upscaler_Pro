@@ -59,7 +59,9 @@ from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
 from shared.sparkvsr_ref_utils import (
+    discover_pisa_runtime,
     build_temporal_reference_specs,
+    resolve_pisa_runtime,
     write_temporal_reference_manifest,
 )
 
@@ -415,7 +417,9 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         overlap_width = 32
         model_path = ""
 
-    models_dir = Path(__file__).resolve().parents[2] / "SparkVSR" / "models"
+    app_base_dir = Path(__file__).resolve().parents[2]
+    models_dir = app_base_dir / "SparkVSR" / "models"
+    pisa_runtime = discover_pisa_runtime({}, app_base_dir)
 
     return {
         "input_path": "",
@@ -447,10 +451,10 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "auto_reference_prepass": False,
         "auto_reference_upscaler": "SeedVR2",
         "ref_pisa_cache_dir": "",
-        "pisa_python_executable": "",
-        "pisa_script_path": "",
-        "pisa_sd_model_path": "",
-        "pisa_chkpt_path": "",
+        "pisa_python_executable": pisa_runtime.get("pisa_python_executable", ""),
+        "pisa_script_path": pisa_runtime.get("pisa_script_path", ""),
+        "pisa_sd_model_path": pisa_runtime.get("pisa_sd_model_path", ""),
+        "pisa_chkpt_path": pisa_runtime.get("pisa_chkpt_path", ""),
         "pisa_gpu": "0",
         "png_save": False,
         "save_format": "yuv444p",
@@ -2063,7 +2067,21 @@ def build_sparkvsr_callbacks(
             
             # PRE-FLIGHT CHECKS (mirrors SeedVR2/GAN for consistency)
             from shared.error_handling import check_ffmpeg_available, check_disk_space
-            
+
+            settings, pisa_error, pisa_notes = resolve_pisa_runtime(settings, base_dir)
+            if pisa_error:
+                vid_upd, img_upd = _media_updates(None)
+                yield (
+                    "[ERROR] PiSA-SR configuration is incomplete",
+                    "\n".join([*pisa_notes, pisa_error]),
+                    vid_upd,
+                    img_upd,
+                    gr.update(visible=False),
+                    gr.update(value="", visible=False),
+                    state,
+                )
+                return
+
             # Check ffmpeg availability
             ffmpeg_ok, ffmpeg_msg = check_ffmpeg_available()
             if not ffmpeg_ok:

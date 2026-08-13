@@ -28,6 +28,7 @@ from .sparkvsr_constants import (
     SPARKVSR_INT8_CONVROT_CACHE_NAME,
     SPARKVSR_INT8_CONVROT_MODEL_NAME,
 )
+from .sparkvsr_ref_utils import resolve_pisa_runtime
 from .path_utils import (
     IMAGE_EXTENSIONS,
     collision_safe_path,
@@ -294,6 +295,13 @@ def run_sparkvsr(
         original_input_path = normalize_path(settings.get("_effective_input_path") or settings.get("input_path") or "")
         if not original_input_path or not Path(original_input_path).exists():
             return SparkVSRResult(1, None, f"SparkVSR input path not found: {original_input_path}")
+
+        settings, pisa_error, pisa_notes = resolve_pisa_runtime(settings, base_dir)
+        for note in pisa_notes:
+            log(note)
+        if pisa_error:
+            log(f"[SparkVSR] PiSA-SR preflight failed: {pisa_error}")
+            return SparkVSRResult(1, None, "\n".join(log_lines))
 
         selected_model = str(settings.get("model_name") or SPARKVSR_BF16_MODEL_NAME).strip()
         if not normalize_path(settings.get("model_path") or ""):

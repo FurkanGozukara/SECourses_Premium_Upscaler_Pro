@@ -30,6 +30,7 @@ ComfyUI-FlashVSR_Stable
 outputs/
 tmp/
 Video_Comparison_Slider_v2
+LTX25_Models
 global_config/
 /models
 global.json

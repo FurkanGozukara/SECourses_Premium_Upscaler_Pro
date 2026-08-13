@@ -1,6 +1,5 @@
 import os
 import sys
-import hashlib
 import json
 import string
 import argparse
@@ -15,6 +14,9 @@ if "--windows-int8-defaults" in sys.argv:
 # - hf_transfer can improve download speed but can also cause issues on some Windows setups.
 # - Default to disabled unless the launcher/user explicitly enables it.
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
+# Gradio 6.16+: fewer idle heartbeat round-trips with many open tabs.
+os.environ.setdefault("GRADIO_HEARTBEAT_INTERVAL", "30")
 
 # Migrate deprecated allocator env var so subprocesses and in-app torch startup stay quiet.
 legacy_alloc_conf = os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
@@ -72,17 +74,19 @@ from ui.face_tab import face_tab
 from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
+from ui.ltx25_tab import ltx25_tab
 from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
 from ui.changelog_tab import changelog_tab
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
+from ui.model_tab_common import sync_signature as _sync_signature
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "7.2"
+APP_VERSION = "8.0"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – https://www.patreon.com/posts/150202809"
 
 
@@ -1450,6 +1454,7 @@ def main(argv=None):
             scan_gan_models,
             get_flashvsr_model_names,
             get_sparkvsr_model_names,
+            get_ltx25_model_names,
             get_rife_model_names,
         )
         
@@ -1472,13 +1477,15 @@ def main(argv=None):
         gan_models = scan_gan_models(BASE_DIR)
         flashvsr_models = get_flashvsr_model_names()
         sparkvsr_models = get_sparkvsr_model_names(BASE_DIR)
+        ltx25_models = get_ltx25_model_names(BASE_DIR)
         rife_models = get_rife_model_names(BASE_DIR)
-        
+
         all_models = sorted(list({
             *seedvr2_models,
             *gan_models,
             *flashvsr_models,
             *sparkvsr_models,
+            *ltx25_models,
             *rife_models,
         }))
         if not all_models:
@@ -1699,6 +1706,7 @@ def main(argv=None):
                 "rife_settings": startup_preset.get("rife", {}),
                 "flashvsr_settings": startup_preset.get("flashvsr", {}),
                 "sparkvsr_settings": startup_preset.get("sparkvsr", {}),
+                "ltx25_settings": startup_preset.get("ltx25", {}),
                 "rtx_settings": startup_preset.get("rtx", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
@@ -1805,7 +1813,8 @@ def main(argv=None):
         # inconsistent across Gradio versions/environments.
         oom_banner = gr.HTML(value="", visible=False)
         oom_dismiss_btn = gr.Button("Dismiss VRAM Alert", variant="secondary", size="sm", visible=False, elem_classes=["action-btn", "sec-btn-slate"])
-        oom_timer = gr.Timer(value=2.0, active=True)
+        # 5s keeps VRAM alerts timely while quartering idle queue traffic vs the old 2s poll.
+        oom_timer = gr.Timer(value=5.0, active=True)
         health_sync_signature = gr.State(value="")
         oom_sync_signature = gr.State(value="")
         global_sync_signature = gr.State(value="")
@@ -1983,19 +1992,6 @@ def main(argv=None):
         # - The load button updates ALL tabs in shared_state.
         # - Each tab refreshes its UI values when the user selects the tab.
         # ------------------------------------------------------------------ #
-        def _sync_signature(payload: Dict[str, Any]) -> str:
-            try:
-                blob = json.dumps(
-                    payload,
-                    sort_keys=True,
-                    ensure_ascii=True,
-                    default=str,
-                    separators=(",", ":"),
-                )
-            except Exception:
-                blob = str(payload)
-            return hashlib.sha1(blob.encode("utf-8")).hexdigest()
-
         def _make_tab_sync(tab_name: str):
             tab_defaults = sync_defaults.get(tab_name, {})
 
@@ -2060,6 +2056,7 @@ def main(argv=None):
         tab_sync_gan = gr.State(value="")
         tab_sync_flashvsr = gr.State(value="")
         tab_sync_sparkvsr = gr.State(value="")
+        tab_sync_ltx25 = gr.State(value="")
         tab_sync_rtx = gr.State(value="")
         tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
@@ -2126,6 +2123,26 @@ def main(argv=None):
                 fn=_make_tab_sync("flashvsr"),
                 inputs=[shared_state, tab_sync_flashvsr],
                 outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🎞️ LTX 2.5", render_children=True) as tab_ltx25:
+                ltx25_ui = ltx25_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir,
+                )
+            tab_ltx25.select(
+                fn=_make_tab_sync("ltx25"),
+                inputs=[shared_state, tab_sync_ltx25],
+                outputs=ltx25_ui["inputs_list"] + [ltx25_ui["preset_dropdown"], ltx25_ui["preset_status"], tab_sync_ltx25],
                 queue=False,
                 show_progress="hidden",
                 trigger_mode="always_last",
@@ -2421,7 +2438,10 @@ def main(argv=None):
 
     # Enable Gradio queue so built-in toast notifications (gr.Info/gr.Warning/gr.Error) can work
     # and to improve streaming/progress consistency.
-    demo.queue()
+    # default_concurrency_limit lifts the per-event serial bottleneck for light UI
+    # events (sync/preview/refresh); GPU jobs stay serialized through their shared
+    # concurrency_id="app_processing_queue" lane.
+    demo.queue(default_concurrency_limit=4)
     launch_allowed_paths = _build_launch_allowed_paths(output_dir=active_output_dir, temp_dir=active_temp_dir)
     launch_kwargs = {
         # SECOURSES_NO_BROWSER=1 disables auto-opening a browser tab (useful for

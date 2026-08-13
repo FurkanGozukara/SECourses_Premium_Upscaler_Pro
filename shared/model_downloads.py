@@ -6,6 +6,8 @@ import os
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -108,8 +110,15 @@ def run_model_downloader(
     base_dir: Path,
     arguments: Sequence[str],
     on_progress: ProgressCallback = None,
+    cancel_event=None,
 ) -> tuple[bool, str]:
-    """Run the downloader one folder above the app and stream every line."""
+    """Run the downloader one folder above the app and stream every line.
+
+    When ``cancel_event`` (a threading.Event) is set mid-download the
+    downloader process tree is terminated and (False, "Cancelled by user")
+    is returned. Verified partial ranges are preserved, so the next attempt
+    resumes where it stopped.
+    """
     app_dir = Path(base_dir).resolve()
     downloader_path = app_dir.parent / "Models_Downloader.py"
     if not downloader_path.is_file():
@@ -121,6 +130,7 @@ def run_model_downloader(
     _emit(f"[Model Downloader] Preparing the selected model...", on_progress)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    cancelled = False
     try:
         process = subprocess.Popen(
             command,
@@ -135,15 +145,49 @@ def run_model_downloader(
         )
         output_lines: list[str] = []
         assert process.stdout is not None
+
+        def _cancel_requested() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        def _watch_cancel() -> None:
+            while process.poll() is None:
+                if _cancel_requested():
+                    try:
+                        from shared.process_control import terminate_process_tree
+
+                        terminate_process_tree(process)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                    return
+                time.sleep(0.25)
+
+        watcher = None
+        if cancel_event is not None:
+            watcher = threading.Thread(target=_watch_cancel, daemon=True)
+            watcher.start()
+
         for line in process.stdout:
             output_lines.append(line.rstrip("\r\n"))
             _emit(line, on_progress)
         return_code = process.wait()
+        if watcher is not None:
+            watcher.join(timeout=1.0)
+        cancelled = _cancel_requested()
     except (OSError, subprocess.SubprocessError) as exc:
         error = f"Could not start model downloader: {exc}"
         _emit(f"[Model Downloader] ERROR: {error}", on_progress)
         return False, error
 
+    if cancelled:
+        _emit(
+            "[Model Downloader] Download cancelled by user. "
+            "Verified partial data is kept; the next run resumes it.",
+            on_progress,
+        )
+        return False, "Cancelled by user"
     if return_code != 0:
         tail = "\n".join(line for line in output_lines[-8:] if line).strip()
         error = tail or f"Model downloader exited with code {return_code}"
@@ -262,6 +306,53 @@ def ensure_sparkvsr_model(
         )
         return True, ""
     return ok, error
+
+
+def ensure_ltx25_model(
+    base_dir: Path,
+    model_name: str,
+    text_encoder: str,
+    video_vae: str,
+    on_progress: ProgressCallback = None,
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """Ensure every file the selected LTX 2.5 variant needs exists in LTX25_Models."""
+    from shared.ltx25_constants import (
+        LTX25_ALWAYS_FILES_TUPLE,
+        LTX25_MODELS_DIRNAME,
+        LTX25_TE_FILES,
+        LTX25_TE_INT8,
+        LTX25_TRANSFORMER_FILES,
+        LTX25_VAE_CONV,
+        LTX25_VAE_FILES,
+    )
+
+    models_dir = Path(base_dir) / LTX25_MODELS_DIRNAME
+    model_name = str(model_name or "").strip()
+    text_encoder = str(text_encoder or "").strip()
+    video_vae = str(video_vae or "").strip()
+    transformer_file = LTX25_TRANSFORMER_FILES.get(model_name)
+    if transformer_file is None:
+        return False, f"Unknown LTX 2.5 model: {model_name}"
+    te_file = LTX25_TE_FILES.get(text_encoder) or LTX25_TE_FILES[LTX25_TE_INT8]
+    vae_file = LTX25_VAE_FILES.get(video_vae) or LTX25_VAE_FILES[LTX25_VAE_CONV]
+    required = [
+        models_dir / transformer_file,
+        models_dir / te_file,
+        models_dir / vae_file,
+        *(models_dir / name for name in LTX25_ALWAYS_FILES_TUPLE),
+    ]
+    if _all_files_exist(required):
+        return True, ""
+    args = [
+        "--ensure-ltx25",
+        model_name,
+        "--ltx25-te",
+        text_encoder if text_encoder in LTX25_TE_FILES else LTX25_TE_INT8,
+        "--ltx25-vae",
+        video_vae if video_vae in LTX25_VAE_FILES else LTX25_VAE_CONV,
+    ]
+    return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
 
 
 def ensure_gan_model(

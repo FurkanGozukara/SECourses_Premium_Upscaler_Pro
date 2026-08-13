@@ -4,8 +4,6 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
-import hashlib
-import json
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -30,25 +28,12 @@ from shared.queue_state import (
     snapshot_global_settings,
     merge_payload_state,
 )
-
-
-def resolve_shared_upscale_factor(state: Dict[str, Any] | None) -> float | None:
-    """
-    Resolve shared/global upscale value from app state.
-    """
-    if not isinstance(state, dict):
-        return None
-    try:
-        seed_controls = state.get("seed_controls", {}) or {}
-        raw = seed_controls.get("upscale_factor_val")
-        if raw is None:
-            return None
-        val = float(raw)
-        if val <= 0:
-            return None
-        return val
-    except Exception:
-        return None
+from ui.model_tab_common import (
+    sync_signature as _sync_signature,
+    resolve_shared_upscale_factor,
+    build_input_detection_md as _build_input_detection_md,
+    extract_update_value as _extract_update_value,
+)
 
 
 def gan_tab(
@@ -612,29 +597,6 @@ def gan_tab(
     # Per-tab GPU override removed: global selector controls all runs.
 
     # Input handling
-    def _build_input_detection_md(path_val: str) -> gr.update:
-        from shared.input_detector import detect_input
-        if not path_val or not str(path_val).strip():
-            # Hide when empty (clearing input should clear this panel).
-            return gr.update(value="", visible=False)
-        try:
-            info = detect_input(path_val)
-            if not info.is_valid:
-                return gr.update(value=f"ERROR: **Invalid Input**\n\n{info.error_message}", visible=True)
-            parts = [f"OK: **Input Detected: {info.input_type.upper()}**"]
-            if info.input_type == "frame_sequence":
-                parts.append(f"&nbsp;&nbsp;Pattern: `{info.frame_pattern}`")
-                parts.append(f"&nbsp;&nbsp;Frames: {info.frame_start}-{info.frame_end}")
-                if info.missing_frames:
-                    parts.append(f"&nbsp;&nbsp;Missing: {len(info.missing_frames)}")
-            elif info.input_type == "directory":
-                parts.append(f"&nbsp;&nbsp;Files: {info.total_files}")
-            elif info.input_type in ["video", "image"]:
-                parts.append(f"&nbsp;&nbsp;Format: **{info.format.upper()}**")
-            return gr.update(value=" ".join(parts), visible=True)
-        except Exception as e:
-            return gr.update(value=f"ERROR: **Detection Error**\n\n{str(e)}", visible=True)
-
     def _build_sizing_info(
         input_path_val: str,
         model_name: str,
@@ -1048,14 +1010,6 @@ def gan_tab(
         )
         return gr.update(value=indicator_html, visible=True)
 
-    def _extract_update_value(update_obj):
-        try:
-            if isinstance(update_obj, dict):
-                return update_obj.get("value")
-        except Exception:
-            pass
-        return None
-
     def _compact_single_line(text: Any, max_len: int = 120) -> str:
         raw = str(text or "")
         raw = " ".join(raw.replace("\r", " ").replace("\n", " ").split())
@@ -1359,13 +1313,6 @@ def gan_tab(
     )
 
     gan_upscale_sync_signature = gr.State(value="")
-
-    def _sync_signature(payload: Dict[str, Any]) -> str:
-        try:
-            blob = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str, separators=(",", ":"))
-        except Exception:
-            blob = str(payload)
-        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
     def _sync_upscale_and_sizing_if_needed(
         use_global,

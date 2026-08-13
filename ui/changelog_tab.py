@@ -11,6 +11,22 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V8.0 — 13 August 2026 — NEW: LTX 2.5 Upscaler (22B), Gradio 6.24, Faster Interface",
+        """
+**A brand-new upscaler model joins the app: LTX 2.5 Pixel Spatial Upscaler 2x.**
+
+- **NEW: 🎞️ LTX 2.5 tab** (right next to FlashVSR+) — Lightricks' 22-billion-parameter LTX 2.5 video model with the official IC-LoRA "Pixel Spatial Upscaler", running on our own standalone engine (no ComfyUI needed). It re-renders your video at exactly **2x resolution** with generative detail, faithful to the source.
+  - **7 model variants**: Distilled (8 steps, fast) and Dev (20 steps, max quality) bases, each in **INT8 ConvRot (recommended default)**, **INT4 W4A8 ConvRot** (smallest download), **BF16** (highest fidelity), plus **NVFP4** for the Distilled base — natively accelerated on RTX 50 "Blackwell" GPUs and automatically emulated (same output) on older cards. Identical quantization kernels to ComfyUI.
+  - **Switching model variants auto-sets the right steps / CFG / sampler** for that variant — and you can still override every one of them manually, including the step count (the distilled schedule resamples cleanly to any step count).
+  - **Single-chunk-first VRAM auto-tune**: this model works best when the whole video is processed as ONE chunk. The default "Auto (Single Chunk Preferred)" mode sizes the token budget from your free VRAM and only splits into overlapped, cross-faded chunks when it truly has to — with a "Preview Chunk Plan" button that shows the exact plan (chunk count, token usage) before you spend GPU time. Manual token budget / frame cap / overlap controls mirror the ComfyUI workflow for full control.
+  - **ComfyUI-grade VRAM management**: weights stream from system RAM per-step when the model doesn't fully fit (all variants run even on much smaller GPUs), tiled VAE encode/decode, and the Gemma 4 12B text encoder loads, encodes, and unloads before the transformer ever touches VRAM.
+  - **Everything downloads on first use** into the easy-to-find `LTX25_Models` folder — only the files your selected variant needs (~38 GB for the default INT8 pair). The standalone downloader also gains an "ALL LTX 2.5 files" option.
+  - All the shared features you expect from the SeedVR2/FlashVSR+/SparkVSR tabs: batch processing, presets, scene chunking, comparisons, queue, GPU selection, audio passthrough, metadata, resume folders.
+- **Gradio upgraded to 6.24** with an interface performance pass: smoother and faster tab switching, fewer unnecessary re-renders, snappier video previews and progress updates across every tab.
+- Processing progress for every model is mirrored to both the console window and the in-app log, always.
+""",
+    ),
+    (
         "V6.1 — 5 August 2026 — INT8 ConvRot V2: Higher Quality, Shippable Caches",
         """
 **A pure quality upgrade for INT8 ConvRot on all three diffusion upscalers.** Existing INT8 caches are rebuilt automatically on first use (one-time).

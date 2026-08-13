@@ -3204,6 +3204,15 @@ def chunk_and_process(
             f"(runner output codec may differ by OpenCV runtime; requested codec={expected_codec_name or 'auto'}, "
             f"10bit={expected_use_10bit}).\n"
         )
+    elif model_type == "ltx25":
+        # The LTX 2.5 engine writes MP4 itself (ffmpeg libx264 by default) while
+        # the Output tab may request a different final codec for the merge step.
+        strict_codec_validation = False
+        _emit_diag(
+            "[codec] strict validation disabled for LTX 2.5 "
+            f"(engine writes its own MP4; requested codec={expected_codec_name or 'auto'}, "
+            f"10bit={expected_use_10bit}).\n"
+        )
     if output_format != "png" and expected_codec_name and strict_codec_validation:
         _emit_diag(
             f"[codec] expected output codec={expected_codec_name}, 10bit={expected_use_10bit}\n"

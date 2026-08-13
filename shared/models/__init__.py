@@ -93,6 +93,12 @@ from .sparkvsr_meta import (
     get_sparkvsr_metadata,
     sparkvsr_model_map,
 )
+from .ltx25_meta import (
+    get_ltx25_model_names,
+    get_ltx25_default_model,
+    get_ltx25_metadata,
+    ltx25_model_map,
+)
 from .rife_meta import (
     get_rife_model_names, 
     get_rife_default_model,
@@ -114,6 +120,10 @@ __all__ = [
     "get_sparkvsr_default_model",
     "get_sparkvsr_metadata",
     "sparkvsr_model_map",
+    "get_ltx25_model_names",
+    "get_ltx25_default_model",
+    "get_ltx25_metadata",
+    "ltx25_model_map",
     "get_rife_model_names",
     "get_rife_default_model",
     "get_rife_metadata",

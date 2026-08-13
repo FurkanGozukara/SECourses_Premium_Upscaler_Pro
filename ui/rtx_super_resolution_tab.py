@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import html
-import hashlib
-import json
 import math
 import queue
 import subprocess
@@ -26,6 +24,7 @@ from shared.services.rtx_super_resolution_service import RTX_ORDER, build_rtx_su
 from shared.video_fps_utils import build_output_fps_summary
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
+from ui.model_tab_common import sync_signature as _sync_signature
 from ui.shared_components import warn_cancel_confirmation
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
@@ -1699,13 +1698,6 @@ def rtx_super_resolution_tab(
     )
 
     rtx_sync_signature = gr.State(value="")
-
-    def _sync_signature(payload: Dict[str, Any]) -> str:
-        try:
-            blob = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str, separators=(",", ":"))
-        except Exception:
-            blob = str(payload)
-        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
     def _sync_upscale_and_sizing_if_needed(
         use_global,

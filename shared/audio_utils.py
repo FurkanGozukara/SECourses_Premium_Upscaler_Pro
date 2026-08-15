@@ -143,6 +143,44 @@ def _probe_audio_stream(path: Path) -> dict[str, str]:
     )
 
 
+def _probe_stream_duration_seconds(path: Path, select_streams: str) -> Optional[float]:
+    """Duration (seconds) of the first selected stream, or None."""
+    try:
+        if not path.exists() or path.stat().st_size < 1024:
+            return None
+    except Exception:
+        return None
+    if not _has_ffmpeg():
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                select_streams,
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            return None
+        raw = (proc.stdout or "").strip().splitlines()
+        if not raw:
+            return None
+        val = float(raw[0].strip())
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 def _build_audio_args(audio_codec: str, audio_bitrate: Optional[str]) -> list[str]:
     codec = (audio_codec or "copy").strip().lower()
     if codec in ("none", "no", "off", "disable", "disabled"):
@@ -181,6 +219,31 @@ def mux_audio(
         pass
 
     args_audio = _build_audio_args(audio_codec, audio_bitrate)
+
+    # Never let the audio mux shorten the VIDEO. The old unconditional `-shortest`
+    # trimmed the video whenever it was longer than the audio, which silently hid
+    # chunk-pipeline bugs (duplicated boundary frames) as "the ending is missing" +
+    # progressive A/V drift. Only clamp the AUDIO when it is clearly longer than the
+    # video (e.g. partial/preview runs muxed against a full-length source track).
+    video_dur = _probe_stream_duration_seconds(video_path, "v:0")
+    audio_dur = _probe_stream_duration_seconds(audio_source_path, "a:0")
+    clamp_audio_to_video = False
+    if video_dur is not None and audio_dur is not None:
+        delta = float(video_dur) - float(audio_dur)
+        if delta < -0.5:
+            clamp_audio_to_video = True
+        if abs(delta) > 0.5:
+            _emit_log(
+                "[audio] WARNING: A/V duration mismatch: "
+                f"video={float(video_dur):.3f}s audio={float(audio_dur):.3f}s (video-audio={delta:+.3f}s). "
+                + (
+                    "Audio will be clamped to the video length."
+                    if clamp_audio_to_video
+                    else "Video is kept intact (NOT truncated); audio will end early."
+                ),
+                on_progress,
+            )
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -195,7 +258,10 @@ def mux_audio(
         "-c:v",
         "copy",
         *args_audio,
-        "-shortest",
+    ]
+    if clamp_audio_to_video:
+        cmd.append("-shortest")
+    cmd += [
         "-avoid_negative_ts",
         "make_zero",
     ]

@@ -189,5 +189,56 @@ class MergeAndMuxTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not available")
+class ChunkOutputTimingGuardTests(unittest.TestCase):
+    """The per-chunk output check must catch the drift classes seen in the field:
+    wrong output frame rate (e.g. 24.49 instead of 25) and extra/missing frames."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="avsync_guard_"))
+        cls.chunk = cls.tmp / "chunk_0001.mp4"
+        cls.n = _make_source(cls.chunk, fps="25/1", seconds=4.0, gop_seconds=1.0, audio=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _reencode(self, out: Path, extra_args: list[str]) -> Path:
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(self.chunk), "-map", "0:v:0",
+             *extra_args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", str(out)],
+            check=True,
+        )
+        return out
+
+    def test_decodable_frame_count_matches_metadata_for_clean_file(self):
+        self.assertEqual(chunking._probe_decodable_frames(self.chunk), self.n)
+        self.assertEqual(chunking._probe_chunk_nb_frames(self.chunk), self.n)
+
+    def test_identical_output_passes(self):
+        out = self._reencode(self.tmp / "same.mp4", [])
+        ok, detail = chunking._processed_chunk_matches_input(out, self.chunk, "flashvsr", 25.0)
+        self.assertTrue(ok, detail)
+
+    def test_wrong_output_fps_is_detected(self):
+        # Same frames, but the writer stamped 24.4908 fps (the reporter's merged-file rate).
+        out = self._reencode(self.tmp / "wrongfps.mp4", ["-vf", "setpts=N/(24.4908*TB)", "-r", "24.4908"])
+        ok, detail = chunking._processed_chunk_matches_input(out, self.chunk, "flashvsr", 25.0)
+        self.assertFalse(ok, detail)
+
+    def test_extra_frames_are_detected(self):
+        # Two frames appended (like a keyframe pre-roll or padding leak): +2 frames = 0.08 s,
+        # beyond the 1.5-frame duration tolerance -> rejected (the reporter's +2 frames/chunk case).
+        out = self._reencode(self.tmp / "extra.mp4", ["-vf", "tpad=stop=2:stop_mode=clone"])
+        ok, detail = chunking._processed_chunk_matches_input(out, self.chunk, "flashvsr", 25.0)
+        self.assertFalse(ok, detail)
+
+    def test_one_extra_frame_is_detected_by_frame_count(self):
+        out = self._reencode(self.tmp / "extra1.mp4", ["-vf", "tpad=stop=1:stop_mode=clone"])
+        ok, detail = chunking._processed_chunk_matches_input(out, self.chunk, "flashvsr", 25.0)
+        self.assertFalse(ok, detail)
+
+
 if __name__ == "__main__":
     unittest.main()

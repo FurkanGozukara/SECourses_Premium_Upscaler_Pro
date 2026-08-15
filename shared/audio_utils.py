@@ -261,10 +261,12 @@ def mux_audio(
     ]
     if clamp_audio_to_video:
         cmd.append("-shortest")
-    cmd += [
-        "-avoid_negative_ts",
-        "make_zero",
-    ]
+    # NOTE: no `-avoid_negative_ts make_zero` here. Shifting all timestamps so the first DTS
+    # is zero moves the video's first PTS to +N B-frames (e.g. 0.08 s at 25 fps); depending on
+    # the ffmpeg build that offset ends up in the reported track duration and is added at every
+    # chunk boundary by the concat demuxer (2 frames per chunk = ~50 s on a 42-min film), and it
+    # also introduced a constant ~21 ms audio lead in final outputs. The MP4 muxer default
+    # handles the B-frame delay with an edit list, exactly like a plain `ffmpeg -c:v libx264`.
 
     # MP4 nicety: faststart if output is mp4-ish.
     if output_path.suffix.lower() in (".mp4", ".m4v", ".mov"):

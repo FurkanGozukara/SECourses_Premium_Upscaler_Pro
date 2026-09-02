@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import re
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -334,17 +335,26 @@ def _concatenate_videos(
     audio_bitrate: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Concatenate multiple videos using FFmpeg."""
+    concat_file: Optional[Path] = None
     try:
         if len(video_paths) < 2:
             return False, "Need at least 2 videos to concatenate"
 
-        # Create a temporary concat file
-        concat_file = output_path + ".concat.txt"
-        with open(concat_file, 'w', encoding='utf-8') as f:
-            for video_path in video_paths:
-                f.write(f"file '{video_path.replace(chr(39), chr(39) + chr(39))}'\n")
+        normalized_paths = [Path(normalize_path(path)).resolve() for path in video_paths]
+        missing = [str(path) for path in normalized_paths if not path.is_file()]
+        if missing:
+            return False, f"Missing input video: {missing[0]}"
 
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file]
+        from shared.chunking import _write_concat_list
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        concat_file = output.with_name(
+            f".{output.stem}.{threading.get_ident()}.{time.time_ns()}.ffconcat"
+        )
+        _write_concat_list(concat_file, normalized_paths)
+
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
 
         codec_key = _normalize_video_codec_key(video_codec)
         selected_audio_codec = "none" if no_audio else str(audio_codec or "copy")
@@ -366,21 +376,15 @@ def _concatenate_videos(
 
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
 
-        # Clean up concat file
-        try:
-            Path(concat_file).unlink(missing_ok=True)
-        except:
-            pass
-
-        return result.returncode == 0, result.stderr or result.stdout
+        success = result.returncode == 0 and output.exists() and output.stat().st_size > 1024
+        return success, result.stderr or result.stdout
 
     except Exception as e:
-        # Clean up concat file on error
-        try:
-            Path(concat_file).unlink(missing_ok=True)
-        except:
-            pass
         return False, f"Concatenation failed: {str(e)}"
+    finally:
+        if concat_file is not None:
+            with suppress(Exception):
+                concat_file.unlink(missing_ok=True)
 
 
 def _apply_video_editing(input_path: str, output_path: str, settings: Dict[str, Any],

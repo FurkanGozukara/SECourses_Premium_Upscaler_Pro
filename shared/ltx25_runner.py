@@ -8,6 +8,8 @@ and logs every executed command. Mirrors shared/sparkvsr_runner.py.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import queue
 import random
@@ -18,6 +20,7 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -95,6 +98,118 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def _probe_ltx25_video(path: Path, *, count_frames: bool) -> Optional[Dict[str, Any]]:
+    """Probe one real video stream; container/audio-only duration is intentionally ignored."""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0"]
+        if count_frames:
+            cmd.append("-count_frames")
+        cmd += [
+            "-show_entries",
+            (
+                "stream=codec_name,width,height,r_frame_rate,avg_frame_rate,start_time,duration,"
+                "nb_frames,nb_read_frames"
+            ),
+            "-of",
+            "json",
+            str(path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0:
+            return None
+        streams = (json.loads(proc.stdout or "{}").get("streams") or [])
+        if not streams:
+            return None
+        stream = dict(streams[0] or {})
+        if not str(stream.get("codec_name") or "").strip():
+            return None
+        if int(float(stream.get("width") or 0)) <= 0 or int(float(stream.get("height") or 0)) <= 0:
+            return None
+        return stream
+    except Exception:
+        return None
+
+
+def _validate_ltx25_video_output(
+    input_path: Path,
+    output_path: Path,
+    *,
+    expected_fps: float,
+    start_frame: int = 0,
+    end_frame: int = -1,
+) -> Tuple[bool, str]:
+    """Require a complete frame-preserving LTX video before reporting model success."""
+    source = _probe_ltx25_video(Path(input_path), count_frames=True)
+    output = _probe_ltx25_video(Path(output_path), count_frames=True)
+    if source is None:
+        return False, "input has no probeable video stream"
+    if output is None:
+        return False, "output has no usable video stream"
+
+    def _frame_count(stream: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not stream:
+            return None
+        raw = str(stream.get("nb_read_frames") or stream.get("nb_frames") or "").strip()
+        try:
+            value = int(raw)
+            return value if value > 0 else None
+        except Exception:
+            return None
+
+    source_frames = _frame_count(source)
+    output_frames = _frame_count(output)
+    if source_frames is None:
+        return False, "decoded input frame count is unavailable"
+    if output_frames is None:
+        return False, "decoded output frame count is unavailable"
+
+    first = max(0, int(start_frame))
+    stop = source_frames if int(end_frame) < 0 else min(source_frames, int(end_frame) + 1)
+    expected_frames = max(0, stop - first)
+    if expected_frames <= 0:
+        return False, "the selected input frame range is empty"
+    if output_frames != expected_frames:
+        return False, f"decoded frame count mismatch {output_frames}/{expected_frames}"
+
+    def _rate(raw: Any) -> float:
+        try:
+            value = float(Fraction(str(raw)))
+            return value if math.isfinite(value) and value > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    actual_fps = _rate(output.get("r_frame_rate")) or _rate(output.get("avg_frame_rate"))
+    if actual_fps <= 0:
+        return False, "output frame rate is unavailable"
+    if expected_fps > 0 and abs(actual_fps - float(expected_fps)) > max(1e-6, 1e-4 * float(expected_fps)):
+        return False, f"frame rate mismatch {actual_fps:.9f}/{float(expected_fps):.9f}"
+
+    try:
+        start = float(output.get("start_time") or 0.0)
+    except Exception:
+        start = 0.0
+    if not math.isfinite(start) or abs(start) > 0.001:
+        return False, f"output video starts at {start:.6f}s instead of zero"
+
+    try:
+        duration = float(output.get("duration") or 0.0)
+    except Exception:
+        duration = 0.0
+    expected_duration = float(output_frames) / actual_fps
+    if not math.isfinite(duration) or duration <= 0:
+        return False, "output video duration is unavailable"
+    if abs(duration - expected_duration) > max(0.05, 1.25 / actual_fps):
+        return False, (
+            f"output duration {duration:.6f}s does not match "
+            f"{output_frames} frames at {actual_fps:.9f} fps"
+        )
+
+    return True, (
+        f"video={output_frames} frames at {actual_fps:.9f} fps, "
+        f"duration={duration:.6f}s, start={start:.6f}s"
+    )
 
 
 def _resolve_python_executable(base_dir: Path) -> str:
@@ -422,6 +537,7 @@ def run_ltx25(
     cancel_event=None,
     process_handle: Optional[Dict] = None,
 ) -> Ltx25Result:
+    settings = dict(settings or {})
     start_time = time.time()
     log_lines: List[str] = []
     cmd: List[str] = []
@@ -449,6 +565,37 @@ def run_ltx25(
                     "Convert image sequences to a video first, or use another tab for single images."
                 ),
             )
+
+        # A writer-side FPS override only changes playback timestamps; it does not create
+        # the frame inventory needed to preserve duration and source-audio sync. Convert the
+        # complete input to the requested CFR once before LTX planning. Universal app-level
+        # chunking performs the same guard before splitting and resets ``fps`` to zero, so
+        # this path is primarily for LTX's default single-pass/internal-chunk mode.
+        try:
+            requested_fps = float(settings.get("fps") or 0.0)
+        except Exception:
+            requested_fps = 0.0
+        if requested_fps > 0:
+            from .video_fps_utils import apply_video_fps_override_preprocess
+
+            preprocess_root = Path(
+                settings.get("_run_dir") or (Path(base_dir) / "temp" / "ltx25_fps_preprocess")
+            ) / "fps_preprocess"
+            fps_ok, fps_note = apply_video_fps_override_preprocess(
+                settings,
+                fps_key="fps",
+                run_dir=preprocess_root,
+                on_progress=log,
+            )
+            if fps_note:
+                log(fps_note)
+            if not fps_ok:
+                return Ltx25Result(1, None, fps_note or "LTX 2.5 FPS preprocess failed")
+            input_path = normalize_path(
+                settings.get("_effective_input_path") or settings.get("input_path") or ""
+            )
+            if not input_path or not Path(input_path).exists():
+                return Ltx25Result(1, None, "LTX 2.5 FPS preprocess output is missing")
 
         seed_value = _resolve_seed(settings, log)
 
@@ -573,13 +720,39 @@ def run_ltx25(
             log("LTX 2.5 process reported cancellation (exit code 130).")
             result = Ltx25Result(1, None, "\n".join(log_lines + ["[Cancelled by user]"]))
             return result
-        if output_path and returncode != 0:
-            log(f"LTX 2.5 exited with code {returncode} after producing output; treating run as successful.")
-            returncode = 0
-        if not output_path:
+        output_valid = False
+        output_detail = ""
+        if output_path:
+            output_valid, output_detail = _validate_ltx25_video_output(
+                Path(input_path),
+                Path(output_path),
+                expected_fps=float(output_fps),
+                start_frame=max(0, _parse_int(settings.get("start_frame"), 0)),
+                end_frame=_parse_int(settings.get("end_frame"), -1),
+            )
+
+        if returncode != 0:
+            log(
+                f"LTX 2.5 exited with code {returncode}; refusing partial/stale output"
+                + (f" ({output_detail})." if output_detail else ".")
+            )
+            # A non-zero engine exit is never a resumable completed chunk, even when
+            # ffmpeg happened to finalize a decodable prefix. Leaving it under the
+            # canonical chunk name lets the resume scanner pick up stale data later.
+            if output_path:
+                with suppress(Exception):
+                    Path(output_path).unlink(missing_ok=True)
+            result = Ltx25Result(returncode or 1, None, "\n".join(log_lines))
+        elif not output_path:
             log("No LTX 2.5 output file generated.")
             result = Ltx25Result(returncode or 1, None, "\n".join(log_lines))
+        elif not output_valid:
+            log(f"LTX 2.5 output validation failed: {output_detail}")
+            with suppress(Exception):
+                Path(output_path).unlink(missing_ok=True)
+            result = Ltx25Result(1, None, "\n".join(log_lines))
         else:
+            log(f"LTX 2.5 output validation passed: {output_detail}")
             log(f"Output saved: {output_path}")
             result = Ltx25Result(
                 int(returncode),

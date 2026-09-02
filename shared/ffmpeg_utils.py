@@ -84,8 +84,6 @@ def scale_video(
                 "copy",
                 "-movflags",
                 "+faststart",
-                "-avoid_negative_ts",
-                "make_zero",
                 str(output_path),
             ]
         )
@@ -113,8 +111,6 @@ def scale_video(
             *aac_args,
             "-movflags",
             "+faststart",
-            "-avoid_negative_ts",
-            "make_zero",
             str(output_path),
         ]
     )

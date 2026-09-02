@@ -8,6 +8,9 @@ import subprocess
 import threading
 import tempfile
 import time
+from collections import deque
+from functools import lru_cache
+from fractions import Fraction
 from statistics import median
 from contextlib import suppress
 from pathlib import Path
@@ -329,7 +332,16 @@ def fallback_scenes(video_path: str, chunk_seconds: float = 60.0, overlap_second
     from .path_utils import get_media_duration_seconds
     
     try:
-        duration = get_media_duration_seconds(video_path)
+        # Prefer the playable video timeline. Format duration is the longest stream and
+        # can be seconds longer when audio has padding/tails, creating an empty final chunk.
+        src_frames, _method = _probe_source_frame_count(Path(video_path))
+        r_fps, avg_fps = _probe_frame_rates(Path(video_path))
+        timeline_fps = avg_fps or r_fps
+        duration = (float(src_frames) / float(timeline_fps)) if src_frames and timeline_fps else None
+        if not duration or duration <= 0:
+            duration = _probe_video_stream_duration(Path(video_path))
+        if not duration or duration <= 0:
+            duration = get_media_duration_seconds(video_path)
         if not duration or duration <= 0:
             # Try ffprobe as fallback
             proc = subprocess.run(
@@ -341,7 +353,10 @@ def fallback_scenes(video_path: str, chunk_seconds: float = 60.0, overlap_second
             duration = float(proc.stdout.strip())
     except Exception:
         # If all fails, use default
-        duration = chunk_seconds * 2
+        duration = max(float(chunk_seconds or 0.0), 1.0) * 2
+
+    if chunk_seconds <= 0:
+        return [(0.0, float(duration))] if duration and duration > 0 else []
     
     scenes = []
     start = 0.0
@@ -539,6 +554,7 @@ def split_video(
     #    otherwise);
     #  * the video stream's start_time -> absolute timestamps for `trim`.
     src_r_fps_str = ""
+    src_avg_fps_str = ""
     src_avg_fps: Optional[float] = None
     src_is_cfr = False
     src_video_start = 0.0
@@ -553,13 +569,14 @@ def split_video(
         )
         st0 = (json.loads(proc_src.stdout or "{}").get("streams") or [{}])[0]
         src_r_fps_str = str(st0.get("r_frame_rate") or "").strip()
-        src_avg_fps = _parse_fraction_to_float(st0.get("avg_frame_rate"))
+        src_avg_fps_str = str(st0.get("avg_frame_rate") or "").strip()
+        src_avg_fps = _parse_fraction_to_float(src_avg_fps_str)
         r_val = _parse_fraction_to_float(src_r_fps_str)
         if r_val and src_avg_fps:
             src_is_cfr = abs(r_val - src_avg_fps) <= max(1e-6, 0.002 * r_val)
         try:
             src_video_start = float(st0.get("start_time") or 0.0)
-            if not math.isfinite(src_video_start) or src_video_start < 0:
+            if not math.isfinite(src_video_start):
                 src_video_start = 0.0
         except Exception:
             src_video_start = 0.0
@@ -568,6 +585,20 @@ def split_video(
     if not src_r_fps_str or _parse_fraction_to_float(src_r_fps_str) is None:
         src_r_fps_str = ""
         src_is_cfr = False
+
+    # Prefer ffprobe's exact rational over a rounded helper float. Model pipelines
+    # write CFR outputs, so VFR inputs use their exact average rate as a deterministic
+    # timeline while retaining every decoded source frame.
+    timeline_fps_str = src_r_fps_str if src_is_cfr else src_avg_fps_str
+    timeline_fps = _parse_fraction_to_float(timeline_fps_str)
+    if timeline_fps and 0.01 <= timeline_fps <= 1000.0:
+        fps_for_align = float(timeline_fps)
+    elif fps_for_align > 0:
+        timeline_fps_str = str(Fraction(fps_for_align).limit_denominator(1_000_000))
+    else:
+        timeline_fps_str = ""
+
+    source_frame_count, source_frame_count_method = _probe_source_frame_count(Path(video_path))
 
     def _snap_us(t: float) -> int:
         t = max(0.0, float(t))
@@ -584,7 +615,7 @@ def split_video(
     half_frame_sec = (0.5 / fps_for_align) if fps_for_align > 0 else 0.0005
     normalized_us: List[Tuple[int, int]] = []
     prev_end_us: Optional[int] = None
-    for start, end in scenes:
+    for scene_idx, (start, end) in enumerate(scenes):
         try:
             start_f = float(start)
             end_f = float(end)
@@ -594,6 +625,14 @@ def split_video(
             continue
         s_us = _snap_us(start_f)
         e_us = _snap_us(end_f)
+        # Container edit lists can make the advertised final timestamp disagree with
+        # the number of frames a decoder actually delivers. Anchor the outer scene
+        # boundaries to that decoded inventory so odd DiT frame counts cannot lose
+        # their final frame.
+        if scene_idx == 0 and source_frame_count and fps_for_align > 0:
+            s_us = 0
+        if scene_idx == len(scenes) - 1 and source_frame_count and fps_for_align > 0:
+            e_us = int(round(int(source_frame_count) * 1_000_000.0 / fps_for_align))
         # Contiguous scenes must share the exact same boundary timestamp.
         if prev_end_us is not None and abs(start_f - (prev_end_us / 1_000_000.0)) <= (half_frame_sec + 1e-6):
             s_us = prev_end_us
@@ -630,7 +669,7 @@ def split_video(
         start_frame_i = _frame_index_of_us(s_us)
         end_frame_i = _frame_index_of_us(e_us)
         expected_frames: Optional[int] = None
-        if src_is_cfr and start_frame_i is not None and end_frame_i is not None and end_frame_i > start_frame_i:
+        if timeline_fps_str and start_frame_i is not None and end_frame_i is not None and end_frame_i > start_frame_i:
             expected_frames = int(end_frame_i - start_frame_i)
         split_mode_used = "unknown"
 
@@ -658,7 +697,7 @@ def split_video(
             # before -ss, so the chunk may start early. Exactness is verified afterwards.
             cmd = [
                 "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
-                "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(out),
+                "-c", "copy", "-movflags", "+faststart", str(out),
             ]
             _run_ffmpeg(cmd)
 
@@ -667,7 +706,7 @@ def split_video(
             cmd = [
                 "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
                 "-map", "0:v:0", "-c:v", "copy", "-an",
-                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(out),
+                "-movflags", "+faststart", str(out),
             ]
             _run_ffmpeg(cmd)
 
@@ -676,7 +715,7 @@ def split_video(
             cmd = [
                 "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
                 "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(out),
+                "-movflags", "+faststart", str(out),
             ]
             _run_ffmpeg(cmd)
 
@@ -706,8 +745,8 @@ def split_video(
             cmd += ["-vf", f"trim=start={start_abs_str}:end={end_abs_str},setpts=PTS-STARTPTS"]
             if with_audio:
                 cmd += ["-af", f"atrim=start={start_abs_str}:end={end_abs_str},asetpts=PTS-STARTPTS"]
-            if src_is_cfr and src_r_fps_str:
-                cmd += ["-r", src_r_fps_str]
+            if timeline_fps_str:
+                cmd += ["-r", timeline_fps_str]
             cmd += _lossless_video_args(encoder)
             if pix_fmt:
                 cmd += ["-pix_fmt", pix_fmt]
@@ -746,8 +785,22 @@ def split_video(
             tol = (0.75 / fps_for_align) if fps_for_align > 0 else 0.03
             if expected_frames is not None:
                 n_frames = _probe_chunk_nb_frames(out)
-                if n_frames is not None and int(n_frames) != int(expected_frames):
+                if n_frames is None:
+                    return False, "frame-count probe failed"
+                if int(n_frames) != int(expected_frames):
                     return False, f"{int(n_frames)} decodable frames vs expected {int(expected_frames)}"
+                declared_frames = _probe_container_nb_frames(out)
+                if declared_frames is not None and int(declared_frames) != int(n_frames):
+                    return False, (
+                        f"container advertises {int(declared_frames)} frames but decoder delivers "
+                        f"{int(n_frames)} (edit-list/discard samples present)"
+                    )
+                expected_dur = float(expected_frames) / float(fps_for_align) if fps_for_align > 0 else duration
+                if abs(float(actual_dur) - float(expected_dur)) > tol:
+                    return False, (
+                        f"video duration {float(actual_dur):.6f}s vs frame-timeline "
+                        f"{float(expected_dur):.6f}s"
+                    )
                 return True, ""
             if abs(float(actual_dur) - float(duration)) > tol:
                 return False, (
@@ -769,41 +822,70 @@ def split_video(
                 for pix in ((src_pix_fmt, None) if src_pix_fmt else (None,)):
                     _unlink_out()
                     rc = _split_precise_lossless(pix, want_audio, encoder)
-                    if want_audio and _ok_with_audio():
+                    media_ok = _ok_with_audio() if want_audio else _is_decodable(out)
+                    exact, why = _chunk_is_exact() if media_ok else (False, "not decodable")
+                    if media_ok and exact:
                         return True
-                    if not want_audio and _is_decodable(out):
-                        return True
-                    if want_audio and _is_decodable(out):
-                        # Video is frame-accurate; only chunk-audio validation failed
-                        # (e.g. source audio shorter than video). Keep the accurate video.
-                        try:
-                            if on_progress:
-                                on_progress(
-                                    f"WARN: Split chunk {idx}: chunk audio could not be validated; "
-                                    "keeping frame-accurate video (chunk audio is preview-only).\n"
-                                )
-                        except Exception:
-                            pass
-                        return True
+                    if media_ok and on_progress:
+                        on_progress(
+                            f"WARN: Split chunk {idx}: timestamp cut was not exact ({why}); "
+                            "retrying an alternate lossless path.\n"
+                        )
                     if want_audio:
                         # Audio mapping/encoding may be the culprit: retry video-only.
                         _unlink_out()
                         rc = _split_precise_lossless(pix, False, encoder)
-                        if _is_decodable(out):
+                        exact, why = _chunk_is_exact() if _is_decodable(out) else (False, "not decodable")
+                        if exact:
                             try:
                                 if on_progress:
                                     on_progress(
-                                        f"WARN: Split chunk {idx}: chunk audio could not be encoded "
-                                        f"({last_ffmpeg_error or 'unknown error'}); keeping video-only chunk.\n"
+                                        f"WARN: Split chunk {idx}: chunk audio could not be retained; "
+                                        "keeping the exact video-only chunk.\n"
                                     )
                             except Exception:
                                 pass
                             return True
+                        if _is_decodable(out) and on_progress:
+                            on_progress(
+                                f"WARN: Split chunk {idx}: video-only timestamp cut was not exact ({why}).\n"
+                            )
                     if rc != 0 and last_ffmpeg_error and on_progress:
                         try:
                             on_progress(f"WARN: Split chunk {idx}: {encoder} lossless cut failed: {last_ffmpeg_error}\n")
                         except Exception:
                             pass
+
+            # Timestamp selection can be off by one with edit lists, unusual time bases,
+            # or older ffmpeg builds. Select the decoded frame interval itself as a
+            # deterministic repair. It is intentionally a last resort because a late
+            # chunk may require decoding from the start of the source.
+            if expected_frames is not None and start_frame_i is not None and end_frame_i is not None:
+                split_mode_used = "lossless-frame-index"
+                for encoder in ("libx264", "libx265"):
+                    for pix in ((src_pix_fmt, None) if src_pix_fmt else (None,)):
+                        _unlink_out()
+                        frame_filter = (
+                            f"trim=start_frame={int(start_frame_i)}:end_frame={int(end_frame_i)},"
+                            f"setpts=N/({timeline_fps_str or fps_for_align}*TB)"
+                        )
+                        cmd = [
+                            "ffmpeg", "-y", "-i", video_path,
+                            "-map", "0:v:0", "-vf", frame_filter,
+                            "-frames:v", str(int(expected_frames)),
+                        ]
+                        if timeline_fps_str:
+                            cmd += ["-r", timeline_fps_str]
+                        cmd += _lossless_video_args(encoder)
+                        if pix:
+                            cmd += ["-pix_fmt", pix]
+                        cmd += ["-an", "-movflags", "+faststart", str(out)]
+                        _run_ffmpeg(cmd)
+                        exact, _why = _chunk_is_exact() if _is_decodable(out) else (False, "not decodable")
+                        if exact:
+                            if on_progress:
+                                on_progress(f"Split chunk {idx}: frame-index repair succeeded.\n")
+                            return True
             return False
 
         def _attempt_copy_chain(require_exact: bool) -> bool:
@@ -912,8 +994,12 @@ def split_video(
             "source": str(video_path),
             "fps_for_align": float(fps_for_align) if fps_for_align > 0 else None,
             "source_fps_rational": src_r_fps_str or None,
+            "timeline_fps_rational": timeline_fps_str or None,
+            "timeline_is_cfr": bool(timeline_fps_str),
             "source_avg_fps": float(src_avg_fps) if src_avg_fps else None,
             "source_is_cfr": bool(src_is_cfr),
+            "source_frame_count": int(source_frame_count) if source_frame_count else None,
+            "source_frame_count_method": source_frame_count_method or None,
             "source_video_start": float(src_video_start),
             "precise_requested": bool(precise),
             "chunks": manifest_entries,
@@ -1026,9 +1112,13 @@ def _probe_video_stream_duration(path: Path) -> Optional[float]:
     except Exception:
         pass
     try:
-        val2 = get_media_duration_seconds(str(path))
-        if val2 and val2 > 0:
-            return float(val2)
+        # Some containers (notably MPEG-TS) omit stream.duration. Format duration is
+        # a valid fallback only after proving that the file really has a video stream;
+        # otherwise an audio-only interrupted output masquerades as a video here.
+        if _probe_concat_video_signature(Path(path)) is not None:
+            val2 = get_media_duration_seconds(str(path))
+            if val2 and val2 > 0:
+                return float(val2)
     except Exception:
         pass
     return None
@@ -1037,47 +1127,99 @@ def _probe_video_stream_duration(path: Path) -> Optional[float]:
 SPLIT_MANIFEST_NAME = "chunks_manifest.json"
 
 
-def _probe_decodable_frames(path: Path) -> Optional[int]:
-    """
-    Number of video frames a decoder will actually deliver: video packets minus the ones the
-    demuxer flags as discard (e.g. samples cut off by an edit list). Container `nb_frames`
-    can over-count those on some ffmpeg builds (7.1 writes a discard-flagged trailing sample),
-    which is exactly the kind of off-by-one that accumulates into A/V drift over many chunks.
-    """
+def _media_probe_fingerprint(path: Path) -> Optional[Tuple[str, int, int]]:
+    try:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+        if not resolved.is_file() or stat.st_size <= 0:
+            return None
+        return str(resolved), int(stat.st_size), int(stat.st_mtime_ns)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=512)
+def _probe_decoded_frames_cached(path_str: str, _size: int, _mtime_ns: int) -> Optional[int]:
+    """Run the expensive decode count once for each immutable file fingerprint."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1", path_str,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            return None
+        for raw in (proc.stdout or "").splitlines():
+            value = raw.strip()
+            if value.isdigit() and int(value) > 0:
+                return int(value)
+    except Exception:
+        pass
+    return None
+
+
+def _probe_playable_video_packets(path: Path) -> Optional[int]:
+    """Packet fallback that excludes MP4 edit-list/pre-roll samples marked DISCARD."""
     try:
         proc = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "packet=flags", "-of", "csv=p=0", str(path),
             ],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
         if proc.returncode != 0:
             return None
-        n = 0
+        count = 0
         seen = False
-        for line in (proc.stdout or "").splitlines():
-            flags = line.strip().strip(",")
+        for raw in (proc.stdout or "").splitlines():
+            flags = raw.strip().strip(",")
             if not flags:
                 continue
             seen = True
-            if "D" in flags:
-                continue
-            n += 1
-        return n if seen and n > 0 else None
+            if "D" not in flags:
+                count += 1
+        return count if seen and count > 0 else None
     except Exception:
         return None
 
 
+def _probe_decodable_frames(path: Path) -> Optional[int]:
+    """
+    Number of video frames a decoder actually delivers.
+
+    A packet count is not a frame count for every codec/container combination (AV1 temporal
+    units, field-coded material, and edit lists are common counterexamples). ``nb_frames``
+    also includes samples hidden by MP4 edit lists on affected ffmpeg builds. Use ffprobe's
+    real decoded-frame inventory and cache it by path/size/mtime; only fall back to playable
+    packet count when decoding cannot be probed.
+    """
+    fingerprint = _media_probe_fingerprint(Path(path))
+    if fingerprint is not None:
+        decoded = _probe_decoded_frames_cached(*fingerprint)
+        if decoded is not None and decoded > 0:
+            return int(decoded)
+    return _probe_playable_video_packets(Path(path))
+
+
 def _probe_chunk_nb_frames(path: Path) -> Optional[int]:
     """
-    Frame count of a chunk video: decodable frames first (packet scan, no decode), then
-    container metadata as fallback.
+    Frame count of a chunk video: decoded frames first, then container/packet metadata.
     """
     decodable = _probe_decodable_frames(Path(path))
     if decodable is not None and decodable > 0:
         return int(decodable)
-    for entries, flag in (("stream=nb_frames", None), ("stream=nb_read_packets", "-count_packets")):
+    declared = _probe_container_nb_frames(Path(path))
+    if declared is not None:
+        return int(declared)
+    for entries, flag in (("stream=nb_read_packets", "-count_packets"),):
         try:
             cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0"]
             if flag:
@@ -1093,11 +1235,44 @@ def _probe_chunk_nb_frames(path: Path) -> Optional[int]:
     return None
 
 
+def _probe_container_nb_frames(path: Path) -> Optional[int]:
+    """Container-declared frame count, kept separate from the decoded inventory."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+    except Exception:
+        pass
+    return None
+
+
 def _probe_source_frame_count(path: Path) -> Tuple[Optional[int], str]:
     """
-    Frame count of the source video: (count, method). method is "nb_frames" (exact, MP4/MOV),
-    "packets" (fast, one packet per frame for normal video codecs) or "" when unavailable.
+    Frame count of the source video: (count, method).
+
+    Count frames delivered by the decoder before trusting container ``nb_frames``. MP4 edit
+    lists can retain a pre-roll/trailing sample in metadata; ffprobe then reports, for
+    example, ``nb_frames=158`` although every decoder delivers 157 frames. Comparing that
+    metadata value with split chunks caused the field-reported fatal ``delta -1`` regression.
     """
+    fingerprint = _media_probe_fingerprint(Path(path))
+    if fingerprint is not None:
+        decoded = _probe_decoded_frames_cached(*fingerprint)
+        if decoded is not None and decoded > 0:
+            return int(decoded), "decoded_frames"
+    packets = _probe_playable_video_packets(Path(path))
+    if packets is not None and packets > 0:
+        return int(packets), "playable_packets"
     try:
         proc = subprocess.run(
             [
@@ -1110,20 +1285,6 @@ def _probe_source_frame_count(path: Path) -> Tuple[Optional[int], str]:
         raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
         if raw.isdigit() and int(raw) > 0:
             return int(raw), "nb_frames"
-    except Exception:
-        pass
-    try:
-        proc = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-                "-show_entries", "stream=nb_read_packets",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-            ],
-            capture_output=True, text=True, timeout=600,
-        )
-        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
-        if raw.isdigit() and int(raw) > 0:
-            return int(raw), "packets"
     except Exception:
         pass
     return None, ""
@@ -1190,7 +1351,7 @@ def _manifest_overlap_frames(manifest: Optional[Dict[str, Any]], chunk_count: in
 # Other models are checked the same way but only warned about (their frame handling was
 # not verified here), and the final merged-duration check still reports any drift.
 # RIFE changes the frame count/fps by design and is checked by duration only.
-_STRICT_TIMING_MODELS = {"flashvsr", "gan", "rtx"}
+_STRICT_TIMING_MODELS = {"seedvr2", "gan", "flashvsr", "sparkvsr", "ltx25", "rtx"}
 _FRAME_PRESERVING_MODELS = _STRICT_TIMING_MODELS  # backward-compatible alias
 
 
@@ -1211,11 +1372,13 @@ def _processed_chunk_matches_input(
         inp = Path(input_chunk_path)
         outp = Path(processed_path)
         if not (inp.exists() and inp.is_file() and outp.exists() and outp.is_file()):
-            return True, "skipped (missing file)"
+            return False, "missing input or output file"
+        if _probe_concat_video_signature(inp) is None or _probe_concat_video_signature(outp) is None:
+            return False, "input or output has no usable video stream"
         in_dur = _probe_video_stream_duration(inp)
         out_dur = _probe_video_stream_duration(outp)
         if in_dur is None or out_dur is None or in_dur <= 0 or out_dur <= 0:
-            return True, "skipped (duration probe unavailable)"
+            return False, "video duration probe unavailable"
         fps = 0.0
         try:
             fps = float(get_media_fps(str(inp)) or 0.0)
@@ -1236,18 +1399,37 @@ def _processed_chunk_matches_input(
             out_r, out_avg = _probe_frame_rates(outp)
             out_fps = out_r or out_avg
             fps_rel_tol = 1e-4 if strict else 5e-3
-            if out_fps and abs(float(out_fps) - float(expected_fps)) > fps_rel_tol * float(expected_fps):
+            if not out_fps:
+                return False, f"output frame rate is unavailable ({detail})"
+            if abs(float(out_fps) - float(expected_fps)) > fps_rel_tol * float(expected_fps):
                 return False, f"output frame rate {float(out_fps):.6f} vs source {float(expected_fps):.6f} ({detail})"
-            detail += f"; fps {float(out_fps) if out_fps else 0.0:.6f}"
+            detail += f"; fps {float(out_fps):.6f}"
         if model_key != "rife":
             n_in = _probe_chunk_nb_frames(inp)
             n_out = _probe_chunk_nb_frames(outp)
-            if n_in is not None and n_out is not None and int(n_in) != int(n_out):
+            if n_in is None or n_out is None:
+                return False, f"decoded frame count is unavailable ({detail})"
+            if int(n_in) != int(n_out):
                 return False, f"input {int(n_in)} frames vs output {int(n_out)} frames ({detail})"
             detail += f"; frames {n_in} -> {n_out}"
         return True, detail
     except Exception as exc:
-        return True, f"skipped ({exc})"
+        return False, f"timing validation failed ({exc})"
+
+
+def _processed_chunk_timing_is_repairable(
+    processed_path: Path,
+    input_chunk_path: Path,
+    model_type: str,
+    expected_fps: Optional[float],
+) -> bool:
+    """A timestamp/FPS error is recoverable when the model preserved every frame."""
+    model_key = str(model_type or "").strip().lower()
+    if model_key == "rife" or not expected_fps or expected_fps <= 0:
+        return False
+    n_in = _probe_chunk_nb_frames(Path(input_chunk_path))
+    n_out = _probe_chunk_nb_frames(Path(processed_path))
+    return bool(n_in is not None and n_out is not None and int(n_in) > 0 and int(n_in) == int(n_out))
 
 
 def _verify_split_coverage(
@@ -1275,6 +1457,7 @@ def _verify_split_coverage(
     src_frames, method = _probe_source_frame_count(Path(source_path))
     r_fps, avg_fps = _probe_frame_rates(Path(source_path))
     is_cfr = bool(r_fps and avg_fps and abs(r_fps - avg_fps) <= max(1e-6, 0.002 * r_fps))
+    exact_timeline = bool(is_cfr or (manifest and manifest.get("timeline_is_cfr")))
 
     chunk_frames: List[Optional[int]] = [_probe_chunk_nb_frames(Path(p)) for p in chunk_paths]
     if any(v is None for v in chunk_frames):
@@ -1294,9 +1477,15 @@ def _verify_split_coverage(
             for i, exp in enumerate(expected_list)
             if exp is not None and i < len(chunk_frames) and int(chunk_frames[i]) != int(exp)  # type: ignore[arg-type]
         ]
-        if mismatched and is_cfr:
+        if mismatched and exact_timeline:
             preview = ", ".join(f"chunk {i}: {got} vs {exp}" for i, got, exp in mismatched[:8])
-            _say(f"Split verification: {len(mismatched)} chunk(s) differ from the requested frame range ({preview}).")
+            msg = (
+                f"Split verification failed: {len(mismatched)} chunk(s) differ from their requested "
+                f"frame ranges ({preview}). A balanced total can still hide a duplicated frame at one "
+                "boundary and a missing frame at another."
+            )
+            _say("ERROR: " + msg)
+            return False, msg
 
     if src_frames is None:
         _say(
@@ -1307,7 +1496,7 @@ def _verify_split_coverage(
 
     expected_total = int(src_frames) + int(intended_overlap)
     delta = total_chunk_frames - expected_total
-    tolerance = 0 if method == "nb_frames" else 1
+    tolerance = 0 if method in {"decoded_frames", "nb_frames", "playable_packets"} else 1
     summary = (
         f"Split verification: {len(chunk_paths)} chunks, {total_chunk_frames} frames total; "
         f"source has {src_frames} frames ({method}); intended overlap {intended_overlap}; delta {delta:+d}."
@@ -1316,7 +1505,7 @@ def _verify_split_coverage(
         _say(summary + " OK")
         return True, ""
 
-    if is_cfr:
+    if exact_timeline:
         msg = (
             summary
             + f" FAILED: chunks would {'duplicate' if delta > 0 else 'lose'} {abs(delta)} frame(s), which causes "
@@ -1359,8 +1548,6 @@ def _remux_video_with_fresh_timestamps(
         "-an",
         "-movflags",
         "+faststart",
-        "-avoid_negative_ts",
-        "make_zero",
         str(dst_path),
     ]
     proc = _run_ffmpeg(cmd)
@@ -1395,8 +1582,12 @@ def _wait_for_media_file_ready(
     poll_sec: float = 0.35,
 ) -> bool:
     """
-    Wait until a media file exists, has non-trivial size, and appears stable.
-    This mitigates races where chunk files are still being finalized.
+    Wait until a media file exists, has non-trivial size, and has a stable VIDEO stream.
+
+    Container duration is not enough: an interrupted model writer can leave a perfectly
+    probeable MP4 containing only its already-muxed audio track. Treating that artifact as a
+    finished model output sends concat/OpenCV into slow fallbacks and can look like a freeze
+    on the last chunk.
     """
     media_path = Path(media_path)
     deadline = time.time() + max(0.5, float(timeout_sec))
@@ -1408,7 +1599,8 @@ def _wait_for_media_file_ready(
             if media_path.exists() and media_path.is_file():
                 size = int(media_path.stat().st_size or 0)
                 if size > 1024:
-                    dur = get_media_duration_seconds(str(media_path))
+                    video_sig = _probe_concat_video_signature(media_path)
+                    dur = _probe_video_stream_duration(media_path) if video_sig is not None else None
                     dur_ok = bool(dur and dur > 0)
                     if dur_ok and expected_duration and expected_duration > 0:
                         # Use a forgiving threshold; some pipelines trim a small tail.
@@ -1427,9 +1619,72 @@ def _wait_for_media_file_ready(
         time.sleep(max(0.05, float(poll_sec)))
 
     try:
-        return media_path.exists() and media_path.is_file() and media_path.stat().st_size > 1024
+        if not (media_path.exists() and media_path.is_file() and media_path.stat().st_size > 1024):
+            return False
+        if _probe_concat_video_signature(media_path) is None:
+            return False
+        duration = _probe_video_stream_duration(media_path)
+        return bool(duration and float(duration) > 0)
     except Exception:
         return False
+
+
+def _wait_for_media_files_ready(
+    media_paths: List[Path],
+    *,
+    timeout_sec: float = 20.0,
+    poll_sec: float = 0.25,
+) -> List[Path]:
+    """
+    Stabilize a merge set concurrently instead of waiting ~0.7 s per chunk.
+
+    Hundreds of already-finished chunks used to be polled one-by-one immediately before
+    concat, leaving the UI apparently frozen for several minutes on the last chunk. One
+    shared polling clock provides the same size/duration safety with constant wait time.
+    """
+    ordered = [Path(path) for path in media_paths]
+    pending = set(range(len(ordered)))
+    last_sizes: Dict[int, int] = {}
+    ready: set[int] = set()
+    deadline = time.time() + max(0.5, float(timeout_sec))
+
+    while pending and time.time() < deadline:
+        for index in list(pending):
+            path = ordered[index]
+            try:
+                if not path.exists() or not path.is_file():
+                    continue
+                size = int(path.stat().st_size or 0)
+                if size <= 1024:
+                    last_sizes[index] = size
+                    continue
+                if last_sizes.get(index) == size:
+                    video_sig = _probe_concat_video_signature(path)
+                    duration = _probe_video_stream_duration(path) if video_sig is not None else None
+                    if duration and float(duration) > 0:
+                        ready.add(index)
+                        pending.remove(index)
+                        continue
+                last_sizes[index] = size
+            except Exception:
+                continue
+        if pending:
+            time.sleep(max(0.05, float(poll_sec)))
+
+    # A caller may invoke concat just after a slow network rename. Fail closed unless the
+    # final probe can see a non-empty, playable video.
+    for index in list(pending):
+        path = ordered[index]
+        try:
+            if path.exists() and path.is_file() and path.stat().st_size > 1024:
+                video_sig = _probe_concat_video_signature(path)
+                duration = _probe_video_stream_duration(path) if video_sig is not None else None
+                if duration and float(duration) > 0:
+                    ready.add(index)
+        except Exception:
+            pass
+
+    return [path for index, path in enumerate(ordered) if index in ready]
 
 
 def _collect_merge_chunk_paths(
@@ -1486,6 +1741,15 @@ def _collect_merge_chunk_paths(
     return ordered
 
 
+def _ffconcat_quote_path(path: Path) -> str:
+    """Quote an absolute path for ffmpeg's concat-demuxer grammar."""
+    value = Path(path).resolve().as_posix()
+    # The concat parser accepts adjacent quoted/unquoted tokens. Close the quoted
+    # token, emit an escaped apostrophe, and reopen it (the same form FFmpeg's own
+    # documentation uses for shell-hostile paths).
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def _write_concat_list(
     txt_path: Path,
     paths: List[Path],
@@ -1503,11 +1767,11 @@ def _write_concat_list(
     """
     with txt_path.open("w", encoding="utf-8") as f:
         for i, p in enumerate(paths):
-            f.write(f"file '{p.resolve().as_posix()}'\n")
+            f.write(f"file {_ffconcat_quote_path(Path(p))}\n")
             if durations is not None and i < len(durations):
                 dur = durations[i]
                 if dur is not None and dur > 0:
-                    f.write(f"duration {float(dur):.6f}\n")
+                    f.write(f"duration {float(dur):.12f}\n")
 
 
 def _run_ffmpeg(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -1545,6 +1809,20 @@ def _parse_fraction_to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _parse_finite_float(value: Any) -> Optional[float]:
+    """Parse a finite scalar, including zero and negative timestamp values."""
+    try:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw or raw.lower() in {"n/a", "nan"}:
+            return None
+        out = float(raw)
+        return float(out) if math.isfinite(out) else None
+    except Exception:
+        return None
+
+
 def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
     """
     Probe merge-relevant video stream fields for concat compatibility decisions.
@@ -1561,7 +1839,14 @@ def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=codec_name,pix_fmt,width,height,time_base,r_frame_rate,avg_frame_rate,start_time,duration,nb_frames",
+                (
+                    "stream=codec_name,profile,level,codec_tag_string,pix_fmt,width,height,"
+                    "time_base,r_frame_rate,avg_frame_rate,start_time,duration,nb_frames,"
+                    "color_range,color_space,color_transfer,color_primaries,chroma_location,"
+                    "field_order,extradata_hash"
+                ),
+                "-show_data_hash",
+                "sha256",
                 "-of",
                 "json",
                 str(p),
@@ -1596,7 +1881,7 @@ def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
         fps = fps_r or fps_avg
 
         duration = _parse_fraction_to_float(st.get("duration"))
-        start_time = _parse_fraction_to_float(st.get("start_time"))
+        start_time = _parse_finite_float(st.get("start_time"))
 
         frame_count: Optional[int] = None
         try:
@@ -1610,6 +1895,9 @@ def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
             return None
         return {
             "codec_name": codec,
+            "profile": str(st.get("profile") or "").strip().lower(),
+            "level": str(st.get("level") or "").strip().lower(),
+            "codec_tag_string": str(st.get("codec_tag_string") or "").strip().lower(),
             "pix_fmt": pix_fmt,
             "width": width,
             "height": height,
@@ -1620,6 +1908,13 @@ def _probe_concat_video_signature(video_path: Path) -> Optional[Dict[str, Any]]:
             "duration": duration,
             "start_time": start_time,
             "nb_frames": frame_count,
+            "color_range": str(st.get("color_range") or "").strip().lower(),
+            "color_space": str(st.get("color_space") or "").strip().lower(),
+            "color_transfer": str(st.get("color_transfer") or "").strip().lower(),
+            "color_primaries": str(st.get("color_primaries") or "").strip().lower(),
+            "chroma_location": str(st.get("chroma_location") or "").strip().lower(),
+            "field_order": str(st.get("field_order") or "").strip().lower(),
+            "extradata_hash": str(st.get("extradata_hash") or "").strip().lower(),
         }
     except Exception:
         return None
@@ -1634,16 +1929,29 @@ def _merge_stream_copy_is_safe(signatures: List[Optional[Dict[str, Any]]]) -> Tu
         return False, "missing ffprobe stream signatures"
 
     # Stream-copy concat is sensitive to per-chunk timing fields.
-    required_fields = ["codec_name", "pix_fmt", "width", "height", "time_base", "r_frame_rate"]
+    required_fields = [
+        "codec_name", "profile", "level", "codec_tag_string", "pix_fmt", "width", "height",
+        "time_base", "r_frame_rate", "color_range", "color_space", "color_transfer",
+        "color_primaries", "chroma_location", "field_order", "extradata_hash",
+    ]
     mismatched: List[str] = []
     for field in required_fields:
         values = {str(sig.get(field) or "").strip().lower() for sig in sigs}
-        values.discard("")
         if len(values) > 1:
             mismatched.append(field)
 
     if mismatched:
         return False, f"mixed chunk stream fields: {', '.join(mismatched)}"
+
+    # H.264/HEVC/AV1/MPEG-4 decoders need codec configuration carried outside the
+    # elementary packets (SPS/PPS, sequence headers, etc.). If an older ffprobe
+    # cannot expose that data, equality of the remaining fields is not enough to
+    # prove that concatenating the packets is safe. Fail closed and re-encode rather
+    # than risk correct frame counts with corrupt pictures after the first chunk.
+    codec_name = str(sigs[0].get("codec_name") or "").strip().lower()
+    if codec_name in {"h264", "hevc", "h265", "av1", "mpeg4"}:
+        if any(not str(sig.get("extradata_hash") or "").strip() for sig in sigs):
+            return False, f"{codec_name} codec configuration hash is unavailable"
     return True, ""
 
 
@@ -1932,11 +2240,11 @@ def concat_videos(
         return False
 
     # Filter and stabilize candidate chunk files before writing concat list.
-    stable_chunks: List[Path] = []
-    for p in chunk_paths:
-        p = Path(p)
-        if _wait_for_media_file_ready(p, timeout_sec=20.0):
-            stable_chunks.append(p)
+    stable_chunks = _wait_for_media_files_ready(
+        [Path(p) for p in chunk_paths],
+        timeout_sec=20.0,
+        poll_sec=0.25,
+    )
 
     if not stable_chunks:
         if on_progress:
@@ -1950,23 +2258,57 @@ def concat_videos(
             )
         return False
 
-    # Video-stream durations per chunk: used both for the merge duration check and as explicit
-    # concat-demuxer `duration` directives (so a slightly longer preview-audio track inside a
-    # chunk cannot push the next chunk's timestamps and open gaps in the merged video).
-    chunk_video_durations: List[Optional[float]] = [_probe_video_stream_duration(Path(p)) for p in stable_chunks]
+    signatures = [_probe_concat_video_signature(p) for p in stable_chunks]
+    probed_fps_str = _pick_merge_fps_str(signatures, stable_chunks)
     nominal_fps_val = _parse_fraction_to_float(nominal_fps) if nominal_fps else None
-    if nominal_fps_val and nominal_fps_val > 0:
-        frame_based: List[Optional[float]] = []
-        for p in stable_chunks:
-            n = _probe_chunk_nb_frames(Path(p))
-            frame_based.append((float(n) / float(nominal_fps_val)) if n else None)
-        if all(d is not None and d > 0 for d in frame_based):
-            chunk_video_durations = frame_based
-            if on_progress:
-                on_progress(f"Merge timing: per-chunk durations derived from frame counts at {nominal_fps} fps.\n")
 
-    txt = output_path.parent / "concat.txt"
+    # ``nominal_fps`` is the caller's required output timeline, not merely a hint. If a
+    # frame-preserving backend stamped its chunks at 24.49 instead of 25 fps, retaining the
+    # backend metadata creates progressive A/V drift. Keep the exact frame inventory and
+    # force a single merge re-encode at the required rational rate. FPS-changing pipelines
+    # (RIFE) deliberately call this function without a source-rate requirement.
+    nominal_rate_mismatch = False
+    if nominal_fps_val and nominal_fps_val > 0:
+        for sig in signatures:
+            sig_fps = _parse_fraction_to_float(sig.get("r_frame_rate")) if isinstance(sig, dict) else None
+            if sig_fps is None or abs(float(sig_fps) - float(nominal_fps_val)) > max(
+                1e-6, 1e-4 * float(nominal_fps_val)
+            ):
+                nominal_rate_mismatch = True
+                break
+    merge_fps_str = str(nominal_fps) if nominal_fps_val and nominal_fps else (probed_fps_str or "")
+    merge_fps_val = _parse_fraction_to_float(merge_fps_str)
+
+    chunk_frame_counts: List[Optional[int]] = [_probe_chunk_nb_frames(Path(p)) for p in stable_chunks]
+    expected_frame_count: Optional[int] = None
+    if all(n is not None and int(n) > 0 for n in chunk_frame_counts):
+        expected_frame_count = int(sum(int(n) for n in chunk_frame_counts if n is not None))
+
+    # Video-stream durations are also explicit concat-demuxer directives, preventing
+    # preview audio from inserting a timestamp gap. Prefer exact frames/FPS to container
+    # duration whenever the complete inventory is available.
+    chunk_video_durations: List[Optional[float]] = [_probe_video_stream_duration(Path(p)) for p in stable_chunks]
+    if merge_fps_val and merge_fps_val > 0 and expected_frame_count is not None:
+        chunk_video_durations = [
+            (float(n) / float(merge_fps_val)) if n is not None and int(n) > 0 else None
+            for n in chunk_frame_counts
+        ]
+        if on_progress:
+            on_progress(
+                f"Merge timing: {expected_frame_count} frames at {merge_fps_str} fps "
+                "(per-chunk durations derived from decoded frame counts).\n"
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    txt = output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.{threading.get_ident()}.ffconcat"
+    )
     _write_concat_list(txt, stable_chunks, durations=chunk_video_durations)
+
+    def _finish_merge(result: bool) -> bool:
+        with suppress(Exception):
+            txt.unlink(missing_ok=True)
+        return result
 
     expected_duration: Optional[float] = None
     if all(d is not None and d > 0 for d in chunk_video_durations):
@@ -1976,31 +2318,57 @@ def concat_videos(
             on_progress(
                 "ERROR: Could not probe duration for every chunk; aborting merge to prevent short output.\n"
             )
-        return False
+        return _finish_merge(False)
     if on_progress:
         on_progress(f"Concatenating {len(stable_chunks)} chunk(s) (video-only merge)...\n")
 
-    def _validate_or_fix_duration(path: Path, min_ratio: float = 0.90) -> bool:
+    def _candidate_is_exact(path: Path, *, emit: bool = True) -> bool:
         if not (path.exists() and path.stat().st_size > 1024):
             return False
-        if expected_duration is None or expected_duration <= 0:
-            return True
-
         actual_now = _probe_video_stream_duration(path)
-        if on_progress and actual_now is not None:
+        actual_frames = _probe_chunk_nb_frames(path) if expected_frame_count is not None else None
+        candidate_sig = _probe_concat_video_signature(path)
+        start_time = candidate_sig.get("start_time") if isinstance(candidate_sig, dict) else None
+        if emit and on_progress:
             on_progress(
-                "Merge duration check: "
-                f"expected~{float(expected_duration):.3f}s, actual={float(actual_now):.3f}s.\n"
+                "Merge validation: "
+                f"frames expected={expected_frame_count or 'unknown'}, actual={actual_frames or 'unknown'}; "
+                f"duration expected={float(expected_duration or 0.0):.6f}s, "
+                f"actual={float(actual_now or 0.0):.6f}s; "
+                f"video_start={float(start_time) if start_time is not None else 'unknown'}.\n"
             )
+        if expected_frame_count is not None and actual_frames != expected_frame_count:
+            return False
+        if expected_duration and expected_duration > 0:
+            if actual_now is None or actual_now <= 0:
+                return False
+            frame_tol = (1.25 / float(merge_fps_val)) if merge_fps_val and merge_fps_val > 0 else 0.05
+            if abs(float(actual_now) - float(expected_duration)) > max(0.02, frame_tol):
+                return False
+        if merge_fps_val and merge_fps_val > 0:
+            out_r, out_avg = _probe_frame_rates(path)
+            out_fps = out_r or out_avg
+            if out_fps and abs(float(out_fps) - float(merge_fps_val)) > max(1e-6, 1e-4 * float(merge_fps_val)):
+                return False
+        # A positive first video PTS is the B-frame-delay regression fixed in V8.2. It
+        # produces a constant audio lead and used to be accepted because duration/frame
+        # count alone still looked correct. Final app outputs always start at timeline 0.
+        if start_time is not None and abs(float(start_time)) > 0.001:
+            return False
+        return True
 
-        if _duration_is_plausible(path, expected_duration, min_ratio=min_ratio):
+    def _validate_or_fix_duration(path: Path, min_ratio: float = 0.90) -> bool:
+        del min_ratio  # retained for compatibility with the older call sites below
+        if _candidate_is_exact(path):
             return True
+        if not (path.exists() and path.stat().st_size > 1024):
+            return False
 
         actual_before = _probe_video_stream_duration(path)
         if on_progress:
             on_progress(
                 "WARN: Merge duration drift detected "
-                f"(expected~{float(expected_duration):.3f}s, "
+                f"(expected~{float(expected_duration or 0.0):.3f}s, "
                 f"actual={float(actual_before or 0.0):.3f}s). "
                 "Attempting timestamp remux fix.\n"
             )
@@ -2013,7 +2381,7 @@ def concat_videos(
                 tmp_fixed.unlink(missing_ok=True)
             return False
 
-        fixed_ok = _duration_is_plausible(tmp_fixed, expected_duration, min_ratio=min_ratio)
+        fixed_ok = _candidate_is_exact(tmp_fixed)
         actual_after = _probe_video_stream_duration(tmp_fixed)
         if fixed_ok:
             try:
@@ -2039,23 +2407,19 @@ def concat_videos(
             tmp_fixed.unlink(missing_ok=True)
         return False
 
-    # Trivial fast-path: only one chunk.
-    if len(stable_chunks) == 1:
-        try:
-            output_path.unlink(missing_ok=True)
-            shutil.copy2(stable_chunks[0], output_path)
-            return _validate_or_fix_duration(output_path, min_ratio=0.90)
-        except Exception:
-            return False
-
-    signatures = [_probe_concat_video_signature(p) for p in stable_chunks]
-    stream_copy_safe, stream_copy_reason = _merge_stream_copy_is_safe(signatures)
+    stream_signatures_compatible, stream_copy_reason = _merge_stream_copy_is_safe(signatures)
+    stream_copy_safe = stream_signatures_compatible
+    if nominal_rate_mismatch:
+        stream_copy_safe = False
+        stream_copy_reason = (
+            f"chunk frame rate differs from required timeline {merge_fps_str}"
+        )
 
     def _build_fallback_encode_args() -> Tuple[List[str], str]:
         enc = _normalize_video_encode_settings(encode_settings)
         # Exact rational when possible ("24000/1001"); a snapped/rounded value would
         # change playback speed and desync audio.
-        fps_str = _pick_merge_fps_str(signatures, stable_chunks) or "30"
+        fps_str = merge_fps_str or _pick_merge_fps_str(signatures, stable_chunks) or "30"
         video_encode_args = build_ffmpeg_video_encode_args(
             codec=enc["codec"],
             quality=int(enc["quality"]),
@@ -2102,6 +2466,10 @@ def concat_videos(
         cmd_pipe = [
             "ffmpeg",
             "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -2122,23 +2490,42 @@ def concat_videos(
 
         proc_pipe: Optional[subprocess.Popen] = None
         frames_written = 0
+        stderr_tail: List[str] = []
+        drain_thread: Optional[threading.Thread] = None
         try:
             proc_pipe = subprocess.Popen(
                 cmd_pipe,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             if proc_pipe.stdin is None:
                 raise RuntimeError("ffmpeg stdin pipe unavailable")
 
-            for chunk_path in stable_chunks:
+            # Windows pipes are small. Drain ffmpeg diagnostics while raw frames are
+            # being written or a long fallback merge can deadlock near the last chunk.
+            def _drain_pipe_stderr() -> None:
+                try:
+                    if proc_pipe is None or proc_pipe.stderr is None:
+                        return
+                    for raw_line in iter(proc_pipe.stderr.readline, b""):
+                        line = raw_line.decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            stderr_tail.append(line)
+                            if len(stderr_tail) > 80:
+                                del stderr_tail[:-80]
+                except Exception:
+                    pass
+
+            drain_thread = threading.Thread(target=_drain_pipe_stderr, daemon=True)
+            drain_thread.start()
+
+            for chunk_i, chunk_path in enumerate(stable_chunks):
                 cap = cv2.VideoCapture(str(chunk_path))
                 if not cap.isOpened():
                     cap.release()
-                    if on_progress:
-                        on_progress(f"WARN: Frame-stream fallback could not open chunk: {chunk_path.name}\n")
-                    continue
+                    raise RuntimeError(f"could not open required chunk: {chunk_path.name}")
+                chunk_written = 0
                 try:
                     while True:
                         ok, frame = cap.read()
@@ -2149,11 +2536,21 @@ def concat_videos(
                             frame = cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_LINEAR)
                         proc_pipe.stdin.write(frame.tobytes())
                         frames_written += 1
+                        chunk_written += 1
                 finally:
                     cap.release()
 
+                expected_chunk_frames = chunk_frame_counts[chunk_i] if chunk_i < len(chunk_frame_counts) else None
+                if expected_chunk_frames is not None and chunk_written != int(expected_chunk_frames):
+                    raise RuntimeError(
+                        f"decoded {chunk_written}/{int(expected_chunk_frames)} frames from {chunk_path.name}"
+                    )
+
             proc_pipe.stdin.close()
-            _stdout, _stderr = proc_pipe.communicate()
+            proc_pipe.stdin = None
+            proc_pipe.wait()
+            if drain_thread is not None:
+                drain_thread.join(timeout=5.0)
             if proc_pipe.returncode == 0 and frames_written > 0 and _validate_or_fix_duration(output_path, min_ratio=0.90):
                 if on_progress:
                     on_progress(
@@ -2163,14 +2560,29 @@ def concat_videos(
                 return True
 
             if on_progress:
-                tail = (_stderr.decode(errors="ignore") if isinstance(_stderr, (bytes, bytearray)) else str(_stderr or ""))[-500:]
+                tail = " | ".join(stderr_tail[-8:])[-1000:]
                 on_progress("WARN: Frame-stream fallback failed.\n")
                 if tail:
                     on_progress(f"ffmpeg: {tail}\n")
             return False
         except Exception as e:
+            # A broken raw-video pipe usually means ffmpeg rejected the requested codec or
+            # container before frame 1. Let its stderr drainer reach EOF so the user sees the
+            # actionable encoder error instead of only ``[Errno 32] Broken pipe``.
+            if proc_pipe is not None:
+                with suppress(Exception):
+                    if proc_pipe.stdin:
+                        proc_pipe.stdin.close()
+                        proc_pipe.stdin = None
+                with suppress(Exception):
+                    proc_pipe.wait(timeout=3.0)
+            if drain_thread is not None:
+                drain_thread.join(timeout=3.0)
             if on_progress:
                 on_progress(f"WARN: Frame-stream fallback exception: {str(e)}\n")
+                tail = " | ".join(stderr_tail[-8:])[-1000:]
+                if tail:
+                    on_progress(f"ffmpeg: {tail}\n")
             return False
         finally:
             if proc_pipe is not None:
@@ -2179,6 +2591,9 @@ def concat_videos(
                         proc_pipe.stdin.close()
                 with suppress(Exception):
                     proc_pipe.kill()
+                with suppress(Exception):
+                    if proc_pipe.stderr:
+                        proc_pipe.stderr.close()
 
     def _try_demuxer_reencode_concat(reason: str) -> bool:
         video_encode_args, fps_str = _build_fallback_encode_args()
@@ -2266,7 +2681,7 @@ def concat_videos(
                 on_progress(
                     f"Concatenated {len(stable_chunks)} chunk(s) via direct stream copy.\n"
                 )
-            return True
+            return _finish_merge(True)
         if on_progress:
             tail = (proc_copy.stderr or proc_copy.stdout or "").strip()[-400:]
             on_progress("WARN: Direct stream-copy concat failed validation; trying TS fallback.\n")
@@ -2342,26 +2757,35 @@ def concat_videos(
                             on_progress(
                                 f"Concatenated {len(stable_chunks)} chunk(s) via TS stream copy (codec={common_codec}).\n"
                             )
-                        return True
+                        return _finish_merge(True)
                     if on_progress:
                         tail = (proc_ts_concat.stderr or proc_ts_concat.stdout or "").strip()[-400:]
                         on_progress("WARN: TS stream-copy concat failed validation; trying robust fallback.\n")
                         if tail:
                             on_progress(f"ffmpeg: {tail}\n")
 
-    # Robust fallback path for mixed-timestamp chunks or failed stream-copy concat.
-    if _try_framepipe_reencode_concat(stream_copy_reason or "stream-copy merge failed"):
-        return True
-    if _try_demuxer_reencode_concat(stream_copy_reason or "stream-copy merge failed"):
-        return True
+    # A concat-demuxer decode is efficient and preserves high-bit-depth/chroma data, but
+    # it is not safe when codec extradata/profile changes between files: ffmpeg can keep
+    # decoding subsequent chunks with the first chunk's SPS/PPS and silently produce the
+    # right frame count with completely wrong pictures. In that case, reopen each file
+    # through the frame-stream path instead. When signatures agree (for example, only the
+    # backend FPS is wrong), prefer the native ffmpeg path.
+    fallback_reason = stream_copy_reason or "stream-copy merge failed"
+    if stream_signatures_compatible:
+        if _try_demuxer_reencode_concat(fallback_reason):
+            return _finish_merge(True)
+        if _try_framepipe_reencode_concat(fallback_reason):
+            return _finish_merge(True)
+    elif _try_framepipe_reencode_concat(fallback_reason):
+        return _finish_merge(True)
 
     # Avoid leaving a broken file with the final output name.
     with suppress(Exception):
         output_path.unlink(missing_ok=True)
-    return False
+    return _finish_merge(False)
 
 
-def concat_videos_with_blending(
+def _concat_videos_with_blending_legacy(
     chunk_paths: List[Path],
     output_path: Path,
     overlap_frames: Any = 0,
@@ -2576,6 +3000,270 @@ def concat_videos_with_blending(
             on_progress(f"❌ Blending failed: {e}\n")
         # Fallback to simple concat
         return concat_videos(chunk_paths, output_path, encode_settings=encode_settings, on_progress=on_progress)
+
+
+def concat_videos_with_blending(
+    chunk_paths: List[Path],
+    output_path: Path,
+    overlap_frames: Any = 0,
+    fps: Optional[float] = None,
+    encode_settings: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+    nominal_fps: Optional[str] = None,
+) -> bool:
+    """Merge chunks while removing each intentional overlap exactly once.
+
+    Only one chunk plus its pending overlap tail is held in memory. The previous
+    implementation accumulated the entire movie before starting ffmpeg, which could
+    exhaust RAM or appear frozen on long production inputs.
+    """
+    if not chunk_paths:
+        return False
+
+    if isinstance(overlap_frames, (list, tuple)):
+        overlaps = [max(0, int(v or 0)) for v in overlap_frames]
+    else:
+        try:
+            uniform = max(0, int(overlap_frames or 0))
+        except Exception:
+            uniform = 0
+        overlaps = [uniform] * max(0, len(chunk_paths) - 1)
+    boundary_count = max(0, len(chunk_paths) - 1)
+    if len(overlaps) < boundary_count:
+        overlaps += [overlaps[-1] if overlaps else 0] * (boundary_count - len(overlaps))
+    overlaps = overlaps[:boundary_count]
+
+    if not any(overlaps):
+        return concat_videos(
+            chunk_paths,
+            output_path,
+            encode_settings=encode_settings,
+            on_progress=on_progress,
+            nominal_fps=nominal_fps,
+        )
+
+    proc: Optional[subprocess.Popen] = None
+    drain_thread: Optional[threading.Thread] = None
+    try:
+        if on_progress:
+            on_progress("Concatenating chunks with frame-exact overlap blending...\n")
+
+        frame_counts = [_probe_chunk_nb_frames(Path(p)) for p in chunk_paths]
+        if any(n is None or int(n) <= 0 for n in frame_counts):
+            raise RuntimeError("could not count every overlap input chunk")
+        for i, overlap in enumerate(overlaps):
+            if overlap > int(frame_counts[i]) or overlap > int(frame_counts[i + 1]):  # type: ignore[arg-type]
+                raise RuntimeError(
+                    f"boundary {i + 1} overlap ({overlap}) exceeds an adjacent chunk frame count"
+                )
+        expected_frames = int(sum(int(n) for n in frame_counts if n is not None) - sum(overlaps))
+        if expected_frames <= 0:
+            raise RuntimeError("overlap plan produces no output frames")
+
+        signatures = [_probe_concat_video_signature(Path(p)) for p in chunk_paths]
+        fps_str = str(nominal_fps or "").strip()
+        fps_val = _parse_fraction_to_float(fps_str)
+        if not fps_val:
+            fps_str = _pick_merge_fps_str(signatures, [Path(p) for p in chunk_paths]) or ""
+            fps_val = _parse_fraction_to_float(fps_str)
+        if not fps_val:
+            fps_val = float(fps or 30.0)
+            fps_str = str(Fraction(float(fps_val)).limit_denominator(1_000_000))
+
+        with tempfile.TemporaryDirectory(prefix="blend_") as temp_dir:
+            temp_output = Path(temp_dir) / "blended_temp.mp4"
+            stderr_tail: List[str] = []
+            pending_tail: List[np.ndarray] = []
+            frames_written = 0
+            width = height = 0
+
+            for i, chunk_path in enumerate(chunk_paths):
+                if on_progress:
+                    on_progress(f"Blending chunk {i + 1}/{len(chunk_paths)}...\n")
+                cap = cv2.VideoCapture(str(chunk_path))
+                if not cap.isOpened():
+                    cap.release()
+                    raise RuntimeError(f"could not open required chunk: {Path(chunk_path).name}")
+                previous_overlap = int(overlaps[i - 1]) if i > 0 else 0
+                next_overlap = int(overlaps[i]) if i < len(overlaps) else 0
+                if len(pending_tail) != previous_overlap:
+                    cap.release()
+                    raise RuntimeError(
+                        f"boundary {i} retained {len(pending_tail)}/{previous_overlap} overlap frames"
+                    )
+
+                decoded = 0
+                head_frames: List[np.ndarray] = []
+                held_for_next = deque()
+
+                def _emit_candidate(frame: np.ndarray) -> None:
+                    nonlocal frames_written
+                    if next_overlap:
+                        held_for_next.append(frame)
+                        if len(held_for_next) <= next_overlap:
+                            return
+                        frame = held_for_next.popleft()
+                    if proc is None or proc.stdin is None:
+                        raise RuntimeError("ffmpeg blend encoder stdin is unavailable")
+                    proc.stdin.write(frame.tobytes())
+                    frames_written += 1
+
+                try:
+                    ok, first_frame = cap.read()
+                    if not ok or first_frame is None:
+                        raise RuntimeError(f"could not decode required chunk: {Path(chunk_path).name}")
+                    decoded = 1
+
+                    chunk_h, chunk_w = first_frame.shape[:2]
+                    if i == 0:
+                        height, width = int(chunk_h), int(chunk_w)
+                        enc = _normalize_video_encode_settings(encode_settings)
+                        video_encode_args = build_ffmpeg_video_encode_args(
+                            codec=enc["codec"],
+                            quality=enc["quality"],
+                            pixel_format=enc["pixel_format"],
+                            preset=enc["preset"],
+                            h265_tune=enc["h265_tune"],
+                            av1_film_grain=enc["av1_film_grain"],
+                            av1_film_grain_denoise=enc["av1_film_grain_denoise"],
+                            audio_codec="none",
+                        )
+                        ffmpeg_cmd = [
+                            "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+                            "-s", f"{width}x{height}", "-pix_fmt", "bgr24", "-r", fps_str,
+                            "-i", "-", *video_encode_args, "-movflags", "+faststart", str(temp_output),
+                        ]
+                        proc = subprocess.Popen(
+                            ffmpeg_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        if proc.stdin is None:
+                            raise RuntimeError("ffmpeg blend encoder stdin is unavailable")
+
+                        def _drain_blend_stderr() -> None:
+                            try:
+                                if proc is None or proc.stderr is None:
+                                    return
+                                for raw_line in iter(proc.stderr.readline, b""):
+                                    line = raw_line.decode("utf-8", errors="replace").rstrip()
+                                    if line:
+                                        stderr_tail.append(line)
+                                        if len(stderr_tail) > 80:
+                                            del stderr_tail[:-80]
+                            except Exception:
+                                pass
+
+                        drain_thread = threading.Thread(target=_drain_blend_stderr, daemon=True)
+                        drain_thread.start()
+                    elif int(chunk_w) != width or int(chunk_h) != height:
+                        raise RuntimeError(
+                            f"chunk dimensions changed at {Path(chunk_path).name}: "
+                            f"{chunk_w}x{chunk_h} vs {width}x{height}"
+                        )
+
+                    if previous_overlap:
+                        head_frames.append(first_frame)
+                        while len(head_frames) < previous_overlap:
+                            ok, frame = cap.read()
+                            if not ok or frame is None:
+                                break
+                            decoded += 1
+                            head_frames.append(frame)
+                        if len(head_frames) != previous_overlap:
+                            raise RuntimeError(
+                                f"chunk {i + 1} decoded only {len(head_frames)}/{previous_overlap} "
+                                "required leading overlap frames"
+                            )
+                        blended = blend_overlapping_frames_opencv(
+                            np.asarray(pending_tail), np.asarray(head_frames), previous_overlap
+                        )
+                        for frame in blended:
+                            _emit_candidate(frame)
+                    else:
+                        _emit_candidate(first_frame)
+
+                    # Stream the remainder while retaining only the exact tail needed by
+                    # the next boundary. Memory is O(overlap), independent of chunk length.
+                    while True:
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            break
+                        decoded += 1
+                        if frame.shape[1] != width or frame.shape[0] != height:
+                            raise RuntimeError(
+                                f"frame dimensions changed inside {Path(chunk_path).name}"
+                            )
+                        _emit_candidate(frame)
+                finally:
+                    cap.release()
+
+                if decoded != int(frame_counts[i]):
+                    raise RuntimeError(
+                        f"decoded {decoded}/{int(frame_counts[i])} frames from {Path(chunk_path).name}"
+                    )
+                if len(held_for_next) != next_overlap:
+                    raise RuntimeError(
+                        f"chunk {i + 1} retained {len(held_for_next)}/{next_overlap} "
+                        "required trailing overlap frames"
+                    )
+                pending_tail = list(held_for_next)
+
+            if pending_tail:
+                raise RuntimeError("final chunk unexpectedly retained overlap frames")
+            if frames_written != expected_frames:
+                raise RuntimeError(f"blend wrote {frames_written}/{expected_frames} expected frames")
+
+            assert proc is not None and proc.stdin is not None
+            proc.stdin.close()
+            proc.stdin = None
+            proc.wait()
+            if drain_thread is not None:
+                drain_thread.join(timeout=5.0)
+            if proc.returncode != 0 or not temp_output.exists():
+                raise RuntimeError("ffmpeg blend encode failed: " + " | ".join(stderr_tail[-10:]))
+
+            actual_frames = _probe_chunk_nb_frames(temp_output)
+            actual_duration = _probe_video_stream_duration(temp_output)
+            expected_duration = float(expected_frames) / float(fps_val)
+            if actual_frames != expected_frames:
+                raise RuntimeError(f"blended output has {actual_frames}/{expected_frames} frames")
+            if actual_duration is None or abs(float(actual_duration) - expected_duration) > max(
+                0.02, 1.25 / float(fps_val)
+            ):
+                raise RuntimeError(
+                    f"blended duration {float(actual_duration or 0.0):.6f}s vs {expected_duration:.6f}s"
+                )
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.unlink(missing_ok=True)
+            shutil.move(str(temp_output), str(output_path))
+            if on_progress:
+                on_progress(
+                    f"Blended video saved: {expected_frames} frames at {fps_str} fps -> {output_path}\n"
+                )
+            return True
+    except Exception as exc:
+        with suppress(Exception):
+            output_path.unlink(missing_ok=True)
+        if on_progress:
+            on_progress(f"ERROR: Frame-exact overlap blending failed: {exc}\n")
+        # Never silently append overlapping frames; that duplicates content and causes drift.
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            with suppress(Exception):
+                if proc.stdin:
+                    proc.stdin.close()
+            with suppress(Exception):
+                proc.kill()
+        if drain_thread is not None and drain_thread.is_alive():
+            drain_thread.join(timeout=1.0)
+        if proc is not None:
+            with suppress(Exception):
+                if proc.stderr:
+                    proc.stderr.close()
 
 
 def detect_resume_state(work_dir: Path, output_format: str) -> Tuple[Optional[Path], List[Path]]:
@@ -2875,6 +3563,46 @@ def chunk_and_process(
         output_format = "mp4"
     work_root = Path(work_dir)
     work_root.mkdir(parents=True, exist_ok=True)
+
+    # Services normally canonicalize an FPS override before they enter the universal
+    # chunker. Do it here as a final guard as well, especially for LTX 2.5: applying an
+    # override independently inside each scene rounds every scene's frame count and makes
+    # the rounding error accumulate at concat time. Canonicalize the whole source once,
+    # then split that exact CFR inventory. RIFE is excluded because changing FPS is its
+    # actual model operation.
+    model_key_for_fps = str(model_type or "").strip().lower()
+    fps_key_for_preprocess = "fps_override" if model_key_for_fps in {"seedvr2", "gan"} else "fps"
+    if model_key_for_fps != "rife":
+        try:
+            requested_fps = float(settings.get(fps_key_for_preprocess) or 0.0)
+        except Exception:
+            requested_fps = 0.0
+        if requested_fps > 0:
+            try:
+                from .video_fps_utils import apply_video_fps_override_preprocess
+
+                fps_ok, fps_note = apply_video_fps_override_preprocess(
+                    settings,
+                    fps_key=fps_key_for_preprocess,
+                    run_dir=work_root / "fps_preprocess",
+                    on_progress=on_progress,
+                )
+            except Exception as exc:
+                fps_ok, fps_note = False, str(exc)
+            if not fps_ok:
+                return 1, f"FPS override preprocess failed: {fps_note}", "", 0
+            if fps_note:
+                try:
+                    on_progress(f"{fps_note}\n")
+                except Exception:
+                    pass
+
+            input_path = normalize_path(settings.get("_effective_input_path") or settings.get("input_path"))
+            audio_source_for_mux = (
+                normalize_path(settings.get("_original_input_path_before_preprocess")) or input_path
+            )
+            input_type = detect_input_type(input_path)
+
     input_chunks_dir = work_root / "input_chunks"
     processed_chunks_dir = work_root / "processed_chunks"
     input_chunks_dir.mkdir(parents=True, exist_ok=True)
@@ -2958,7 +3686,11 @@ def chunk_and_process(
             return 1, "No frames found in folder for chunking", "", 0
         fps_guess = 30.0
         frame_window = len(frames) if chunk_seconds <= 0 else max(1, int(chunk_seconds * fps_guess))
+        if model_key_for_fps == "rife" and len(frames) > 1:
+            frame_window = max(2, frame_window)
         overlap_frames = 0 if chunk_overlap <= 0 else int(chunk_overlap * fps_guess)
+        if model_key_for_fps == "rife" and frame_window < len(frames):
+            overlap_frames = max(1, overlap_frames)
         if overlap_frames >= frame_window:
             overlap_frames = max(0, frame_window - 1)
         chunk_specs = []
@@ -2982,10 +3714,41 @@ def chunk_and_process(
         # Frame-folder chunks overlap by exactly `overlap_frames` frames at every boundary.
         exact_boundary_overlaps = [int(overlap_frames)] * max(0, len(chunk_paths) - 1)
     else:
-        scenes = detect_scenes(input_path, threshold=scene_threshold, min_scene_len=min_scene_len)
+        scenes = detect_scenes(
+            input_path,
+            threshold=scene_threshold,
+            min_scene_len=min_scene_len,
+            overlap_sec=max(0.0, float(chunk_overlap or 0.0)),
+        )
         if not scenes or chunk_seconds > 0:
             effective_seconds = chunk_seconds if chunk_seconds > 0 else max(min_scene_len, 30)
             scenes = fallback_scenes(input_path, chunk_seconds=effective_seconds, overlap_seconds=max(0.0, chunk_overlap))
+
+        # RIFE emits q*(N-1)+1 frames for N inputs: every independently processed
+        # boundary would therefore lose q-1 interpolated timeline frames. Share one
+        # real source frame between adjacent chunks so each boundary is represented
+        # in both model outputs and can be removed exactly once during merge.
+        if model_key_for_fps == "rife" and len(scenes) > 1:
+            try:
+                input_fps_for_rife = float(get_media_fps(input_path) or 0.0)
+            except Exception:
+                input_fps_for_rife = 0.0
+            if input_fps_for_rife > 0:
+                one_frame_sec = 1.0 / input_fps_for_rife
+                repaired_scenes: List[Tuple[float, float]] = [
+                    (float(scenes[0][0]), float(scenes[0][1]))
+                ]
+                for scene_start, scene_end in scenes[1:]:
+                    previous_end = float(repaired_scenes[-1][1])
+                    start_value = float(scene_start)
+                    if previous_end - start_value < one_frame_sec - 1e-9:
+                        start_value = max(0.0, previous_end - one_frame_sec)
+                    repaired_scenes.append((start_value, float(scene_end)))
+                scenes = repaired_scenes
+                on_progress(
+                    "RIFE chunk timing: retaining at least one shared source frame at every "
+                    "boundary so interpolation does not shorten the merged video.\n"
+                )
         on_progress(f"Detected {len(scenes)} scenes for chunking\n")
 
         precise_split = bool(settings.get("frame_accurate_split", True))
@@ -3024,17 +3787,36 @@ def chunk_and_process(
         # Exact per-boundary overlaps (frames) from the split manifest, when available.
         split_manifest = _load_split_manifest(input_chunks_dir)
         exact_boundary_overlaps = _manifest_overlap_frames(split_manifest, len(chunk_paths))
-        if split_manifest and split_manifest.get("source_is_cfr") and split_manifest.get("source_fps_rational"):
-            source_fps_rational = str(split_manifest.get("source_fps_rational") or "").strip() or None
+        if split_manifest and split_manifest.get("timeline_is_cfr") and split_manifest.get("timeline_fps_rational"):
+            source_fps_rational = str(split_manifest.get("timeline_fps_rational") or "").strip() or None
             source_fps_float = _parse_fraction_to_float(source_fps_rational)
             if source_fps_float and source_fps_float > 0:
                 on_progress(
-                    f"[timing] source is CFR at {source_fps_rational} fps; chunk outputs will be held to this "
+                    f"[timing] canonical timeline is CFR at {source_fps_rational} fps; chunk outputs will be held to this "
                     f"frame rate and per-chunk frame counts.\n"
                 )
             else:
                 source_fps_rational = None
                 source_fps_float = None
+
+        # A full-file scene is intentionally not split and therefore has no manifest.
+        # Still carry an exact CFR requirement into per-chunk validation and final merge;
+        # otherwise a single model output stamped at (for example) 24.49 instead of 25
+        # FPS could evade the same timing repair that protects multi-chunk runs.
+        if not source_fps_rational:
+            source_sig = _probe_concat_video_signature(Path(input_path))
+            if isinstance(source_sig, dict):
+                rate_raw = str(source_sig.get("r_frame_rate") or "").strip()
+                avg_raw = str(source_sig.get("avg_frame_rate") or "").strip()
+                rate_val = _parse_fraction_to_float(rate_raw)
+                avg_val = _parse_fraction_to_float(avg_raw)
+                if rate_val and avg_val and abs(rate_val - avg_val) <= max(1e-6, 0.002 * rate_val):
+                    source_fps_rational = rate_raw
+                    source_fps_float = rate_val
+                    on_progress(
+                        f"[timing] source is CFR at {source_fps_rational} fps; model output will be held "
+                        "to this frame rate and decoded frame inventory.\n"
+                    )
 
     split_stage_weight = 0.10 if input_type != "directory" else 0.04
     merge_stage_weight = 0.06 if output_format != "png" else 0.03
@@ -3293,6 +4075,95 @@ def chunk_and_process(
             pass
         return None
 
+    def _output_overlap_plan(paths: List[Path]) -> Any:
+        """Map input overlap frames to the processed output timeline."""
+        boundary_count = max(0, len(paths) - 1)
+        if boundary_count <= 0:
+            return 0
+
+        if exact_boundary_overlaps and len(exact_boundary_overlaps) >= boundary_count:
+            base_overlaps = [max(0, int(v)) for v in exact_boundary_overlaps[:boundary_count]]
+        elif chunk_overlap > 0:
+            try:
+                input_rate = float(get_media_fps(str(chunk_paths[0])) or get_media_fps(input_path) or 30.0)
+            except Exception:
+                input_rate = 30.0
+            base_overlaps = [max(0, int(round(float(chunk_overlap) * input_rate)))] * boundary_count
+        else:
+            base_overlaps = [0] * boundary_count
+
+        if str(model_type or "").strip().lower() == "rife" and any(base_overlaps):
+            input_overlap_plan = list(base_overlaps)
+            try:
+                input_rate = float(get_media_fps(str(chunk_paths[0])) or get_media_fps(input_path) or 0.0)
+            except Exception:
+                input_rate = 0.0
+            output_rate = float(_get_merge_fps_hint(paths) or 0.0)
+            rate_scale = (output_rate / input_rate) if input_rate > 0 and output_rate > 0 else 2.0
+            if not math.isfinite(rate_scale) or rate_scale <= 0:
+                rate_scale = 2.0
+            base_overlaps = [
+                (max(1, int(round((frames - 1) * rate_scale)) + 1) if frames > 0 else 0)
+                for frames in base_overlaps
+            ]
+
+            # A non-integer target FPS is rounded independently inside every RIFE
+            # subprocess. Those local rounding decisions do not always add up to the
+            # one global q*(N-1)+1 timeline. Adjust only the duplicated boundary region
+            # so the merged inventory matches a single whole-video interpolation.
+            source_frames, _source_count_method = _probe_source_frame_count(Path(input_path))
+            processed_counts = [_probe_chunk_nb_frames(Path(path)) for path in paths]
+            desired_frames: Optional[int] = None
+            required_removal: Optional[int] = None
+            if source_frames and all(count is not None and int(count) > 0 for count in processed_counts):
+                desired_frames = max(1, int(round((int(source_frames) - 1) * rate_scale)) + 1)
+                required_removal = int(sum(int(count) for count in processed_counts if count is not None)) - desired_frames
+                if required_removal >= 0:
+                    current_removal = int(sum(base_overlaps))
+                    if current_removal > required_removal:
+                        remaining = current_removal - required_removal
+                        while remaining > 0:
+                            changed = False
+                            for index in range(len(base_overlaps)):
+                                if remaining <= 0:
+                                    break
+                                if base_overlaps[index] > 0:
+                                    base_overlaps[index] -= 1
+                                    remaining -= 1
+                                    changed = True
+                            if not changed:
+                                break
+                    elif current_removal < required_removal:
+                        remaining = required_removal - current_removal
+                        caps = [
+                            min(int(processed_counts[i] or 0), int(processed_counts[i + 1] or 0))
+                            for i in range(boundary_count)
+                        ]
+                        while remaining > 0:
+                            changed = False
+                            for index in range(len(base_overlaps)):
+                                if remaining <= 0:
+                                    break
+                                if base_overlaps[index] < caps[index]:
+                                    base_overlaps[index] += 1
+                                    remaining -= 1
+                                    changed = True
+                            if not changed:
+                                break
+                else:
+                    # The chunks collectively contain fewer frames than a whole-video
+                    # interpolation. Retain every boundary frame; final duration checks
+                    # will still fail closed if the deficit is material.
+                    base_overlaps = [0] * boundary_count
+            _emit_diag(
+                "RIFE merge overlap plan: "
+                f"input={input_overlap_plan}, output={base_overlaps}, rate_scale={rate_scale:.6f}, "
+                f"desired_frames={desired_frames or 'unknown'}, "
+                f"required_boundary_removal={required_removal if required_removal is not None else 'unknown'}.\n"
+            )
+
+        return base_overlaps if any(base_overlaps) else 0
+
     def _notify_progress(progress_val: float, desc: str, **kwargs) -> None:
         """
         Call the optional `progress_tracker` in a backward-compatible way.
@@ -3380,19 +4251,16 @@ def chunk_and_process(
                 processed_dir=processed_chunks_dir,
                 expected_count=expected_count,
             )
-            ready: List[Path] = []
-            for p in candidates:
-                idx = _extract_chunk_index(Path(p))
-                expected_dur = None
-                if idx is not None and 1 <= idx <= len(chunk_paths):
-                    try:
-                        expected_dur = get_media_duration_seconds(str(chunk_paths[idx - 1]))
-                    except Exception:
-                        expected_dur = None
-                # Short per-candidate wait; outer loop handles longer retries.
-                _wait_for_media_file_ready(Path(p), expected_duration=expected_dur, timeout_sec=2.0, poll_sec=0.2)
-                if Path(p).exists() and Path(p).is_file():
-                    ready.append(Path(p))
+            # Stabilize the whole set on one polling clock. The old per-file loop
+            # spent roughly 0.4-0.7 seconds on every already-finished chunk, so a
+            # long run appeared frozen for minutes immediately after its last chunk.
+            # This also uses the helper's real-video check instead of accepting any
+            # existing file (including an interrupted writer's audio-only MP4).
+            ready = _wait_for_media_files_ready(
+                candidates,
+                timeout_sec=2.0,
+                poll_sec=0.2,
+            )
 
             if len(ready) > len(best_ready):
                 best_ready = list(ready)
@@ -3452,9 +4320,7 @@ def chunk_and_process(
             return None
         partial_target = partial_video_target or collision_safe_path(work_root / "partial_concat.mp4")
         merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
-        overlap_frames_for_blend: Any = int(chunk_overlap * merge_fps_hint) if chunk_overlap > 0 else 0
-        if chunk_overlap > 0 and exact_boundary_overlaps and len(exact_boundary_overlaps) >= len(merge_chunks) - 1:
-            overlap_frames_for_blend = list(exact_boundary_overlaps[: max(0, len(merge_chunks) - 1)])
+        overlap_frames_for_blend: Any = _output_overlap_plan(merge_chunks)
         ok = concat_videos_with_blending(
             merge_chunks,
             partial_target,
@@ -3462,7 +4328,11 @@ def chunk_and_process(
             fps=merge_fps_hint,
             encode_settings=settings,
             on_progress=on_progress,
-            nominal_fps=source_fps_rational,
+            nominal_fps=(
+                None
+                if str(model_type or "").strip().lower() == "rife"
+                else source_fps_rational
+            ),
         )
         if ok:
             try:
@@ -3764,7 +4634,30 @@ def chunk_and_process(
     # If resuming, load existing completed chunks and skip them
     if resuming and existing_chunks:
         validated_existing_chunks: List[Path] = []
+        ready_existing_keys: Optional[set[str]] = None
+        if output_format != "png":
+            ready_existing = _wait_for_media_files_ready(
+                [Path(path) for path in existing_chunks],
+                timeout_sec=2.0,
+                poll_sec=0.2,
+            )
+            ready_existing_keys = set()
+            for ready_path in ready_existing:
+                try:
+                    ready_existing_keys.add(str(Path(ready_path).resolve()).lower())
+                except Exception:
+                    ready_existing_keys.add(str(ready_path).lower())
         for i, chunk_path in enumerate(existing_chunks, 1):
+            if ready_existing_keys is not None:
+                try:
+                    existing_key = str(Path(chunk_path).resolve()).lower()
+                except Exception:
+                    existing_key = str(chunk_path).lower()
+                if existing_key not in ready_existing_keys:
+                    _emit_diag(
+                        f"Resume: existing chunk {i} is not a finalized video; reprocessing from this chunk onward.\n"
+                    )
+                    break
             ok_codec, resolved_chunk = _ensure_expected_chunk_codec(
                 i,
                 "resume_existing",
@@ -3791,7 +4684,21 @@ def chunk_and_process(
                     match_ok, match_detail = _processed_chunk_matches_input(
                         Path(resolved_chunk), Path(chunk_paths[i - 1]), model_type, source_fps_float
                     )
-                    if not match_ok:
+                    repairable = bool(
+                        not match_ok
+                        and _processed_chunk_timing_is_repairable(
+                            Path(resolved_chunk),
+                            Path(chunk_paths[i - 1]),
+                            model_type,
+                            source_fps_float,
+                        )
+                    )
+                    if repairable:
+                        _emit_diag(
+                            f"Resume: chunk {i} preserved its full frame inventory but has repairable "
+                            f"timestamp/FPS metadata ({match_detail}); the final merge will normalize it.\n"
+                        )
+                    elif not match_ok:
                         _emit_diag(
                             f"Resume: chunk {i} output from the previous run does not match its input chunk "
                             f"({match_detail}); reprocessing from chunk {i} onward." + "\n"
@@ -3951,34 +4858,62 @@ def chunk_and_process(
             # to the console themselves; skip the local echo to avoid double printing.
             _emit_progress_line(text, console=(model_type != "flashvsr"))
         
-        # Use provided processing function or select based on model type
-        if process_func:
-            if custom_process_accepts_kw_on_progress:
-                res = process_func(chunk_settings, on_progress=_chunk_progress_proxy)
-            elif custom_process_accepts_pos_on_progress:
-                res = process_func(chunk_settings, _chunk_progress_proxy)
-            else:
-                res = process_func(chunk_settings)
-        elif model_type == "seedvr2":
-            res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
-        elif model_type == "gan":
-            # Forward GAN progress so frame-level runtime status can be shown in the UI.
-            res = runner.run_gan(chunk_settings, on_progress=_chunk_progress_proxy)
-        elif model_type == "rife":
-            res = runner.run_rife(chunk_settings, on_progress=_chunk_progress_proxy)
-        elif model_type == "flashvsr":
-            if hasattr(runner, "run_flashvsr"):
+        # Use provided processing function or select based on model type. Convert model
+        # exceptions/invalid returns into a normal chunk failure so the GUI always gets a
+        # structured result instead of a late ``NoneType`` crash.
+        try:
+            if process_func:
+                if custom_process_accepts_kw_on_progress:
+                    res = process_func(chunk_settings, on_progress=_chunk_progress_proxy)
+                elif custom_process_accepts_pos_on_progress:
+                    res = process_func(chunk_settings, _chunk_progress_proxy)
+                else:
+                    res = process_func(chunk_settings)
+            elif model_type == "seedvr2":
+                res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
+            elif model_type == "gan":
+                res = runner.run_gan(chunk_settings, on_progress=_chunk_progress_proxy)
+            elif model_type == "rife":
+                res = runner.run_rife(chunk_settings, on_progress=_chunk_progress_proxy)
+            elif model_type == "flashvsr":
+                if not hasattr(runner, "run_flashvsr"):
+                    raise AttributeError("model_type='flashvsr' requires runner.run_flashvsr()")
                 res = runner.run_flashvsr(chunk_settings, on_progress=_chunk_progress_proxy)
-            else:
-                raise AttributeError("chunk_and_process: model_type='flashvsr' requires runner.run_flashvsr() or a custom process_func")
-        elif model_type == "sparkvsr":
-            if hasattr(runner, "run_sparkvsr"):
+            elif model_type == "sparkvsr":
+                if not hasattr(runner, "run_sparkvsr"):
+                    raise AttributeError("model_type='sparkvsr' requires runner.run_sparkvsr()")
                 res = runner.run_sparkvsr(chunk_settings, on_progress=_chunk_progress_proxy)
+            elif model_type == "ltx25" and hasattr(runner, "run_ltx25"):
+                res = runner.run_ltx25(chunk_settings, on_progress=_chunk_progress_proxy)
+            elif model_type == "rtx" and hasattr(runner, "run_rtx_superres"):
+                res = runner.run_rtx_superres(chunk_settings, on_progress=_chunk_progress_proxy)
             else:
-                raise AttributeError("chunk_and_process: model_type='sparkvsr' requires runner.run_sparkvsr() or a custom process_func")
-        else:
-            # Fallback to seedvr2 for backward compatibility
-            res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
+                res = runner.run_seedvr2(chunk_settings, on_progress=_chunk_progress_proxy, preview_only=False)
+        except Exception as exc:
+            msg = f"Chunk {idx} model execution raised {type(exc).__name__}: {exc}"
+            _emit_diag(msg + "\n")
+            partial = _finalize_partial_output(
+                idx=idx,
+                returncode=1,
+                canceled=bool(getattr(runner, "is_canceled", lambda: False)()),
+                reason="model exception",
+            )
+            if partial:
+                return partial
+            return 1, msg, "", len(chunk_paths)
+
+        if res is None or not hasattr(res, "returncode"):
+            msg = f"Chunk {idx} model returned no valid result ({type(res).__name__})."
+            _emit_diag(msg + "\n")
+            partial = _finalize_partial_output(
+                idx=idx,
+                returncode=1,
+                canceled=False,
+                reason="invalid model result",
+            )
+            if partial:
+                return partial
+            return 1, msg, "", len(chunk_paths)
 
         if res.returncode != 0 or getattr(runner, "is_canceled", lambda: False)():
             on_progress(f"Chunk {idx} failed with code {res.returncode}\n")
@@ -4009,6 +4944,18 @@ def chunk_and_process(
                 return partial
             return res.returncode, res.log, res.output_path or "", len(chunk_paths)
         outp: Optional[Path] = Path(res.output_path) if res.output_path else None
+        if outp is None:
+            msg = f"Chunk {idx} reported success but did not provide an output path."
+            _emit_diag(msg + "\n")
+            partial = _finalize_partial_output(
+                idx=idx,
+                returncode=1,
+                canceled=False,
+                reason="missing model output",
+            )
+            if partial:
+                return partial
+            return 1, msg, "", len(chunk_paths)
         if outp:
             expected_chunk_duration = None
             try:
@@ -4017,11 +4964,12 @@ def chunk_and_process(
             except Exception:
                 expected_chunk_duration = None
 
-            if not _wait_for_media_file_ready(
+            outp_ready = _wait_for_media_file_ready(
                 outp,
                 expected_duration=expected_chunk_duration,
                 timeout_sec=25.0,
-            ):
+            )
+            if not outp_ready:
                 # Fallback discovery in case the runner returned early with a predictable path.
                 fallback_candidates = [
                     processed_chunks_dir / f"{Path(chunk).stem}_upscaled.mp4",
@@ -4034,9 +4982,10 @@ def chunk_and_process(
                         timeout_sec=8.0,
                     ):
                         outp = cand
+                        outp_ready = True
                         break
 
-            if outp.exists() and outp.is_file():
+            if outp_ready and outp.exists() and outp.is_file():
                 codec_ok, resolved_outp = _ensure_expected_chunk_codec(
                     idx,
                     "post_model",
@@ -4104,16 +5053,25 @@ def chunk_and_process(
                     if match_ok:
                         _emit_diag(f"[chunk {idx}] output timing check OK: {match_detail}" + "\n")
                     elif str(model_type or "").strip().lower() in _STRICT_TIMING_MODELS:
-                        _emit_diag(
-                            f"[chunk {idx}] ERROR: model output does not match the input chunk timing: {match_detail}. "
-                            "Merging it would desync audio/video, so processing is stopped." + "\n"
-                        )
-                        return (
-                            1,
-                            f"Chunk {idx} output timing mismatch ({model_type}): {match_detail}",
-                            str(outp),
-                            len(chunk_paths),
-                        )
+                        if _processed_chunk_timing_is_repairable(
+                            Path(outp), Path(chunk), model_type, source_fps_float
+                        ):
+                            _emit_diag(
+                                f"[chunk {idx}] WARNING: model preserved every input frame but stamped "
+                                f"repairable timing metadata ({match_detail}). The final frame-stream merge "
+                                "will normalize the exact frame inventory to the source FPS.\n"
+                            )
+                        else:
+                            _emit_diag(
+                                f"[chunk {idx}] ERROR: model output does not match the input chunk timing: {match_detail}. "
+                                "Merging it would desync audio/video, so processing is stopped." + "\n"
+                            )
+                            return (
+                                1,
+                                f"Chunk {idx} output timing mismatch ({model_type}): {match_detail}",
+                                str(outp),
+                                len(chunk_paths),
+                            )
                     else:
                         _emit_diag(
                             f"[chunk {idx}] WARNING: model output does not match the input chunk timing: {match_detail}. "
@@ -4125,6 +5083,16 @@ def chunk_and_process(
                     on_progress(f"WARN: Chunk {idx} output missing/unready at merge stage: {res.output_path}\n")
                 except Exception:
                     pass
+                msg = f"Chunk {idx} output file is missing or was not finalized: {res.output_path}"
+                partial = _finalize_partial_output(
+                    idx=idx,
+                    returncode=1,
+                    canceled=False,
+                    reason="missing/unready model output",
+                )
+                if partial:
+                    return partial
+                return 1, msg, str(res.output_path or ""), len(chunk_paths)
         # Update progress only after successful chunk completion, include paths for UI preview.
         _notify_progress(
             idx / max(1, len(chunk_paths)),
@@ -4258,9 +5226,7 @@ def chunk_and_process(
 
     # Use blending concat if overlap specified.
     merge_fps_hint = _get_merge_fps_hint(merge_chunks) or 30.0
-    overlap_frames_for_blend: Any = int(chunk_overlap * merge_fps_hint) if chunk_overlap > 0 else 0
-    if chunk_overlap > 0 and exact_boundary_overlaps and len(exact_boundary_overlaps) == len(merge_chunks) - 1:
-        overlap_frames_for_blend = list(exact_boundary_overlaps)
+    overlap_frames_for_blend: Any = _output_overlap_plan(merge_chunks)
     merge_stage_progress = 0.30
     _emit_overall_progress("Merging processed chunks", force=True)
     ok = concat_videos_with_blending(
@@ -4270,7 +5236,11 @@ def chunk_and_process(
         fps=merge_fps_hint,
         encode_settings=settings,
         on_progress=on_progress,
-        nominal_fps=source_fps_rational,
+        nominal_fps=(
+            None
+            if str(model_type or "").strip().lower() == "rife"
+            else source_fps_rational
+        ),
     )
     
     if not ok:
@@ -4304,10 +5274,16 @@ def chunk_and_process(
             dur_delta = float(merged_dur) - float(source_dur)
             if abs(dur_delta) > dur_tol:
                 _emit_diag(
-                    "WARNING: merged video duration "
+                    "ERROR: merged video duration "
                     f"{float(merged_dur):.3f}s differs from source {float(source_dur):.3f}s "
-                    f"({dur_delta:+.3f}s). Audio/video may drift; the video will NOT be truncated. "
-                    "Check the per-chunk frame counts above.\n"
+                    f"({dur_delta:+.3f}s). Refusing to hide the mismatch with audio muxing.\n"
+                )
+                return (
+                    1,
+                    "Merged video timeline does not match the source "
+                    f"({float(merged_dur):.6f}s vs {float(source_dur):.6f}s).",
+                    str(final_path),
+                    len(chunk_paths),
                 )
             else:
                 _emit_diag(
@@ -4315,6 +5291,9 @@ def chunk_and_process(
                 )
     except Exception:
         pass
+
+    pre_audio_frame_count = _probe_chunk_nb_frames(Path(final_path))
+    pre_audio_duration = _probe_video_stream_duration(Path(final_path))
 
     # Audio normalization for merged output using user-configured codec/bitrate.
     # This is robust: if source has no audio, output remains valid.
@@ -4335,6 +5314,37 @@ def chunk_and_process(
     except Exception as e:
         # Never fail the whole operation due to audio issues
         on_progress(f"Audio replacement skipped: {str(e)}\n")
+
+    post_audio_frame_count = _probe_chunk_nb_frames(Path(final_path))
+    post_audio_duration = _probe_video_stream_duration(Path(final_path))
+    if (
+        pre_audio_frame_count is not None
+        and post_audio_frame_count is not None
+        and int(pre_audio_frame_count) != int(post_audio_frame_count)
+    ):
+        _emit_overall_progress("Final output validation failed", force=True)
+        return (
+            1,
+            f"Final audio mux changed video frame count {pre_audio_frame_count}->{post_audio_frame_count}.",
+            str(final_path),
+            len(chunk_paths),
+        )
+    if pre_audio_duration and post_audio_duration:
+        audio_mux_dur_tol = max(0.10, 0.002 * float(pre_audio_duration))
+        if abs(float(post_audio_duration) - float(pre_audio_duration)) > audio_mux_dur_tol:
+            _emit_overall_progress("Final output validation failed", force=True)
+            return (
+                1,
+                "Final audio mux changed the video timeline "
+                f"{float(pre_audio_duration):.6f}s->{float(post_audio_duration):.6f}s.",
+                str(final_path),
+                len(chunk_paths),
+            )
+    audio_pref = str(settings.get("audio_codec") or "copy").strip().lower()
+    audio_requested = audio_pref not in {"none", "no", "off", "disable", "disabled"}
+    if audio_requested and has_audio_stream(Path(audio_source_for_mux)) and not has_audio_stream(Path(final_path)):
+        _emit_overall_progress("Final output validation failed", force=True)
+        return 1, "Final audio mux did not produce the requested audio stream.", str(final_path), len(chunk_paths)
     final_codec_ok, _final_probe_path = _ensure_expected_chunk_codec(
         0,
         "post_merge_audio",

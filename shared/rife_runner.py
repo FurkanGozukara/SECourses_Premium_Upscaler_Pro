@@ -10,6 +10,7 @@ Provides interface to RIFE for:
 
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -503,16 +504,23 @@ def run_video_concatenate(
     Returns:
         True if successful
     """
+    concat_file: Optional[Path] = None
     try:
         if not input_paths:
             return False
-        
-        # Create concat file
-        concat_file = Path(output_path).parent / "concat_list.txt"
-        with concat_file.open("w", encoding="utf-8") as f:
-            for path in input_paths:
-                # Escape single quotes and use absolute paths
-                f.write(f"file '{Path(normalize_path(path)).as_posix()}'\n")
+
+        normalized_paths = [Path(normalize_path(path)).resolve() for path in input_paths]
+        if any(not path.is_file() for path in normalized_paths):
+            return False
+
+        # Reuse the chunker's tested ffconcat quoting. Doubling an apostrophe is not
+        # valid ffconcat escaping on Windows.
+        from .chunking import _write_concat_list
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        concat_file = collision_safe_path(output.with_suffix(".concat.txt"))
+        _write_concat_list(concat_file, normalized_paths)
         
         cmd = [
             "ffmpeg", "-y",
@@ -525,10 +533,7 @@ def run_video_concatenate(
         
         result = subprocess.run(cmd, capture_output=True, text=True)
         
-        # Clean up concat file
-        concat_file.unlink(missing_ok=True)
-        
-        if result.returncode == 0 and Path(output_path).exists():
+        if result.returncode == 0 and output.exists() and output.stat().st_size > 1024:
             if on_progress:
                 on_progress(f"✅ Concatenated {len(input_paths)} videos\n")
             return True
@@ -541,4 +546,8 @@ def run_video_concatenate(
         if on_progress:
             on_progress(f"❌ Concatenation error: {e}\n")
         return False
+    finally:
+        if concat_file is not None:
+            with suppress(Exception):
+                concat_file.unlink(missing_ok=True)
 

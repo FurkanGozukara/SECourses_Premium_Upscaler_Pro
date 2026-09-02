@@ -181,6 +181,89 @@ def _probe_stream_duration_seconds(path: Path, select_streams: str) -> Optional[
         return None
 
 
+def _probe_stream_start_seconds(path: Path, select_streams: str) -> Optional[float]:
+    """Start timestamp of the first selected stream, including an exact zero."""
+    try:
+        fields = _probe_stream_fields(path, select_streams, "stream=start_time")
+        raw = fields.get("start_time")
+        if raw is None:
+            return None
+        value = float(raw)
+        return value if value == value and value not in {float("inf"), float("-inf")} else None
+    except Exception:
+        return None
+
+
+def _probe_decodable_video_packets(path: Path) -> Optional[int]:
+    """Count decoded video frames, with playable packets as a last-resort fallback."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "packet=flags", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode != 0:
+            return None
+        count = 0
+        seen = False
+        for raw in (proc.stdout or "").splitlines():
+            flags = raw.strip().strip(",")
+            if not flags:
+                continue
+            seen = True
+            if "D" not in flags:
+                count += 1
+        return count if seen and count > 0 else None
+    except Exception:
+        return None
+
+
+def _video_timing_preserved(
+    source_path: Path,
+    candidate_path: Path,
+    source_frames: Optional[int] = None,
+    source_duration: Optional[float] = None,
+) -> tuple[bool, str]:
+    """Audio muxing must be a bitstream-copy operation for the video timeline."""
+    source_frames = source_frames or _probe_decodable_video_packets(source_path)
+    candidate_frames = _probe_decodable_video_packets(candidate_path)
+    if source_frames is not None and candidate_frames is not None and candidate_frames != source_frames:
+        return False, f"video frame count changed {source_frames}->{candidate_frames}"
+    source_duration = source_duration or _probe_stream_duration_seconds(source_path, "v:0")
+    candidate_duration = _probe_stream_duration_seconds(candidate_path, "v:0")
+    if source_duration and candidate_duration:
+        tolerance = max(0.10, 0.002 * float(source_duration))
+        if abs(float(candidate_duration) - float(source_duration)) > tolerance:
+            return False, (
+                f"video duration changed {float(source_duration):.6f}s->"
+                f"{float(candidate_duration):.6f}s"
+            )
+    candidate_start = _probe_stream_start_seconds(candidate_path, "v:0")
+    if candidate_start is not None and abs(float(candidate_start)) > 0.001:
+        return False, f"video timeline starts at {float(candidate_start):.6f}s instead of zero"
+    return True, ""
+
+
 def _build_audio_args(audio_codec: str, audio_bitrate: Optional[str]) -> list[str]:
     codec = (audio_codec or "copy").strip().lower()
     if codec in ("none", "no", "off", "disable", "disabled"):
@@ -219,6 +302,9 @@ def mux_audio(
         pass
 
     args_audio = _build_audio_args(audio_codec, audio_bitrate)
+    codec_norm = (audio_codec or "copy").strip().lower()
+    want_audio = codec_norm not in {"none", "no", "off", "disable", "disabled"}
+    src_has_audio = has_audio_stream(audio_source_path) if want_audio else False
 
     # Never let the audio mux shorten the VIDEO. The old unconditional `-shortest`
     # trimmed the video whenever it was longer than the audio, which silently hid
@@ -226,7 +312,8 @@ def mux_audio(
     # progressive A/V drift. Only clamp the AUDIO when it is clearly longer than the
     # video (e.g. partial/preview runs muxed against a full-length source track).
     video_dur = _probe_stream_duration_seconds(video_path, "v:0")
-    audio_dur = _probe_stream_duration_seconds(audio_source_path, "a:0")
+    video_frames = _probe_decodable_video_packets(video_path)
+    audio_dur = _probe_stream_duration_seconds(audio_source_path, "a:0") if want_audio else None
     clamp_audio_to_video = False
     if video_dur is not None and audio_dur is not None:
         delta = float(video_dur) - float(audio_dur)
@@ -244,21 +331,13 @@ def mux_audio(
                 on_progress,
             )
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(video_path),
-        "-i",
-        str(audio_source_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a?",
-        "-c:v",
-        "copy",
-        *args_audio,
-    ]
+    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+    if want_audio:
+        cmd += ["-i", str(audio_source_path)]
+    cmd += ["-map", "0:v:0"]
+    if want_audio:
+        cmd += ["-map", "1:a?"]
+    cmd += ["-c:v", "copy", *args_audio]
     if clamp_audio_to_video:
         cmd.append("-shortest")
     # NOTE: no `-avoid_negative_ts make_zero` here. Shifting all timestamps so the first DTS
@@ -274,7 +353,6 @@ def mux_audio(
 
     cmd.append(str(output_path))
 
-    src_has_audio = has_audio_stream(audio_source_path)
     dst_has_audio_before = has_audio_stream(video_path)
     video_ref, source_ref = _display_media_ref(video_path, audio_source_path)
     _emit_log(
@@ -290,8 +368,66 @@ def mux_audio(
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
+        if (
+            proc.returncode != 0
+            and src_has_audio
+            and (audio_codec or "copy").strip().lower() in {"copy", "passthrough"}
+            and output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}
+        ):
+            # MP4 cannot carry every source codec (for example PCM variants). Preserve
+            # the video bitstream and transparently fall back to AAC audio rather than
+            # returning a silent "successful" production output.
+            retry_cmd = list(cmd)
+            try:
+                audio_arg_idx = retry_cmd.index("-c:a")
+                retry_cmd[audio_arg_idx + 1] = "aac"
+                retry_cmd[audio_arg_idx + 2:audio_arg_idx + 2] = ["-b:a", str(audio_bitrate or "192k")]
+            except (ValueError, IndexError):
+                retry_cmd = []
+            if retry_cmd:
+                _emit_log("[audio] passthrough is incompatible with the output container; retrying as AAC.", on_progress)
+                _emit_log(f"[audio] ffmpeg retry: {_format_cmd(retry_cmd)}", on_progress)
+                proc = subprocess.run(retry_cmd, capture_output=True, text=True)
+                cmd = retry_cmd
         if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
+            timing_ok, timing_error = _video_timing_preserved(
+                video_path,
+                output_path,
+                source_frames=video_frames,
+                source_duration=video_dur,
+            )
+            if not timing_ok and clamp_audio_to_video:
+                # Some ffmpeg/muxer combinations make -shortest drop the final video
+                # packet. Retry without it; a slightly longer audio track is preferable
+                # to a missing ending, and callers merge/validate the video stream itself.
+                _emit_log(
+                    f"[audio] WARNING: -shortest altered video timing ({timing_error}); retrying without it.",
+                    on_progress,
+                )
+                output_path.unlink(missing_ok=True)
+                cmd = [part for part in cmd if part != "-shortest"]
+                _emit_log(f"[audio] ffmpeg retry: {_format_cmd(cmd)}", on_progress)
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                timing_ok = bool(
+                    proc.returncode == 0
+                    and output_path.exists()
+                    and output_path.stat().st_size > 1024
+                )
+                if timing_ok:
+                    timing_ok, timing_error = _video_timing_preserved(
+                        video_path,
+                        output_path,
+                        source_frames=video_frames,
+                        source_duration=video_dur,
+                    )
+            if not timing_ok:
+                output_path.unlink(missing_ok=True)
+                _emit_log(f"[audio] mux rejected: {timing_error}", on_progress)
+                return False, f"Audio mux changed video timing: {timing_error}"
             out_has_audio = has_audio_stream(output_path)
+            if want_audio and src_has_audio and not out_has_audio:
+                output_path.unlink(missing_ok=True)
+                return False, "Audio mux completed without the requested audio stream"
             out_video_info = _probe_video_stream(output_path)
             _emit_log(
                 f"[audio] mux success: output='{output_path.name}', has_audio={out_has_audio}",
@@ -580,7 +716,6 @@ def replace_audio_from_original(
         "-map", "1:a:0",           # Audio from second input (original)
         "-c:v", "copy",            # Don't re-encode video
         "-c:a", "copy",            # Don't re-encode audio
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         str(tmp)
     ]
@@ -617,7 +752,6 @@ def replace_audio_from_original(
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         str(tmp)
     ]

@@ -23,6 +23,11 @@ from shared.services.sparkvsr_service import (
 )
 from shared.preset_manager import PresetManager
 from shared.rtx_superres_runner import _build_dimensions_plan
+from shared.runner import (
+    Runner,
+    _console_safe_text,
+    _normalize_seedvr2_attention_mode,
+)
 from shared.sparkvsr_ref_utils import resolve_pisa_runtime
 from shared.ui_validators import SEEDVR2_MAX_BATCH_SIZE, validate_batch_size_seedvr2
 from tools.sparkvsr_inference import (
@@ -163,6 +168,41 @@ class SeedVR2BatchLimitRegressionTests(unittest.TestCase):
             silent_migration=True,
         )
         self.assertEqual(guarded["batch_size"], 601)
+
+
+class SeedVR2LaunchRegressionTests(unittest.TestCase):
+    def test_legacy_attention_aliases_are_valid_cli_values(self):
+        self.assertEqual(_normalize_seedvr2_attention_mode("flash_attn"), "flash_attn_2")
+        self.assertEqual(_normalize_seedvr2_attention_mode("sage"), "sageattn_2")
+        self.assertEqual(_normalize_seedvr2_attention_mode("flash_attn_3"), "flash_attn_3")
+        self.assertEqual(_normalize_seedvr2_attention_mode("not-a-backend"), "sdpa")
+
+    def test_command_builder_never_emits_legacy_attention_name(self):
+        runner = Runner.__new__(Runner)
+        runner.base_dir = ROOT
+        cmd = runner._build_seedvr2_cmd(
+            Path("inference_cli.py"),
+            {"input_path": "input.mp4", "attention_mode": "flash_attn"},
+            "mp4",
+            False,
+            "output.mp4",
+        )
+        index = cmd.index("--attention_mode")
+        self.assertEqual(cmd[index + 1], "flash_attn_2")
+
+    def test_seed_defaults_only_use_attention_choice_accepted_by_cli(self):
+        from shared.services.seedvr2_service import seedvr2_defaults
+
+        defaults = seedvr2_defaults("seedvr2_ema_3b-Q4_K_M.gguf", ROOT)
+        self.assertIn(
+            defaults["attention_mode"],
+            {"sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"},
+        )
+
+    def test_subprocess_unicode_is_printable_on_cp1252_console(self):
+        rendered = _console_safe_text("progress \U0001f4ca 50%", "cp1252")
+        rendered.encode("cp1252")
+        self.assertIn("50%", rendered)
 
 
 class RTXSuperResolutionRegressionTests(unittest.TestCase):

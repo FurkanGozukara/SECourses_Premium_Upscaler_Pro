@@ -24,6 +24,20 @@ import torch
 log = logging.getLogger("ltx25.video_io")
 
 
+def _format_fps_rate(value: float | Fraction | str) -> str:
+    """Return an exact ffmpeg rational whenever the input rate permits it."""
+    try:
+        if isinstance(value, Fraction):
+            rate = value
+        else:
+            rate = Fraction(str(float(value))).limit_denominator(1_000_000)
+        if rate > 0:
+            return f"{rate.numerator}/{rate.denominator}"
+    except Exception:
+        pass
+    raise ValueError(f"Invalid video frame rate: {value!r}")
+
+
 def find_ffmpeg() -> str:
     candidates = []
     env = os.environ.get("FFMPEG_PATH") or os.environ.get("IMAGEIO_FFMPEG_EXE")
@@ -71,7 +85,7 @@ class FfmpegWriter:
         output_path: str,
         width: int,
         height: int,
-        fps: float,
+        fps: float | Fraction | str,
         audio_source: Optional[str] = None,
         codec: str = "libx264",
         crf: int = 15,
@@ -80,7 +94,7 @@ class FfmpegWriter:
     ):
         self.output_path = str(output_path)
         ffmpeg = find_ffmpeg()
-        fps_str = f"{fps:.6f}".rstrip("0").rstrip(".")
+        fps_str = _format_fps_rate(fps)
         cmd = [
             ffmpeg, "-y", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -97,7 +111,10 @@ class FfmpegWriter:
             cmd += ["-crf", str(int(crf)), "-preset", "8"]
         cmd += ["-pix_fmt", pixel_format]
         if audio_source:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+            # Never let a shorter/offset audio track stop the raw-video encoder before
+            # every model frame is written. The app validates and remuxes source audio
+            # after chunk merging; standalone outputs may simply have audio end first.
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
         cmd += [self.output_path]
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.proc = subprocess.Popen(

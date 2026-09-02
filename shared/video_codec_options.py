@@ -159,6 +159,22 @@ ENCODING_PRESETS = [
     "veryslow",   # Best compression, slowest
 ]
 
+# libsvtav1 exposes a numeric speed preset (0 is slowest/best compression, 13 is
+# fastest), unlike x264/x265's named presets. Passing values such as ``ultrafast``
+# makes ffmpeg exit before it reads the first frame, which previously broke the
+# concat re-encode fallback whenever AV1 was selected.
+SVT_AV1_PRESET_MAP = {
+    "veryslow": 2,
+    "slower": 3,
+    "slow": 4,
+    "medium": 6,
+    "fast": 8,
+    "faster": 9,
+    "veryfast": 10,
+    "superfast": 11,
+    "ultrafast": 12,
+}
+
 H265_TUNE_OPTIONS = [
     "none",
     "grain",
@@ -276,7 +292,8 @@ def build_ffmpeg_video_encode_args(
     
     # Encoding preset (if supported)
     if profile.supports_presets and preset in ENCODING_PRESETS:
-        args.extend(["-preset", preset])
+        preset_value = str(SVT_AV1_PRESET_MAP[preset]) if codec == "av1" else preset
+        args.extend(["-preset", preset_value])
 
     # Codec-specific tuning hooks.
     if codec == "h265":

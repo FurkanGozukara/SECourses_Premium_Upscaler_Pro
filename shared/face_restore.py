@@ -231,6 +231,7 @@ def restore_video(
             fps = num / den
         else:
             fps = float(fps_str) if fps_str else 30.0
+        fps_arg = fps_str if fps_str and fps > 0 else str(fps)
         
         # Create output path (allow override)
         if output_path:
@@ -249,7 +250,7 @@ def restore_video(
 
         base_cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(fps),
+            "-framerate", fps_arg,
             "-i", frames_pattern,
         ]
 
@@ -259,7 +260,6 @@ def restore_video(
                 "-map", "0:v:0",
                 "-map", "1:a?",
                 "-c:a", "copy",
-                "-shortest",
             ]
         else:
             base_cmd += ["-an"]

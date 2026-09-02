@@ -9,7 +9,7 @@ DEFAULT_BATCH_SIZE = 5
 # Default attention mode: flash_attn preferred, falls back to sdpa if unavailable
 # This is used as fallback for unknown models. Runtime detection (_get_default_attention_mode) 
 # tests actual GPU compatibility and takes precedence.
-DEFAULT_ATTENTION = "flash_attn"  # Preferred default, runtime will fall back to sdpa if needed
+DEFAULT_ATTENTION = "flash_attn_2"  # Valid CLI value; runtime can still fall back to sdpa.
 
 # Local scan will look for common weight extensions inside ./models/seedvr2 (and siblings).
 MODEL_EXTS = {".safetensors", ".gguf"}
@@ -58,14 +58,14 @@ def _built_ins() -> List[SeedVR2Model]:
         SeedVR2Model(
             name="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             size="3B", precision="fp8_e4m3fn", variant="standard",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=6.0, max_resolution=4096, max_blocks_to_swap=32,
             notes="Lightweight 3B model with fp8 quantization. Good balance of speed and quality."
         ),
         SeedVR2Model(
             name="seedvr2_ema_3b_fp16.safetensors",
             size="3B", precision="fp16", variant="standard",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=8.0, max_resolution=4096, max_blocks_to_swap=32,
             notes="Standard 3B model with fp16 precision. Recommended for 8GB+ VRAM."
         ),
@@ -90,7 +90,7 @@ def _built_ins() -> List[SeedVR2Model]:
         SeedVR2Model(
             name="seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             size="7B", precision="fp8_e4m3fn_mixed_block35_fp16", variant="standard",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=12.0, max_resolution=4096,
             default_batch_size=5, max_blocks_to_swap=35,
             notes="Mixed precision 7B. Balances VRAM usage and quality. 12GB+ recommended."
@@ -98,7 +98,7 @@ def _built_ins() -> List[SeedVR2Model]:
         SeedVR2Model(
             name="seedvr2_ema_7b_fp16.safetensors",
             size="7B", precision="fp16", variant="standard",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=16.0, max_resolution=4096,
             default_batch_size=5,
             notes="Full fp16 7B model. Highest quality, requires 16GB+ VRAM."
@@ -123,7 +123,7 @@ def _built_ins() -> List[SeedVR2Model]:
         SeedVR2Model(
             name="seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             size="7B", precision="fp8_e4m3fn_mixed_block35_fp16", variant="sharp",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=12.0, max_resolution=4096,
             default_batch_size=5, max_blocks_to_swap=35,
             notes="Sharp variant with enhanced edge detail. Mixed precision for efficiency."
@@ -131,7 +131,7 @@ def _built_ins() -> List[SeedVR2Model]:
         SeedVR2Model(
             name="seedvr2_ema_7b_sharp_fp16.safetensors",
             size="7B", precision="fp16", variant="sharp",
-            preferred_attention="flash_attn", supports_multi_gpu=True,
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
             estimated_vram_gb=16.0, max_resolution=4096,
             default_batch_size=5,
             notes="Sharp variant fp16. Maximum quality with edge enhancement. 16GB+ VRAM."

@@ -115,8 +115,6 @@ def _resize_video(
             "copy",
             "-movflags",
             "+faststart",
-            "-avoid_negative_ts",
-            "make_zero",
             str(dst),
         ]
     )
@@ -134,8 +132,6 @@ def _resize_video(
             *audio_args,
             "-movflags",
             "+faststart",
-            "-avoid_negative_ts",
-            "make_zero",
             str(dst),
         ]
     )

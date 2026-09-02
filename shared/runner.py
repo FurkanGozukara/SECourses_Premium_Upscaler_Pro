@@ -32,6 +32,48 @@ from .processing_queue import queue_resource_keys_for_gpu_selection
 from .model_downloads import ensure_rife_model, ensure_seedvr2_model
 
 
+_SEEDVR2_ATTENTION_ALIASES = {
+    "flash_attn": "flash_attn_2",
+    "flash_attention": "flash_attn_2",
+    "flash": "flash_attn_2",
+    "sageattn": "sageattn_2",
+    "sage_attention": "sageattn_2",
+    "sage": "sageattn_2",
+}
+_SEEDVR2_ATTENTION_MODES = {
+    "sdpa",
+    "flash_attn_2",
+    "flash_attn_3",
+    "sageattn_2",
+    "sageattn_3",
+}
+
+
+def _normalize_seedvr2_attention_mode(value: Any) -> str:
+    """Return a value accepted by the bundled SeedVR2 CLI."""
+    normalized = str(value or "sdpa").strip().lower()
+    normalized = _SEEDVR2_ATTENTION_ALIASES.get(normalized, normalized)
+    return normalized if normalized in _SEEDVR2_ATTENTION_MODES else "sdpa"
+
+
+def _console_safe_text(value: Any, encoding: Optional[str] = None) -> str:
+    """Make arbitrary subprocess text printable by legacy Windows consoles."""
+    rendered = str(value)
+    target_encoding = encoding or getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        rendered.encode(target_encoding)
+        return rendered
+    except (LookupError, UnicodeEncodeError):
+        try:
+            return rendered.encode(target_encoding, errors="backslashreplace").decode(target_encoding)
+        except LookupError:
+            return rendered.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
+def _safe_console_print(value: Any = "", *, end: str = "\n", flush: bool = False) -> None:
+    print(_console_safe_text(value), end=end, flush=flush)
+
+
 class RunResult:
     def __init__(self, returncode: int, output_path: Optional[str], log: str):
         self.returncode = returncode
@@ -739,7 +781,7 @@ class Runner:
         def log_output(message: str, force_console: bool = True):
             """Log message to console (always) and callback (if provided)."""
             if force_console:
-                print(message, end='', flush=True)  # Print to CMD for user visibility
+                _safe_console_print(message, end='', flush=True)
             if on_progress:
                 on_progress(message)
         
@@ -926,7 +968,7 @@ class Runner:
                     if line:  # Only add non-empty lines
                         log_lines.append(line)
                         # Print to console for user visibility AND send to callback
-                        print(line, flush=True)  # Always print to CMD
+                        _safe_console_print(line, flush=True)
                         if on_progress:
                             on_progress(line + "\n")
 
@@ -949,7 +991,7 @@ class Runner:
                 if log_lines:
                     print("\n[SeedVR2] Last 15 lines of output:", flush=True)
                     for line in log_lines[-15:]:
-                        print(f"  {line}", flush=True)
+                        _safe_console_print(f"  {line}", flush=True)
                     log_output("[SeedVR2] Last 15 lines of output:\n")
                     for line in log_lines[-15:]:
                         log_output(f"  {line}\n")
@@ -2010,7 +2052,10 @@ class Runner:
 
         # Performance
         if settings.get("attention_mode"):
-            cmd.extend(["--attention_mode", settings["attention_mode"]])
+            cmd.extend([
+                "--attention_mode",
+                _normalize_seedvr2_attention_mode(settings["attention_mode"]),
+            ])
         if settings.get("compile_dit"):
             cmd.append("--compile_dit")
         if settings.get("compile_vae"):

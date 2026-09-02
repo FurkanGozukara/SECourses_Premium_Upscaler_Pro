@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import math
 import shutil
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -18,6 +21,70 @@ def format_fps_value(value: Optional[float]) -> Optional[str]:
         return f"{fps_val:.3f}".rstrip("0").rstrip(".")
     except Exception:
         return None
+
+
+def _probe_video_rate_pair(path: Path) -> tuple[Optional[float], Optional[float]]:
+    """Return ffprobe's (nominal, average) video rates."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+                "-of", "json", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            return None, None
+        stream = (json.loads(proc.stdout or "{}").get("streams") or [{}])[0]
+
+        def _rate(raw: Any) -> Optional[float]:
+            try:
+                value = float(Fraction(str(raw)))
+                return value if math.isfinite(value) and value > 0 else None
+            except Exception:
+                return None
+
+        return _rate(stream.get("r_frame_rate")), _rate(stream.get("avg_frame_rate"))
+    except Exception:
+        return None, None
+
+
+def _packet_durations_match_rate(path: Path, fps: float) -> bool:
+    """Confirm CFR packet timing; r/avg_frame_rate alone can both lie for VFR files."""
+    if not math.isfinite(float(fps)) or float(fps) <= 0:
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-read_intervals", "%+#512",
+                "-select_streams", "v:0", "-show_entries", "packet=duration_time",
+                "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return False
+        durations: list[float] = []
+        for raw in (proc.stdout or "").splitlines():
+            try:
+                value = float(raw.strip().strip(","))
+            except Exception:
+                continue
+            if math.isfinite(value) and value > 0:
+                durations.append(value)
+        if not durations:
+            return False
+        expected = 1.0 / float(fps)
+        # Matroska and MPEG-TS commonly quantize a CFR duration to milliseconds.
+        tolerance = max(0.0011, 0.03 * expected)
+        return all(abs(value - expected) <= tolerance for value in durations)
+    except Exception:
+        return False
 
 
 def normalize_rife_multiplier(raw: Any) -> int:
@@ -106,6 +173,14 @@ def remux_video_fps(
     *,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
+    """
+    Convert a video to a real CFR timeline while preserving playback duration.
+
+    Stream-copy plus ``-r`` does not change H.264/HEVC packet timestamps; the old
+    implementation therefore reported success while leaving the source FPS untouched.
+    A true override necessarily duplicates/drops decoded frames, so use a lossless x264
+    intermediate and validate the resulting rate, duration, frame count, and timeline origin.
+    """
     input_path = Path(input_path)
     output_path = Path(output_path)
 
@@ -121,23 +196,131 @@ def remux_video_fps(
     except Exception:
         pass
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0",
-        "-c",
-        "copy",
-        "-r",
-        str(float(fps)),
-        "-avoid_negative_ts",
-        "make_zero",
-    ]
-    if output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
-        cmd.extend(["-movflags", "+faststart"])
-    cmd.append(str(output_path))
+    target_rate = Fraction(str(float(fps))).limit_denominator(1_000_000)
+    fps_text = f"{target_rate.numerator}/{target_rate.denominator}"
+
+    def _probe(path: Path, *, count_frames: bool = False) -> dict[str, Any]:
+        try:
+            cmd_probe = ["ffprobe", "-v", "error"]
+            if count_frames:
+                cmd_probe.append("-count_frames")
+            cmd_probe += [
+                "-show_entries",
+                (
+                    "stream=index,codec_type,pix_fmt,r_frame_rate,avg_frame_rate,start_time,duration,"
+                    "nb_frames,nb_read_frames"
+                ),
+                "-of",
+                "json",
+                str(path),
+            ]
+            proc_probe = subprocess.run(cmd_probe, capture_output=True, text=True, timeout=1800)
+            if proc_probe.returncode == 0:
+                return json.loads(proc_probe.stdout or "{}")
+        except Exception:
+            pass
+        return {}
+
+    source_probe = _probe(input_path)
+    source_streams = source_probe.get("streams") or []
+    source_video = next((s for s in source_streams if s.get("codec_type") == "video"), {})
+    source_audio = next((s for s in source_streams if s.get("codec_type") == "audio"), {})
+
+    def _number(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else default
+        except Exception:
+            return default
+
+    source_video_start = _number(source_video.get("start_time"), 0.0)
+    source_audio_start = _number(source_audio.get("start_time"), source_video_start)
+    relative_audio_start = source_audio_start - source_video_start
+    source_duration = _number(source_video.get("duration"), 0.0)
+    source_pix_fmt = str(source_video.get("pix_fmt") or "").strip().lower()
+    x264_pix_fmts = {
+        "yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "yuv422p10le",
+        "yuv444p10le", "gray", "gray10le",
+    }
+    preferred_pix_fmt = source_pix_fmt if source_pix_fmt in x264_pix_fmts else "yuv420p"
+    has_audio = bool(source_audio)
+
+    def _build_cmd(pixel_format: str) -> list[str]:
+        video_filter = f"fps=fps={fps_text}:round=near,setpts=N/({fps_text}*TB)"
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_path),
+            "-map", "0:v:0",
+        ]
+        if has_audio:
+            cmd += ["-map", "0:a:0?"]
+        cmd += [
+            "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0",
+            "-pix_fmt", pixel_format,
+            "-r", fps_text,
+            "-fps_mode", "cfr",
+        ]
+        if has_audio:
+            cmd += [
+                "-af", f"asetpts=PTS-STARTPTS+({relative_audio_start:.12f})/TB",
+                "-c:a", "aac", "-b:a", "192k",
+            ]
+        else:
+            cmd.append("-an")
+        cmd += ["-map_metadata", "0"]
+        if output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(str(output_path))
+        return cmd
+
+    def _validate() -> tuple[bool, str]:
+        if not output_path.exists() or output_path.stat().st_size <= 1024:
+            return False, "FPS preprocess produced no usable output"
+        payload = _probe(output_path, count_frames=True)
+        streams = payload.get("streams") or []
+        video = next((s for s in streams if s.get("codec_type") == "video"), {})
+        if not video:
+            return False, "FPS preprocess output has no video stream"
+
+        def _rate(value: Any) -> float:
+            try:
+                return float(Fraction(str(value)))
+            except Exception:
+                return 0.0
+
+        actual_fps = _rate(video.get("r_frame_rate")) or _rate(video.get("avg_frame_rate"))
+        if actual_fps <= 0 or abs(actual_fps - float(target_rate)) > max(1e-6, float(target_rate) * 1e-5):
+            return False, f"FPS preprocess rate mismatch: {actual_fps:.6f} vs {float(target_rate):.6f}"
+        frame_raw = str(video.get("nb_read_frames") or video.get("nb_frames") or "").strip()
+        if not frame_raw.isdigit() or int(frame_raw) <= 0:
+            return False, "FPS preprocess frame count unavailable"
+        actual_frames = int(frame_raw)
+        start_time = _number(video.get("start_time"), 0.0)
+        if abs(start_time) > 0.001:
+            return False, f"FPS preprocess video starts at {start_time:.6f}s instead of zero"
+        actual_duration = _number(video.get("duration"), 0.0)
+        frame_timeline_duration = float(actual_frames) / float(target_rate)
+        if actual_duration <= 0 or abs(actual_duration - frame_timeline_duration) > max(
+            0.02, 1.25 / float(target_rate)
+        ):
+            return False, (
+                f"FPS preprocess timeline mismatch: duration={actual_duration:.6f}s, "
+                f"frames/rate={frame_timeline_duration:.6f}s"
+            )
+        if source_duration > 0 and actual_duration > 0:
+            duration_tol = max(0.10, 2.0 / float(target_rate))
+            if abs(actual_duration - source_duration) > duration_tol:
+                return False, (
+                    f"FPS preprocess duration mismatch: {actual_duration:.6f}s vs {source_duration:.6f}s"
+                )
+            expected_frames = int(round(source_duration * float(target_rate)))
+            if abs(actual_frames - expected_frames) > 2:
+                return False, (
+                    f"FPS preprocess frame inventory mismatch: {actual_frames} vs about {expected_frames} "
+                    f"for {source_duration:.6f}s at {float(target_rate):.9f} fps"
+                )
+        return True, ""
 
     if on_progress:
         try:
@@ -146,13 +329,24 @@ def remux_video_fps(
             pass
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        last_error = ""
+        for pixel_format in dict.fromkeys((preferred_pix_fmt, "yuv420p")):
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            cmd = _build_cmd(pixel_format)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0:
+                valid, validation_error = _validate()
+                if valid:
+                    return True, ""
+                last_error = validation_error
+            else:
+                last_error = (proc.stderr or proc.stdout or "ffmpeg FPS conversion failed").strip()
     except Exception as exc:
         return False, str(exc)
-
-    if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
-        return True, ""
-    return False, (proc.stderr or proc.stdout or "ffmpeg FPS remux failed").strip()
+    return False, last_error or "ffmpeg FPS conversion failed"
 
 
 def apply_video_fps_override_preprocess(
@@ -190,7 +384,15 @@ def apply_video_fps_override_preprocess(
     source_fps_text = format_fps_value(source_fps)
     target_fps_text = format_fps_value(target_fps) or str(float(target_fps))
 
-    if source_fps and abs(float(source_fps) - float(target_fps)) <= 0.01:
+    nominal_fps, average_fps = _probe_video_rate_pair(Path(input_path))
+    source_is_cfr = bool(
+        nominal_fps
+        and average_fps
+        and abs(float(nominal_fps) - float(average_fps))
+        <= max(1e-6, 0.002 * float(nominal_fps))
+        and _packet_durations_match_rate(Path(input_path), float(nominal_fps))
+    )
+    if source_fps and source_is_cfr and abs(float(source_fps) - float(target_fps)) <= 0.01:
         settings[fps_key] = 0.0
         settings["_fps_override_requested"] = float(target_fps)
         settings["_fps_override_source_fps"] = float(source_fps)
@@ -199,10 +401,11 @@ def apply_video_fps_override_preprocess(
 
     run_dir = Path(run_dir)
     original_name = str(settings.get("_original_filename") or Path(input_path).name or "input.mp4")
-    original_suffix = Path(original_name).suffix or Path(input_path).suffix or ".mp4"
     safe_stem = sanitize_filename(Path(original_name).stem or "input")
     fps_token = target_fps_text.replace(".", "_")
-    output_path = collision_safe_path(run_dir / f"fps_override_{safe_stem}_{fps_token}{original_suffix}")
+    # The validated CFR intermediate is lossless H.264/AAC. Always use MP4 rather than
+    # inheriting an incompatible source suffix such as .webm or .wmv.
+    output_path = collision_safe_path(run_dir / f"fps_override_{safe_stem}_{fps_token}.mp4")
 
     ok, err = remux_video_fps(Path(input_path), output_path, target_fps, on_progress=on_progress)
     if not ok:

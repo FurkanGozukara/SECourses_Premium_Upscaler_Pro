@@ -15,6 +15,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, List, Optional
 
 import torch
@@ -305,15 +306,13 @@ class Ltx25Pipeline:
         )
         audio_mask = torch.zeros((1, 1, audio_latent.shape[2], 1), dtype=torch.float32)
 
-        writer = FfmpegWriter(
-            s.output_path,
-            width=plan.output_width,
-            height=plan.output_height,
-            fps=fps,
-            audio_source=(s.input_path if (s.keep_audio and has_audio) else None),
-            codec=s.codec, crf=int(s.crf), preset=s.preset, pixel_format=s.pixel_format,
-        )
-        merger = StreamingChunkMerger(writer, plan.overlap_frames, plan.total_frames)
+        # Start ffmpeg lazily after the first chunk has actually decoded. Starting it before
+        # VAE/sampling work leaves an audio-only MP4 when inference fails early; older runner
+        # code then mistook that artifact for a successful video and entered concat fallbacks.
+        writer: Optional[FfmpegWriter] = None
+        merger: Optional[StreamingChunkMerger] = None
+        pipeline_failed = True
+        writer_close_error: Optional[Exception] = None
 
         total_steps = plan.chunk_count * int(s.steps)
         done_steps = 0
@@ -386,6 +385,20 @@ class Ltx25Pipeline:
                 self.vae.to_cpu()
 
                 pixels = pixels[:plan.chunk_length, : plan.output_height, : plan.output_width, :]
+                if writer is None:
+                    writer = FfmpegWriter(
+                        s.output_path,
+                        width=plan.output_width,
+                        height=plan.output_height,
+                        fps=fps,
+                        audio_source=(s.input_path if (s.keep_audio and has_audio) else None),
+                        codec=s.codec,
+                        crf=int(s.crf),
+                        preset=s.preset,
+                        pixel_format=s.pixel_format,
+                    )
+                    merger = StreamingChunkMerger(writer, plan.overlap_frames, plan.total_frames)
+                assert merger is not None
                 merger.add_chunk(
                     pixels, keep_length, is_last=(chunk_index == plan.chunk_count - 1)
                 )
@@ -400,11 +413,34 @@ class Ltx25Pipeline:
                 self.progress.line(
                     f"Chunk {chunk_index + 1}/{plan.chunk_count} done in {time.time() - chunk_t0:.1f}s{peak_note}"
                 )
+            pipeline_failed = False
         finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as exc:
+                    writer_close_error = exc
+                    log.warning(f"Writer close: {exc}")
+            if pipeline_failed or writer_close_error is not None:
+                # This path belongs to the current collision-safe run. Do not leave a partial
+                # chunk that resume/concat discovery could later classify as completed.
+                try:
+                    Path(s.output_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        if writer_close_error is not None:
+            raise RuntimeError(f"LTX 2.5 video writer failed to finalize: {writer_close_error}") from writer_close_error
+
+        if writer is None or int(writer.frames_written) != int(plan.total_frames):
+            written = int(writer.frames_written) if writer is not None else 0
             try:
-                writer.close()
-            except Exception as exc:
-                log.warning(f"Writer close: {exc}")
+                Path(s.output_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"LTX 2.5 writer produced {written}/{int(plan.total_frames)} required frames"
+            )
 
         self.progress.line(
             f"LTX 2.5 upscale complete: {writer.frames_written} frames -> {s.output_path}"

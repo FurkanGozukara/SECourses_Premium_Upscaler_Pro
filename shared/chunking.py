@@ -1969,7 +1969,7 @@ def _pick_merge_fps(
         fps_val = _parse_fraction_to_float(sig.get("r_frame_rate")) or _parse_fraction_to_float(
             sig.get("avg_frame_rate")
         )
-        if fps_val and 1.0 <= fps_val <= 240.0:
+        if fps_val:
             fps_values.append(float(fps_val))
 
     if not fps_values and chunk_paths:
@@ -1990,7 +1990,9 @@ def _pick_merge_fps(
     nearest_int = round(picked)
     if abs(picked - nearest_int) <= 1e-3:
         picked = float(nearest_int)
-    return max(1.0, min(240.0, picked))
+    # RIFE can legitimately produce rates above 240 (e.g. 60 fps x8 = 480).
+    # Clamping the rate changes both the merge's expected duration and playback speed.
+    return picked
 
 
 def _pick_merge_fps_str(
@@ -2008,7 +2010,7 @@ def _pick_merge_fps_str(
             continue
         raw = str(sig.get("r_frame_rate") or "").strip()
         val = _parse_fraction_to_float(raw)
-        if raw and val and 1.0 <= val <= 240.0:
+        if raw and val:
             rationals.add(raw)
     if len(rationals) == 1:
         return next(iter(rationals))
@@ -2231,10 +2233,10 @@ def concat_videos(
     Concatenate chunk videos into a single MP4.
     Merge is always done as video-only; caller can remux original audio afterward.
 
-    `nominal_fps` (ffmpeg rational such as "24000/1001") is the exact frame rate of a CFR
-    source. When given, per-chunk durations for the concat demuxer are computed as
-    decodable_frames / fps instead of being read from container metadata (which some ffmpeg
-    builds report including start offsets or minus the last frame).
+    `nominal_fps` (ffmpeg rational such as "24000/1001") is the required OUTPUT frame rate.
+    FPS-changing pipelines must not pass their source rate here. With no explicit rate,
+    use the processed chunks' rate. All merge paths share the same decoded_frames / fps
+    timeline instead of trusting container duration metadata.
     """
     if not chunk_paths:
         return False
@@ -2732,7 +2734,10 @@ def concat_videos(
 
                 if ts_ok and len(ts_paths) == len(stable_chunks):
                     ts_txt = td_path / "concat_ts.txt"
-                    _write_concat_list(ts_txt, ts_paths)
+                    # Keep the same frame-derived offsets used by the direct merge.
+                    # Re-probing TS container durations can reintroduce gaps or compressed
+                    # boundaries after the direct concat has already rejected that timing.
+                    _write_concat_list(ts_txt, ts_paths, durations=chunk_video_durations)
                     cmd_ts_concat = [
                         "ffmpeg",
                         "-y",

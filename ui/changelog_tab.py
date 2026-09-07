@@ -11,6 +11,17 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V8.4 — 7 September 2026 — RIFE Merge Timing & Validation",
+        """
+**More reliable final merging for videos processed with RIFE.**
+
+- **Correct playback duration for interpolated chunks**, including 24 → 48 fps with RIFE 4.26. Merge validation uses the output frame rate, so a five-second video is not incorrectly expected to last ten seconds. Slightly different chunk frame counts are handled without repeated failed re-encoding attempts.
+- **Consistent timing during fallback merging** — alternate merge attempts now keep the same frame-based chunk durations as the initial attempt.
+- **Fixed playback speed above 240 fps** — high frame rates such as 480 fps, including fractional rates, are retained accurately instead of being capped during merging.
+- **Frame and audio safeguards retained** — missing frames still fail validation. Verified with a real video in Google Chrome, including chunked RIFE 4.26 processing, complete playback, and unchanged audio.
+""",
+    ),
+    (
         "V8.0 — 13 August 2026 — NEW: LTX 2.5 Upscaler (22B), Gradio 6.24, Faster Interface",
         """
 **A brand-new upscaler model joins the app: LTX 2.5 Pixel Spatial Upscaler 2x.**

@@ -13,6 +13,8 @@ from typing import Any, Callable, Optional, Tuple
 import cv2
 import numpy as np
 
+from .image_io import imwrite, load_image_bgr8
+
 
 # Check available face restoration backends
 def _check_gfpgan() -> bool:
@@ -359,7 +361,7 @@ def _restore_with_gfpgan(
         )
         
         # Read image
-        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        img = load_image_bgr8(image_path)
         if img is None:
             if on_progress:
                 on_progress("⚠️ Failed to read image\n")
@@ -384,7 +386,7 @@ def _restore_with_gfpgan(
             outp = Path(image_path).with_stem(f"{Path(image_path).stem}_gfpgan")
 
         outp.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(outp), restored_img)
+        imwrite(outp, restored_img)
 
         return str(outp)
         

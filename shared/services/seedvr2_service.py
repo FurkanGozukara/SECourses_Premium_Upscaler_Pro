@@ -26,6 +26,7 @@ from shared.preset_auto_serializer import (
     create_auto_order
 )
 from shared.runner import Runner, RunResult
+from shared import image_io
 from shared.path_utils import (
     normalize_path,
     collision_safe_path,
@@ -1847,7 +1848,7 @@ def _create_autotune_demo_video(
             cap.release()
 
         elif input_kind == "image":
-            frame = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+            frame = image_io.load_image_bgr8(input_path)
             if frame is None:
                 raise RuntimeError(f"Failed to read input image for autotune: {input_path}")
             frame = _resize_if_needed(frame)
@@ -1871,7 +1872,7 @@ def _create_autotune_demo_video(
             for fp in frames:
                 if written >= int(target_frames):
                     break
-                frame = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+                frame = image_io.load_image_bgr8(fp)
                 if frame is None:
                     continue
                 frame = _resize_if_needed(frame)
@@ -2229,7 +2230,7 @@ def _process_single_file(
                         try:
                             import cv2  # type: ignore
 
-                            img = cv2.imread(str(in_path), cv2.IMREAD_UNCHANGED)
+                            img = image_io.imread(in_path, cv2.IMREAD_UNCHANGED)
                             if img is not None:
                                 resized = cv2.resize(
                                     img,
@@ -2239,7 +2240,7 @@ def _process_single_file(
                                 pre_out = collision_safe_path(
                                     pre_root / f"{Path(in_path).stem}_pre{plan.preprocess_width}x{plan.preprocess_height}{Path(in_path).suffix}"
                                 )
-                                cv2.imwrite(str(pre_out), resized)
+                                image_io.imwrite(pre_out, resized)
                                 if not pre_out.exists():
                                     pre_out = None
                         except Exception:
@@ -2258,7 +2259,7 @@ def _process_single_file(
                             pre_dir.mkdir(parents=True, exist_ok=True)
 
                             for frame_file in frame_files:
-                                img = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
+                                img = image_io.imread(frame_file, cv2.IMREAD_UNCHANGED)
                                 if img is None:
                                     raise ValueError(f"Cannot open frame for preprocessing: {frame_file}")
                                 resized = cv2.resize(
@@ -2267,7 +2268,7 @@ def _process_single_file(
                                     interpolation=cv2.INTER_LANCZOS4,
                                 )
                                 out_frame = pre_dir / frame_file.name
-                                cv2.imwrite(str(out_frame), resized)
+                                image_io.imwrite(out_frame, resized)
                                 if not out_frame.exists():
                                     raise ValueError(f"Failed to write preprocessed frame: {out_frame}")
 

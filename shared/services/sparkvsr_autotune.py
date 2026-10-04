@@ -24,6 +24,7 @@ import gradio as gr
 
 from shared.gpu_utils import get_global_gpu_override, get_gpu_info
 from shared.oom_alert import clear_vram_oom_alert
+from shared import image_io
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
     detect_input_type,
@@ -376,7 +377,7 @@ def _extract_demo_reference(demo_video_path: Path, ref_path: Path) -> Optional[P
             cap.release()
         if not ok or frame is None:
             return None
-        if cv2.imwrite(str(ref_path), frame):
+        if image_io.imwrite(ref_path, frame):
             return ref_path
     except Exception:
         return None

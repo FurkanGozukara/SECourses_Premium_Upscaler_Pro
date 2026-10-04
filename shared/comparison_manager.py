@@ -14,6 +14,8 @@ from typing import Optional, Tuple, Dict, Any
 import cv2
 import numpy as np
 
+from .image_io import imwrite, load_image_bgr8
+
 
 class ComparisonManager:
     """
@@ -151,8 +153,8 @@ class ComparisonManager:
         """
         try:
             # Load images
-            img1 = cv2.imread(image1_path, cv2.IMREAD_COLOR)
-            img2 = cv2.imread(image2_path, cv2.IMREAD_COLOR)
+            img1 = load_image_bgr8(image1_path)
+            img2 = load_image_bgr8(image2_path)
             
             if img1 is None or img2 is None:
                 return None
@@ -189,7 +191,7 @@ class ComparisonManager:
             if output_path is None:
                 output_path = str(Path(image2_path).with_stem(f"{Path(image2_path).stem}_diff"))
             
-            cv2.imwrite(output_path, overlay)
+            imwrite(output_path, overlay)
             
             return output_path
             

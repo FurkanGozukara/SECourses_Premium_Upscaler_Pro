@@ -57,6 +57,7 @@ from shared.sparkvsr_int8_convrot import (
     is_int8_convrot_model_path,
     load_int8_convrot_transformer,
 )
+from shared.image_io import load_image_rgb_pil
 from shared.sparkvsr_ref_utils import (
     choose_temporal_reference_path,
     load_temporal_reference_manifest,
@@ -166,7 +167,7 @@ def is_video_file(filename: str | os.PathLike) -> bool:
 def image_to_tensor(path: str | os.PathLike) -> torch.Tensor:
     import numpy as np
 
-    img = Image.open(path).convert("RGB")
+    img = load_image_rgb_pil(path)  # Pillow's convert("RGB") clips 16-bit grayscale to white
     arr = np.asarray(img).astype("float32") / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 

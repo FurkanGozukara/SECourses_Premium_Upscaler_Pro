@@ -11,6 +11,19 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V8.5 — 4 October 2026 — 16-bit Images, Non-English File Names & GAN Video Fixed",
+        """
+**Fixed upscales that came out almost completely white or stopped with an error: 16-bit images, non-English file names and GAN videos with FFmpeg 9.**
+
+- **SeedVR2: 16-bit images no longer come out white.** Many AI-generated PNGs and 16-bit TIFFs store colors with extra precision. SeedVR2 read them like normal images, so the result was an almost pure white picture. They are now read correctly, including grayscale and transparent ones, in single images, image folders and frame sequences. Grayscale single images, which could stop with an error, also work now.
+- **GAN image upscalers: 16-bit grayscale images no longer come out white.** 32-bit float TIFF images, which could not be opened before, now work too.
+- **FlashVSR+, SparkVSR and RTX Super Resolution:** 32-bit float TIFF images now work instead of stopping with "Failed to read input image". SparkVSR's automatic reference image is also read correctly from 16-bit grayscale inputs.
+- **GAN video upscaling works with FFmpeg 9.** FFmpeg 9 removed an option the GAN tab used when splitting a video into frames, so GAN video upscales stopped with an error. The new option is used now, and older FFmpeg versions keep working.
+- **File names with Turkish or other non-English letters (ç, ğ, ı, ö, ş, ü, é, 日本...) now work in every model.** Such images could fail to open in SeedVR2, FlashVSR+, SparkVSR and RTX Super Resolution, and resized copies, face restoration results and saved images could be written under a garbled name and then go missing.
+- Verified with every image model (SeedVR2, GAN, FlashVSR+, SparkVSR, RTX Super Resolution) on 11 kinds of image files: normal, 16-bit color, 16-bit grayscale, 16-bit with transparency, grayscale, grayscale with transparency, palette, 16-bit TIFF, float TIFF, CMYK JPEG and a Turkish file name. The new `tools/image_input_smoke.py` repeats this check for future versions.
+""",
+    ),
+    (
         "V8.4 — 7 September 2026 — RIFE Merge Timing & Validation",
         """
 **More reliable final merging for videos processed with RIFE.**

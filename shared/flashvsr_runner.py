@@ -306,13 +306,14 @@ def _build_temp_video_from_frames(
 ) -> tuple[bool, str]:
     try:
         import cv2  # type: ignore
+        from .image_io import load_image_bgr8
     except Exception as e:
         return False, f"OpenCV (cv2) is required for image/directory input conversion: {e}"
 
     if not image_paths:
         return False, "No image frames found to build temporary video input."
 
-    first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
+    first = load_image_bgr8(image_paths[0])
     if first is None:
         return False, f"Failed to read first image frame: {image_paths[0]}"
     h, w = first.shape[:2]
@@ -323,7 +324,7 @@ def _build_temp_video_from_frames(
 
     try:
         for frame_path in image_paths:
-            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            frame = load_image_bgr8(frame_path)
             if frame is None:
                 continue
             if frame.shape[0] != h or frame.shape[1] != w:
@@ -349,6 +350,7 @@ def _extract_single_image_from_video(
     try:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
+        from .image_io import imwrite
     except Exception as e:
         return None, f"OpenCV/numpy are required for single-image postprocess: {e}"
 
@@ -394,7 +396,7 @@ def _extract_single_image_from_video(
     elif fmt == "webp":
         imwrite_params = [int(cv2.IMWRITE_WEBP_QUALITY), quality]
 
-    ok = cv2.imwrite(str(out_path), out_frame, imwrite_params)
+    ok = imwrite(out_path, out_frame, imwrite_params)
     if not ok:
         return None, f"Failed to save extracted single-image output: {out_path}"
     return str(out_path), None

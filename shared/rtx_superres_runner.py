@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from shared.image_io import imwrite, load_image_bgr8
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -648,7 +649,7 @@ def run_rtx_superres(
                     )
                 total_frames = len(frame_paths)
             else:
-                single_image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+                single_image = load_image_bgr8(input_path)
                 if single_image is None:
                     return RTXSuperResResult(
                         returncode=1,
@@ -802,7 +803,7 @@ def run_rtx_superres(
                     save_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(image_output_quality)]
                 elif out_path.suffix.lower() == ".webp":
                     save_params = [int(cv2.IMWRITE_WEBP_QUALITY), int(image_output_quality)]
-                ok = cv2.imwrite(str(out_path), out_frame, save_params)
+                ok = imwrite(out_path, out_frame, save_params)
                 if not ok:
                     return RTXSuperResResult(
                         returncode=1,
@@ -840,7 +841,7 @@ def run_rtx_superres(
                     if frame_idx >= len(frame_paths):
                         break
                     frame_file = frame_paths[frame_idx]
-                    frame_bgr = cv2.imread(str(frame_file), cv2.IMREAD_COLOR)
+                    frame_bgr = load_image_bgr8(frame_file)
                     if frame_bgr is None:
                         return RTXSuperResResult(
                             returncode=1,
@@ -882,7 +883,7 @@ def run_rtx_superres(
                 elif output_dir_path is not None:
                     frame_name = f"{Path(input_path).stem}_{next_idx:06d}.png"
                     out_file = output_dir_path / frame_name
-                    if not cv2.imwrite(str(out_file), out_frame):
+                    if not imwrite(out_file, out_frame):
                         return RTXSuperResResult(
                             returncode=1,
                             output_path=None,

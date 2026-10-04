@@ -388,6 +388,8 @@ def save_ref_frames_locally(
 
     import cv2  # type: ignore
 
+    from shared.image_io import imwrite
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{video_id}_" if video_id else ""
@@ -439,7 +441,7 @@ def save_ref_frames_locally(
             if not ok:
                 continue
             frame_path = out_dir / f"{prefix}frame_{int(idx):05d}.png"
-            cv2.imwrite(str(frame_path), frame_bgr)
+            imwrite(frame_path, frame_bgr)
             saved.append((int(idx), str(frame_path)))
     finally:
         if cap is not None:

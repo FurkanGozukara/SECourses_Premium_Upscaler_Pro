@@ -311,10 +311,11 @@ def create_frame_difference(
         import cv2
         import numpy as np
         from .path_utils import normalize_path
+        from .image_io import imwrite, load_image_bgr8
         
         # Read images
-        img1 = cv2.imread(normalize_path(frame1_path))
-        img2 = cv2.imread(normalize_path(frame2_path))
+        img1 = load_image_bgr8(normalize_path(frame1_path))
+        img2 = load_image_bgr8(normalize_path(frame2_path))
         
         if img1 is None or img2 is None:
             return False, None, "Failed to load one or both images"
@@ -345,7 +346,7 @@ def create_frame_difference(
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         
         # Save difference image
-        cv2.imwrite(output_path, diff)
+        imwrite(output_path, diff)
         
         if Path(output_path).exists():
             return True, output_path, ""

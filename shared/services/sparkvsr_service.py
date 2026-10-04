@@ -33,6 +33,7 @@ from shared.path_utils import (
     resolve_batch_output_dir,
 )
 from shared.logging_utils import RunLogger
+from shared import image_io
 from shared.comparison_unified import create_unified_comparison
 from shared.models.sparkvsr_meta import (
     get_sparkvsr_metadata,
@@ -796,10 +797,7 @@ def build_sparkvsr_callbacks(
             kind = detect_input_type(str(src))
             if kind == "image":
                 try:
-                    from PIL import Image
-
-                    with Image.open(src) as im:
-                        im.convert("RGB").save(dst, format="PNG")
+                    image_io.load_image_rgb_pil(src).save(dst, format="PNG")
                 except Exception:
                     shutil.copy2(src, dst)
                 return dst if dst.exists() else None
@@ -837,7 +835,7 @@ def build_sparkvsr_callbacks(
                         cap.set(cv2.CAP_PROP_POS_FRAMES, read_idx)
                         ok, frame = cap.read()
                         cap.release()
-                        if ok and frame is not None and cv2.imwrite(str(dst), frame):
+                        if ok and frame is not None and image_io.imwrite(dst, frame):
                             return dst if dst.exists() else None
                     else:
                         cap.release()
@@ -892,10 +890,7 @@ def build_sparkvsr_callbacks(
                     if str(src) == str(dst):
                         return dst
                 try:
-                    from PIL import Image
-
-                    with Image.open(src) as im:
-                        im.convert("RGB").save(dst, format="PNG")
+                    image_io.load_image_rgb_pil(src).save(dst, format="PNG")
                 except Exception:
                     shutil.copy2(src, dst)
                 return dst if dst.exists() else None
@@ -1727,14 +1722,14 @@ def build_sparkvsr_callbacks(
                         try:
                             import cv2  # type: ignore
 
-                            img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                            img = image_io.imread(src_file, cv2.IMREAD_UNCHANGED)
                             if img is not None:
                                 resized = cv2.resize(
                                     img,
                                     (int(plan.preprocess_width), int(plan.preprocess_height)),
                                     interpolation=cv2.INTER_AREA,
                                 )
-                                saved = bool(cv2.imwrite(str(pre_file), resized))
+                                saved = bool(image_io.imwrite(pre_file, resized))
                         except Exception:
                             saved = False
 
@@ -1786,7 +1781,7 @@ def build_sparkvsr_callbacks(
                         try:
                             import cv2  # type: ignore
                             for f in img_files:
-                                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                                img = image_io.imread(f, cv2.IMREAD_UNCHANGED)
                                 if img is None:
                                     continue
                                 resized = cv2.resize(
@@ -1794,7 +1789,7 @@ def build_sparkvsr_callbacks(
                                     (int(plan.preprocess_width), int(plan.preprocess_height)),
                                     interpolation=cv2.INTER_AREA,
                                 )
-                                cv2.imwrite(str(pre_dir / f.name), resized)
+                                image_io.imwrite(pre_dir / f.name, resized)
                         except Exception:
                             try:
                                 from PIL import Image  # type: ignore
@@ -1932,14 +1927,14 @@ def build_sparkvsr_callbacks(
                             try:
                                 import cv2  # type: ignore
 
-                                img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                                img = image_io.imread(src_file, cv2.IMREAD_UNCHANGED)
                                 if img is not None:
                                     resized = cv2.resize(
                                         img,
                                         (int(plan.preprocess_width), int(plan.preprocess_height)),
                                         interpolation=cv2.INTER_AREA,
                                     )
-                                    saved = bool(cv2.imwrite(str(pre_file), resized))
+                                    saved = bool(image_io.imwrite(pre_file, resized))
                             except Exception:
                                 saved = False
 
@@ -1983,7 +1978,7 @@ def build_sparkvsr_callbacks(
                             try:
                                 import cv2  # type: ignore
                                 for f in img_files:
-                                    img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                                    img = image_io.imread(f, cv2.IMREAD_UNCHANGED)
                                     if img is None:
                                         continue
                                     resized = cv2.resize(
@@ -1991,7 +1986,7 @@ def build_sparkvsr_callbacks(
                                         (int(plan.preprocess_width), int(plan.preprocess_height)),
                                         interpolation=cv2.INTER_AREA,
                                     )
-                                    cv2.imwrite(str(pre_dir / f.name), resized)
+                                    image_io.imwrite(pre_dir / f.name, resized)
                             except Exception:
                                 try:
                                     from PIL import Image  # type: ignore

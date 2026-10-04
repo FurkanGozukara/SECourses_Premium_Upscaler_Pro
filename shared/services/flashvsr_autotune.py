@@ -25,6 +25,7 @@ from shared.flashvsr_runner import (
 )
 from shared.gpu_utils import get_global_gpu_override, get_gpu_info
 from shared.oom_alert import clear_vram_oom_alert
+from shared import image_io
 from shared.path_utils import IMAGE_EXTENSIONS, detect_input_type, get_media_dimensions, normalize_path
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.services.autotune_search import (
@@ -829,7 +830,7 @@ def _create_autotune_demo_video(
             cap.release()
 
         elif input_kind == "image":
-            frame = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+            frame = image_io.load_image_bgr8(input_path)
             if frame is None:
                 raise RuntimeError(f"Failed to read input image for autotune: {input_path}")
             frame = _resize_if_needed(frame)
@@ -853,7 +854,7 @@ def _create_autotune_demo_video(
             for fp in frames:
                 if written >= int(target_frames):
                     break
-                frame = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+                frame = image_io.load_image_bgr8(fp)
                 if frame is None:
                     continue
                 frame = _resize_if_needed(frame)

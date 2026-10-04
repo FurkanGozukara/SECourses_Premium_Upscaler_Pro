@@ -33,6 +33,7 @@ from shared.path_utils import (
     resolve_batch_output_dir,
 )
 from shared.logging_utils import RunLogger
+from shared import image_io
 from shared.comparison_unified import create_unified_comparison
 from shared.models.flashvsr_meta import (
     get_flashvsr_metadata,
@@ -1010,14 +1011,14 @@ def build_flashvsr_callbacks(
                         try:
                             import cv2  # type: ignore
 
-                            img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                            img = image_io.imread(src_file, cv2.IMREAD_UNCHANGED)
                             if img is not None:
                                 resized = cv2.resize(
                                     img,
                                     (int(plan.preprocess_width), int(plan.preprocess_height)),
                                     interpolation=cv2.INTER_AREA,
                                 )
-                                saved = bool(cv2.imwrite(str(pre_file), resized))
+                                saved = bool(image_io.imwrite(pre_file, resized))
                         except Exception:
                             saved = False
 
@@ -1069,7 +1070,7 @@ def build_flashvsr_callbacks(
                         try:
                             import cv2  # type: ignore
                             for f in img_files:
-                                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                                img = image_io.imread(f, cv2.IMREAD_UNCHANGED)
                                 if img is None:
                                     continue
                                 resized = cv2.resize(
@@ -1077,7 +1078,7 @@ def build_flashvsr_callbacks(
                                     (int(plan.preprocess_width), int(plan.preprocess_height)),
                                     interpolation=cv2.INTER_AREA,
                                 )
-                                cv2.imwrite(str(pre_dir / f.name), resized)
+                                image_io.imwrite(pre_dir / f.name, resized)
                         except Exception:
                             try:
                                 from PIL import Image  # type: ignore
@@ -1215,14 +1216,14 @@ def build_flashvsr_callbacks(
                             try:
                                 import cv2  # type: ignore
 
-                                img = cv2.imread(str(src_file), cv2.IMREAD_UNCHANGED)
+                                img = image_io.imread(src_file, cv2.IMREAD_UNCHANGED)
                                 if img is not None:
                                     resized = cv2.resize(
                                         img,
                                         (int(plan.preprocess_width), int(plan.preprocess_height)),
                                         interpolation=cv2.INTER_AREA,
                                     )
-                                    saved = bool(cv2.imwrite(str(pre_file), resized))
+                                    saved = bool(image_io.imwrite(pre_file, resized))
                             except Exception:
                                 saved = False
 
@@ -1266,7 +1267,7 @@ def build_flashvsr_callbacks(
                             try:
                                 import cv2  # type: ignore
                                 for f in img_files:
-                                    img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                                    img = image_io.imread(f, cv2.IMREAD_UNCHANGED)
                                     if img is None:
                                         continue
                                     resized = cv2.resize(
@@ -1274,7 +1275,7 @@ def build_flashvsr_callbacks(
                                         (int(plan.preprocess_width), int(plan.preprocess_height)),
                                         interpolation=cv2.INTER_AREA,
                                     )
-                                    cv2.imwrite(str(pre_dir / f.name), resized)
+                                    image_io.imwrite(pre_dir / f.name, resized)
                             except Exception:
                                 try:
                                     from PIL import Image  # type: ignore

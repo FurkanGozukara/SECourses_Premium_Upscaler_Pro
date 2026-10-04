@@ -163,13 +163,14 @@ def _resolve_model_path(base_dir: Path, settings: Dict[str, Any]) -> tuple[Optio
 def _build_temp_video_from_frames(image_paths: List[Path], output_path: Path, fps: float) -> tuple[bool, str]:
     try:
         import cv2  # type: ignore
+        from .image_io import load_image_bgr8
     except Exception as exc:
         return False, f"OpenCV (cv2) is required for SparkVSR image/folder conversion: {exc}"
 
     if not image_paths:
         return False, "No image frames found to build temporary SparkVSR video input."
 
-    first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
+    first = load_image_bgr8(image_paths[0])
     if first is None:
         return False, f"Failed to read first image frame: {image_paths[0]}"
     height, width = first.shape[:2]
@@ -183,7 +184,7 @@ def _build_temp_video_from_frames(image_paths: List[Path], output_path: Path, fp
         return False, f"Failed to create temporary video writer: {output_path}"
     try:
         for frame_path in image_paths:
-            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            frame = load_image_bgr8(frame_path)
             if frame is None:
                 continue
             if frame.shape[0] != height or frame.shape[1] != width:
@@ -239,6 +240,7 @@ def _extract_single_image_from_video(
 ) -> tuple[Optional[str], Optional[str]]:
     try:
         import cv2  # type: ignore
+        from .image_io import imwrite
     except Exception as exc:
         return None, f"OpenCV is required for SparkVSR single-image export: {exc}"
 
@@ -265,7 +267,7 @@ def _extract_single_image_from_video(
         params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
     elif fmt == "webp":
         params = [int(cv2.IMWRITE_WEBP_QUALITY), quality]
-    if not cv2.imwrite(str(output_path), frame, params):
+    if not imwrite(output_path, frame, params):
         return None, f"Failed to save SparkVSR image output: {output_path}"
     return str(output_path), None
 

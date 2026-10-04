@@ -22,6 +22,7 @@ from .path_utils import (
     detect_input_type,
 )
 from .face_restore import restore_image, restore_video
+from .image_io import load_image_rgb_pil
 from .command_logger import get_command_logger
 from .model_downloads import ensure_gan_model
 from .video_encoder import encode_video
@@ -516,14 +517,24 @@ def _run_gan_video(
         # Preserve one output image per decoded source frame.
         # Without this, ffmpeg may duplicate frames for some chunk timestamps,
         # which later appears as frozen-frame segments in GAN outputs.
-        extract_cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-map", "0:v:0",
-            "-vsync", "0",
-            str(frames_dir / frame_pattern)
-        ]
-        subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        # FFmpeg 9 removed "-vsync"; "-fps_mode passthrough" is its replacement
+        # (FFmpeg 5.1+), with "-vsync 0" kept as the fallback for older builds.
+        extract_cmd = None
+        for passthrough in (["-fps_mode", "passthrough"], ["-vsync", "0"]):
+            extract_cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-map", "0:v:0",
+                *passthrough,
+                str(frames_dir / frame_pattern)
+            ]
+            proc = subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+            if proc.returncode == 0:
+                break
+            if f"Unrecognized option '{passthrough[0].lstrip('-')}'" not in (proc.stderr or ""):
+                raise subprocess.CalledProcessError(proc.returncode, extract_cmd, stderr=proc.stderr)
+        else:
+            raise subprocess.CalledProcessError(proc.returncode, extract_cmd, stderr=proc.stderr)
 
         if cancel_event and cancel_event.is_set():
             return GanResult(1, None, "Canceled after frame extraction")
@@ -643,8 +654,7 @@ def _run_gan_video(
                     frame_tensors = []
                     frame_indices = []
                     for frame_path in batch_frames:
-                        with spandrel_image_cls.open(frame_path) as img:
-                            img_array = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+                        img_array = np.array(load_image_rgb_pil(frame_path)).astype(np.float32) / 255.0
                         frame_tensors.append(
                             spandrel_torch.from_numpy(img_array).permute(2, 0, 1)
                         )
@@ -1058,8 +1068,8 @@ def _run_with_spandrel_image(
             model_path = base_dir / "Image_Upscale_Models" / model_name
         model = spandrel.ModelLoader().load_from_file(str(model_path))
         
-        # Load image
-        img = Image.open(input_path).convert('RGB')
+        # Load image (16-bit grayscale and float files must not clip to white)
+        img = load_image_rgb_pil(input_path)
         img_array = np.array(img).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)
         

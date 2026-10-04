@@ -23,6 +23,7 @@ from shared.path_utils import (
 )
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from shared.logging_utils import RunLogger
+from shared import image_io
 from shared.output_run_manager import (
     prepare_single_video_run,
     downscaled_video_path,
@@ -573,7 +574,7 @@ def build_gan_callbacks(
                 # Image resolution adjustment with OpenCV
                 try:
                     import cv2
-                    img = cv2.imread(s["input_path"], cv2.IMREAD_UNCHANGED)
+                    img = image_io.imread(s["input_path"], cv2.IMREAD_UNCHANGED)
                     if img is not None:
                         adjusted = cv2.resize(img, (optimal_w, optimal_h), interpolation=cv2.INTER_AREA)
                         pre_dir = Path(s.get("_run_dir") or current_output_dir_local) / "pre_processed"
@@ -581,7 +582,7 @@ def build_gan_callbacks(
                         tmp_path = collision_safe_path(
                             pre_dir / f"gan_input_adjust_{Path(s['input_path']).stem}_{optimal_w}x{optimal_h}{Path(s['input_path']).suffix}"
                         )
-                        cv2.imwrite(str(tmp_path), adjusted)
+                        image_io.imwrite(tmp_path, adjusted)
                         if tmp_path.exists():
                             s["_original_input_path_before_preprocess"] = (
                                 s.get("_original_input_path_before_preprocess") or s["input_path"]
@@ -608,11 +609,11 @@ def build_gan_callbacks(
 
                     import cv2
                     for f in img_files:
-                        img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                        img = image_io.imread(f, cv2.IMREAD_UNCHANGED)
                         if img is None:
                             continue
                         adjusted = cv2.resize(img, (optimal_w, optimal_h), interpolation=cv2.INTER_AREA)
-                        cv2.imwrite(str(tmp_dir / f.name), adjusted)
+                        image_io.imwrite(tmp_dir / f.name, adjusted)
 
                     if any(tmp_dir.iterdir()):
                         s["_original_input_path_before_preprocess"] = (

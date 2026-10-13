@@ -93,7 +93,7 @@ class RifeMergeTimingTests(unittest.TestCase):
                 ), "".join(messages))
                 self._assert_timeline(output, "48/1")
                 self.assertTrue(any(success_message in message for message in messages), messages)
-                self.assertFalse(any("duration drift" in message for message in messages), messages)
+                self.assertFalse(any("Merge validation failed" in message for message in messages), messages)
 
     def test_rife_rates_above_240_keep_the_exact_output_timeline(self):
         for fps in ("480/1", "480000/1001"):

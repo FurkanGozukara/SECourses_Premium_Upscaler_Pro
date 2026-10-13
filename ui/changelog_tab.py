@@ -11,6 +11,21 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V8.6 — 13 October 2026 — RIFE Chunk Merge Fixes",
+        """
+**Fixed RIFE runs that stopped at the very end with "Merge failed" or "Merged video timeline does not match the source", and RIFE outputs that silently lost frames.**
+
+- **Videos whose audio ends before the picture no longer fail.** RIFE's own audio step cut the interpolated video to the length of the audio, so the last chunk came out short and the final check rejected the whole run at about 96%. RIFE now writes the video only and the app adds the audio itself, without ever shortening the video. This also fixes the RIFE tab and single-pass Global RIFE, which could lose the end of the video the same way.
+- **MPEG-TS camcorder and broadcast files (.ts, .m2ts, .mts) now work correctly.** Their frame rate, size and video length were read wrongly, so chunked RIFE dropped interpolated frames at every chunk boundary and chunk splitting needed slow repair steps.
+- **MKV and WebM sources with a longer audio track** are now measured by their video length instead of the audio length.
+- **A more robust final merge.** If OpenCV cannot read a chunk exactly, the merge automatically retries with FFmpeg's own decoder instead of failing. Duplicate boundary frames are matched chunk by chunk, and merge warnings now name the exact problem (frame count, duration, frame rate or start time) instead of always saying "duration drift".
+- **No more freeze while splitting.** A chunk file that ended up with sound but no picture could make the app hang forever while checking it. Such files are now rejected immediately.
+- **RIFE tab: a Target FPS above the multiplier now works.** For example 24 fps with x2 and Target FPS 60 stayed at 48 fps. RIFE now interpolates x4 and resamples to exactly 60 fps.
+- **The Windows updater now really updates the app.** `Windows_Install_and_Update.bat` updated RIFE, SeedVR2 and the other model folders but never the app itself, so existing installations kept running their old version after "updating". Download the new zip once and run it; from then on updates arrive normally.
+- Verified with real RIFE 4.26 runs: 24, 23.976, 25, 29.97 and 60 fps sources; x2, x4 and x8 (up to 480 fps); automatic scenes, a single chunk, 20 chunks and chunk overlap; variable frame rate, MPEG-TS and MKV input; H.265 10-bit and AV1 output; audio shorter or longer than the video; Target FPS above and below the multiplier; and Global RIFE, chunked and single pass. Every result has the exact interpolated frame count, frame rate and length, starts at zero and keeps its audio.
+""",
+    ),
+    (
         "V8.5 — 4 October 2026 — 16-bit Images, Non-English File Names & GAN Video Fixed",
         """
 **Fixed upscales that came out almost completely white or stopped with an error: 16-bit images, non-English file names and GAN videos with FFmpeg 9.**

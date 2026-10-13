@@ -26,6 +26,7 @@ from .path_utils import (
     resolve_output_location,
     detect_input_type,
     emit_metadata,
+    first_ffprobe_value,
     get_media_fps,
     get_media_duration_seconds,
 )
@@ -38,6 +39,17 @@ try:
     PYSCENEDETECT_AVAILABLE = True
 except ImportError:
     PYSCENEDETECT_AVAILABLE = False
+
+
+def _cv2_capture(path: Path) -> Any:
+    """
+    Open a media file with OpenCV's FFmpeg backend only.
+
+    With the default backend list OpenCV falls through to Media Foundation when FFmpeg
+    cannot open a file, and on Windows that call blocks forever on an audio-only MP4
+    (what an interrupted writer or an empty video trim leaves behind).
+    """
+    return cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
 
 
 def _has_scenedetect() -> bool:
@@ -379,6 +391,60 @@ def fallback_scenes(video_path: str, chunk_seconds: float = 60.0, overlap_second
     return scenes
 
 
+def _is_mpegts_container(path: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=format_name",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return "mpegts" in first_ffprobe_value(proc.stdout).lower().split(",")
+    except Exception:
+        return False
+
+
+def _remux_mpegts_for_cutting(
+    source: Path,
+    work_dir: Path,
+    include_audio: bool,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Optional[Path]:
+    """
+    Stream-copy an MPEG-TS source into Matroska for cutting.
+
+    FFmpeg cannot seek into MPEG-TS together with -copyts: the timestamp cut then loses
+    its video frames (or leaves an audio-only file). The copy keeps every frame and its
+    timing but gives the precise cut an index to seek on.
+    """
+    target = Path(work_dir) / "_split_source.mkv"
+    attempts = [["-map", "0:v:0", "-map", "0:a?"]] if include_audio else []
+    attempts.append(["-map", "0:v:0"])  # some broadcast audio codecs cannot go into Matroska
+    for maps in attempts:
+        with suppress(Exception):
+            target.unlink(missing_ok=True)
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source), *maps, "-c", "copy", "-sn", "-dn", str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if (
+            proc.returncode == 0
+            and target.exists()
+            and target.stat().st_size > 1024
+            and _probe_concat_video_signature(target) is not None
+        ):
+            if on_progress:
+                on_progress("Split: MPEG-TS source stream-copied to Matroska for frame-accurate cutting.\n")
+            return target
+    with suppress(Exception):
+        target.unlink(missing_ok=True)
+    return None
+
+
 def split_video(
     video_path: str,
     scenes: List[Tuple[float, float]],
@@ -389,6 +455,37 @@ def split_video(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
     work_dir.mkdir(parents=True, exist_ok=True)
+    remuxed: Optional[Path] = None
+    if len(scenes) > 1 and shutil.which("ffmpeg") is not None and _is_mpegts_container(Path(video_path)):
+        remuxed = _remux_mpegts_for_cutting(Path(video_path), work_dir, include_audio, on_progress)
+    try:
+        return _split_video_impl(
+            video_path,
+            scenes,
+            work_dir,
+            precise=precise,
+            preserve_quality=preserve_quality,
+            include_audio=include_audio,
+            on_progress=on_progress,
+            cut_path=str(remuxed) if remuxed else str(video_path),
+        )
+    finally:
+        if remuxed is not None:
+            with suppress(Exception):
+                remuxed.unlink(missing_ok=True)
+
+
+def _split_video_impl(
+    video_path: str,
+    scenes: List[Tuple[float, float]],
+    work_dir: Path,
+    precise: bool,
+    preserve_quality: bool,
+    include_audio: bool,
+    on_progress: Optional[Callable[[str], None]],
+    cut_path: str,
+) -> List[Path]:
+    """split_video body; every probe and cut reads `cut_path` (a stream copy of `video_path`)."""
     chunk_paths: List[Path] = []
 
     if shutil.which("ffmpeg") is None:
@@ -415,7 +512,7 @@ def split_video(
         try:
             if not p.exists() or p.stat().st_size < 1024:
                 return False
-            cap = cv2.VideoCapture(str(p))
+            cap = _cv2_capture(p)
             if not cap.isOpened():
                 return False
             ok, frame = cap.read()
@@ -443,7 +540,7 @@ def split_video(
                 text=True,
                 timeout=10,
             )
-            pix = (proc.stdout or "").strip()
+            pix = first_ffprobe_value(proc.stdout)
             return pix if pix else None
         except Exception:
             return None
@@ -541,7 +638,7 @@ def split_video(
     # ------------------------------------------------------------------
     fps_for_align = 0.0
     try:
-        fps_for_align = float(get_media_fps(video_path) or 0.0)
+        fps_for_align = float(get_media_fps(cut_path) or 0.0)
     except Exception:
         fps_for_align = 0.0
     if not (fps_for_align > 0 and math.isfinite(fps_for_align)):
@@ -563,7 +660,7 @@ def split_video(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=r_frame_rate,avg_frame_rate,start_time",
-                "-of", "json", str(video_path),
+                "-of", "json", str(cut_path),
             ],
             capture_output=True, text=True, timeout=30,
         )
@@ -644,8 +741,8 @@ def split_video(
     if not normalized_us:
         return [Path(video_path)]
 
-    src_has_audio = has_audio_stream(Path(video_path)) if include_audio else False
-    src_pix_fmt = _probe_pix_fmt(video_path) if preserve_quality else None
+    src_has_audio = has_audio_stream(Path(cut_path)) if include_audio else False
+    src_pix_fmt = _probe_pix_fmt(cut_path) if preserve_quality else None
     manifest_entries: List[Dict[str, Any]] = []
     # Seek this far before the chunk start (lands on an earlier keyframe), then cut by
     # absolute timestamps with the trim filters. Bound the amount of input read with an
@@ -696,7 +793,7 @@ def split_video(
             # NOTE: stream copy is keyframe-limited: ffmpeg keeps everything from the last keyframe
             # before -ss, so the chunk may start early. Exactness is verified afterwards.
             cmd = [
-                "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
+                "ffmpeg", "-y", "-ss", start_str, "-i", cut_path, "-t", dur_str,
                 "-c", "copy", "-movflags", "+faststart", str(out),
             ]
             _run_ffmpeg(cmd)
@@ -704,7 +801,7 @@ def split_video(
         def _split_copy_video_only() -> None:
             # Stream-copy video only. Useful when audio codecs cannot be muxed into MP4.
             cmd = [
-                "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
+                "ffmpeg", "-y", "-ss", start_str, "-i", cut_path, "-t", dur_str,
                 "-map", "0:v:0", "-c:v", "copy", "-an",
                 "-movflags", "+faststart", str(out),
             ]
@@ -713,7 +810,7 @@ def split_video(
         def _split_copy_aac_audio() -> None:
             # Stream-copy video but re-encode audio to AAC for MP4 compatibility.
             cmd = [
-                "ffmpeg", "-y", "-ss", start_str, "-i", video_path, "-t", dur_str,
+                "ffmpeg", "-y", "-ss", start_str, "-i", cut_path, "-t", dur_str,
                 "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart", str(out),
             ]
@@ -739,7 +836,7 @@ def split_video(
                 the final output re-muxes the original audio) is re-encoded to AAC and trimmed
                 with the same window.
             """
-            cmd = ["ffmpeg", "-y", "-ss", seek_str, "-t", read_limit_str, "-copyts", "-i", video_path, "-map", "0:v:0"]
+            cmd = ["ffmpeg", "-y", "-ss", seek_str, "-t", read_limit_str, "-copyts", "-i", cut_path, "-map", "0:v:0"]
             if with_audio:
                 cmd += ["-map", "0:a?"]
             cmd += ["-vf", f"trim=start={start_abs_str}:end={end_abs_str},setpts=PTS-STARTPTS"]
@@ -870,7 +967,7 @@ def split_video(
                             f"setpts=N/({timeline_fps_str or fps_for_align}*TB)"
                         )
                         cmd = [
-                            "ffmpeg", "-y", "-i", video_path,
+                            "ffmpeg", "-y", "-i", cut_path,
                             "-map", "0:v:0", "-vf", frame_filter,
                             "-frames:v", str(int(expected_frames)),
                         ]
@@ -1084,6 +1181,20 @@ def _duration_is_plausible(
     return min_allowed <= float(actual) <= max_allowed
 
 
+def _parse_hms_duration(value: Any) -> Optional[float]:
+    """Parse ffprobe tag durations such as "00:01:02.500000000" (or plain seconds)."""
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        total = 0.0
+        for part in raw.split(":"):
+            total = total * 60.0 + float(part)
+        return total if math.isfinite(total) and total > 0 else None
+    except Exception:
+        return None
+
+
 def _probe_video_stream_duration(path: Path) -> Optional[float]:
     try:
         proc = subprocess.run(
@@ -1104,11 +1215,34 @@ def _probe_video_stream_duration(path: Path) -> Optional[float]:
             timeout=10,
         )
         if proc.returncode == 0:
-            raw = (proc.stdout or "").strip()
+            raw = first_ffprobe_value(proc.stdout)
             if raw:
                 val = float(raw)
                 if val > 0:
                     return val
+    except Exception:
+        pass
+    try:
+        # Matroska/WebM keep the per-track length only in a DURATION tag. The format
+        # duration below is the longest stream, so a longer audio track would be
+        # mistaken for video length.
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream_tags", "-of", "json", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            streams = json.loads(proc.stdout or "{}").get("streams") or [{}]
+            tags = (streams[0] or {}).get("tags") or {}
+            for key, value in tags.items():
+                if str(key).upper().startswith("DURATION"):
+                    tagged = _parse_hms_duration(value)
+                    if tagged:
+                        return tagged
     except Exception:
         pass
     try:
@@ -1227,7 +1361,7 @@ def _probe_chunk_nb_frames(path: Path) -> Optional[int]:
             cmd += ["-show_entries", entries, "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if proc.returncode == 0:
-                raw = (proc.stdout or "").strip()
+                raw = first_ffprobe_value(proc.stdout)
                 if raw.isdigit() and int(raw) > 0:
                     return int(raw)
         except Exception:
@@ -1248,7 +1382,7 @@ def _probe_container_nb_frames(path: Path) -> Optional[int]:
             text=True,
             timeout=30,
         )
-        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        raw = first_ffprobe_value(proc.stdout) if proc.returncode == 0 else ""
         if raw.isdigit() and int(raw) > 0:
             return int(raw)
     except Exception:
@@ -1282,7 +1416,7 @@ def _probe_source_frame_count(path: Path) -> Tuple[Optional[int], str]:
             ],
             capture_output=True, text=True, timeout=30,
         )
-        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        raw = first_ffprobe_value(proc.stdout) if proc.returncode == 0 else ""
         if raw.isdigit() and int(raw) > 0:
             return int(raw), "nb_frames"
     except Exception:
@@ -1781,6 +1915,101 @@ def _run_ffmpeg(cmd: List[str]) -> subprocess.CompletedProcess:
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def _probe_video_display_size(path: Path) -> Optional[Tuple[int, int]]:
+    """(width, height) of the frames ffmpeg decodes, after its default autorotation."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        stream = (json.loads(proc.stdout or "{}").get("streams") or [{}])[0] or {}
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return None
+        rotation = 0.0
+        for side_data in stream.get("side_data_list") or []:
+            with suppress(Exception):
+                rotation = float(side_data.get("rotation"))
+        if not rotation:
+            with suppress(Exception):
+                rotation = float((stream.get("tags") or {}).get("rotate") or 0.0)
+        if int(round(abs(rotation))) % 180 == 90:
+            width, height = height, width
+        return width, height
+    except Exception:
+        return None
+
+
+class _FFmpegFrameReader:
+    """
+    cv2.VideoCapture-compatible BGR24 reader that decodes with the system ffmpeg.
+
+    Its decoded inventory comes from the same libavcodec build that ffprobe used to count
+    the merge plan, so it cannot disagree with that count the way OpenCV's bundled FFmpeg
+    can. Used as the second attempt of every frame-stream merge.
+    """
+
+    def __init__(self, path: Path, scale_to: Optional[Tuple[int, int]] = None):
+        self._proc: Optional[subprocess.Popen] = None
+        decoded = _probe_video_display_size(Path(path))
+        size = tuple(scale_to) if scale_to else decoded
+        if not size:
+            return
+        width, height = int(size[0]), int(size[1])
+        self._shape = (height, width, 3)
+        self._frame_bytes = width * height * 3
+        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", "0:v:0"]
+        if decoded != (width, height):
+            cmd += ["-vf", f"scale={width}:{height}:flags=bicubic"]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        with suppress(Exception):
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def isOpened(self) -> bool:
+        return self._proc is not None and self._proc.stdout is not None
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if not self.isOpened():
+            return False, None
+        data = self._proc.stdout.read(self._frame_bytes)  # type: ignore[union-attr]
+        if not data or len(data) < self._frame_bytes:
+            return False, None
+        return True, np.frombuffer(data, dtype=np.uint8).reshape(self._shape)
+
+    def release(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        with suppress(Exception):
+            if proc.stdout:
+                proc.stdout.close()
+        with suppress(Exception):
+            if proc.poll() is None:
+                proc.kill()
+        with suppress(Exception):
+            proc.wait(timeout=5)
+
+
+FRAME_DECODERS = ("opencv", "ffmpeg")
+
+
+def _open_frame_reader(path: Path, decoder: str, scale_to: Optional[Tuple[int, int]] = None) -> Any:
+    """Open a sequential BGR frame reader (OpenCV first; ffmpeg as the independent retry)."""
+    if decoder == "ffmpeg":
+        return _FFmpegFrameReader(Path(path), scale_to=scale_to)
+    return _cv2_capture(Path(path))
 
 
 def _parse_fraction_to_float(value: Any) -> Optional[float]:
@@ -2324,7 +2553,11 @@ def concat_videos(
     if on_progress:
         on_progress(f"Concatenating {len(stable_chunks)} chunk(s) (video-only merge)...\n")
 
+    # Which check rejected the last candidate; logged so a report names the real cause.
+    validation_issue = ["output missing"]
+
     def _candidate_is_exact(path: Path, *, emit: bool = True) -> bool:
+        validation_issue[0] = "output missing"
         if not (path.exists() and path.stat().st_size > 1024):
             return False
         actual_now = _probe_video_stream_duration(path)
@@ -2340,23 +2573,31 @@ def concat_videos(
                 f"video_start={float(start_time) if start_time is not None else 'unknown'}.\n"
             )
         if expected_frame_count is not None and actual_frames != expected_frame_count:
+            validation_issue[0] = f"frame count {actual_frames or 'unknown'} instead of {expected_frame_count}"
             return False
         if expected_duration and expected_duration > 0:
             if actual_now is None or actual_now <= 0:
+                validation_issue[0] = "video duration is unavailable"
                 return False
             frame_tol = (1.25 / float(merge_fps_val)) if merge_fps_val and merge_fps_val > 0 else 0.05
             if abs(float(actual_now) - float(expected_duration)) > max(0.02, frame_tol):
+                validation_issue[0] = (
+                    f"duration {float(actual_now):.3f}s instead of {float(expected_duration):.3f}s"
+                )
                 return False
         if merge_fps_val and merge_fps_val > 0:
             out_r, out_avg = _probe_frame_rates(path)
             out_fps = out_r or out_avg
             if out_fps and abs(float(out_fps) - float(merge_fps_val)) > max(1e-6, 1e-4 * float(merge_fps_val)):
+                validation_issue[0] = f"frame rate {float(out_fps):.6f} instead of {float(merge_fps_val):.6f}"
                 return False
         # A positive first video PTS is the B-frame-delay regression fixed in V8.2. It
         # produces a constant audio lead and used to be accepted because duration/frame
         # count alone still looked correct. Final app outputs always start at timeline 0.
         if start_time is not None and abs(float(start_time)) > 0.001:
+            validation_issue[0] = f"video starts at {float(start_time):.6f}s instead of 0"
             return False
+        validation_issue[0] = ""
         return True
 
     def _validate_or_fix_duration(path: Path, min_ratio: float = 0.90) -> bool:
@@ -2366,12 +2607,9 @@ def concat_videos(
         if not (path.exists() and path.stat().st_size > 1024):
             return False
 
-        actual_before = _probe_video_stream_duration(path)
         if on_progress:
             on_progress(
-                "WARN: Merge duration drift detected "
-                f"(expected~{float(expected_duration or 0.0):.3f}s, "
-                f"actual={float(actual_before or 0.0):.3f}s). "
+                f"WARN: Merge validation failed ({validation_issue[0]}). "
                 "Attempting timestamp remux fix.\n"
             )
 
@@ -2401,10 +2639,7 @@ def concat_videos(
                 return False
 
         if on_progress:
-            on_progress(
-                "WARN: Timestamp remux did not fix duration drift "
-                f"(new duration={float(actual_after or 0.0):.3f}s).\n"
-            )
+            on_progress(f"WARN: Timestamp remux did not fix the merge ({validation_issue[0]}).\n")
         with suppress(Exception):
             tmp_fixed.unlink(missing_ok=True)
         return False
@@ -2435,12 +2670,12 @@ def concat_videos(
         )
         return video_encode_args, fps_str
 
-    def _try_framepipe_reencode_concat(reason: str) -> bool:
+    def _try_framepipe_reencode_concat(reason: str, decoder: str = "opencv") -> bool:
         video_encode_args, fps_str = _build_fallback_encode_args()
         if on_progress:
             on_progress(
                 "WARN: Falling back to frame-stream concat re-encode "
-                f"(reason: {reason}; target_fps={fps_str}).\n"
+                f"(reason: {reason}; target_fps={fps_str}; decoder={decoder}).\n"
             )
 
         output_path.unlink(missing_ok=True)
@@ -2449,7 +2684,7 @@ def concat_videos(
         width = 0
         height = 0
         for chunk_path in stable_chunks:
-            cap = cv2.VideoCapture(str(chunk_path))
+            cap = _open_frame_reader(chunk_path, decoder)
             if not cap.isOpened():
                 cap.release()
                 continue
@@ -2523,7 +2758,7 @@ def concat_videos(
             drain_thread.start()
 
             for chunk_i, chunk_path in enumerate(stable_chunks):
-                cap = cv2.VideoCapture(str(chunk_path))
+                cap = _open_frame_reader(chunk_path, decoder, scale_to=(int(width), int(height)))
                 if not cap.isOpened():
                     cap.release()
                     raise RuntimeError(f"could not open required chunk: {chunk_path.name}")
@@ -2557,7 +2792,7 @@ def concat_videos(
                 if on_progress:
                     on_progress(
                         f"Concatenated {len(stable_chunks)} chunk(s) via frame-stream fallback "
-                        f"(frames={frames_written}).\n"
+                        f"(frames={frames_written}, decoder={decoder}).\n"
                     )
                 return True
 
@@ -2776,13 +3011,13 @@ def concat_videos(
     # through the frame-stream path instead. When signatures agree (for example, only the
     # backend FPS is wrong), prefer the native ffmpeg path.
     fallback_reason = stream_copy_reason or "stream-copy merge failed"
-    if stream_signatures_compatible:
-        if _try_demuxer_reencode_concat(fallback_reason):
-            return _finish_merge(True)
-        if _try_framepipe_reencode_concat(fallback_reason):
-            return _finish_merge(True)
-    elif _try_framepipe_reencode_concat(fallback_reason):
+    if stream_signatures_compatible and _try_demuxer_reencode_concat(fallback_reason):
         return _finish_merge(True)
+    # Each chunk is reopened on its own, first with OpenCV and then with the system ffmpeg
+    # decoder (the build that counted the frames), so one decoder's quirk cannot fail the run.
+    for decoder in FRAME_DECODERS:
+        if _try_framepipe_reencode_concat(fallback_reason, decoder):
+            return _finish_merge(True)
 
     # Avoid leaving a broken file with the final output name.
     with suppress(Exception):
@@ -2853,7 +3088,7 @@ def _concat_videos_with_blending_legacy(
                     on_progress(f"Loading chunk {i+1}/{len(chunk_paths)}...\n")
                 
                 # Read chunk frames
-                cap = cv2.VideoCapture(str(chunk_path))
+                cap = _cv2_capture(Path(chunk_path))
                 if not cap.isOpened():
                     if on_progress:
                         on_progress(f"⚠️ Failed to open chunk {chunk_path}, skipping\n")
@@ -3047,12 +3282,50 @@ def concat_videos_with_blending(
             nominal_fps=nominal_fps,
         )
 
+    if on_progress:
+        on_progress("Concatenating chunks with frame-exact overlap blending...\n")
+    for decoder in FRAME_DECODERS:
+        try:
+            _blend_concat_once(
+                chunk_paths,
+                output_path,
+                overlaps,
+                fps,
+                encode_settings,
+                on_progress,
+                nominal_fps,
+                decoder,
+            )
+            return True
+        except Exception as exc:
+            with suppress(Exception):
+                output_path.unlink(missing_ok=True)
+            if on_progress:
+                if decoder != FRAME_DECODERS[-1]:
+                    on_progress(
+                        f"WARN: Frame-exact overlap blending failed with the {decoder} decoder ({exc}); "
+                        "retrying with the ffmpeg decoder.\n"
+                    )
+                else:
+                    on_progress(f"ERROR: Frame-exact overlap blending failed: {exc}\n")
+    # Never silently append overlapping frames; that duplicates content and causes drift.
+    return False
+
+
+def _blend_concat_once(
+    chunk_paths: List[Path],
+    output_path: Path,
+    overlaps: List[int],
+    fps: Optional[float],
+    encode_settings: Optional[Dict[str, Any]],
+    on_progress: Optional[Callable[[str], None]],
+    nominal_fps: Optional[str],
+    decoder: str,
+) -> None:
+    """One complete frame-exact overlap merge using `decoder`; raises on any failure."""
     proc: Optional[subprocess.Popen] = None
     drain_thread: Optional[threading.Thread] = None
     try:
-        if on_progress:
-            on_progress("Concatenating chunks with frame-exact overlap blending...\n")
-
         frame_counts = [_probe_chunk_nb_frames(Path(p)) for p in chunk_paths]
         if any(n is None or int(n) <= 0 for n in frame_counts):
             raise RuntimeError("could not count every overlap input chunk")
@@ -3085,7 +3358,7 @@ def concat_videos_with_blending(
             for i, chunk_path in enumerate(chunk_paths):
                 if on_progress:
                     on_progress(f"Blending chunk {i + 1}/{len(chunk_paths)}...\n")
-                cap = cv2.VideoCapture(str(chunk_path))
+                cap = _open_frame_reader(Path(chunk_path), decoder)
                 if not cap.isOpened():
                     cap.release()
                     raise RuntimeError(f"could not open required chunk: {Path(chunk_path).name}")
@@ -3246,16 +3519,9 @@ def concat_videos_with_blending(
             shutil.move(str(temp_output), str(output_path))
             if on_progress:
                 on_progress(
-                    f"Blended video saved: {expected_frames} frames at {fps_str} fps -> {output_path}\n"
+                    f"Blended video saved: {expected_frames} frames at {fps_str} fps "
+                    f"(decoder={decoder}) -> {output_path}\n"
                 )
-            return True
-    except Exception as exc:
-        with suppress(Exception):
-            output_path.unlink(missing_ok=True)
-        if on_progress:
-            on_progress(f"ERROR: Frame-exact overlap blending failed: {exc}\n")
-        # Never silently append overlapping frames; that duplicates content and causes drift.
-        return False
     finally:
         if proc is not None and proc.poll() is None:
             with suppress(Exception):
@@ -3263,6 +3529,8 @@ def concat_videos_with_blending(
                     proc.stdin.close()
             with suppress(Exception):
                 proc.kill()
+            with suppress(Exception):
+                proc.wait(timeout=5)
         if drain_thread is not None and drain_thread.is_alive():
             drain_thread.join(timeout=1.0)
         if proc is not None:
@@ -3734,10 +4002,24 @@ def chunk_and_process(
         # real source frame between adjacent chunks so each boundary is represented
         # in both model outputs and can be removed exactly once during merge.
         if model_key_for_fps == "rife" and len(scenes) > 1:
-            try:
-                input_fps_for_rife = float(get_media_fps(input_path) or 0.0)
-            except Exception:
-                input_fps_for_rife = 0.0
+            # Use split_video's own frame grid (r_frame_rate for CFR, average rate for VFR):
+            # a shorter step can round to a zero-frame overlap at the snapped boundary.
+            input_fps_for_rife = 0.0
+            r_rate, avg_rate = _probe_frame_rates(Path(input_path))
+            if r_rate and avg_rate and abs(r_rate - avg_rate) <= max(1e-6, 0.002 * r_rate):
+                input_fps_for_rife = float(r_rate)
+            elif avg_rate:
+                input_fps_for_rife = float(avg_rate)
+            if input_fps_for_rife <= 0:
+                try:
+                    input_fps_for_rife = float(get_media_fps(input_path) or 0.0)
+                except Exception:
+                    input_fps_for_rife = 0.0
+            if input_fps_for_rife <= 0:
+                on_progress(
+                    "WARNING: RIFE chunk timing: the source frame rate could not be probed, so chunk "
+                    "boundaries cannot share a source frame.\n"
+                )
             if input_fps_for_rife > 0:
                 one_frame_sec = 1.0 / input_fps_for_rife
                 repaired_scenes: List[Tuple[float, float]] = [
@@ -4080,6 +4362,23 @@ def chunk_and_process(
             pass
         return None
 
+    def _input_chunk_frame_counts(count: int) -> Optional[List[int]]:
+        """Frame count of every split input chunk (manifest first: inputs may be cleaned up)."""
+        manifest = _load_split_manifest(input_chunks_dir)
+        entries = (manifest or {}).get("chunks") or []
+        if len(entries) == count:
+            values = [entry.get("expected_frames") for entry in entries]
+            if all(isinstance(value, int) and value > 0 for value in values):
+                return [int(value) for value in values]
+        counts: List[int] = []
+        for path in list(chunk_paths)[:count]:
+            p = Path(path)
+            frames = _count_frames_in_chunk(p) if p.is_dir() else (_probe_chunk_nb_frames(p) if p.is_file() else None)
+            if not frames or int(frames) <= 0:
+                return None
+            counts.append(int(frames))
+        return counts if len(counts) == count else None
+
     def _output_overlap_plan(paths: List[Path]) -> Any:
         """Map input overlap frames to the processed output timeline."""
         boundary_count = max(0, len(paths) - 1)
@@ -4112,17 +4411,41 @@ def chunk_and_process(
                 for frames in base_overlaps
             ]
 
+            source_frames, _source_count_method = _probe_source_frame_count(Path(input_path))
+            processed_counts = [_probe_chunk_nb_frames(Path(path)) for path in paths]
+            counts_known = all(count is not None and int(count) > 0 for count in processed_counts)
+            desired_frames: Optional[int] = None
+            required_removal: Optional[int] = None
+            if source_frames and counts_known:
+                desired_frames = max(1, int(round((int(source_frames) - 1) * rate_scale)) + 1)
+                required_removal = int(sum(int(count) for count in processed_counts if count is not None)) - desired_frames
+
+            # At an integer multiplier RIFE writes exactly q*(n-1)+1 frames for n input
+            # frames, and a chunk can only lose frames from its tail, i.e. from the
+            # duplicated boundary region itself. Comparing every chunk with its own input
+            # removes exactly the duplicates each boundary still has.
+            plan_method = "global"
+            q_int = int(round(rate_scale))
+            if counts_known and q_int >= 1 and abs(rate_scale - q_int) <= 1e-6:
+                input_counts = _input_chunk_frame_counts(len(paths))
+                if input_counts:
+                    exact_plan: List[int] = []
+                    for index in range(boundary_count):
+                        deficit = (q_int * (int(input_counts[index]) - 1) + 1) - int(processed_counts[index] or 0)
+                        if deficit < 0:
+                            exact_plan = []
+                            break
+                        cap = min(int(processed_counts[index] or 0), int(processed_counts[index + 1] or 0))
+                        exact_plan.append(max(0, min(cap, int(base_overlaps[index]) - deficit)))
+                    if len(exact_plan) == boundary_count:
+                        base_overlaps = exact_plan
+                        plan_method = "per-chunk"
+
             # A non-integer target FPS is rounded independently inside every RIFE
             # subprocess. Those local rounding decisions do not always add up to the
             # one global q*(N-1)+1 timeline. Adjust only the duplicated boundary region
             # so the merged inventory matches a single whole-video interpolation.
-            source_frames, _source_count_method = _probe_source_frame_count(Path(input_path))
-            processed_counts = [_probe_chunk_nb_frames(Path(path)) for path in paths]
-            desired_frames: Optional[int] = None
-            required_removal: Optional[int] = None
-            if source_frames and all(count is not None and int(count) > 0 for count in processed_counts):
-                desired_frames = max(1, int(round((int(source_frames) - 1) * rate_scale)) + 1)
-                required_removal = int(sum(int(count) for count in processed_counts if count is not None)) - desired_frames
+            if plan_method == "global" and required_removal is not None:
                 if required_removal >= 0:
                     current_removal = int(sum(base_overlaps))
                     if current_removal > required_removal:
@@ -4163,7 +4486,7 @@ def chunk_and_process(
             _emit_diag(
                 "RIFE merge overlap plan: "
                 f"input={input_overlap_plan}, output={base_overlaps}, rate_scale={rate_scale:.6f}, "
-                f"desired_frames={desired_frames or 'unknown'}, "
+                f"method={plan_method}, desired_frames={desired_frames or 'unknown'}, "
                 f"required_boundary_removal={required_removal if required_removal is not None else 'unknown'}.\n"
             )
 
@@ -4416,13 +4739,13 @@ def chunk_and_process(
                     timeout=20,
                 )
                 if proc.returncode == 0:
-                    raw = (proc.stdout or "").strip()
+                    raw = first_ffprobe_value(proc.stdout)
                     if raw.isdigit():
                         val = int(raw)
                         if val > 0:
                             return val
             try:
-                cap = cv2.VideoCapture(str(p))
+                cap = _cv2_capture(p)
                 if cap.isOpened():
                     val = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
                     cap.release()
@@ -4811,6 +5134,10 @@ def chunk_and_process(
                 user_fps_override = 0.0
             if user_fps_override <= 0:
                 chunk_settings["fps"] = float(source_fps_float)
+        # The chunk's own audio is re-muxed right after the model (never shortening the
+        # video), so RIFE renders video-only chunks and skips its own audio step entirely.
+        if model_type == "rife" and output_format != "png":
+            chunk_settings["no_audio"] = True
         # Direct per-chunk outputs to the run folder (processed_chunks/).
         if output_format == "png":
             chunk_settings["output_override"] = str(processed_chunks_dir / f"{chunk.stem}_upscaled")

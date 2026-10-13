@@ -2406,6 +2406,19 @@ class Runner:
             settings,
             on_progress=on_progress,
         )
+        # RIFE's own audio transfer muxes with `-c copy -shortest`: whenever the source audio
+        # ends before the video it truncates the interpolated video, which surfaces much later
+        # as a short chunk and a failed merge timeline. Always render video-only and mux the
+        # source audio below with the app's muxer, which never shortens the video.
+        audio_pref = str(settings.get("audio_codec") or "copy").strip().lower()
+        mux_source_audio = bool(
+            not cli_png_output
+            and not settings.get("no_audio")
+            and audio_pref not in {"none", "no", "off", "disable", "disabled"}
+            and detect_input_type(effective_input) == "video"
+        )
+        if not cli_png_output and "--no-audio" not in cmd:
+            cmd.append("--no-audio")
 
         compat_wrapper = self.base_dir / "tools" / "rife_inference_wrapper.py"
         if self._active_mode == "subprocess":
@@ -2470,6 +2483,8 @@ class Runner:
                     except Exception:
                         pass
                     output_path = str(packaged_path)
+            if rc == 0 and mux_source_audio:
+                output_path = self._mux_rife_source_audio(output_path, effective_input, settings, on_progress)
             meta_payload = {
                 "returncode": rc,
                 "output": output_path,
@@ -2660,6 +2675,8 @@ class Runner:
         ):
             adjusted = ffmpeg_set_fps(Path(output_path), settings["fps_override"])
             output_path = str(adjusted)
+        if returncode_val == 0 and mux_source_audio:
+            output_path = self._mux_rife_source_audio(output_path, effective_input, settings, on_progress)
         execution_time = time.time() - start_time
         
         meta_payload = {
@@ -2819,6 +2836,38 @@ class Runner:
 
         prefix, digits = match.groups()
         return f"{prefix}%0{len(digits)}d{first.suffix.lower()}", int(digits)
+
+    @staticmethod
+    def _mux_rife_source_audio(
+        video_path: str,
+        audio_source: str,
+        settings: Dict[str, Any],
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Add the source audio to a video-only RIFE output without touching its frames."""
+        out = Path(str(video_path or ""))
+        if not out.is_file():
+            return str(video_path)
+        try:
+            from .audio_utils import ensure_audio_on_video
+
+            _changed, final_path, err = ensure_audio_on_video(
+                video_path=out,
+                audio_source_path=Path(str(audio_source)),
+                audio_codec=str(settings.get("audio_codec") or "copy"),
+                audio_bitrate=str(settings.get("audio_bitrate")) if settings.get("audio_bitrate") else None,
+                force_replace=True,
+                on_progress=on_progress,
+            )
+            if err and on_progress:
+                on_progress(f"WARNING: RIFE audio mux skipped: {err}\n")
+            if final_path and Path(final_path).is_file():
+                return str(final_path)
+        except Exception as exc:
+            # Audio must never fail an otherwise finished interpolation.
+            if on_progress:
+                on_progress(f"WARNING: RIFE audio mux skipped: {exc}\n")
+        return str(video_path)
 
     def _package_rife_sequence_to_video(
         self,
@@ -3079,13 +3128,43 @@ class Runner:
                 multi_val = int(multi_raw)
         except Exception:
             multi_val = 2
+        try:
+            exp_val = int(settings.get("exp") or 1)
+        except Exception:
+            exp_val = 1
+        if exp_val != 1:
+            multi_val = 2 ** max(0, exp_val)  # inference_video.py lets --exp override --multi
+
+        # RIFE can only lower its interpolated rate to a target FPS; a target above
+        # input_fps * multiplier silently stays at the multiplier's rate. Interpolate to the
+        # next power of two that reaches the target and let RIFE resample down to it.
+        try:
+            target_fps = float(settings.get("fps_override") or 0.0)
+        except Exception:
+            target_fps = 0.0
+        if target_fps > 0 and not settings.get("img_mode"):
+            try:
+                input_fps = float(get_media_fps(input_path) or 0.0)
+            except Exception:
+                input_fps = 0.0
+            if input_fps > 0 and input_fps * max(1, multi_val) < target_fps - 1e-6:
+                needed = 2
+                while input_fps * needed < target_fps - 1e-6 and needed < 64:
+                    needed *= 2
+                if on_progress:
+                    on_progress(
+                        f"RIFE: target {target_fps:g} fps needs x{needed} interpolation from "
+                        f"{input_fps:.3f} fps; using x{needed} instead of x{multi_val}.\n"
+                    )
+                multi_val = needed
+                exp_val = 1
 
         if multi_val > 1 and multi_val != 2:
             cmd.extend(["--multi", str(int(multi_val))])
-        if settings.get("fps_override") and settings["fps_override"] > 0:
+        if target_fps > 0:
             cmd.extend(["--fps", str(settings["fps_override"])])
-        if settings.get("exp") and settings["exp"] != 1:
-            cmd.extend(["--exp", str(settings["exp"])])
+        if exp_val != 1:
+            cmd.extend(["--exp", str(exp_val)])
 
         # Output options
         if settings.get("png_output"):

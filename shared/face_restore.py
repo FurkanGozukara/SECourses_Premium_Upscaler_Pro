@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .image_io import imwrite, load_image_bgr8
+from .path_utils import first_ffprobe_value
 
 
 # Check available face restoration backends
@@ -225,7 +226,7 @@ def restore_video(
             video_path
         ]
         fps_result = subprocess.run(fps_cmd, capture_output=True, text=True)
-        fps_str = fps_result.stdout.strip()
+        fps_str = first_ffprobe_value(fps_result.stdout)
         
         # Parse FPS (format: "30/1" or "30000/1001")
         if "/" in fps_str:

@@ -126,6 +126,21 @@ def detect_input_type(path: str) -> str:
     return "unknown"
 
 
+def first_ffprobe_value(stdout: Any) -> str:
+    """
+    First non-empty value of flat ffprobe output (``default=...:nokey=1`` or ``csv=p=0``).
+
+    MPEG-TS/M2TS/MTS files list every stream a second time inside their PROGRAM section,
+    so a single-stream query prints the same value twice ("24/1\\n24/1"). Parsing the
+    whole output as one value fails and silently disables every FPS/duration-based step.
+    """
+    for raw in str(stdout or "").splitlines():
+        value = raw.strip().strip(",").strip()
+        if value:
+            return value
+    return ""
+
+
 def get_media_dimensions(path: str) -> Optional[Tuple[int, int]]:
     """
     Return (width, height) for an image or video using ffprobe first, Pillow fallback.
@@ -160,10 +175,10 @@ def get_media_dimensions(path: str) -> Optional[Tuple[int, int]]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=20,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            parts = proc.stdout.strip().split(",")
+            parts = first_ffprobe_value(proc.stdout).split(",")
             if len(parts) >= 2:
                 return int(parts[0]), int(parts[1])
     except Exception:
@@ -196,10 +211,10 @@ def get_media_duration_seconds(path: str) -> Optional[float]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=20,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            return float(proc.stdout.strip())
+            return float(first_ffprobe_value(proc.stdout))
     except Exception:
         return None
     return None
@@ -223,12 +238,12 @@ def get_media_fps(path: str) -> Optional[float]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=20,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            rate = proc.stdout.strip()
+            rate = first_ffprobe_value(proc.stdout)
             if "/" in rate:
-                num, den = rate.split("/")
+                num, den = rate.split("/", 1)
                 return float(num) / float(den)
             return float(rate)
     except Exception:

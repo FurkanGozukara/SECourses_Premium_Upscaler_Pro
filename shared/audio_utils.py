@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+from .path_utils import first_ffprobe_value
+
 
 def _emit_log(message: str, on_progress: Optional[Callable[[str], None]] = None) -> None:
     line = str(message)
@@ -207,7 +209,7 @@ def _probe_decodable_video_packets(path: Path) -> Optional[int]:
             text=True,
             timeout=1800,
         )
-        raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        raw = first_ffprobe_value(proc.stdout) if proc.returncode == 0 else ""
         if raw.isdigit() and int(raw) > 0:
             return int(raw)
     except Exception:
@@ -661,7 +663,7 @@ def replace_audio_from_original(
                 timeout=15,
             )
             if proc.returncode == 0:
-                raw = (proc.stdout or "").strip()
+                raw = first_ffprobe_value(proc.stdout)
                 if raw:
                     v = float(raw)
                     if v > 0:

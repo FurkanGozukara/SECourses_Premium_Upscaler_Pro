@@ -31,6 +31,63 @@ from comfy.quant_ops import QuantizedTensor
 
 log = logging.getLogger("ltx25.loader")
 
+GIB = 1024 ** 3
+_VRAM_CAP: Dict[str, float] = {"bytes": 0.0, "save": 0.0}
+
+
+def device_free_bytes(device: torch.device) -> int:
+    """Free VRAM that other processes cannot take from us.
+
+    On Windows (WDDM) cudaMemGetInfo does not see memory other processes hold, so a shared GPU
+    looks empty; nvidia-smi reports the device-wide figure, so the smaller of the two is used."""
+    free = int(mm.get_free_memory(device))
+    if getattr(device, "type", "cuda") != "cuda" or not torch.cuda.is_available():
+        return free
+    try:
+        import os
+        import subprocess
+
+        uuid = str(torch.cuda.get_device_properties(device).uuid)
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        ).stdout
+        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        for line in out.splitlines():
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) == 2 and parts[0].endswith(uuid):
+                free = min(free, int(float(parts[1])) * 1024 * 1024 + max(0, cached))
+    except Exception:
+        pass
+    return free
+
+
+def apply_vram_cap(device: torch.device, save_gb: float, emit: Optional[Callable[[str], None]] = None) -> int:
+    """Cap this process at (free VRAM now - Save VRAM): past it PyTorch raises an out-of-memory
+    error instead of the Windows driver spilling into shared GPU memory (about 20x slower)."""
+    if getattr(device, "type", "cuda") != "cuda" or not torch.cuda.is_available():
+        return 0
+    torch.empty(1, device=device)  # the CUDA context exists before the free figure is read
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    save = max(0.0, float(save_gb)) * GIB
+    cap = int(torch.cuda.memory_reserved(device) + device_free_bytes(device) - save)
+    cap = max(int(1 * GIB), min(cap, total))
+    torch.cuda.set_per_process_memory_fraction(min(1.0, cap / total), device)
+    _VRAM_CAP.update(bytes=float(cap), save=save)
+    if emit:
+        emit(f"VRAM limit: {cap / GIB:.1f} GB of {total / GIB:.1f} GB (Save VRAM {float(save_gb):g} GB kept free); "
+             "weights that do not fit stream from RAM instead of spilling into shared GPU memory")
+    return cap
+
+
+def budget_free_bytes(device: torch.device) -> int:
+    """Free VRAM for planning, never above what the cap still allows this process."""
+    free = device_free_bytes(device)
+    if _VRAM_CAP["bytes"]:
+        free = min(free, int(_VRAM_CAP["bytes"]) - torch.cuda.memory_allocated(device) + int(_VRAM_CAP["save"]))
+    return max(0, int(free))
+
 # Keys in the embedded transformer config that are not LTXAVModel kwargs.
 _NON_MODEL_CONFIG_KEYS = {"image_model", "_class_name", "_diffusers_version", "scheduler"}
 
@@ -243,13 +300,7 @@ def place_transformer(
     """
     emit = on_progress or (lambda s: None)
 
-    def module_bytes(module: nn.Module) -> int:
-        total = 0
-        for p in module.parameters(recurse=True):
-            total += p.numel() * p.element_size()
-        for b in module.buffers(recurse=True):
-            total += b.numel() * b.element_size()
-        return total
+    module_bytes = _module_bytes
 
     blocks = list(model.transformer_blocks)
     non_block_bytes = module_bytes(model) - sum(module_bytes(b) for b in blocks)
@@ -279,23 +330,47 @@ def place_transformer(
         for module in block.modules():
             if hasattr(module, "comfy_cast_weights"):
                 module.comfy_cast_weights = True
+    sizes = (f" [free {free_vram_bytes / 1024 ** 3:.1f} GB, activations reserved {activation_budget_bytes / 1024 ** 3:.1f} GB, "
+             f"non-block weights {non_block_bytes / 1024 ** 3:.2f} GB, block {module_bytes(blocks[0]) / 1024 ** 3:.3f} GB]")
     if resident < len(blocks):
         # Pin the CPU-resident tail for faster async streaming when allowed.
         emit(
             f"VRAM placement: {resident}/{len(blocks)} transformer blocks resident on GPU, "
-            f"{len(blocks) - resident} streamed from RAM per step (ComfyUI-style offload)"
+            f"{len(blocks) - resident} streamed from RAM per step (ComfyUI-style offload)" + sizes
         )
     else:
-        emit(f"VRAM placement: full model resident on GPU ({len(blocks)} blocks)")
+        emit(f"VRAM placement: full model resident on GPU ({len(blocks)} blocks)" + sizes)
     return resident, len(blocks)
 
 
 def transformer_weight_bytes(model: nn.Module) -> int:
+    return _module_bytes(model)
+
+
+def _tensor_bytes(t: torch.Tensor) -> int:
+    """Bytes the tensor occupies on its device. A QuantizedTensor reports its original (bf16) dtype,
+    which counted INT8 blocks at twice their size (0.72 instead of 0.37 GB) and kept half of the
+    blocks that fit in RAM; its real storage is the quantized data plus the scale tensors."""
+    if isinstance(t, QuantizedTensor):
+        total = int(t._qdata.nbytes)
+        params = getattr(t, "_params", None)
+        fields = vars(params).values() if hasattr(params, "__dict__") else (
+            getattr(params, name) for name in getattr(params, "__dataclass_fields__", {}))
+        return total + sum(int(v.nbytes) for v in fields if torch.is_tensor(v))
+    return t.numel() * t.element_size()
+
+
+def _logical_bytes(module: nn.Module) -> int:
+    """Size once dequantized (a QuantizedTensor reports its original dtype), e.g. a streamed layer's cast copy."""
+    return sum(t.numel() * t.element_size() for t in list(module.parameters()) + list(module.buffers()))
+
+
+def _module_bytes(module: nn.Module) -> int:
     total = 0
-    for p in model.parameters():
-        total += p.numel() * p.element_size()
-    for b in model.buffers():
-        total += b.numel() * b.element_size()
+    for p in module.parameters(recurse=True):
+        total += _tensor_bytes(p)
+    for b in module.buffers(recurse=True):
+        total += _tensor_bytes(b)
     return total
 
 
@@ -346,9 +421,43 @@ class Ltx25TextEncoder:
         # extra == {"unprocessed_ltxav_embeds": True}; connectors run in the DiT.
         return out
 
-    def to_gpu(self):
-        self.model.gemma3_12b.transformer.to(self.device)
+    def to_gpu(self, budget_bytes: Optional[int] = None, emit: Optional[Callable[[str], None]] = None):
+        """Move the encoder to the GPU; with a budget, keep only the decoder layers that fit and
+        stream the rest from RAM per call (comfy cast ops), so a small Save VRAM budget never
+        pushes the 12B encoder into shared GPU memory."""
+        transformer = self.model.gemma3_12b.transformer
         self.model.text_embedding_projection.to(self.device)
+        layers = None
+        for module in transformer.modules():
+            if isinstance(module, nn.ModuleList) and (layers is None or len(module) > len(layers)):
+                layers = module
+        if budget_bytes is None or layers is None:
+            transformer.to(self.device)
+            return
+        layer_ids = {id(layer) for layer in layers}
+        # The encoder is budgeted at its dequantized (bf16) size: streamed INT8 layers are cast to bf16 on
+        # the GPU, and counting the real INT8 size kept so many layers resident that 9-10 GB budgets failed
+        # in the forward (the transformer, which reserves its cast buffers explicitly, uses real sizes).
+        used = _logical_bytes(self.model.text_embedding_projection)
+        for name, child in transformer.named_children():
+            if child is layers:
+                continue
+            if not any(id(m) in layer_ids for m in child.modules()):
+                child.to(self.device)
+                used += _logical_bytes(child)
+        sizes = [_logical_bytes(layer) for layer in layers]
+        resident = 0
+        for layer, size in zip(layers, sizes):
+            if used + size <= budget_bytes:
+                layer.to(self.device)
+                used += size
+                resident += 1
+            else:
+                for module in layer.modules():
+                    if hasattr(module, "comfy_cast_weights"):
+                        module.comfy_cast_weights = True
+        if emit and resident < len(layers):
+            emit(f"Text encoder: {resident}/{len(layers)} layers on the GPU, the rest stream from RAM (Save VRAM budget)")
 
     def unload(self):
         self.model.gemma3_12b.transformer.to("cpu")

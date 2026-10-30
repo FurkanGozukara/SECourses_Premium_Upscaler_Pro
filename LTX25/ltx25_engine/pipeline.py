@@ -86,11 +86,16 @@ class Ltx25Settings:
 
     # VRAM
     reserve_vram_gb: float = 1.0
-    bytes_per_token: float = 1_400_000.0
+    bytes_per_token: float = planner_mod.BYTES_PER_TOKEN
 
     dev_max_shift: float = 2.05
     dev_base_shift: float = 0.95
     dev_terminal: float = 0.1
+
+
+# Fixed VRAM next to the resident blocks during sampling/VAE: two streaming cast buffers (2 x 0.72 GB
+# blocks) and the tiled VAE working set (measured 2026-10-30, RTX 5090; benchmarks/vram/ltx25.jsonl).
+ACTIVATION_BASE_BYTES = planner_mod.ACTIVATION_BASE_BYTES
 
 
 @dataclass
@@ -124,7 +129,9 @@ class Ltx25Pipeline:
         te = loader_mod.Ltx25TextEncoder(
             s.text_encoder_path, self.device, self.dtype, on_progress=self.progress.line
         )
-        te.to_gpu()
+        # Leave room for the prompt's activations (about 2 GB for the 12B encoder) under Save VRAM.
+        te_budget = loader_mod.budget_free_bytes(self.device) - int((float(s.reserve_vram_gb) + 2.0) * (1024 ** 3))
+        te.to_gpu(budget_bytes=max(0, te_budget), emit=self.progress.line)
         raw_pos = te.encode(s.positive_prompt or "")
         raw_neg = None
         if float(s.cfg) != 1.0:
@@ -151,8 +158,10 @@ class Ltx25Pipeline:
 
         # Activation budget: total sequence = video*1.25 + text + audio slack.
         seq_tokens = plan.effective_tokens * 1.25 + 2048
-        activation_budget = int(seq_tokens * float(s.bytes_per_token))
-        free_vram = mm.get_free_memory(self.device)
+        # + a fixed part for the two streaming cast buffers and the tiled VAE that runs beside the blocks.
+        activation_budget = int(ACTIVATION_BASE_BYTES
+                                + seq_tokens * float(s.bytes_per_token) * planner_mod.ACTIVATION_SAFETY)
+        free_vram = loader_mod.budget_free_bytes(self.device)
         loader_mod.place_transformer(
             model,
             self.device,
@@ -246,6 +255,9 @@ class Ltx25Pipeline:
         total_start = time.time()
         cancel_check = cancel_check or (lambda: False)
 
+        # Save VRAM: never ask for more than (free now - Save VRAM); no shared GPU memory.
+        loader_mod.apply_vram_cap(self.device, float(s.reserve_vram_gb), emit=self.progress.line)
+
         frames_u8, src_fps, has_audio = read_video_frames(s.input_path)
         fps = float(s.fps_override) if float(s.fps_override or 0) > 0 else src_fps
         start_f = max(0, int(s.start_frame))
@@ -269,7 +281,7 @@ class Ltx25Pipeline:
         # --- plan chunks -------------------------------------------------
         if str(s.token_budget_mode).lower() == "auto":
             weight_bytes_hint = 0  # weights stream; activation budget dominates
-            free_vram = mm.get_free_memory(self.device)
+            free_vram = loader_mod.budget_free_bytes(self.device)
             budget, reason = planner_mod.auto_token_budget(
                 total_frames, width, height,
                 free_vram_bytes=int(free_vram),

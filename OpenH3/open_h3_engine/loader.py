@@ -23,6 +23,7 @@ shared GPU memory (about 20x slower), and the pipeline then streams more blocks
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -523,6 +524,7 @@ class H3VideoVAE:
     """MiniMax H3 video VAE (stock or Sol fast decoder), comfy.sd.VAE parity for this model."""
 
     def __init__(self, path: str, device: torch.device, emit: Emit = None):
+        self._emit = emit
         _emit(emit, f"Loading H3 video VAE: {path}")
         sd, metadata = comfy.utils.load_torch_file(str(path), safe_load=True, return_metadata=True)
         if "blocks.0.scale1" in sd:  # Sol-H3-VAE as released: decoder unprefixed, possibly merged with the encoder
@@ -578,7 +580,31 @@ class H3VideoVAE:
         self.model.to(self.device)
         buffer = torch.empty(self.model.decode_output_shape(tuple(latent.shape)), dtype=torch.float16,
                              device=mm.intermediate_device())
-        return self.model.decode(latent.to(self.device, self.dtype), output_buffer=buffer)
+        try:
+            return self.model.decode(latent.to(self.device, self.dtype), output_buffer=buffer)
+        except torch.OutOfMemoryError:
+            pass
+        # The whole-window decode did not fit the VRAM cap (a 4K window needs about 20.5 GB allocated,
+        # 24.6 GB reserved: benchmarks/vram/open_h3_decode.jsonl). Decode overlapping spatial tiles with
+        # the whole window's frames each and feather them together, like ComfyUI's tiled VAE decode.
+        gc.collect()
+        mm.soft_empty_cache()
+        frames_of = lambda t: self.model.decode_output_shape((1, 1, int(t), 1, 1))[2]  # noqa: E731
+        for tile in (96, 64, 48):
+            if tile >= max(latent.shape[-2:]):
+                continue
+            _emit(self._emit, f"H3 VAE decode did not fit the VRAM limit: decoding {tile * 16}px tiles")
+            try:
+                pixels = comfy.utils.tiled_scale_multidim(
+                    latent, lambda z: self.model.decode(z.to(self.device, self.dtype)),
+                    tile=(latent.shape[2], tile, tile), overlap=(0, 8, 8),
+                    upscale_amount=(frames_of, 16, 16), index_formulas=(frames_of, 16, 16),
+                    out_channels=self.model.decoder.out_channels, output_device=mm.intermediate_device())
+                return buffer.copy_(pixels)
+            except torch.OutOfMemoryError:
+                gc.collect()
+                mm.soft_empty_cache()
+        raise torch.OutOfMemoryError("H3 VAE decode does not fit even with 768px tiles")
 
     def offload(self) -> None:
         self.model.to("cpu")

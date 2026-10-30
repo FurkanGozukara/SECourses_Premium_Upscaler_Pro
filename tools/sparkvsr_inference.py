@@ -38,7 +38,7 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 from transformers import set_seed
 
-from diffusers import CogVideoXDPMScheduler, CogVideoXImageToVideoPipeline
+from diffusers import CogVideoXDPMScheduler, CogVideoXImageToVideoPipeline, CogVideoXTransformer3DModel
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 
 import decord  # isort:skip
@@ -759,6 +759,25 @@ def _ensure_model_path_ready(args: argparse.Namespace, started_at: float, *, sta
     return model_path
 
 
+def _weights_exceed_vram_limit(pipe, margin_gb: float = 2.0) -> bool:
+    """True when the loaded components alone would not fit the app's Save VRAM limit
+    (SECOURSES_VRAM_LIMIT_GB, set by the runner for this process tree)."""
+    try:
+        limit_gb = float(os.environ.get("SECOURSES_VRAM_LIMIT_GB") or 0.0)
+    except ValueError:
+        limit_gb = 0.0
+    if limit_gb <= 0:
+        return False
+    total = 0
+    for name in ("text_encoder", "transformer", "vae"):
+        module = getattr(pipe, name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            total += param.numel() * param.element_size()
+    return total / (1024 ** 3) > max(0.0, limit_gb - margin_gb)
+
+
 def load_sparkvsr_pipeline(
     args: argparse.Namespace,
     dtype: torch.dtype,
@@ -821,26 +840,37 @@ def load_sparkvsr_pipeline(
     if device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA requested but unavailable. Falling back to CPU.", flush=True)
         device = "cpu"
-    if args.is_cpu_offload and device != "cpu":
+    if device != "cpu" and str(stage_label).endswith("text") and _weights_exceed_vram_limit(pipe, margin_gb=2.0):
+        # Save VRAM limit is below the T5 text encoder (about 9.5 GB): stream it per module instead of
+        # failing at the cap (only runs when the prompt is not cached yet).
+        emit_progress(0.115, "memory", f"{stage_label}: text encoder larger than the VRAM limit - streaming it from RAM",
+                      started_at=started_at)
+        pipe.enable_sequential_cpu_offload(device=device)
+    elif args.group_offload and device != "cpu" and getattr(pipe, "transformer", None) is not None:
+        # Block-level group offload keeps only one group of transformer blocks on the GPU. It must own
+        # the transformer's placement: combined with model CPU offload (which moves the whole
+        # transformer to the GPU for its forward) it saved nothing (12.86 GB either way).
+        from diffusers.hooks import apply_group_offloading
+
+        emit_progress(0.115, "memory", f"{stage_label}: block group offload for the transformer", started_at=started_at)
+        for name in ("text_encoder", "vae"):
+            module = getattr(pipe, name, None)
+            if module is not None:
+                module.to(device)
+        apply_group_offloading(
+            pipe.transformer,
+            onload_device=torch.device(device),
+            offload_device=torch.device("cpu"),
+            offload_type="block_level",
+            num_blocks_per_group=max(1, int(args.num_blocks_per_group or 1)),
+        )
+        print(f"Group offload enabled: num_blocks_per_group={args.num_blocks_per_group}", flush=True)
+    elif args.is_cpu_offload and device != "cpu":
         emit_progress(0.115, "memory", f"{stage_label}: enabling CPU offload", started_at=started_at)
         pipe.enable_model_cpu_offload(device=device)
     else:
         emit_progress(0.115, "memory", f"{stage_label}: moving pipeline to {device}", started_at=started_at)
         pipe.to(device)
-
-    if args.group_offload and device != "cpu" and getattr(pipe, "transformer", None) is not None:
-        try:
-            from diffusers.hooks import apply_group_offloading
-
-            apply_group_offloading(
-                pipe.transformer,
-                onload_device=torch.device("cuda"),
-                offload_type="block_level",
-                num_blocks_per_group=max(1, int(args.num_blocks_per_group or 1)),
-            )
-            print(f"Group offload enabled: num_blocks_per_group={args.num_blocks_per_group}", flush=True)
-        except Exception as exc:
-            print(f"Group offload unavailable: {exc}", flush=True)
 
     if args.is_vae_st and getattr(pipe, "vae", None) is not None:
         emit_progress(0.12, "memory", f"{stage_label}: enabling VAE slicing/tiling", started_at=started_at)

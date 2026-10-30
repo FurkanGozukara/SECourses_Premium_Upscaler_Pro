@@ -38,8 +38,10 @@ from shared.universal_preset import dict_to_values
 from ui.media_preview import preview_updates
 from ui.shared_components import (
     autotune_modal_dismiss_js,
-    autotune_modal_reset_js,
+    autotune_vram_controls,
     warn_cancel_confirmation,
+    wire_auto_tune,
+    wire_auto_tune_on_run,
 )
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
@@ -477,20 +479,11 @@ def sparkvsr_tab(
                             info="Text conditioning for SparkVSR. Encodings are cached by prompt hash and reused.",
                         )
                     with gr.Column(scale=1, min_width=260):
-                        auto_tune_btn = gr.Button(
-                            "Auto Tune for Max Quality - VRAM Optimized",
-                            size="md",
-                            min_width=220,
-                            elem_classes=["action-btn", "action-btn-optimize", "SparkVSR-autotune-tall", "sec-btn-crimson"],
+                        auto_tune_btn, save_vram_gb, auto_tune_on_run = autotune_vram_controls(
+                            _value("save_vram_gb", None),
+                            _value("auto_tune_on_run", True),
                         )
                         with gr.Row():
-                            save_vram_gb = gr.Slider(
-                                label="Save VRAM (GB)",
-                                minimum=0.0,
-                                maximum=9.9,
-                                step=0.1,
-                                value=float(_value("save_vram_gb", 2.0) or 2.0),
-                            )
                             split_stage_subprocesses = gr.Checkbox(
                                 label="Stage Subprocess Isolation",
                                 value=bool(_value("split_stage_subprocesses", True)),
@@ -501,12 +494,12 @@ def sparkvsr_tab(
                             )
                 optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
                 gr.Markdown(
-                    (
-                        "**Auto Tune:** Runs a short SparkVSR probe clip, measures live GPU VRAM, and applies the highest-quality "
-                        "spatial tile / temporal chunk settings that keep the selected free-VRAM headroom. "
-                        "It begins at a 17-frame chunk with the smallest spatial tile, then grows in bounded steps. "
-                        "Only completed results matching the exact model, processed shape, selected GPU total VRAM, and reserve are reused."
-                    )
+                    "**Auto Tune (instant, no test runs):** reads your GPU's total and in-use VRAM, the input's size and "
+                    "length, the output size and the model, then sets the longest **Temporal Chunk Length** that fits "
+                    "(longer chunks = steadier video and fewer seams), **no spatial tiling** when the full frame fits "
+                    "(otherwise the largest tiles), and keeps model offloading only where it is needed for speed. "
+                    "It keeps `Save VRAM (GB)` free. Every run is capped at GPU total - in use - Save VRAM, so it "
+                    "never uses shared GPU memory."
                 )
 
                 with gr.Row():
@@ -515,7 +508,7 @@ def sparkvsr_tab(
                         minimum=0,
                         maximum=10000,
                         step=1,
-                        value=int(_value("chunk_len", 65) or 65),
+                        value=int(_value("chunk_len", 65) if _value("chunk_len", 65) not in (None, "") else 65),
                         info=(
                             "Default 65. 0 = process all frames at once. Use shorter chunks for long clips or limited VRAM."
                         ),
@@ -525,7 +518,7 @@ def sparkvsr_tab(
                         minimum=0,
                         maximum=128,
                         step=1,
-                        value=int(_value("overlap_t", 8) or 8),
+                        value=int(_value("overlap_t", 8) if _value("overlap_t", 8) not in (None, "") else 8),
                         info=(
                             "Overlap between temporal chunks. Official default is 8; must be smaller than chunk length."
                         ),
@@ -615,13 +608,13 @@ def sparkvsr_tab(
                         overlap_height = gr.Slider(
                             label="Overlap Height",
                             minimum=0, maximum=1024, step=8,
-                            value=int(_value("overlap_height", 32) or 32),
+                            value=int(_value("overlap_height", 32) if _value("overlap_height", 32) not in (None, "") else 32),
                             info="Vertical overlap between spatial tiles. Official default is 32."
                         )
                         overlap_width = gr.Slider(
                             label="Overlap Width",
                             minimum=0, maximum=1024, step=8,
-                            value=int(_value("overlap_width", 32) or 32),
+                            value=int(_value("overlap_width", 32) if _value("overlap_width", 32) not in (None, "") else 32),
                             info="Horizontal overlap between spatial tiles. Official default is 32."
                         )
 
@@ -1070,6 +1063,7 @@ def sparkvsr_tab(
         save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
         use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
         resume_run_dir, save_vram_gb, keep_only_output_files,
+        auto_tune_on_run,
     ]
 
     # Development validation: inputs_list must stay aligned with SPARKVSR_ORDER
@@ -2056,199 +2050,6 @@ def sparkvsr_tab(
         ):
             yield _expand_service_payload(payload, live_state)
 
-    def _autotune_waiting_output(state, ticket_id: str, position: int):
-        safe_state = state or {}
-        pos = max(1, int(position)) if position else "-"
-        title = f"Queue waiting: {ticket_id} (position {pos})"
-        subtitle = "Auto Tune is queued and will start when a processing slot becomes available."
-        return (
-            gr.update(value=title),
-            gr.update(value=f"Queued and waiting for processing slot. Queue position: {pos}."),
-            _queue_status_indicator(title, subtitle, spinning=True),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            safe_state,
-        )
-
-    def _autotune_cancelled_output(state, ticket_id: str):
-        safe_state = state or {}
-        title = f"Queue item removed: {ticket_id}"
-        subtitle = "This Auto Tune request was removed before it started."
-        return (
-            gr.update(value=title),
-            gr.update(value=subtitle),
-            _queue_status_indicator(title, subtitle, spinning=False),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            safe_state,
-        )
-
-    def _autotune_busy_output(state):
-        safe_state = state or {}
-        title = "Processing already in progress (queue disabled)."
-        subtitle = "Enable queue in Global Settings to run Auto Tune after the active job."
-        return (
-            gr.update(value=title),
-            gr.update(value=subtitle),
-            _queue_status_indicator(title, subtitle, spinning=False),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            safe_state,
-        )
-
-    def _merge_autotune_payload_state(payload, live_state):
-        merged = merge_payload_state(payload, live_state)
-        if not (isinstance(payload, tuple) and payload):
-            return merged
-        worker_state = payload[-1] if isinstance(payload[-1], dict) else {}
-        if not worker_state:
-            return merged
-        merged_state = merged[-1] if (isinstance(merged, tuple) and isinstance(merged[-1], dict)) else {}
-        if not merged_state:
-            return merged
-        worker_seed = worker_state.get("seed_controls", {})
-        merged_seed = merged_state.get("seed_controls", {})
-        if not (isinstance(worker_seed, dict) and isinstance(merged_seed, dict)):
-            return merged
-        if "sparkvsr_settings" in worker_seed:
-            try:
-                merged_seed["sparkvsr_settings"] = dict(worker_seed.get("sparkvsr_settings") or {})
-                merged_state["seed_controls"] = merged_seed
-                return (*merged[:-1], merged_state)
-            except Exception:
-                return merged
-        return merged
-
-    def _autotune_modal_message(payload) -> str | None:
-        if not (isinstance(payload, tuple) and payload):
-            return None
-        status_payload = payload[0]
-        if isinstance(status_payload, dict):
-            status_payload = status_payload.get("value", "")
-        status_text = str(status_payload or "").strip()
-        if not status_text:
-            return None
-        status_lower = status_text.lower()
-        if ("reused a saved result" in status_lower) or ("reused a matching cached result" in status_lower):
-            return (
-                f"{status_text}\n"
-                "No new scan was needed - a previous Auto Tune already measured this input size and GPU."
-            )
-        state_payload = payload[-1] if isinstance(payload[-1], dict) else {}
-        operation_status = str(state_payload.get("operation_status") or "").strip().lower()
-        if operation_status in {"completed", "ready", "error"} and status_lower.startswith("auto tune"):
-            return f"{status_text}\nCheck Run Log for full details."
-        return None
-
-    def _with_autotune_modal(base_payload, payload=None, *, hide_if_no_message: bool = False):
-        if not (isinstance(base_payload, tuple) and base_payload):
-            return base_payload
-        modal_message = _autotune_modal_message(payload if payload is not None else base_payload)
-        if modal_message:
-            return (
-                *base_payload,
-                gr.update(value=str(modal_message)),
-                gr.update(visible=True),
-            )
-        if hide_if_no_message:
-            return (
-                *base_payload,
-                gr.update(value=""),
-                gr.update(visible=False),
-            )
-        return (*base_payload, gr.update(), gr.update())
-
-    def run_autotune_wrapper(*args, progress=gr.Progress()):
-        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
-        queued_state = snapshot_queue_state(live_state)
-        queued_global_settings = snapshot_global_settings(global_settings)
-        queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
-        queue_resource_keys, queue_resource_label = resolve_queue_gpu_resources(queued_state, queued_global_settings)
-        ticket = queue_manager.submit(
-            "sparkvsr",
-            "Auto Tune",
-            resource_keys=queue_resource_keys,
-            resource_label=queue_resource_label,
-        )
-        acquired_slot = queue_manager.is_active(ticket.job_id)
-
-        try:
-            if not queue_enabled:
-                if not acquired_slot:
-                    queue_manager.cancel_waiting([ticket.job_id])
-                    yield _with_autotune_modal(_autotune_busy_output(live_state), hide_if_no_message=True)
-                    return
-                for payload in service["auto_tune_action"](
-                    *args[:-1],
-                    state=queued_state,
-                    progress=progress,
-                    global_settings_snapshot=queued_global_settings,
-                ):
-                    merged_payload = _merge_autotune_payload_state(payload, live_state)
-                    yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
-                return
-
-            wait_notice_sent = False
-            while not ticket.start_event.wait(timeout=0.5):
-                if ticket.cancel_event.is_set():
-                    yield _with_autotune_modal(
-                        _autotune_cancelled_output(live_state, ticket.job_id),
-                        hide_if_no_message=True,
-                    )
-                    return
-                if not wait_notice_sent:
-                    try:
-                        pos = queue_manager.waiting_position(ticket.job_id)
-                        pos_text = max(1, int(pos)) if pos else "-"
-                        gr.Info(f"Queued: {ticket.job_id} (position {pos_text})")
-                        yield _with_autotune_modal(
-                            _autotune_waiting_output(live_state, ticket.job_id, int(pos) if pos else 0),
-                            hide_if_no_message=True,
-                        )
-                    except Exception:
-                        pass
-                    wait_notice_sent = True
-
-            if ticket.cancel_event.is_set() and not queue_manager.is_active(ticket.job_id):
-                yield _with_autotune_modal(
-                    _autotune_cancelled_output(live_state, ticket.job_id),
-                    hide_if_no_message=True,
-                )
-                return
-
-            acquired_slot = True
-            for payload in service["auto_tune_action"](
-                *args[:-1],
-                state=queued_state,
-                progress=progress,
-                global_settings_snapshot=queued_global_settings,
-            ):
-                merged_payload = _merge_autotune_payload_state(payload, live_state)
-                yield _with_autotune_modal(merged_payload, merged_payload, hide_if_no_message=True)
-        finally:
-            if acquired_slot:
-                queue_manager.complete(ticket.job_id)
-            else:
-                queue_manager.cancel_waiting([ticket.job_id])
-
     SparkVSR_upscale_sync_signature = gr.State(value="")
     SparkVSR_chunk_sync_signature = gr.State(value="")
     SparkVSR_pre_run_output_signature = gr.State(value="")
@@ -2288,6 +2089,31 @@ def sparkvsr_tab(
             return gr.skip(), gr.skip(), gr.skip(), previous_signature
         chunk_status_upd, chunk_gallery_upd, chunk_video_upd = refresh_chunk_preview_ui(state)
         return chunk_status_upd, chunk_gallery_upd, chunk_video_upd, signature
+
+    # Registered before the Upscale job: Gradio runs a button's listeners in order and waits for a
+    # queued job to finish before the next one, so a later listener would update the UI only after the run.
+    spark_tuned = {
+        "chunk_len": chunk_len,
+        "overlap_t": overlap_t,
+        "tile_height": tile_height,
+        "tile_width": tile_width,
+        "overlap_height": overlap_height,
+        "overlap_width": overlap_width,
+        "cpu_offload": cpu_offload,
+        "group_offload": group_offload,
+        "num_blocks_per_group": num_blocks_per_group,
+        "vae_tiling": vae_tiling,
+        "split_stage_subprocesses": split_stage_subprocesses,
+    }
+    wire_auto_tune_on_run(
+        upscale_btn=upscale_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=spark_tuned,
+        shared_state=shared_state,
+        auto_tune_on_run=auto_tune_on_run,
+        global_settings=global_settings,
+    )
 
     # Main processing
     upscale_btn.click(
@@ -2367,29 +2193,17 @@ def sparkvsr_tab(
         outputs=[chunk_status, chunk_gallery, chunk_preview_video, SparkVSR_chunk_sync_signature],
     )
 
-    autotune_evt = auto_tune_btn.click(
-        fn=run_autotune_wrapper,
-        inputs=[input_file] + inputs_list + [shared_state],
-        outputs=[
-            status_box,
-            log_box,
-            progress_indicator,
-            tile_height,
-            tile_width,
-            overlap_height,
-            overlap_width,
-            chunk_len,
-            overlap_t,
-            vae_tiling,
-            optimize_summary,
-            shared_state,
-            spark_autotune_notice_text,
-            spark_autotune_notice_modal,
-        ],
-        concurrency_limit=32,
-        concurrency_id="app_processing_queue",
-        trigger_mode="multiple",
-        js=autotune_modal_reset_js("spark-autotune-notice-modal"),
+    autotune_evt = wire_auto_tune(
+        auto_tune_btn=auto_tune_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=spark_tuned,
+        status_box=status_box,
+        shared_state=shared_state,
+        notice_text=spark_autotune_notice_text,
+        notice_modal=spark_autotune_notice_modal,
+        modal_id="spark-autotune-notice-modal",
+        global_settings=global_settings,
     )
     autotune_evt.then(
         fn=refresh_tile_count,

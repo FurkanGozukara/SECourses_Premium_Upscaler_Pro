@@ -11,6 +11,39 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.1 — 30 October 2026 — Instant Auto Tune & Save VRAM for Every Upscaler, Never Shared GPU Memory",
+        """
+**Auto Tune is now instant on all six AI upscalers, and no upscaler ever spills into shared GPU memory again.**
+
+- **New Auto Tune for Max Quality on SeedVR2, FlashVSR+, Open-H3 Regenerate, LTX 2.5, SparkVSR and RTX Super Resolution.** It no longer runs test clips. One click reads your GPU's total VRAM and what is already in use, your input's size and length, your output size and the selected model, and sets the best settings in under a second:
+  - **SeedVR2:** the largest **Batch Size** that fits (the whole clip in one batch when possible; more frames per batch = steadier video, less flicker), split into even batches (72 frames run as 37 + 35, not 65 + a short, flicker-prone 7), then the lowest **BlockSwap**, then VAE tiling only if needed, with the largest tiles.
+  - **FlashVSR+:** the longest **Frame Chunk Size** (the whole clip in one pass when possible), **DiT tiling off** when the full frame fits (otherwise the largest tiles with a wider overlap), KV Ratio 3 and no CPU offloading.
+  - **SparkVSR:** the longest **Temporal Chunk Length**, then **no spatial tiling** (or the largest tiles, now up to 1536 px: 4K output on a 24-32 GB GPU runs 6 tiles instead of 12, fewer tile seams), block offload only when the BF16 model does not fit (with the INT8 ConvRot model block offload uses more VRAM, so Auto Tune never picks it and suggests the BF16 model on cards where INT8 cannot fit), and **Stage Subprocess Isolation off** when the extra 1 GB and the 8.9 GB text encoder fit (one process is about 35% faster; on smaller cards the separate text stage streams the encoder from RAM). Good to know: the INT8 ConvRot SparkVSR model uses *more* VRAM than BF16 on long chunks (18.8 vs 16.0 GB for 65 frames at 1080p), and Auto Tune accounts for it.
+  - **LTX 2.5** and **Open-H3:** automatic token budget with the longest chunk/window, so the whole video runs in one pass whenever it fits, with the plan shown in the report.
+  - **LTX 2.5 runs much longer chunks now.** Its VRAM estimate per frame was re-measured and was about 5x too cautious. On a 32 GB GPU, 121 frames of 720p input (2560x1440 output) now run in **one chunk instead of 5**, and 1080p input (4K output) in 3 chunks of 49 frames instead of 15 chunks of 9 frames: fewer chunk seams, steadier video. 360p input with 121 frames finishes about 20% faster because more transformer layers stay on the GPU.
+  - **RTX Super Resolution:** the highest quality level of the family you picked (Standard, High Bitrate, Denoise or Deblur) that fits.
+- **Save VRAM (GB), default 1.5 GB, on every upscaler tab** — like ComfyUI's `--reserve-vram`. A run uses at most *GPU total − VRAM in use − Save VRAM*. Example: a 31.8 GB GPU with 1.5 GB in use and Save VRAM 1 GB gives the run up to 29.3 GB.
+- **New "Auto Tune on every Upscale" checkbox (on by default).** Each Upscale first applies Auto Tune for that exact input (each file of a batch, each scene chunk) and the VRAM that is free at that moment, then starts. Queued jobs are sized when they actually start, not when you clicked.
+- **Shared GPU memory is never used.** Every SeedVR2, FlashVSR+ and SparkVSR process (including each phase subprocess) and the LTX 2.5 and Open-H3 engines are capped at that budget, so a request past it stops with a normal out-of-memory error instead of Windows silently moving VRAM into system RAM (about 20x slower). RTX Super Resolution checks the budget before it starts. Verified with Windows' per-process GPU memory counters: shared GPU memory stayed flat in every test, including runs deliberately pushed past the limit.
+  - **If a run still reaches its limit** (for example an unusual input needed more than estimated), SeedVR2, SparkVSR and LTX 2.5 re-plan with a smaller budget and run again automatically, and **FlashVSR+** switches to DiT tiling and then smaller tiles instead of failing.
+  - Runs that are planned close to their budget use a memory-allocator setting that avoids fragmentation (without it a 1080p SeedVR2 batch failed with 4 GB of VRAM stuck in unusable pieces); runs with room to spare skip it, because it costs about 10-15% speed.
+  - **LTX 2.5** streams text-encoder and transformer layers from RAM when they do not fit, and **SparkVSR** streams its text encoder when a new prompt has to be encoded on a small budget.
+- **Tested on an RTX 5090 (32 GB) and an RTX 3090 (24 GB)** with 1080p to 8K outputs and every aspect ratio, plus 8, 10, 12 and 16 GB cards simulated with Save VRAM. Smallest GPU each upscaler ran on at the default Save VRAM 1.5 GB: **SeedVR2 and RTX Super Resolution 8 GB; SparkVSR 10 GB with the BF16 model, 12 GB with INT8 ConvRot; FlashVSR+, LTX 2.5 and Open-H3 12 GB.** On a smaller card, lower Save VRAM and close other GPU apps; a run that does not fit stops with a clear out-of-memory message.
+- **Model downloader: pick any presets in one go.** `Windows_Download_Models_and_or_Resume.bat` now opens a menu of 26 presets instead of always downloading the regular set: type one number (`5`), several (`1,3,8`) or ranges (`1-3,15-18`) and everything selected downloads in one resumable run, with shared files fetched once. New presets for the app's default models: SeedVR2 7B Sharp INT8 ConvRot (~8.5 GB), SparkVSR INT8 ConvRot (~16 GB), the LTX 2.5 default set (~38 GB) and the Open-H3 default set (~55 GB). `Models_Downloader.py --select "1,3-5"` does the same without asking.
+- **Fixed: SeedVR2 used up to 6 GB of shared GPU memory on large batches.** Its runner selected a memory allocator that ignores memory limits; the limit now works.
+- **Fixed: Universal Preset "Reset All" (and loading a preset) could leave other tabs showing old values** when you had edited them by hand and the preset's values equalled the ones that tab last showed. Every load and reset now refreshes each tab when you open it.
+- **Fixed: Open-H3 at 4K failed on 24 GB GPUs** after the whole video had been regenerated: the fast Sol VAE decoder needs about 21-25 GB for a 4K window. When a window does not fit, it is now decoded in overlapping 1536 px tiles (smaller if needed), blended like ComfyUI's tiled decode: identical to the full decode within 49 dB PSNR, no visible seams, about 14 s per 4K window.
+- **Fixed: LTX 2.5 counted its INT8 ConvRot transformer at twice its real VRAM size,** so it kept half of the layers that fit in RAM; now more layers stay on the GPU: a 73-frame 720p chunk takes 25.5 s instead of 38.4 s on an RTX 5090.
+- **Fixed: FlashVSR+ reported a run that stopped part-way (for example out of VRAM) as finished** and kept the truncated video. It now reports the error.
+- **Fixed: FlashVSR+ automatic out-of-memory recovery turned on tiled VAE in Full mode,** which can corrupt colours. It now tiles the DiT instead.
+- **Fixed: FPS Override crashed FlashVSR+ runs** before they started.
+- **Fixed: some FlashVSR+ and SparkVSR batch image runs crashed** while preparing their work folder.
+- **Fixed: Face Restoration after RTX Super Resolution never ran.**
+- **Fixed: on PCs with two different NVIDIA GPUs, the GPU picked in the app could differ from the one actually used.** GPUs are now numbered the same way everywhere.
+- **SparkVSR:** a saved Temporal Chunk Length of 0 (whole clip) no longer shows as 65 when the app starts.
+""",
+    ),
+    (
         "V9.0 — 30 October 2026 — NEW: Open-H3 Regenerate Upscaler & a Faster, Redesigned Interface",
         """
 **A new generative upscaler joins the app, and the whole interface is redesigned and much faster.**

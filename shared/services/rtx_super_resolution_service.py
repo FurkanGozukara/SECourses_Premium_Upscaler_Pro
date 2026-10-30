@@ -53,6 +53,7 @@ from shared.preview_utils import prepare_preview_input
 from shared.global_rife import maybe_apply_global_rife
 from shared.rtx_superres_runner import run_rtx_superres
 from shared.video_fps_utils import apply_video_fps_override_preprocess
+from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
 
 
 RTX_QUALITY_PRESETS: List[str] = [
@@ -138,6 +139,8 @@ def rtx_super_resolution_defaults() -> Dict[str, Any]:
         "auto_transfer_output_to_input": False,
         "streaming_chunk_size_frames": 0,
         "resume_partial_chunks": False,
+        "save_vram_gb": DEFAULT_SAVE_VRAM_GB,
+        "auto_tune_on_run": True,
     }
 
 
@@ -162,7 +165,26 @@ RTX_ORDER: List[str] = [
     "auto_transfer_output_to_input",
     "streaming_chunk_size_frames",
     "resume_partial_chunks",
+    "save_vram_gb",
+    "auto_tune_on_run",
 ]
+
+
+def _enforce_rtx_guardrails(cfg: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Fill missing keys and clamp RTX settings (presets saved before a key existed load cleanly)."""
+    defaults = defaults or rtx_super_resolution_defaults()
+    out = dict(defaults)
+    out.update({k: v for k, v in dict(cfg or {}).items() if v is not None})
+    quality = str(out.get("quality_preset") or defaults["quality_preset"]).strip().upper()
+    out["quality_preset"] = quality if quality in RTX_QUALITY_PRESETS else defaults["quality_preset"]
+    out["upscale_factor"] = max(1.0, min(9.9, _to_float(out.get("upscale_factor"), 4.0)))
+    out["max_resolution"] = max(0, min(8192, _to_int(out.get("max_resolution"), 3840)))
+    out["save_vram_gb"] = clamp_save_vram_gb(out.get("save_vram_gb"), defaults.get("save_vram_gb", DEFAULT_SAVE_VRAM_GB))
+    for key in ("use_resolution_tab", "pre_downscale_then_upscale", "non_blocking_inference",
+                "disable_auto_scene_detection_split", "face_restore_after_upscale", "auto_transfer_output_to_input",
+                "resume_partial_chunks", "batch_enable", "keep_only_output_files", "auto_tune_on_run"):
+        out[key] = _to_bool(out.get(key), bool(defaults.get(key, False)))
+    return out
 
 
 def _rtx_dict_from_args(args: List[Any]) -> Dict[str, Any]:
@@ -348,6 +370,7 @@ def build_rtx_super_resolution_callbacks(
         face_apply: bool,
         face_strength: float,
         progress_cb: Optional[Callable[[str], None]] = None,
+        gpu_device: Any = None,
     ) -> Optional[str]:
         if not output_path or not face_apply:
             return output_path
@@ -365,13 +388,13 @@ def build_rtx_super_resolution_callbacks(
                     str(path_obj),
                     strength=float(face_strength),
                     on_progress=(lambda m: progress_cb(m) if (progress_cb and m) else None),
-                    gpu_device=settings_local.get("device"),
+                    gpu_device=gpu_device,
                 )
             else:
                 restored = restore_image(
                     str(path_obj),
                     strength=float(face_strength),
-                    gpu_device=settings_local.get("device"),
+                    gpu_device=gpu_device,
                 )
             if restored and Path(restored).exists():
                 return str(restored)
@@ -699,7 +722,8 @@ def build_rtx_super_resolution_callbacks(
                 output_path_local = final_output if final_output else None
                 if output_path_local:
                     output_path_local = _apply_face_restore_if_enabled(
-                        output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line
+                        output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line,
+                        gpu_device=runtime_settings.get("device"),
                     )
                     output_path_local = _apply_audio_policy(
                         output_path_local,
@@ -789,7 +813,8 @@ def build_rtx_super_resolution_callbacks(
             output_path_local = res.output_path
             if output_path_local:
                 output_path_local = _apply_face_restore_if_enabled(
-                    output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line
+                    output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line,
+                    gpu_device=runtime_settings.get("device"),
                 )
                 output_path_local = _apply_audio_policy(
                     output_path_local,
@@ -1399,130 +1424,54 @@ def build_rtx_super_resolution_callbacks(
 
     def auto_tune_action(
         upload,
-        input_path,
-        current_quality,
-        use_resolution_tab,
-        local_upscale_factor,
-        max_resolution,
-        pre_downscale_then_upscale,
-        non_blocking_inference,
-        disable_auto_scene_detection_split,
-        cuda_stream_ptr,
-        state,
-    ):
+        *args,
+        state: Dict[str, Any] = None,
+        global_settings_snapshot: Dict[str, Any] | None = None,
+        **_ignored,
+    ) -> Dict[str, Any]:
+        """Instant Auto Tune (no test runs): the highest quality level of the selected family whose
+        VRAM fits (GPU total - in use - Save VRAM) for this input and output size."""
+        from shared.rtx_superres_runner import _build_dimensions_plan
+        from shared.vram_autotune import rtx as rtx_plan
+        from shared.vram_autotune.common import probe_media, resolve_budget
+
         state = state if isinstance(state, dict) else {"seed_controls": {}}
-        seed_controls = state.get("seed_controls", {}) if isinstance(state.get("seed_controls"), dict) else {}
-        if not isinstance(seed_controls, dict):
-            seed_controls = {}
-
-        def _persist_autotune_settings(selected_quality: str) -> None:
-            rtx_settings = seed_controls.get("rtx_settings", {})
-            if not isinstance(rtx_settings, dict):
-                rtx_settings = {}
-            rtx_settings["quality_preset"] = str(selected_quality or current_quality or "HIGHBITRATE_ULTRA")
-            rtx_settings["use_resolution_tab"] = bool(use_resolution_tab)
-            rtx_settings["upscale_factor"] = float(_to_float(local_upscale_factor, 4.0))
-            rtx_settings["max_resolution"] = int(_to_int(max_resolution, 3840))
-            rtx_settings["pre_downscale_then_upscale"] = bool(_to_bool(pre_downscale_then_upscale, True))
-            rtx_settings["non_blocking_inference"] = bool(_to_bool(non_blocking_inference, True))
-            rtx_settings["disable_auto_scene_detection_split"] = bool(_to_bool(disable_auto_scene_detection_split, True))
-            rtx_settings["cuda_stream_ptr"] = int(_to_int(cuda_stream_ptr, 0))
-            seed_controls["rtx_settings"] = rtx_settings
-            seed_controls["preset_dirty"] = True
-            state["seed_controls"] = seed_controls
-
-        raw_input = upload if upload else input_path
+        seed_controls = state.setdefault("seed_controls", {})
+        if len(args) != len(RTX_ORDER):
+            return {"status": "Auto Tune: settings schema mismatch.", "report": "", "updates": {}, "state": state}
+        settings = _enforce_rtx_guardrails(_rtx_dict_from_args(list(args)))
+        raw_input = upload if upload else settings.get("input_path")
         if isinstance(raw_input, dict):
             raw_input = raw_input.get("path") or ""
-        input_path_val = normalize_path(str(raw_input or ""))
-        if not input_path_val or not Path(input_path_val).exists():
-            _persist_autotune_settings(str(current_quality or "HIGHBITRATE_ULTRA"))
-            return (
-                gr.update(value=current_quality),
-                "Auto Tune: input path is missing or invalid.",
-                state,
-            )
-
-        preview_src, preview_note = prepare_preview_input(
-            input_path_val,
-            Path(global_settings.get("temp_dir", temp_dir)),
-            prefix="rtx_autotune",
-            as_single_frame_dir=False,
+        media = probe_media(normalize_path(str(raw_input or "")))
+        if media is None:
+            return {"status": "Auto Tune needs an input first (upload a file or enter an Input Path).",
+                    "report": "", "updates": {}, "state": state}
+        snapshot = dict(global_settings_snapshot) if isinstance(global_settings_snapshot, dict) else dict(global_settings)
+        device = get_global_gpu_override(seed_controls, snapshot)
+        if bool(settings.get("use_resolution_tab", True)):
+            shared_scale = _resolve_shared_upscale_factor(state)
+            if shared_scale is not None:
+                settings["upscale_factor"] = float(shared_scale)
+        dims = _build_dimensions_plan(
+            input_width=media.width, input_height=media.height,
+            upscale_factor=float(settings.get("upscale_factor") or 4.0),
+            max_edge=int(settings.get("max_resolution") or 0),
+            pre_downscale_then_upscale=bool(settings.get("pre_downscale_then_upscale", True)),
+            quality_name=str(settings.get("quality_preset")),
         )
-        if not preview_src:
-            _persist_autotune_settings(str(current_quality or "HIGHBITRATE_ULTRA"))
-            return (
-                gr.update(value=current_quality),
-                f"Auto Tune failed: {preview_note or 'could not prepare preview input'}",
-                state,
-            )
-
-        use_global = bool(use_resolution_tab)
-        shared_scale = _resolve_shared_upscale_factor(state if use_global else None)
-        effective_scale = shared_scale if shared_scale is not None else _to_float(local_upscale_factor, 4.0)
-        effective_scale = max(1.0, min(9.9, float(effective_scale)))
-
-        quality_order = [
-            "ULTRA",
-            "HIGH",
-            "MEDIUM",
-            "LOW",
-            "BICUBIC",
-            "HIGHBITRATE_ULTRA",
-            "HIGHBITRATE_HIGH",
-            "HIGHBITRATE_MEDIUM",
-            "HIGHBITRATE_LOW",
-            "DENOISE_ULTRA",
-            "DENOISE_HIGH",
-            "DENOISE_MEDIUM",
-            "DENOISE_LOW",
-            "DEBLUR_ULTRA",
-            "DEBLUR_HIGH",
-            "DEBLUR_MEDIUM",
-            "DEBLUR_LOW",
-        ]
-
-        logs: List[str] = []
-        best_quality: Optional[str] = None
-        for quality in quality_order:
-            trial_settings = {
-                "input_path": preview_src,
-                "quality_preset": quality,
-                "upscale_factor": effective_scale,
-                "max_resolution": _to_int(max_resolution, 0),
-                "pre_downscale_then_upscale": _to_bool(pre_downscale_then_upscale, True),
-                "non_blocking_inference": _to_bool(non_blocking_inference, True),
-                "disable_auto_scene_detection_split": _to_bool(disable_auto_scene_detection_split, True),
-                "cuda_stream_ptr": _to_int(cuda_stream_ptr, 0),
-                "output_format": "png",
-                "global_output_dir": str(Path(global_settings.get("temp_dir", temp_dir)) / "rtx_autotune"),
-                "image_output_format": "png",
-                "image_output_quality": 95,
-                "device": "" if get_global_gpu_override(seed_controls, global_settings) == "cpu" else get_global_gpu_override(seed_controls, global_settings),
-            }
-            try:
-                res = run_rtx_superres(trial_settings, base_dir=base_dir, on_progress=None, cancel_event=None)
-                if int(res.returncode) == 0 and res.output_path and Path(res.output_path).exists():
-                    best_quality = quality
-                    logs.append(f"PASS: {quality}")
-                    break
-                logs.append(f"FAIL: {quality} ({str(res.log).splitlines()[-1] if res.log else 'unknown error'})")
-            except Exception as e:
-                logs.append(f"FAIL: {quality} ({str(e)})")
-
-        if best_quality:
-            _persist_autotune_settings(best_quality)
-            return (
-                gr.update(value=best_quality),
-                f"Auto Tune selected {best_quality} for current VRAM/input constraints.\n" + "\n".join(logs[:12]),
-                state,
-            )
-        _persist_autotune_settings(str(current_quality or "HIGHBITRATE_ULTRA"))
-        return (
-            gr.update(value=current_quality),
-            "Auto Tune could not find a stable preset. Check logs and lower upscale/max resolution.\n" + "\n".join(logs[:12]),
-            state,
-        )
+        budget = None if device == "cpu" else resolve_budget(device, settings.get("save_vram_gb"), overhead_gb=0.0)
+        tp = rtx_plan.plan(settings, in_w=int(dims["preprocess_width"]), in_h=int(dims["preprocess_height"]),
+                           model_out_w=int(dims["model_output_width"]), model_out_h=int(dims["model_output_height"]),
+                           budget=budget)
+        report = tp.report("Auto Tune")
+        if tp.updates:
+            seed_controls.setdefault("rtx_settings", {}).update(tp.updates)
+            state["preset_dirty"] = True
+        for _line in report.splitlines():
+            print(f"[RTX Auto Tune] {_line}", flush=True)
+        status = report.splitlines()[0] if tp.fits else "Auto Tune: this output size does not fit the VRAM budget - see the details."
+        return {"status": status, "report": report, "updates": dict(tp.updates), "state": state}
 
     def open_outputs_folder_rtx(state: Dict[str, Any]):
         from shared.services.global_service import open_outputs_folder

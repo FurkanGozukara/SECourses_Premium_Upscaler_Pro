@@ -33,6 +33,8 @@ from .path_utils import (
     resolve_output_location,
 )
 from .process_control import terminate_process_tree
+from .vram_autotune.common import apply_vram_cap_env, is_tight
+from .vram_autotune.flashvsr import FLASHVSR_PROCESS_OVERHEAD_GB, auto_apply as flashvsr_auto_apply
 
 
 @dataclass
@@ -591,6 +593,9 @@ def run_flashvsr(
         vae_model = _sanitize_vae_model(settings.get("vae_model", "Wan2.1"))
         attention_mode = _sanitize_attention(settings.get("attention_mode", settings.get("attention", "sparse_sage_attention")))
         device_arg, visible_gpu, gpu_note = _resolve_flashvsr_device(settings.get("device", "auto"))
+        if _bool(settings.get("auto_tune_on_run"), False):
+            # "Auto Tune on every Upscale": size this pass for this exact input and the VRAM free now.
+            flashvsr_auto_apply(settings, effective_input_path, scale, log=log)
 
         flashvsr_root = _resolve_flashvsr_root(base_dir)
         flashvsr_script = flashvsr_root / "cli_main.py"
@@ -927,6 +932,17 @@ def run_flashvsr(
             if legacy_alloc_conf and not proc_env.get("PYTORCH_ALLOC_CONF"):
                 proc_env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
                 log("[FlashVSR] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF")
+            # Save VRAM: cap at total - in use - Save VRAM so the run never spills into shared memory.
+            if device_arg != "cpu":
+                apply_vram_cap_env(
+                    proc_env,
+                    visible_gpu if visible_gpu is not None else settings.get("device", "auto"),
+                    settings.get("save_vram_gb"),
+                    overhead_gb=FLASHVSR_PROCESS_OVERHEAD_GB,
+                    log=log,
+                    tag="FlashVSR",
+                    settings_tight=is_tight(settings),
+                )
             if visible_gpu is not None:
                 proc_env["CUDA_VISIBLE_DEVICES"] = visible_gpu
             triton_cache_dir = base_dir / "temp" / "triton_cache"
@@ -1092,6 +1108,13 @@ def run_flashvsr(
                     output_path=None,
                     log="\n".join(log_lines + ["[Cancelled by user]"]),
                 )
+            if returncode != 0 and "FlashVSR stopped after" in (attempt_blob or ""):
+                # The CLI reported a run that ended part-way (for example at the VRAM cap):
+                # the file on disk is truncated, not a result.
+                with suppress(Exception):
+                    if output_file.exists():
+                        output_file.unlink()
+                break
             if output_file.exists():
                 output_path = str(output_file)
                 break

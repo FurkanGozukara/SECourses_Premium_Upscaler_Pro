@@ -50,3 +50,8 @@ Nvidia_RTX_Nodes_ComfyUI/
 nvidia-vfx-python-samples/
 gfpgan/
 OpenH3_Models
+
+# Local test artifacts (browser automation, test clips)
+output/
+test_media/
+.playwright-cli/

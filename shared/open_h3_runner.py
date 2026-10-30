@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .command_logger import get_command_logger
+from .vram_autotune.open_h3 import auto_apply as open_h3_auto_apply
 from .ltx25_runner import (
     _build_env,
     _format_command_for_log,
@@ -241,6 +242,12 @@ def _write_prompt_file(base_dir: Path, settings: Dict[str, Any]) -> Path:
     path.write_text(str(settings.get("prompt") or ""), encoding="utf-8")
     return path
 
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 def build_command(python_exe: str, script_path: Path, settings: Dict[str, Any], paths: Dict[str, Path],
                   input_path: str, output_file: Path, seed_value: int, target: Tuple[int, int],
@@ -484,6 +491,8 @@ def run_open_h3(
         if gpu_note:
             log(gpu_note)
 
+        if _truthy(settings.get("auto_tune_on_run")):
+            open_h3_auto_apply(settings, log)
         prompt_file = _write_prompt_file(base_dir, settings)
         cache_dir = Path(base_dir) / OPENH3_MODELS_DIRNAME / ".cache"
         cmd = build_command(python_exe, script_path, settings, paths, input_path, output_file, seed_value,
@@ -637,6 +646,8 @@ def run_open_h3_batch(
             for index, input_path, _kind, item in plans
         ], indent=1), encoding="utf-8")
         first_index, first_input, _k, first_item = plans[0]
+        if _truthy(base.get("auto_tune_on_run")):
+            open_h3_auto_apply(base, log)
         prompt_file = _write_prompt_file(base_dir, base)
         python_exe = _resolve_python_executable(base_dir)
         script_path = Path(base_dir) / "tools" / "open_h3_inference.py"

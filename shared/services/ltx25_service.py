@@ -53,6 +53,7 @@ from shared.ltx25_constants import (
     ltx25_is_distilled,
 )
 from shared.gpu_utils import get_global_gpu_override
+from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.output_run_manager import (
     prepare_single_video_run,
@@ -205,31 +206,19 @@ def _probe_video_for_plan(path: str) -> Optional[Tuple[int, int, int, float, boo
 
 
 def _free_vram_bytes_for_plan(device_value: str) -> Tuple[float, str]:
-    """Free VRAM via NVML/nvidia-smi (no CUDA context); 3s cache."""
+    """Free VRAM of the GPU the run will use, via nvidia-smi (no CUDA context); 3s cache."""
+    from shared.vram_autotune.common import pick_gpu_index, query_gpu_memory
+
     now = time.time()
     if now - float(_PLAN_VRAM_CACHE.get("ts", 0.0)) > 3.0:
-        try:
-            from shared.gpu_utils import get_gpu_info
-
-            _PLAN_VRAM_CACHE["gpus"] = get_gpu_info() or []
-        except Exception:
-            _PLAN_VRAM_CACHE["gpus"] = []
+        _PLAN_VRAM_CACHE["gpus"] = query_gpu_memory()
         _PLAN_VRAM_CACHE["ts"] = now
-    gpus = _PLAN_VRAM_CACHE.get("gpus") or []
-    if not gpus:
+    gpus = _PLAN_VRAM_CACHE.get("gpus") or {}
+    idx = pick_gpu_index(device_value, gpus) if gpus else None
+    if idx is None:
         return 0.0, "no NVIDIA GPU detected"
-    wanted = str(device_value or "").strip()
-    chosen = None
-    if wanted.isdigit():
-        for gpu in gpus:
-            if str(getattr(gpu, "id", "")) == wanted:
-                chosen = gpu
-                break
-    if chosen is None:
-        chosen = max(gpus, key=lambda g: float(getattr(g, "available_memory_gb", 0.0) or 0.0))
-    free_gb = float(getattr(chosen, "available_memory_gb", 0.0) or 0.0)
-    label = f"GPU {getattr(chosen, 'id', '?')} free {free_gb:.1f}GB"
-    return free_gb * (1024.0 ** 3), label
+    free_gb = float(gpus[idx].free_gb)
+    return free_gb * (1024.0 ** 3), f"GPU {idx} free {free_gb:.1f}GB"
 
 
 def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
@@ -281,7 +270,7 @@ def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
                 height,
                 free_vram_bytes=int(free_bytes),
                 weight_resident_bytes=0,
-                reserve_gb=float(settings.get("reserve_vram_gb") or 1.0),
+                reserve_gb=clamp_save_vram_gb(settings.get("reserve_vram_gb")),
             )
             lines.append(f"[Plan] auto budget {budget} ({reason}) | {vram_label}")
 
@@ -397,7 +386,7 @@ def ltx25_defaults() -> Dict[str, Any]:
         "max_latent_tokens": 18000,
         "max_chunk_frames": 121,
         "overlap_frames": 1,
-        "reserve_vram_gb": 1.0,
+        "reserve_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "attention_backend": "auto",
         "encode_tile_size": 512,
         "encode_tile_overlap": 64,
@@ -417,6 +406,7 @@ def ltx25_defaults() -> Dict[str, Any]:
         "batch_output_path": "",
         "resume_run_dir": "",
         "keep_only_output_files": False,
+        "auto_tune_on_run": True,
     }
 
 
@@ -460,6 +450,7 @@ LTX25_ORDER: List[str] = [
     "batch_output_path",
     "resume_run_dir",
     "keep_only_output_files",
+    "auto_tune_on_run",
 ]
 
 
@@ -532,7 +523,8 @@ def _enforce_ltx25_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> 
     if overlap >= cfg["max_chunk_frames"]:
         overlap = _snap_down_8n1(max(1, cfg["max_chunk_frames"] - 8), 1, 257)
     cfg["overlap_frames"] = overlap
-    cfg["reserve_vram_gb"] = max(0.0, min(8.0, _to_float(cfg.get("reserve_vram_gb"), 1.0)))
+    cfg["reserve_vram_gb"] = clamp_save_vram_gb(cfg.get("reserve_vram_gb"), defaults.get("reserve_vram_gb", DEFAULT_SAVE_VRAM_GB))
+    cfg["auto_tune_on_run"] = _to_bool(cfg.get("auto_tune_on_run", defaults.get("auto_tune_on_run", True)), True)
     attention = str(cfg.get("attention_backend", "auto") or "auto").strip().lower()
     cfg["attention_backend"] = attention if attention in set(LTX25_ATTENTION_OPTIONS) else "auto"
 
@@ -729,6 +721,46 @@ def build_ltx25_callbacks(
             return f"[ERROR] Live chunk plan failed: {exc}"
 
     def auto_tune_action(
+        uploaded_file,
+        *args,
+        state: Dict[str, Any] = None,
+        global_settings_snapshot: Dict[str, Any] | None = None,
+        _global_settings: Dict[str, Any] = global_settings,
+        **_ignored,
+    ) -> Dict[str, Any]:
+        """Instant Auto Tune (no test runs): Auto token budget with the longest chunk allowed,
+        plus the chunk plan for this input, the 2x output size and (GPU total - in use - Save VRAM)."""
+        from shared.vram_autotune import ltx25 as ltx_plan
+        from shared.vram_autotune.common import resolve_budget
+
+        snapshot = dict(global_settings_snapshot) if isinstance(global_settings_snapshot, dict) else dict(_global_settings)
+        state = state or {"seed_controls": {}}
+        seed_controls = state.setdefault("seed_controls", {})
+        settings = {**defaults, **_ltx25_dict_from_args(list(args))}
+        settings = _enforce_ltx25_guardrails(settings, defaults)
+        global_gpu_device = get_global_gpu_override(seed_controls, snapshot)
+        settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
+        uploaded_path = ""
+        if uploaded_file:
+            if isinstance(uploaded_file, dict):
+                uploaded_path = str(uploaded_file.get("path") or uploaded_file.get("name") or "")
+            else:
+                uploaded_path = str(getattr(uploaded_file, "name", "") or uploaded_file)
+        candidate = normalize_path(settings.get("input_path") or "") or normalize_path(uploaded_path)
+        if not candidate or not Path(candidate).exists():
+            return {"status": "Auto Tune needs an input first (upload a video or enter an Input Path).",
+                    "report": "", "updates": {}, "state": state}
+        settings["_effective_input_path"] = candidate
+        budget = None if settings["device"] == "cpu" else resolve_budget(settings["device"], settings.get("reserve_vram_gb"))
+        tp = ltx_plan.plan(settings, base_dir, budget)
+        report = tp.report("Auto Tune")
+        seed_controls.setdefault("ltx25_settings", {}).update(tp.updates)
+        state["preset_dirty"] = True
+        for _line in report.splitlines():
+            print(f"[LTX25 Auto Tune] {_line}", flush=True)
+        return {"status": report.splitlines()[0], "report": report, "updates": dict(tp.updates), "state": state}
+
+    def cli_plan_preview_action(
         uploaded_file,
         *args,
         state: Dict[str, Any] = None,
@@ -2168,6 +2200,7 @@ def build_ltx25_callbacks(
         "load_preset": load_preset,
         "safe_defaults": safe_defaults,
         "auto_tune_action": auto_tune_action,
+        "cli_plan_preview": cli_plan_preview_action,
         "live_plan": live_plan_action,
         "run_action": run_action,
         "cancel_action": cancel_action,

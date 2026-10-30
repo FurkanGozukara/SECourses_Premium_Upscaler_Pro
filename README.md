@@ -50,6 +50,7 @@ static-frame skip, recursion depth.
 - Face Restoration as both standalone processor and integrated post-processing across pipelines.
 - Global face restoration enable + global strength control from Global Settings.
 - Unified cross-model resolution strategy: Upscale-x, max-edge cap, and pre-downscale-then-upscale behavior.
+- Instant Auto Tune for Max Quality on SeedVR2, FlashVSR+, Open-H3, LTX 2.5, SparkVSR and RTX Super Resolution: sets the largest batch / chunk / window and the least offloading and tiling that fit GPU total - in use - Save VRAM, from measured memory formulas (no test runs); optionally applied automatically on every Upscale.
 
 ##  Tier 2: Output, Encoding, and Comparison
 
@@ -96,6 +97,7 @@ static-frame skip, recursion depth.
 ##   Tier 5: Reliability, Safety, and Recovery
 - Default subprocess execution mode with strong cancellation and cleanup behavior.
 - Confirm-cancel safety checkbox in processing tabs.
+- Save VRAM (GB) on every upscaler (like ComfyUI --reserve-vram): each run is capped at GPU total - in use - Save VRAM and never spills into shared GPU memory.
 - VRAM OOM detection and prominent OOM alert banner with remediation guidance.
 - Best-effort salvage of partial outputs on cancellation/failure.
 - Collision-safe output naming to avoid overwrite.

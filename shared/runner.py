@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .path_utils import (
+    collision_safe_path,
     emit_metadata,
     ffmpeg_set_fps,
     get_media_fps,
@@ -30,6 +31,8 @@ from .command_logger import get_command_logger
 from .video_codec_options import build_ffmpeg_video_encode_args
 from .processing_queue import queue_resource_keys_for_gpu_selection
 from .model_downloads import ensure_rife_model, ensure_seedvr2_model
+from .vram_autotune.common import apply_vram_cap_env, is_tight
+from .vram_autotune.seedvr2 import SEEDVR2_PROCESS_OVERHEAD_GB, auto_apply as seedvr2_auto_apply
 
 
 _SEEDVR2_ATTENTION_ALIASES = {
@@ -73,6 +76,20 @@ def _console_safe_text(value: Any, encoding: Optional[str] = None) -> str:
 def _safe_console_print(value: Any = "", *, end: str = "\n", flush: bool = False) -> None:
     print(_console_safe_text(value), end=end, flush=flush)
 
+
+
+def _is_cuda_oom_text(text: str) -> bool:
+    """A CUDA out-of-memory error in a run log (the Save VRAM cap raises these instead of spilling)."""
+    from .oom_alert import is_vram_oom_text
+
+    return is_vram_oom_text(text)
+
+
+def _truthy(value: Any) -> bool:
+    """Checkbox/preset value as bool ("false"/"0"/"" are False)."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 class RunResult:
     def __init__(self, returncode: int, output_path: Optional[str], log: str):
@@ -503,6 +520,16 @@ class Runner:
         output_format = settings.get("output_format") or "auto"
         format_for_cli = None if output_format == "auto" else output_format
 
+        # "Auto Tune on every Upscale": size batch / BlockSwap / VAE tiling for this exact
+        # input (file or chunk), output size and the VRAM free right now.
+        if _truthy(settings.get("auto_tune_on_run")):
+            seedvr2_auto_apply(
+                settings,
+                input_path,
+                log=lambda m: (print(m, flush=True), on_progress(m + "\n") if on_progress else None),
+                preview_only=preview_only,
+            )
+
         batch_mode = bool(settings.get("batch_mode"))
         # FIXED: Always honor global output_dir, even when Output Override is empty
         # The SeedVR2 CLI's generate_output_path() REQUIRES --output to use custom directory,
@@ -598,6 +625,40 @@ class Runner:
             return self._run_seedvr2_in_app(cli_path, cmd, predicted_output, settings, on_progress)
         else:
             result = self._run_seedvr2_subprocess(cli_path, cmd, predicted_output, settings, on_progress)
+
+            # -----------------------------------------------------------------
+            # Auto Tune safety net: the run hit its Save VRAM cap (another app took VRAM
+            # mid-run, or allocator fragmentation exceeded the estimate). Re-plan with a
+            # tighter budget and run again instead of failing; the cap still prevents
+            # any spill into shared GPU memory.
+            # -----------------------------------------------------------------
+            if _truthy(settings.get("auto_tune_on_run")) and not self._canceled:
+                for cap_scale in (0.85, 0.7):
+                    if result.returncode == 0 or not _is_cuda_oom_text(result.log or ""):
+                        break
+                    retry_msg = (
+                        f"\n[SeedVR2 Auto Tune] Out of VRAM at the Save VRAM limit; re-planning with "
+                        f"{int(cap_scale * 100)}% of the budget and retrying.\n"
+                    )
+                    print(retry_msg, flush=True)
+                    if on_progress:
+                        on_progress(retry_msg)
+                    retry_settings = settings.copy()
+                    retry_settings["_vram_tight"] = True
+                    seedvr2_auto_apply(
+                        retry_settings,
+                        input_path,
+                        log=lambda m: (print(m, flush=True), on_progress(m + "\n") if on_progress else None),
+                        preview_only=preview_only,
+                        cap_scale=cap_scale,
+                    )
+                    retry_cmd = self._build_seedvr2_cmd(
+                        cli_path, retry_settings, format_for_cli, preview_only, output_override=cli_output_arg
+                    )
+                    previous_log = result.log or ""
+                    result = self._run_seedvr2_subprocess(cli_path, retry_cmd, predicted_output, retry_settings, on_progress)
+                    result = RunResult(result.returncode, result.output_path, previous_log + "\n" + (result.log or ""))
+                    settings = retry_settings
 
             # -----------------------------------------------------------------
             # CLI model-choice fallback (invalid --dit_model)
@@ -837,6 +898,18 @@ class Runner:
                 else:
                     env.update(vs_env)
                     log_output(f"INFO: Using VS Build Tools for torch.compile: {vcvars_path}\n   {vs_detail}\n")
+
+        # Save VRAM: cap the CLI (and its phase subprocesses) at total - in use - Save VRAM
+        # so it raises an OOM instead of spilling into shared GPU memory.
+        apply_vram_cap_env(
+            env,
+            settings.get("cuda_device") or env.get("SECOURSES_GLOBAL_GPU_DEVICE"),
+            settings.get("save_vram_gb"),
+            overhead_gb=SEEDVR2_PROCESS_OVERHEAD_GB,
+            log=lambda m: log_output(m + "\n"),
+            tag="SeedVR2",
+            settings_tight=is_tight(settings),
+        )
 
         # Constrain visible GPU(s) before CLI startup to prevent stray contexts on GPU 0.
         cmd, gpu_isolation_note = self._enforce_seedvr2_gpu_visibility(cmd, settings, env)

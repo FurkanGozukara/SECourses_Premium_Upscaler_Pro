@@ -436,6 +436,14 @@ def _normalize_tab_settings(tab_name: str, data: Dict[str, Any], defaults: Dict[
         return _normalize_ltx25_settings(cfg)
     if tab_name == "open_h3":
         return _normalize_open_h3_settings(cfg)
+    if tab_name == "rtx":
+        try:
+            from shared.services.rtx_super_resolution_service import _enforce_rtx_guardrails
+
+            cfg = _enforce_rtx_guardrails(cfg, defaults or None)
+        except Exception:
+            pass
+        return cfg
     if tab_name == "rife":
         return _normalize_rife_settings(cfg)
     if tab_name == "output":
@@ -775,6 +783,9 @@ def update_shared_state_from_preset(
     # Track current preset
     seed_controls["current_preset_name"] = preset_name
     seed_controls["preset_dirty"] = False
+    # Every load / reset bumps this: tab sync must re-apply even when the new values equal the ones it
+    # last synced, because the user may have edited the tab's fields since (Reset All left them stale).
+    seed_controls["preset_epoch"] = int(seed_controls.get("preset_epoch") or 0) + 1
     
     # Also update individual cached values that other parts of the app use
     res_settings = preset.get("resolution", {})

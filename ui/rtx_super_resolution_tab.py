@@ -25,7 +25,13 @@ from shared.video_fps_utils import build_output_fps_summary
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
 from ui.model_tab_common import sync_signature as _sync_signature
-from ui.shared_components import warn_cancel_confirmation
+from ui.shared_components import (
+    autotune_modal_dismiss_js,
+    autotune_vram_controls,
+    warn_cancel_confirmation,
+    wire_auto_tune,
+    wire_auto_tune_on_run,
+)
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
 
@@ -873,16 +879,20 @@ def rtx_super_resolution_tab(
                 label="Apply Face Restoration after upscale",
                 value=bool(_value("face_restore_after_upscale", False)),
             )
-            auto_tune_btn = gr.Button("Auto Tune Max Quality (VRAM Optimized)", elem_classes=["action-btn", "action-btn-optimize", "sec-btn-crimson"])
+            auto_tune_btn, save_vram_gb, auto_tune_on_run = autotune_vram_controls(
+                _value("save_vram_gb", None),
+                _value("auto_tune_on_run", True),
+            )
             gr.Markdown(
                 (
-                    "**How Auto Tune works (RTX Super Resolution):** Tests a short preview input against RTX presets "
-                    "from highest to lower quality and picks the first stable one for your current VRAM/input setup. "
-                    "It uses your current Upscale x, Max Resolution, pre-downscale mode, non-blocking setting, and CUDA stream pointer."
+                    "**Auto Tune (instant, no test runs):** keeps the family you picked (standard upscale, High "
+                    "Bitrate, Denoise or Deblur) and selects its highest quality level whose VRAM fits GPU total - "
+                    "in use - Save VRAM for this input and output size. NVIDIA's SDK allocates outside PyTorch, so "
+                    "every run checks the same budget before it starts and stops with a clear message instead of "
+                    "using shared GPU memory."
                 ),
                 elem_classes=["resolution-info"],
             )
-            auto_tune_status = gr.Markdown("", visible=False)
 
             with gr.Row():
                 output_override = gr.Textbox(
@@ -940,6 +950,18 @@ def rtx_super_resolution_tab(
         with gr.Column(scale=2):
             gr.Markdown("### Output / Actions")
             status_box = gr.Markdown("Ready for processing.", elem_classes=["runtime-status-box"])
+            with gr.Group(
+                visible=False,
+                elem_id="rtx-autotune-notice-modal",
+                elem_classes=["autotune-modal-overlay"],
+            ) as rtx_autotune_notice_modal:
+                with gr.Group(elem_classes=["autotune-modal-card"]):
+                    with gr.Row(elem_classes=["autotune-modal-header"]):
+                        gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
+                        rtx_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
+                    rtx_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
+                    with gr.Row(elem_classes=["autotune-modal-actions"]):
+                        rtx_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
             progress_indicator = gr.Markdown("", visible=False, elem_classes=["runtime-progress-box"])
             with gr.Group():
                 use_resolution_tab = gr.Checkbox(
@@ -1048,7 +1070,14 @@ def rtx_super_resolution_tab(
         pre_downscale_then_upscale, non_blocking_inference, disable_auto_scene_detection_split, cuda_stream_ptr,
         output_format, face_restore_after_upscale, resume_run_dir,
         auto_transfer_output_to_input, streaming_chunk_size_frames, resume_partial_chunks,
+        save_vram_gb, auto_tune_on_run,
     ]
+
+    if len(inputs_list) != len(RTX_ORDER):
+        import logging
+        logging.getLogger("RTXTab").error(
+            f"ERROR: inputs_list ({len(inputs_list)}) != RTX_ORDER ({len(RTX_ORDER)})"
+        )
 
     def _build_input_detection_md(path_val: str) -> gr.update:
         from shared.input_detector import detect_input
@@ -1609,6 +1638,19 @@ def rtx_super_resolution_tab(
             "Auto-transferred latest output into input.",
         )
 
+    # Registered before the Upscale job: Gradio runs a button's listeners in order and waits for a
+    # queued job to finish before the next one, so a later listener would update the UI only after the run.
+    rtx_tuned = {"quality_preset": quality_preset}
+    wire_auto_tune_on_run(
+        upscale_btn=upscale_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=rtx_tuned,
+        shared_state=shared_state,
+        auto_tune_on_run=auto_tune_on_run,
+        global_settings=global_settings,
+    )
+
     upscale_btn.click(
         fn=capture_latest_output_signature,
         inputs=[shared_state],
@@ -1649,15 +1691,30 @@ def rtx_super_resolution_tab(
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
     )
 
-    auto_tune_btn.click(
-        fn=service["auto_tune_action"],
-        inputs=[
-            input_file, input_path, quality_preset, use_resolution_tab, upscale_factor,
-            max_resolution, pre_downscale_then_upscale, non_blocking_inference,
-            disable_auto_scene_detection_split, cuda_stream_ptr, shared_state,
-        ],
-        outputs=[quality_preset, auto_tune_status, shared_state],
-    ).then(fn=lambda: gr.update(visible=True), outputs=[auto_tune_status])
+    wire_auto_tune(
+        auto_tune_btn=auto_tune_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=rtx_tuned,
+        status_box=status_box,
+        shared_state=shared_state,
+        notice_text=rtx_autotune_notice_text,
+        notice_modal=rtx_autotune_notice_modal,
+        modal_id="rtx-autotune-notice-modal",
+        global_settings=global_settings,
+    )
+
+    def _dismiss_rtx_autotune_notice():
+        return gr.update(value=""), gr.update(visible=False)
+
+    for _btn in (rtx_autotune_notice_ok_btn, rtx_autotune_notice_close_btn):
+        _btn.click(
+            fn=_dismiss_rtx_autotune_notice,
+            outputs=[rtx_autotune_notice_text, rtx_autotune_notice_modal],
+            queue=False,
+            show_progress="hidden",
+            js=autotune_modal_dismiss_js("rtx-autotune-notice-modal"),
+        )
 
     def _cancel_with_confirmation(ok, state):
         if ok:

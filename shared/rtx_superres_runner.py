@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from shared.image_io import imwrite, load_image_bgr8
+from shared.vram_autotune.rtx import check_or_pick as rtx_check_or_pick
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -491,6 +492,25 @@ def run_rtx_superres(
         model_out_h = int(plan["model_output_height"])
         out_w = int(plan["output_width"])
         out_h = int(plan["output_height"])
+
+        # Save VRAM: the SDK allocates outside PyTorch, so check the budget before loading it
+        # (Auto Tune picks the best level that fits) instead of letting Windows spill.
+        vram_ok, vram_reason = rtx_check_or_pick(
+            settings, in_w=preprocess_w, in_h=preprocess_h,
+            model_out_w=model_out_w, model_out_h=model_out_h, log=log,
+        )
+        if not vram_ok:
+            log(f"[RTX] Not started: {vram_reason}")
+            return RTXSuperResResult(
+                returncode=1,
+                output_path=None,
+                log="\n".join(logs + [f"Not enough free VRAM: {vram_reason}"]),
+                elapsed_seconds=max(0.0, time.time() - start_ts),
+            )
+        tuned_quality = str(settings.get("quality_preset") or quality_name).strip().upper()
+        if tuned_quality != quality_name and tuned_quality in VideoSuperRes.QualityLevel.__members__:
+            quality_name = tuned_quality
+            quality_enum = VideoSuperRes.QualityLevel[quality_name]
 
         if resolved_output_format == "mp4" and (out_w > 8192 or out_h > 8192):
             return RTXSuperResResult(

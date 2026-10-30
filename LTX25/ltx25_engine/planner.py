@@ -13,6 +13,17 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+# Sampling VRAM per transformer-sequence token and the fixed part beside it (two streaming cast
+# buffers + tiled VAE), measured 2026-10-30 on an RTX 5090 (benchmarks/vram/ltx25.jsonl): 0.19-0.22 MB
+# per token live, 0.25 MB with allocator slack. The non-block weights (4.55 GB in memory for every
+# 22B variant) always stay on the GPU; transformer blocks stream from RAM when they do not fit.
+BYTES_PER_TOKEN = 250_000.0
+ACTIVATION_BASE_BYTES = 3.0e9
+NON_BLOCK_WEIGHT_BYTES = 4.9e9
+# The allocator keeps 12-18% above the live activations (a 3840x2160 chunk planned at exactly the cap
+# failed with 4.5 GB stranded in split blocks), so the per-token part carries this margin.
+ACTIVATION_SAFETY = 1.15
+
 # torch is only needed by the tensor helpers (pad/slice/merge). The planning
 # math is pure Python so the app process can import this module for the LIVE
 # chunk-plan preview without initializing torch.
@@ -168,8 +179,8 @@ def auto_token_budget(
     free_vram_bytes: int,
     weight_resident_bytes: int,
     reserve_gb: float = 1.0,
-    bytes_per_token: float = 1_400_000.0,
-    base_overhead_bytes: float = 2.5e9,
+    bytes_per_token: float = BYTES_PER_TOKEN,
+    base_overhead_bytes: float = ACTIVATION_BASE_BYTES + NON_BLOCK_WEIGHT_BYTES,
 ) -> Tuple[int, str]:
     """
     Choose the largest safe token budget for the available VRAM, preferring a
@@ -177,7 +188,7 @@ def auto_token_budget(
 
     The activation cost model is linear in the *total* transformer sequence:
     video tokens x 1.25 (surviving IC-LoRA guide tokens) + text/audio slack,
-    calibrated with a conservative bytes/token so the first run never OOMs.
+    calibrated per token (BYTES_PER_TOKEN) on top of the fixed part and the resident non-block weights.
     Returns (token_budget, reason).
     """
     padded_w = math.ceil(width / 32) * 32
@@ -191,7 +202,7 @@ def auto_token_budget(
         return max(4096, spatial_tokens * 2), "minimum (weights consume nearly all VRAM)"
 
     # tokens the sampler actually attends to = budget * 1.25 (+ ~1.2k text tokens)
-    max_video_tokens = int(usable / (bytes_per_token * 1.25))
+    max_video_tokens = int(usable / (bytes_per_token * 1.25 * ACTIVATION_SAFETY))
     max_video_tokens = max(4096, max_video_tokens)
 
     single = one_chunk_length(total_frames)

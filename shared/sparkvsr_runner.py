@@ -39,6 +39,8 @@ from .path_utils import (
     resolve_output_location,
 )
 from .process_control import terminate_process_tree
+from .vram_autotune.common import apply_vram_cap_env, is_tight
+from .vram_autotune.sparkvsr import SPARKVSR_PROCESS_OVERHEAD_GB, auto_apply as sparkvsr_auto_apply
 
 
 @dataclass
@@ -279,6 +281,37 @@ def run_sparkvsr(
     cancel_event=None,
     process_handle: Optional[Dict] = None,
 ) -> SparkVSRResult:
+    """Run SparkVSR; with Auto Tune on every Upscale, a run that hits its Save VRAM cap is re-planned
+    with a tighter budget and run again (the cap itself prevents any shared GPU memory use)."""
+    result = _run_sparkvsr_once(settings, base_dir, on_progress, cancel_event, process_handle)
+    if not _bool(settings.get("auto_tune_on_run"), False):
+        return result
+    from .oom_alert import is_vram_oom_text
+
+    for cap_scale in (0.85, 0.7):
+        if result.returncode == 0 or not is_vram_oom_text(result.log or ""):
+            break
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            break
+        note = (f"[SparkVSR Auto Tune] Out of VRAM at the Save VRAM limit; re-planning with "
+                f"{int(cap_scale * 100)}% of the budget and retrying.")
+        if on_progress:
+            with suppress(Exception):
+                on_progress(note)
+        previous_log = result.log or ""
+        result = _run_sparkvsr_once(dict(settings, _autotune_cap_scale=cap_scale, _vram_tight=True), base_dir, on_progress,
+                                    cancel_event, process_handle)
+        result.log = "\n".join([previous_log, note, result.log or ""])
+    return result
+
+
+def _run_sparkvsr_once(
+    settings: Dict[str, Any],
+    base_dir: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+    cancel_event=None,
+    process_handle: Optional[Dict] = None,
+) -> SparkVSRResult:
     start_time = time.time()
     log_lines: List[str] = []
     cmd: List[str] = []
@@ -360,6 +393,10 @@ def run_sparkvsr(
             log(f"[SparkVSR] Using venv python: {python_exe}")
         prompt_text = str(settings.get("prompt") or "").strip()
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+
+        if _bool(settings.get("auto_tune_on_run"), False):
+            # "Auto Tune on every Upscale": size chunk / tiles for this exact input and the VRAM free now.
+            sparkvsr_auto_apply(settings, original_input_path, max(1, min(16, _parse_int(settings.get("scale"), 4))), log=log)
 
         tile_h = max(0, _parse_int(settings.get("tile_height"), 0))
         tile_w = max(0, _parse_int(settings.get("tile_width"), 0))
@@ -475,6 +512,18 @@ def run_sparkvsr(
         if legacy_alloc_conf and not env.get("PYTORCH_ALLOC_CONF"):
             env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
             log("[SparkVSR] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF")
+        # Save VRAM: cap the CLI and its stage subprocesses at total - in use - Save VRAM
+        # so they never spill into shared GPU memory.
+        if visible_gpu != "":
+            apply_vram_cap_env(
+                env,
+                visible_gpu if visible_gpu is not None else settings.get("device", "auto"),
+                settings.get("save_vram_gb"),
+                overhead_gb=SPARKVSR_PROCESS_OVERHEAD_GB,
+                log=log,
+                tag="SparkVSR",
+                settings_tight=is_tight(settings),
+            )
         if visible_gpu is not None:
             env["CUDA_VISIBLE_DEVICES"] = visible_gpu
         triton_cache_dir = base_dir / "temp" / "triton_cache"

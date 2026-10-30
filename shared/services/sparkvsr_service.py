@@ -59,6 +59,7 @@ from shared.comparison_video_service import maybe_generate_input_vs_output_compa
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
+from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
 from shared.sparkvsr_ref_utils import (
     discover_pisa_runtime,
     build_temporal_reference_specs,
@@ -483,7 +484,8 @@ def sparkvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "upscale_factor": float(scale),
         "max_target_resolution": 1920,
         "pre_downscale_then_upscale": True,
-        "save_vram_gb": 2.0,
+        "save_vram_gb": DEFAULT_SAVE_VRAM_GB,
+        "auto_tune_on_run": True,
     }
 
 
@@ -549,6 +551,7 @@ SPARKVSR_ORDER: List[str] = [
     "resume_run_dir",
     "save_vram_gb",
     "keep_only_output_files",
+    "auto_tune_on_run",
 ]
 
 
@@ -672,16 +675,8 @@ def _enforce_sparkvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["png_save"] = _to_bool(cfg.get("png_save"), _to_bool(defaults.get("png_save", False), False))
     save_format = str(cfg.get("save_format", defaults.get("save_format", "yuv444p")) or "yuv444p").strip().lower()
     cfg["save_format"] = save_format if save_format in set(SPARKVSR_SAVE_FORMAT_OPTIONS) else "yuv444p"
-    cfg["save_vram_gb"] = round(
-        max(
-            0.0,
-            min(
-                9.9,
-                _to_float(cfg.get("save_vram_gb"), _to_float(defaults.get("save_vram_gb", 2.0), 2.0)),
-            ),
-        ),
-        1,
-    )
+    cfg["save_vram_gb"] = clamp_save_vram_gb(cfg.get("save_vram_gb"), defaults.get("save_vram_gb", DEFAULT_SAVE_VRAM_GB))
+    cfg["auto_tune_on_run"] = _to_bool(cfg.get("auto_tune_on_run", defaults.get("auto_tune_on_run", True)), True)
 
     cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
     codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()
@@ -1414,29 +1409,66 @@ def build_sparkvsr_callbacks(
         uploaded_file,
         *args,
         state: Dict[str, Any] = None,
-        progress=None,
         global_settings_snapshot: Dict[str, Any] | None = None,
         _global_settings: Dict[str, Any] = global_settings,
-    ):
-        from shared.services.sparkvsr_autotune import sparkvsr_auto_tune_action
+        **_ignored,
+    ) -> Dict[str, Any]:
+        """Instant Auto Tune (no test runs): longest temporal chunk, then no/largest spatial tiles,
+        for this input, the output size and (GPU total - in use - Save VRAM)."""
+        from shared.vram_autotune import sparkvsr as spark_plan
+        from shared.vram_autotune.common import frames_per_unit, probe_media, resolve_budget
 
-        yield from sparkvsr_auto_tune_action(
-            uploaded_file=uploaded_file,
-            args=tuple(args),
-            state=state,
-            progress=progress,
-            global_settings_snapshot=global_settings_snapshot,
-            global_settings_fallback=_global_settings,
-            defaults=defaults,
-            sparkvsr_order=SPARKVSR_ORDER,
-            parse_args_fn=_sparkvsr_dict_from_args,
-            guardrail_fn=_enforce_sparkvsr_guardrails,
-            canonical_scale_fn=canonical_sparkvsr_scale,
-            base_dir=base_dir,
-            temp_dir=temp_dir,
-            cancel_event=_sparkvsr_cancel_event,
-        )
-        return
+        snapshot = dict(global_settings_snapshot) if isinstance(global_settings_snapshot, dict) else dict(_global_settings)
+        state = state or {"seed_controls": {}}
+        seed_controls = state.setdefault("seed_controls", {})
+        if len(args) != len(SPARKVSR_ORDER):
+            return {"status": "Auto Tune: settings schema mismatch.", "report": "", "updates": {}, "state": state}
+        cfg = _enforce_sparkvsr_guardrails(_sparkvsr_dict_from_args(list(args)), defaults)
+        raw = uploaded_file if uploaded_file else cfg.get("input_path")
+        if isinstance(raw, dict):
+            raw = raw.get("path") or ""
+        path = normalize_path(str(raw or ""))
+        if path and Path(path).is_dir() and bool(cfg.get("batch_enable")):
+            infos = [i for i in (probe_media(str(f)) for f in sorted(Path(path).iterdir())[:64]) if i]
+            path = max(infos, key=lambda i: i.width * i.height * max(1, i.frames)).path if infos else ""
+        media = probe_media(path) if path else None
+        if media is None:
+            return {"status": "Auto Tune needs an input first (upload a file or enter an Input Path).",
+                    "report": "", "updates": {}, "state": state}
+        model_scale = canonical_sparkvsr_scale(scale_value=cfg.get("scale"), upscale_factor_value=cfg.get("upscale_factor"))
+        requested = float(cfg.get("upscale_factor") or model_scale)
+        if bool(cfg.get("use_resolution_tab", True)) and seed_controls.get("upscale_factor_val") is not None:
+            try:
+                requested = float(seed_controls.get("upscale_factor_val"))
+            except Exception:
+                pass
+        try:
+            sizing = estimate_fixed_scale_upscale_plan_from_dims(
+                media.width, media.height, requested_scale=requested, model_scale=max(2, int(model_scale)),
+                max_edge=int(cfg.get("max_target_resolution") or 0),
+                force_pre_downscale=bool(cfg.get("pre_downscale_then_upscale", True)),
+            )
+            out_w, out_h = int(sizing.resize_width), int(sizing.resize_height)
+        except Exception:
+            out_w, out_h = media.width * int(model_scale), media.height * int(model_scale)
+        frames = media.frames
+        start_f = max(0, int(cfg.get("start_frame") or 0))
+        end_f = int(cfg.get("end_frame") if cfg.get("end_frame") is not None else -1)
+        frames = max(1, (min(frames, end_f + 1) if end_f >= 0 else frames) - start_f)
+        frames = frames_per_unit(type(media)(media.path, media.kind, media.width, media.height, frames, media.fps),
+                                 seed_controls)
+        device = get_global_gpu_override(seed_controls, snapshot)
+        budget = None if device == "cpu" else resolve_budget(device, cfg.get("save_vram_gb"),
+                                                             overhead_gb=spark_plan.SPARKVSR_PROCESS_OVERHEAD_GB)
+        tp = spark_plan.plan(cfg, out_w=out_w, out_h=out_h, frames=frames, budget=budget, image=media.kind == "image")
+        report = tp.report("Auto Tune")
+        if tp.updates:
+            seed_controls.setdefault("sparkvsr_settings", {}).update(tp.updates)
+            state["preset_dirty"] = True
+        for _line in report.splitlines():
+            print(f"[SparkVSR Auto Tune] {_line}", flush=True)
+        status = report.splitlines()[0] if tp.fits else "Auto Tune: this input does not fit the VRAM budget - see the details."
+        return {"status": status, "report": report, "updates": dict(tp.updates), "state": state}
 
     def run_action(
         upload,
@@ -3417,7 +3449,6 @@ def build_sparkvsr_callbacks(
                         try:
                             from shared.chunking import detect_resume_state, concat_videos
                             from shared.path_utils import collision_safe_path as _collision_safe_path_local
-                            import shutil
                             
                             # Check for completed video chunks
                             partial_video, completed_chunks = detect_resume_state(temp_chunks_dir, "mp4")

@@ -45,7 +45,13 @@ from ui.universal_preset_section import (
     wire_universal_preset_events,
 )
 from ui.media_preview import preview_updates
-from ui.shared_components import warn_cancel_confirmation
+from ui.shared_components import (
+    autotune_modal_dismiss_js,
+    autotune_vram_controls,
+    warn_cancel_confirmation,
+    wire_auto_tune,
+    wire_auto_tune_on_run,
+)
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
@@ -296,6 +302,16 @@ def open_h3_tab(
                         minimum=0,
                         info="Caps the longer output edge in every mode.",
                     )
+                auto_tune_btn, reserve_vram_gb, auto_tune_on_run = autotune_vram_controls(
+                    _value("reserve_vram_gb", None),
+                    _value("auto_tune_on_run", True),
+                )
+                gr.Markdown(
+                    "**Auto Tune (instant, no test runs):** reads your GPU's total and in-use VRAM, the input and the "
+                    "output size, then sets the token budget to Auto, the longest window (one window over the whole "
+                    "clip when it fits, up to 361 frames) and allows all 50 DiT blocks on the GPU, and shows the "
+                    "window plan. It keeps `Save VRAM (GB)` free; the engine never uses shared GPU memory."
+                )
 
             with gr.Accordion("🎛️ Open-H3 Models", open=True):
                 isolated_stages = gr.Checkbox(
@@ -355,15 +371,6 @@ def open_h3_tab(
                     elem_classes=["open-h3-vram-note"],
                 )
                 with gr.Row():
-                    reserve_vram_gb = gr.Slider(
-                        label="Save VRAM (GB)",
-                        minimum=0.0,
-                        maximum=16.0,
-                        step=0.5,
-                        value=float(_value("reserve_vram_gb", 2.0) if _value("reserve_vram_gb", 2.0) is not None else 2.0),
-                        info=("VRAM always left free for Windows and other apps (like ComfyUI --reserve-vram). "
-                              "Raise it if other GPU apps run at the same time."),
-                    )
                     max_gpu_blocks = gr.Slider(
                         label="Max DiT Blocks on GPU (Block Swap)",
                         minimum=0,
@@ -555,6 +562,18 @@ def open_h3_tab(
         with gr.Column(scale=2):
             gr.Markdown("#### 📤 Output & Actions")
             status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
+            with gr.Group(
+                visible=False,
+                elem_id="openh3-autotune-notice-modal",
+                elem_classes=["autotune-modal-overlay"],
+            ) as h3_autotune_notice_modal:
+                with gr.Group(elem_classes=["autotune-modal-card"]):
+                    with gr.Row(elem_classes=["autotune-modal-header"]):
+                        gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
+                        h3_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
+                    h3_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
+                    with gr.Row(elem_classes=["autotune-modal-actions"]):
+                        h3_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
             progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
 
             with gr.Group():
@@ -748,6 +767,7 @@ def open_h3_tab(
         device, save_metadata, auto_transfer_output_to_input,
         batch_enable, batch_input, batch_output,
         resume_run_dir, keep_only_output_files,
+        auto_tune_on_run,
     ]
 
     if len(inputs_list) != len(OPENH3_ORDER):
@@ -1518,6 +1538,24 @@ def open_h3_tab(
         shared_state,
     ]
 
+    # Registered before the Upscale job: Gradio runs a button's listeners in order and waits for a
+    # queued job to finish before the next one, so a later listener would update the UI only after the run.
+    h3_tuned = {
+        "token_budget_mode": token_budget_mode,
+        "max_window_frames": max_window_frames,
+        "max_gpu_blocks": max_gpu_blocks,
+        "ffn_chunk_tokens": ffn_chunk_tokens,
+    }
+    wire_auto_tune_on_run(
+        upscale_btn=upscale_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=h3_tuned,
+        shared_state=shared_state,
+        auto_tune_on_run=auto_tune_on_run,
+        global_settings=global_settings,
+    )
+
     # Main processing
     upscale_btn.click(
         fn=capture_latest_output_signature,
@@ -1621,6 +1659,31 @@ def open_h3_tab(
             return status_upd, log_msg, gr.update(value=False)
         message = warn_cancel_confirmation()
         return gr.update(value=f"WARNING: {message}", visible=True), message, gr.update(value=False)
+
+    wire_auto_tune(
+        auto_tune_btn=auto_tune_btn,
+        action=service["auto_tune_action"],
+        inputs=[input_file] + inputs_list,
+        tuned=h3_tuned,
+        status_box=status_box,
+        shared_state=shared_state,
+        notice_text=h3_autotune_notice_text,
+        notice_modal=h3_autotune_notice_modal,
+        modal_id="openh3-autotune-notice-modal",
+        global_settings=global_settings,
+    )
+
+    def _dismiss_h3_autotune_notice():
+        return gr.update(value=""), gr.update(visible=False)
+
+    for _btn in (h3_autotune_notice_ok_btn, h3_autotune_notice_close_btn):
+        _btn.click(
+            fn=_dismiss_h3_autotune_notice,
+            outputs=[h3_autotune_notice_text, h3_autotune_notice_modal],
+            queue=False,
+            show_progress="hidden",
+            js=autotune_modal_dismiss_js("openh3-autotune-notice-modal"),
+        )
 
     cancel_btn.click(
         fn=_cancel_with_confirmation_reset,

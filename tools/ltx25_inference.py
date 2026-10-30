@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_audio", action="store_true")
 
     p.add_argument("--reserve_vram_gb", type=float, default=1.0)
-    p.add_argument("--bytes_per_token", type=float, default=1_400_000.0)
+    p.add_argument("--bytes_per_token", type=float, default=250_000.0)
     p.add_argument("--attention", default="auto", choices=["auto", "sage", "flash", "sdpa"])
     p.add_argument("--vram_mode", default="auto",
                    choices=["auto", "gpu_only", "highvram", "lowvram", "novram"])

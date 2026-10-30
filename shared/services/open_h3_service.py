@@ -50,6 +50,7 @@ from shared.open_h3_constants import (
     OPENH3_VAE_SOL_FP16,
 )
 from shared.gpu_utils import get_global_gpu_override
+from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.output_run_manager import (
     prepare_single_video_run,
@@ -217,31 +218,19 @@ def _probe_video_for_plan(path: str) -> Optional[Tuple[int, int, int, float, boo
 
 
 def _free_vram_bytes_for_plan(device_value: str) -> Tuple[float, str]:
-    """Free VRAM via NVML/nvidia-smi (no CUDA context); 3s cache."""
+    """Free VRAM of the GPU the run will use, via nvidia-smi (no CUDA context); 3s cache."""
+    from shared.vram_autotune.common import pick_gpu_index, query_gpu_memory
+
     now = time.time()
     if now - float(_PLAN_VRAM_CACHE.get("ts", 0.0)) > 3.0:
-        try:
-            from shared.gpu_utils import get_gpu_info
-
-            _PLAN_VRAM_CACHE["gpus"] = get_gpu_info() or []
-        except Exception:
-            _PLAN_VRAM_CACHE["gpus"] = []
+        _PLAN_VRAM_CACHE["gpus"] = query_gpu_memory()
         _PLAN_VRAM_CACHE["ts"] = now
-    gpus = _PLAN_VRAM_CACHE.get("gpus") or []
-    if not gpus:
+    gpus = _PLAN_VRAM_CACHE.get("gpus") or {}
+    idx = pick_gpu_index(device_value, gpus) if gpus else None
+    if idx is None:
         return 0.0, "no NVIDIA GPU detected"
-    wanted = str(device_value or "").strip()
-    chosen = None
-    if wanted.isdigit():
-        for gpu in gpus:
-            if str(getattr(gpu, "id", "")) == wanted:
-                chosen = gpu
-                break
-    if chosen is None:
-        chosen = max(gpus, key=lambda g: float(getattr(g, "available_memory_gb", 0.0) or 0.0))
-    free_gb = float(getattr(chosen, "available_memory_gb", 0.0) or 0.0)
-    label = f"GPU {getattr(chosen, 'id', '?')} free {free_gb:.1f}GB"
-    return free_gb * (1024.0 ** 3), label
+    free_gb = float(gpus[idx].free_gb)
+    return free_gb * (1024.0 ** 3), f"GPU {idx} free {free_gb:.1f}GB"
 
 
 def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
@@ -295,7 +284,7 @@ def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
             budget = int(settings.get("max_tokens") or 160000)
             lines.append(f"[Plan] auto budget unavailable ({vram_label}) - using Manual value {budget}")
         else:
-            budget = planner.auto_token_budget(int(free_bytes), float(settings.get("reserve_vram_gb") or 2.0), 145000.0)
+            budget = planner.auto_token_budget(int(free_bytes), clamp_save_vram_gb(settings.get("reserve_vram_gb")), 145000.0)
             lines.append(f"[Plan] auto token budget {budget} | {vram_label}")
     if kind == "image":
         lines.append("[Plan] image: refined as a 5-frame still, first frame saved")
@@ -422,7 +411,7 @@ def open_h3_defaults() -> Dict[str, Any]:
         "max_window_frames": 121,
         "overlap_frames": 8,
         "ffn_chunk_tokens": 32768,
-        "reserve_vram_gb": 2.0,
+        "reserve_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "max_gpu_blocks": 50,
         "fps_mode": OPENH3_FPS_MODES[0],
         "audio_mode": OPENH3_AUDIO_MODES[0],
@@ -438,6 +427,7 @@ def open_h3_defaults() -> Dict[str, Any]:
         "batch_output_path": "",
         "resume_run_dir": "",
         "keep_only_output_files": False,
+        "auto_tune_on_run": True,
     }
 
 
@@ -487,6 +477,7 @@ OPENH3_ORDER: List[str] = [
     "batch_output_path",
     "resume_run_dir",
     "keep_only_output_files",
+    "auto_tune_on_run",
 ]
 
 
@@ -548,7 +539,8 @@ def _enforce_open_h3_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -
     overlap = max(0, min(64, _to_int(cfg.get("overlap_frames"), 8)))
     cfg["overlap_frames"] = min(overlap, max(0, cfg["max_window_frames"] - 5))
     cfg["ffn_chunk_tokens"] = max(0, min(1 << 20, _to_int(cfg.get("ffn_chunk_tokens"), 32768)))
-    cfg["reserve_vram_gb"] = max(0.0, min(16.0, _to_float(cfg.get("reserve_vram_gb"), 2.0)))
+    cfg["reserve_vram_gb"] = clamp_save_vram_gb(cfg.get("reserve_vram_gb"), defaults.get("reserve_vram_gb", DEFAULT_SAVE_VRAM_GB))
+    cfg["auto_tune_on_run"] = _to_bool(cfg.get("auto_tune_on_run", defaults.get("auto_tune_on_run", True)), True)
     cfg["max_gpu_blocks"] = max(0, min(50, _to_int(cfg.get("max_gpu_blocks"), 50)))
     cfg["isolated_stages"] = _to_bool(cfg.get("isolated_stages"), False)
 
@@ -746,6 +738,46 @@ def build_open_h3_callbacks(
             return f"[ERROR] Live chunk plan failed: {exc}"
 
     def auto_tune_action(
+        uploaded_file,
+        *args,
+        state: Dict[str, Any] = None,
+        global_settings_snapshot: Dict[str, Any] | None = None,
+        _global_settings: Dict[str, Any] = global_settings,
+        **_ignored,
+    ) -> Dict[str, Any]:
+        """Instant Auto Tune (no test runs): opens the engine's quality/speed limits and shows the
+        window plan for this input, output size and (GPU total - in use - Save VRAM)."""
+        from shared.vram_autotune import open_h3 as h3_plan
+        from shared.vram_autotune.common import resolve_budget
+
+        snapshot = dict(global_settings_snapshot) if isinstance(global_settings_snapshot, dict) else dict(_global_settings)
+        state = state or {"seed_controls": {}}
+        seed_controls = state.setdefault("seed_controls", {})
+        settings = {**defaults, **_open_h3_dict_from_args(list(args))}
+        settings = _enforce_open_h3_guardrails(settings, defaults)
+        global_gpu_device = get_global_gpu_override(seed_controls, snapshot)
+        settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
+        uploaded_path = ""
+        if uploaded_file:
+            if isinstance(uploaded_file, dict):
+                uploaded_path = str(uploaded_file.get("path") or uploaded_file.get("name") or "")
+            else:
+                uploaded_path = str(getattr(uploaded_file, "name", "") or uploaded_file)
+        candidate = normalize_path(settings.get("input_path") or "") or normalize_path(uploaded_path)
+        if not candidate or not Path(candidate).exists():
+            return {"status": "Auto Tune needs an input first (upload a file or enter an Input Path).",
+                    "report": "", "updates": {}, "state": state}
+        settings["_effective_input_path"] = candidate
+        budget = None if settings["device"] == "cpu" else resolve_budget(settings["device"], settings.get("reserve_vram_gb"))
+        tp = h3_plan.plan(settings, base_dir, budget)
+        report = tp.report("Auto Tune")
+        seed_controls.setdefault("open_h3_settings", {}).update(tp.updates)
+        state["preset_dirty"] = True
+        for _line in report.splitlines():
+            print(f"[Open-H3 Auto Tune] {_line}", flush=True)
+        return {"status": report.splitlines()[0], "report": report, "updates": dict(tp.updates), "state": state}
+
+    def cli_plan_preview_action(
         uploaded_file,
         *args,
         state: Dict[str, Any] = None,
@@ -2361,6 +2393,7 @@ def build_open_h3_callbacks(
         "load_preset": load_preset,
         "safe_defaults": safe_defaults,
         "auto_tune_action": auto_tune_action,
+        "cli_plan_preview": cli_plan_preview_action,
         "live_plan": live_plan_action,
         "run_action": run_action,
         "cancel_action": cancel_action,

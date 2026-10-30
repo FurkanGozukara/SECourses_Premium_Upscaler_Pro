@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .command_logger import get_command_logger
+from .vram_autotune.ltx25 import auto_apply as ltx25_auto_apply
 from .ltx25_constants import (
     LTX25_AUDIO_VAE_FILE,
     LTX25_IC_LORA_FILE,
@@ -394,6 +395,9 @@ def _build_ltx25_command(
         "--vram_mode",
         str(settings.get("vram_mode") or "auto"),
     ]
+    if _parse_float(settings.get("bytes_per_token"), 0.0) > 0:
+        # Activation VRAM per sampled token (Auto Tune passes the calibrated value).
+        cmd += ["--bytes_per_token", str(_parse_float(settings.get("bytes_per_token"), 250_000.0))]
     if str(settings.get("audio_codec") or "").strip().lower() == "none":
         cmd.append("--no_audio")
     return cmd
@@ -544,6 +548,40 @@ def run_ltx25(
     cancel_event=None,
     process_handle: Optional[Dict] = None,
 ) -> Ltx25Result:
+    """Run LTX 2.5; with Auto Tune on every Upscale, a run that hits its Save VRAM cap runs again with a
+    larger activation reserve per token (shorter chunks, fewer resident blocks)."""
+    result = _run_ltx25_once(settings, base_dir, on_progress, cancel_event, process_handle)
+    if not _bool((settings or {}).get("auto_tune_on_run"), False):
+        return result
+    from .oom_alert import is_vram_oom_text
+
+    base_bpt = _parse_float((settings or {}).get("bytes_per_token"), 0.0) or 250_000.0
+    for factor in (1.6, 2.5):
+        if result.returncode == 0 or not is_vram_oom_text(result.log or ""):
+            break
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            break
+        note = (f"[LTX25 Auto Tune] Out of VRAM at the Save VRAM limit; retrying with {factor:g}x the "
+                "activation reserve per token.")
+        if on_progress:
+            try:
+                on_progress(note)
+            except Exception:
+                pass
+        previous_log = result.log or ""
+        result = _run_ltx25_once(dict(settings, bytes_per_token=base_bpt * factor), base_dir, on_progress,
+                                 cancel_event, process_handle)
+        result.log = "\n".join([previous_log, note, result.log or ""])
+    return result
+
+
+def _run_ltx25_once(
+    settings: Dict[str, Any],
+    base_dir: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+    cancel_event=None,
+    process_handle: Optional[Dict] = None,
+) -> Ltx25Result:
     settings = dict(settings or {})
     start_time = time.time()
     log_lines: List[str] = []
@@ -682,6 +720,8 @@ def run_ltx25(
         if python_exe != sys.executable:
             log(f"[LTX25] Using venv python: {python_exe}")
 
+        if _bool(settings.get("auto_tune_on_run"), False):
+            ltx25_auto_apply(settings, log)
         cmd = _build_ltx25_command(python_exe, script_path, settings, paths, input_path, output_file, seed_value)
 
         schedule = _resolve_schedule(settings, model_name)

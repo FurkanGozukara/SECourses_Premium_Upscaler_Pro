@@ -20,6 +20,10 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 # Gradio 6.16+: fewer idle heartbeat round-trips with many open tabs.
 os.environ.setdefault("GRADIO_HEARTBEAT_INTERVAL", "30")
 
+# Number GPUs the way nvidia-smi does (PCI bus order) in every engine subprocess, so the
+# GPU picked in the UI and the VRAM read for its Save VRAM budget are the GPU CUDA uses.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 # Migrate deprecated allocator env var so subprocesses and in-app torch startup stay quiet.
 legacy_alloc_conf = os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 if legacy_alloc_conf and not os.environ.get("PYTORCH_ALLOC_CONF"):
@@ -99,7 +103,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.0"
+APP_VERSION = "9.1"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1806,6 +1810,7 @@ def main(argv=None):
                     {
                         "tab": tab_name,
                         "current_preset_name": current,
+                        "preset_epoch": seed_controls.get("preset_epoch") if isinstance(seed_controls, dict) else None,
                         "tab_settings": tab_settings,
                         "presets": presets,
                     }

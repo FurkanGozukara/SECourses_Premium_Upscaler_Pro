@@ -37,6 +37,9 @@ MIN_TILE = 128
 TILE_CHOICES = tuple(range(1024, MIN_TILE - 1, -32))
 TILED_OVERLAP = 48         # wider overlap = smoother tile seams (24 is the minimum default)
 RAM_SHARE = 0.5            # use at most half of the free system RAM for one pass
+# The DiT's temporal RoPE table holds 1024 latent positions and a pass advances 2 per 8 frames, so one
+# pass breaks after about 4,090 frames (a 4,200-frame pass crashed); longer clips stream in passes.
+MAX_PASS_FRAMES = 4000
 
 
 def _pad128(v: float) -> int:
@@ -103,7 +106,7 @@ def choose(in_w: int, in_h: int, scale: int, total_frames: int, cap_gb: float, k
         mp = tile_mp(tile, in_w, in_h, scale) if tiled else full_mp
         if _with_margin(peak_gb(mp, 21, kv_ratio, mode)) > cap_gb:
             continue  # not even a short pass fits at this tiling
-        frames = min(total, ram_frames_limit(in_w, in_h, scale, tiled))
+        frames = min(total, ram_frames_limit(in_w, in_h, scale, tiled), MAX_PASS_FRAMES)
         while frames > 21 and _with_margin(peak_gb(mp, frames, kv_ratio, mode)) > cap_gb:
             frames = max(21, int(frames * 0.85))
         overlap = min(TILED_OVERLAP, max(8, tile // 4)) if tiled else 24
@@ -115,7 +118,8 @@ def choose(in_w: int, in_h: int, scale: int, total_frames: int, cap_gb: float, k
         if cand.frames >= total:
             break
     if best is not None and best.frames < total:
-        notes.append(f"The clip is split into passes of {best.frames} frames (VRAM/RAM limit).")
+        why = "model limit" if best.frames >= MAX_PASS_FRAMES else "VRAM/RAM limit"
+        notes.append(f"The clip is split into passes of {best.frames} frames ({why}).")
     return best, notes
 
 

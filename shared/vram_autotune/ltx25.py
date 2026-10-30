@@ -6,8 +6,8 @@ non-block weights, 3.0 GB fixed, then 0.25 MB x 1.15 per sampled token; LTX25/lt
 and keeps as many of the 48 transformer blocks on the GPU as fit, streaming the rest from RAM. This model works best on ONE chunk: every chunk boundary
 is a cross-faded regeneration seam. Auto Tune sets the limits that let it reach that:
 
-- Quality: Auto token budget and the longest chunk allowed (1025 frames), so the whole video is
-  one chunk whenever it fits, and otherwise the fewest, longest chunks.
+- Quality: Auto token budget and the longest chunk the model's 20 s position range allows (up to 1025
+  frames), so a video up to 20 s is one chunk whenever it fits, and otherwise the fewest, longest chunks.
 - Speed: block residency is automatic (all blocks stay on the GPU when they fit).
 """
 
@@ -20,10 +20,35 @@ from .common import TunePlan, VramBudget
 
 TOKEN_BUDGET_AUTO = "Auto (Single Chunk Preferred)"
 MAX_CHUNK_FRAMES = 1025
+# The transformer's time positions are seconds (frame / fps) over max_pos 20: a longer chunk runs past the
+# trained range. Measured (720 frames, 30 fps): one 24 s chunk scored 0.2-0.3 dB below 20 s chunks in every
+# segment, not only after 20 s, so chunks stop at 20 s.
+MAX_CHUNK_SECONDS = 20.0
+
+
+def max_chunk_frames(fps: float) -> int:
+    """Longest 8n+1 chunk whose last frame stays inside the 20 s position range at this frame rate."""
+    if not fps or fps <= 0:
+        fps = 24.0
+    frames = int(MAX_CHUNK_SECONDS * float(fps)) + 1
+    return max(9, min(MAX_CHUNK_FRAMES, ((frames - 1) // 8) * 8 + 1))
+
+
+def _run_fps(settings: Dict[str, Any]) -> float:
+    try:
+        override = float(settings.get("fps") or 0.0)
+    except (TypeError, ValueError):
+        override = 0.0
+    if override > 0:
+        return override
+    from .common import probe_media
+
+    info = probe_media(settings.get("input_path"))
+    return float(info.fps) if info is not None and info.fps else 24.0
 
 
 def tuned_values(settings: Dict[str, Any]) -> Dict[str, Any]:
-    return {"token_budget_mode": TOKEN_BUDGET_AUTO, "max_chunk_frames": MAX_CHUNK_FRAMES}
+    return {"token_budget_mode": TOKEN_BUDGET_AUTO, "max_chunk_frames": max_chunk_frames(_run_fps(settings))}
 
 
 def plan(settings: Dict[str, Any], base_dir: Path, budget: Optional[VramBudget]) -> TunePlan:
@@ -39,8 +64,8 @@ def plan(settings: Dict[str, Any], base_dir: Path, budget: Optional[VramBudget])
         line = line.replace("[Plan] ", "").strip()
         if line and not line.startswith("[Live]"):
             out.lines.append(line)
-    out.lines.append("Token budget Auto (single chunk preferred), longest chunk 1025 frames; transformer "
-                     "blocks that do not fit stream from RAM.")
+    out.lines.append(f"Token budget Auto (single chunk preferred), longest chunk {out.updates['max_chunk_frames']} frames "
+                     "(20 s, the model's position range); transformer blocks that do not fit stream from RAM.")
     if budget is not None and budget.limit_gb < 9.0:
         out.warnings.append(f"Only {budget.limit_gb:.1f} GB is available for this run; LTX 2.5 needs about 9 GB "
                             "(a 12 GB GPU at Save VRAM 1.5: 8 and 10 GB cards stopped with an out-of-memory error, "
@@ -56,7 +81,7 @@ def auto_apply(settings: Dict[str, Any], log: Optional[Callable[[str], None]] = 
     updates = tuned_values(settings)
     settings.update(updates)
     if log:
-        log("[LTX25 Auto Tune] Token budget Auto (single chunk preferred), longest chunk 1025 frames; chunk "
+        log(f"[LTX25 Auto Tune] Token budget Auto (single chunk preferred), longest chunk {updates['max_chunk_frames']} frames (20 s); chunk "
             "length and block streaming are sized from the VRAM free at engine start (Save VRAM "
             f"{settings.get('reserve_vram_gb')} GB kept free).")
     return updates

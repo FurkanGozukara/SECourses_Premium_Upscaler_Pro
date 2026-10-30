@@ -183,6 +183,12 @@ class FlashVSRPlannerTests(unittest.TestCase):
                     self.assertLessEqual(tp.estimate_gb, tp.budget.limit_gb + 1e-6, (total, wh))
                     self.assertFalse(tp.updates["keep_models_on_cpu"])
 
+    def test_pass_never_exceeds_rope_table(self):
+        # A 4,200-frame pass overran the DiT's 1024-position temporal RoPE table and crashed.
+        for mode in ("full", "tiny-long"):
+            tp = flash_plan.plan({"scale": 4, "mode": mode}, in_w=160, in_h=90, frames=20000, budget=budget(48.0))
+            self.assertTrue(0 < tp.updates["frame_chunk_size"] <= flash_plan.MAX_PASS_FRAMES, (mode, tp.updates))
+
     def test_untiled_when_it_fits(self):
         tp = flash_plan.plan({"scale": 4, "mode": "full"}, in_w=320, in_h=180, frames=120, budget=budget(32.0))
         self.assertFalse(tp.updates["tiled_dit"])
@@ -211,8 +217,15 @@ class SparkVSRPlannerTests(unittest.TestCase):
                     self.assertTrue(chunk == 0 or (chunk - 1) % 8 == 0, chunk)
 
     def test_short_clip_is_one_chunk(self):
-        tp = spark_plan.plan({"model_name": "SparkVSR-bf16"}, out_w=1280, out_h=720, frames=60, budget=budget(32.0))
+        tp = spark_plan.plan({"model_name": "SparkVSR-bf16"}, out_w=1280, out_h=720, frames=30, budget=budget(32.0))
         self.assertEqual(tp.updates["chunk_len"], 0)
+
+    def test_longer_clips_use_best_quality_chunk(self):
+        # 33-frame chunks measured best (two clips); longer chunks only bought speed.
+        tp = spark_plan.plan({"model_name": "SparkVSR-int8-convrot"}, out_w=1920, out_h=1080, frames=121,
+                             budget=budget(32.0, used_gb=0.7, overhead=spark_plan.SPARKVSR_PROCESS_OVERHEAD_GB))
+        self.assertEqual(tp.updates["chunk_len"], spark_plan.MAX_CHUNK)
+        self.assertEqual(tp.updates["tile_height"], 0)  # the shorter chunk fits untiled
         self.assertEqual(tp.updates["tile_height"], 0)
 
 
@@ -255,6 +268,16 @@ class LTX25BudgetTests(unittest.TestCase):
                 need = p.NON_BLOCK_WEIGHT_BYTES + p.ACTIVATION_BASE_BYTES + budget * 1.25 * p.BYTES_PER_TOKEN * p.ACTIVATION_SAFETY
                 if budget > 4096:
                     self.assertLessEqual(need, (free_gb - 1.5) * gib, (free_gb, w, h, budget))
+
+    def test_chunks_stay_inside_20s_positions(self):
+        from shared.vram_autotune import ltx25 as ltx_plan
+
+        for fps in (12, 23.976, 24, 25, 30, 50, 60, 120):
+            frames = ltx_plan.max_chunk_frames(fps)
+            self.assertEqual((frames - 1) % 8, 0, fps)
+            self.assertLessEqual((frames - 1) / fps, 20.0 + 1e-9, fps)
+            self.assertLessEqual(frames, ltx_plan.MAX_CHUNK_FRAMES)
+        self.assertEqual(ltx_plan.max_chunk_frames(24), 481)
 
     def test_more_vram_never_shrinks_chunks(self):
         p = self.planner()

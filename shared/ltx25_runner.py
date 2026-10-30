@@ -722,6 +722,10 @@ def _run_ltx25_once(
 
         if _bool(settings.get("auto_tune_on_run"), False):
             ltx25_auto_apply(settings, log)
+        chunk_seconds = _parse_int(settings.get("max_chunk_frames"), 121) / max(1.0, float(output_fps))
+        if chunk_seconds > 20.5:
+            log(f"[LTX25] Max Chunk Frames is {chunk_seconds:.0f} s at {output_fps:g} fps: LTX 2.5's positions cover 20 s, "
+                "so longer chunks lose a little quality (Auto Tune keeps them at 20 s).")
         cmd = _build_ltx25_command(python_exe, script_path, settings, paths, input_path, output_file, seed_value)
 
         schedule = _resolve_schedule(settings, model_name)

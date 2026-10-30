@@ -26,7 +26,11 @@ from .common import TunePlan, mark_tightness, VramBudget, probe_media, resolve_b
 # Non-allocator VRAM of a SparkVSR run: the CLI parent plus one stage child (split mode).
 SPARKVSR_PROCESS_OVERHEAD_GB = 1.0
 
-MAX_CHUNK = 129            # longest temporal window the previous probe campaigns validated
+# Quality vs chunk length, measured 2026-10-30 (720p and 4:3 footage downscaled 4x and upscaled back, PSNR /
+# SSIM / temporal error against the originals): 33-frame chunks scored best on both clips (+0.15 dB over
+# 65-129 frames, lower temporal error); longer chunks never improved quality, they were only faster. Quality
+# first, so chunks stop at 33 frames (the base model was trained on 81).
+MAX_CHUNK = 33
 MIN_CHUNK = 17
 TEXT_TOKENS = 226
 # Transformer stage, PyTorch allocated GiB = weights + per 1k tokens (benchmarks/vram/sparkvsr.jsonl):

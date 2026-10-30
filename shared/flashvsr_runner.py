@@ -34,7 +34,8 @@ from .path_utils import (
 )
 from .process_control import terminate_process_tree
 from .vram_autotune.common import apply_vram_cap_env, is_tight
-from .vram_autotune.flashvsr import FLASHVSR_PROCESS_OVERHEAD_GB, auto_apply as flashvsr_auto_apply
+from .vram_autotune.flashvsr import FLASHVSR_PROCESS_OVERHEAD_GB, MAX_PASS_FRAMES as FLASHVSR_MAX_PASS_FRAMES
+from .vram_autotune.flashvsr import auto_apply as flashvsr_auto_apply
 
 
 @dataclass
@@ -679,6 +680,10 @@ def run_flashvsr(
             ),
         )
         frame_chunk_size = max(0, _parse_int(settings.get("frame_chunk_size"), 0))
+        # One pass of more than about 4,090 frames overruns the DiT's temporal RoPE table and crashes, so
+        # "whole clip" (0) and longer chunks run in passes of at most 4,000 frames (shorter clips: one pass).
+        if frame_chunk_size == 0 or frame_chunk_size > FLASHVSR_MAX_PASS_FRAMES:
+            frame_chunk_size = FLASHVSR_MAX_PASS_FRAMES
         resize_factor = max(0.1, min(1.0, _parse_float(settings.get("resize_factor"), 1.0)))
         seed = max(0, _parse_int(settings.get("seed"), 0))
         start_frame = max(0, _parse_int(settings.get("start_frame"), 0))

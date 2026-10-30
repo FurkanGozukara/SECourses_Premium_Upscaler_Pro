@@ -355,6 +355,47 @@ def ensure_ltx25_model(
     return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
 
 
+def ensure_open_h3_model(
+    base_dir: Path,
+    model_name: str,
+    text_encoder: str,
+    video_vae: str,
+    on_progress: ProgressCallback = None,
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """Ensure every file the selected Open-H3 Regenerate variants need exists in OpenH3_Models."""
+    from shared.open_h3_constants import (
+        OPENH3_ALWAYS_FILES,
+        OPENH3_DIT_FILES,
+        OPENH3_DIT_INT8,
+        OPENH3_MODELS_DIRNAME,
+        OPENH3_TABLE_FILE,
+        OPENH3_TE_FILES,
+        OPENH3_TE_NVFP4,
+        OPENH3_VAE_FILES,
+        OPENH3_VAE_SOL_FP16,
+    )
+
+    models_dir = Path(base_dir) / OPENH3_MODELS_DIRNAME
+    model_name = str(model_name or "").strip() or OPENH3_DIT_INT8
+    dit_file = OPENH3_DIT_FILES.get(model_name)
+    if dit_file is None:
+        return False, f"Unknown Open-H3 model: {model_name}"
+    text_encoder = text_encoder if text_encoder in OPENH3_TE_FILES else OPENH3_TE_NVFP4
+    video_vae = video_vae if video_vae in OPENH3_VAE_FILES else OPENH3_VAE_SOL_FP16
+    required = [
+        models_dir / dit_file,
+        models_dir / OPENH3_TE_FILES[text_encoder],
+        models_dir / OPENH3_VAE_FILES[video_vae],
+        models_dir / OPENH3_TABLE_FILE,
+        *(models_dir / name for name in OPENH3_ALWAYS_FILES),
+    ]
+    if _all_files_exist(required):
+        return True, ""
+    args = ["--ensure-openh3", model_name, "--openh3-te", text_encoder, "--openh3-vae", video_vae]
+    return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
+
+
 def ensure_gan_model(
     base_dir: Path,
     model_filename: str,

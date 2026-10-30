@@ -1,0 +1,74 @@
+"""
+Open-H3 Regenerate constants shared by the tab, service, runner and downloader bridge.
+
+Keep the name maps in sync with Models_Downloader.py (one folder above the app).
+"""
+
+from __future__ import annotations
+
+# Folder (relative to the app base dir) that holds every Open-H3 checkpoint.
+OPENH3_MODELS_DIRNAME = "OpenH3_Models"
+
+# MiniMax H3 FL2VA base (the reference base of the regenerate recipe).
+OPENH3_DIT_INT8 = "FL2VA Pruned INT8 ConvRot"
+OPENH3_DIT_FP8 = "FL2VA Pruned FP8 Scaled"
+OPENH3_DIT_W6A8 = "FL2VA Pruned W6A8"
+OPENH3_DIT_BF16 = "FL2VA Pruned BF16"
+OPENH3_DIT_NAMES = [OPENH3_DIT_INT8, OPENH3_DIT_FP8, OPENH3_DIT_W6A8, OPENH3_DIT_BF16]
+OPENH3_DIT_FILES = {
+    OPENH3_DIT_INT8: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    OPENH3_DIT_FP8: "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+    OPENH3_DIT_W6A8: "minimax_h3_fl2va_pruned_w6a8.safetensors",
+    OPENH3_DIT_BF16: "minimax_h3_fl2va_pruned_bf16.safetensors",
+}
+OPENH3_DIT_SIZES_GB = {OPENH3_DIT_INT8: 21.0, OPENH3_DIT_FP8: 21.0, OPENH3_DIT_W6A8: 16.0, OPENH3_DIT_BF16: 40.2}
+
+# Qwen3-VL-32B conditioning encoder (first 50 layers).
+OPENH3_TE_NVFP4 = "Qwen3-VL 32B NVFP4 AWQ"
+OPENH3_TE_INT8 = "Qwen3-VL 32B INT8 ConvRot"
+OPENH3_TE_BF16 = "Qwen3-VL 32B BF16"
+OPENH3_TE_NAMES = [OPENH3_TE_NVFP4, OPENH3_TE_INT8, OPENH3_TE_BF16]
+OPENH3_TE_FILES = {
+    OPENH3_TE_NVFP4: "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    OPENH3_TE_INT8: "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    OPENH3_TE_BF16: "qwen3vl_32b_minimax_h3_bf16.safetensors",
+}
+OPENH3_TE_SIZES_GB = {OPENH3_TE_NVFP4: 15.7, OPENH3_TE_INT8: 27.1, OPENH3_TE_BF16: 51.5}
+
+# Video VAE: the Sol file holds the H3 encoder plus NVIDIA's fast 24-layer decoder.
+OPENH3_VAE_SOL_FP16 = "Sol Fast VAE FP16"
+OPENH3_VAE_SOL_INT8 = "Sol Fast VAE INT8 ConvRot"
+OPENH3_VAE_RELEASED = "Released H3 VAE FP16"
+OPENH3_VAE_NAMES = [OPENH3_VAE_SOL_FP16, OPENH3_VAE_SOL_INT8, OPENH3_VAE_RELEASED]
+OPENH3_VAE_FILES = {
+    OPENH3_VAE_SOL_FP16: "minimax_h3_sol_vae_fp16.safetensors",
+    OPENH3_VAE_SOL_INT8: "minimax_h3_sol_vae_int8_convrot.safetensors",
+    OPENH3_VAE_RELEASED: "minimax_h3_video_vae_fp16.safetensors",
+}
+OPENH3_VAE_SIZES_GB = {OPENH3_VAE_SOL_FP16: 3.6, OPENH3_VAE_SOL_INT8: 2.0, OPENH3_VAE_RELEASED: 5.2}
+
+OPENH3_LORA_FILE = "open_h3_regenerate_2k_lora.safetensors"
+OPENH3_CURVES_FILE = "sharp_curve_branches.safetensors"
+OPENH3_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+OPENH3_AUDIO_VAE_FILE = "minimax_h3_audio_vae_fp32.safetensors"
+OPENH3_TABLE_FILE = "open_h3_reference_adaln_t_table.safetensors"
+OPENH3_ALWAYS_FILES = (OPENH3_LORA_FILE, OPENH3_CURVES_FILE, OPENH3_UPSCALER_FILE, OPENH3_AUDIO_VAE_FILE)
+OPENH3_ALWAYS_SIZE_GB = 12.5 + 1.2 + 0.7 + 0.6
+
+# Recipe defaults (NVIDIA Open-H3-Regenerate-2K release).
+OPENH3_DEFAULT_SEED = 1766580932
+OPENH3_RESOLUTIONS = {
+    "768p": (1344, 768),
+    "1080p": (1920, 1080),
+    "2k": (2560, 1440),
+    "4k": (3840, 2160),
+}
+
+
+def openh3_download_size_gb(dit: str, text_encoder: str, vae: str) -> float:
+    return (
+        OPENH3_DIT_SIZES_GB.get(dit, 21.0)
+        + OPENH3_TE_SIZES_GB.get(text_encoder, 15.7)
+        + OPENH3_VAE_SIZES_GB.get(vae, 3.6)
+        + OPENH3_ALWAYS_SIZE_GB
+    )

@@ -181,6 +181,14 @@ def build_vram_oom_html(
 """.strip()
 
 
+_OOM_SEQUENCE = 0
+
+
+def vram_oom_sequence() -> int:
+    """Increments whenever any session records a VRAM OOM (polled by the UI's live watcher)."""
+    return _OOM_SEQUENCE
+
+
 def clear_vram_oom_alert(state: Optional[Dict[str, Any]]) -> None:
     """Clear the VRAM OOM banner stored in shared_state."""
     if not isinstance(state, dict):
@@ -202,6 +210,8 @@ def maybe_set_vram_oom_alert(
     if not is_vram_oom_text(text):
         return False
 
+    global _OOM_SEQUENCE
+    _OOM_SEQUENCE += 1
     alerts = state.setdefault("alerts", {})
     prev = alerts.get("oom") if isinstance(alerts.get("oom"), dict) else {}
     modal_shown = bool(prev.get("modal_shown")) if isinstance(prev, dict) else False

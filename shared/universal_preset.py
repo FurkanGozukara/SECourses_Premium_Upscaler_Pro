@@ -34,6 +34,10 @@ from shared.services.ltx25_service import (
     LTX25_ORDER,
     ltx25_defaults,
 )
+from shared.services.open_h3_service import (
+    OPENH3_ORDER,
+    open_h3_defaults,
+)
 from shared.services.rtx_super_resolution_service import (
     RTX_ORDER,
     rtx_super_resolution_defaults,
@@ -130,6 +134,11 @@ TAB_CONFIGS = {
         "defaults_fn": ltx25_defaults,
         "needs_model_arg": False,
     },
+    "open_h3": {
+        "order": OPENH3_ORDER,
+        "defaults_fn": open_h3_defaults,
+        "needs_model_arg": False,
+    },
     "rtx": {
         "order": RTX_ORDER,
         "defaults_fn": rtx_super_resolution_defaults,
@@ -220,6 +229,18 @@ def _normalize_sparkvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["save_metadata"] = bool(cfg.get("save_metadata", True))
     cfg["face_restore_after_upscale"] = bool(cfg.get("face_restore_after_upscale", False))
     cfg["auto_transfer_output_to_input"] = bool(cfg.get("auto_transfer_output_to_input", False))
+    return cfg
+
+
+def _normalize_open_h3_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(data or {})
+    try:
+        from shared.services.open_h3_service import _enforce_open_h3_guardrails
+
+        cfg = _enforce_open_h3_guardrails(cfg, open_h3_defaults())
+        cfg.pop("_multi_gpu_disabled_reason", None)
+    except Exception:
+        pass
     return cfg
 
 
@@ -413,6 +434,8 @@ def _normalize_tab_settings(tab_name: str, data: Dict[str, Any], defaults: Dict[
         return _normalize_sparkvsr_settings(cfg)
     if tab_name == "ltx25":
         return _normalize_ltx25_settings(cfg)
+    if tab_name == "open_h3":
+        return _normalize_open_h3_settings(cfg)
     if tab_name == "rife":
         return _normalize_rife_settings(cfg)
     if tab_name == "output":
@@ -489,6 +512,7 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
 
     # LTX 2.5
     defaults["ltx25"] = ltx25_defaults()
+    defaults["open_h3"] = open_h3_defaults()
 
     # RTX Super Resolution
     defaults["rtx"] = rtx_super_resolution_defaults()
@@ -558,6 +582,7 @@ def create_universal_preset(
     flashvsr_values: List[Any] = None,
     sparkvsr_values: List[Any] = None,
     ltx25_values: List[Any] = None,
+    open_h3_values: List[Any] = None,
     rtx_values: List[Any] = None,
     face_values: List[Any] = None,
     resolution_values: List[Any] = None,
@@ -619,6 +644,11 @@ def create_universal_preset(
         preset["ltx25"] = values_to_dict("ltx25", ltx25_values)
     else:
         preset["ltx25"] = defaults["ltx25"]
+
+    if open_h3_values is not None:
+        preset["open_h3"] = values_to_dict("open_h3", open_h3_values)
+    else:
+        preset["open_h3"] = defaults["open_h3"]
 
     if rtx_values is not None:
         preset["rtx"] = values_to_dict("rtx", rtx_values)
@@ -736,6 +766,7 @@ def update_shared_state_from_preset(
     seed_controls["flashvsr_settings"] = preset.get("flashvsr", {})
     seed_controls["sparkvsr_settings"] = preset.get("sparkvsr", {})
     seed_controls["ltx25_settings"] = preset.get("ltx25", {})
+    seed_controls["open_h3_settings"] = preset.get("open_h3", {})
     seed_controls["rtx_settings"] = preset.get("rtx", {})
     seed_controls["face_settings"] = preset.get("face", {})
     seed_controls["resolution_settings"] = preset.get("resolution", {})
@@ -837,6 +868,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "flashvsr": seed_controls.get("flashvsr_settings", {}),
         "sparkvsr": seed_controls.get("sparkvsr_settings", {}),
         "ltx25": seed_controls.get("ltx25_settings", {}),
+        "open_h3": seed_controls.get("open_h3_settings", {}),
         "rtx": seed_controls.get("rtx_settings", {}),
         "face": seed_controls.get("face_settings", {}),
         "resolution": seed_controls.get("resolution_settings", {}),

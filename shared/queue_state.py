@@ -24,6 +24,8 @@ _RUNTIME_SEED_KEYS = {
     "flashvsr_chunk_preview",
     "flashvsr_batch_outputs",
     "ltx25_batch_outputs",
+    "open_h3_batch_outputs",
+    "open_h3_chunk_preview",
     "rife_chunk_preview",
     "seedvr2_chunk_preview",
     "chunk_gallery_items",

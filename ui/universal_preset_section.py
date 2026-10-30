@@ -33,13 +33,16 @@ from shared.universal_preset import (
 
 
 def _auto_sync_triggers_for_component(comp: gr.components.Component) -> List[Tuple[str, Callable]]:
-    """Return all user-change events that should refresh universal preset state."""
-    triggers: List[Tuple[str, Callable]] = []
-    for event_name in ("release", "input", "change"):
+    """Return the event that should refresh universal preset state.
+
+    In Gradio 6.31 `change` fires for user edits and server-set values alike; adding
+    `input` and `release` only sent two or three sync requests per edit and tripled the
+    triggers the browser registers at page load (about 600 extra for this app)."""
+    for event_name in ("change", "input"):
         trigger = getattr(comp, event_name, None)
         if callable(trigger):
-            triggers.append((event_name, trigger))
-    return triggers
+            return [(event_name, trigger)]
+    return []
 
 
 def create_universal_preset_callbacks(
@@ -329,7 +332,7 @@ def universal_preset_section(
     with gr.Accordion("📦 Universal Preset (All Tabs)", open=open_accordion):
         gr.Markdown("""
         **Save/Load affects ALL tabs simultaneously.**  
-        One preset contains Global Settings, SeedVR2, GAN, RIFE, FlashVSR+, RTX Super Resolution, Face, Resolution, and Output settings.
+        One preset contains Global Settings, SeedVR2, GAN, RIFE, FlashVSR+, Open-H3 Regenerate, LTX 2.5, SparkVSR, RTX Super Resolution, Face, Resolution, and Output settings.
         """)
         
         preset_dropdown = gr.Dropdown(

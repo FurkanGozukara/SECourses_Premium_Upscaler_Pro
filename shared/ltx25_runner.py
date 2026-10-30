@@ -399,7 +399,12 @@ def _build_ltx25_command(
     return cmd
 
 
-def _build_env(base_dir: Path, visible_gpu: Optional[str], log: Callable[[str], None]) -> Dict[str, str]:
+def _build_env(
+    base_dir: Path,
+    visible_gpu: Optional[str],
+    log: Callable[[str], None],
+    tag: str = "LTX25",
+) -> Dict[str, str]:
     env = {
         **os.environ,
         "PYTHONUTF8": "1",
@@ -409,7 +414,7 @@ def _build_env(base_dir: Path, visible_gpu: Optional[str], log: Callable[[str], 
     legacy_alloc_conf = env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     if legacy_alloc_conf and not env.get("PYTORCH_ALLOC_CONF"):
         env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
-        log("[LTX25] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF")
+        log(f"[{tag}] Migrated PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF")
     if visible_gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = visible_gpu
     triton_cache_dir = base_dir / "temp" / "triton_cache"
@@ -432,6 +437,8 @@ def _stream_process(
     log: Callable[[str], None],
     cancel_event,
     process_handle: Optional[Dict],
+    tag: str = "LTX25",
+    label: str = "LTX 2.5",
 ) -> Tuple[int, Optional[str], bool]:
     """
     Stream stdout lines, heartbeat on silence, poll cancellation.
@@ -488,7 +495,7 @@ def _stream_process(
 
     while True:
         if cancel_event and cancel_event.is_set():
-            log("Cancellation requested - terminating LTX 2.5 process")
+            log(f"Cancellation requested - terminating {label} process")
             terminate_process_tree(proc)
             if process_handle is not None:
                 process_handle["proc"] = None
@@ -506,9 +513,9 @@ def _stream_process(
             if now - last_activity > 10:
                 elapsed = _format_duration(now - proc_started)
                 if last_progress_text:
-                    heartbeat = f"[LTX25] still running | elapsed={elapsed} | last={last_progress_text[:180]}"
+                    heartbeat = f"[{tag}] still running | elapsed={elapsed} | last={last_progress_text[:180]}"
                 else:
-                    heartbeat = f"[LTX25] still running | elapsed={elapsed} | waiting for first progress output"
+                    heartbeat = f"[{tag}] still running | elapsed={elapsed} | waiting for first progress output"
                 log(heartbeat)
                 last_activity = now
             continue

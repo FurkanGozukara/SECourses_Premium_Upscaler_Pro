@@ -1485,7 +1485,7 @@ def _manifest_overlap_frames(manifest: Optional[Dict[str, Any]], chunk_count: in
 # Other models are checked the same way but only warned about (their frame handling was
 # not verified here), and the final merged-duration check still reports any drift.
 # RIFE changes the frame count/fps by design and is checked by duration only.
-_STRICT_TIMING_MODELS = {"seedvr2", "gan", "flashvsr", "sparkvsr", "ltx25", "rtx"}
+_STRICT_TIMING_MODELS = {"seedvr2", "gan", "flashvsr", "sparkvsr", "ltx25", "open_h3", "rtx"}
 _FRAME_PRESERVING_MODELS = _STRICT_TIMING_MODELS  # backward-compatible alias
 
 
@@ -4873,12 +4873,12 @@ def chunk_and_process(
             f"(runner output codec may differ by OpenCV runtime; requested codec={expected_codec_name or 'auto'}, "
             f"10bit={expected_use_10bit}).\n"
         )
-    elif model_type == "ltx25":
-        # The LTX 2.5 engine writes MP4 itself (ffmpeg libx264 by default) while
+    elif model_type in ("ltx25", "open_h3"):
+        # The LTX 2.5 / Open-H3 engines write MP4 themselves (ffmpeg libx264 by default) while
         # the Output tab may request a different final codec for the merge step.
         strict_codec_validation = False
         _emit_diag(
-            "[codec] strict validation disabled for LTX 2.5 "
+            f"[codec] strict validation disabled for {'LTX 2.5' if model_type == 'ltx25' else 'Open-H3'} "
             f"(engine writes its own MP4; requested codec={expected_codec_name or 'auto'}, "
             f"10bit={expected_use_10bit}).\n"
         )

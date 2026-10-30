@@ -46,6 +46,7 @@ selection, model caching toggles.
 static-frame skip, recursion depth.
 - FlashVSR+ diffusion upscaling pipeline with version/mode/scale selection and VRAM-aware modes.
 - FlashVSR memory controls: VAE/DiT tiling, tile size/overlap, unload DiT before decode.
+- Open-H3 Regenerate (MiniMax H3 + Open-H3-Regenerate-2K adapters): generative 2K/1080p/4K regeneration with a standalone engine, first-click model download, batch and chunked runs in one engine session.
 - Face Restoration as both standalone processor and integrated post-processing across pipelines.
 - Global face restoration enable + global strength control from Global Settings.
 - Unified cross-model resolution strategy: Upscale-x, max-edge cap, and pre-downscale-then-upscale behavior.

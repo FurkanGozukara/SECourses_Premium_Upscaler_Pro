@@ -43,9 +43,12 @@ def _render_waiting_table(waiting_items: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def queue_tab(queue_tab_component) -> None:
+def queue_tab(queue_tab_component) -> dict:
     """
-    Render queue monitor tab and wire live refresh + delete actions.
+    Render queue monitor tab and wire refresh + delete actions.
+
+    Live refresh comes from the app-level watcher (secourses_app live_poller), which
+    calls the returned refresh function only when the queue changed.
 
     Args:
         queue_tab_component: The gr.Tab instance so we can update its label.
@@ -73,7 +76,6 @@ def queue_tab(queue_tab_component) -> None:
         clear_btn = gr.Button("Clear All Waiting", variant="stop", elem_classes=["action-btn", "sec-btn-red"])
 
     action_status = gr.Markdown("")
-    queue_timer = gr.Timer(value=2.0, active=True)
     queue_sync_signature = gr.State(value="")
 
     def refresh_queue(selected_ids, previous_signature: str = ""):
@@ -116,12 +118,15 @@ def queue_tab(queue_tab_component) -> None:
         if signature == str(previous_signature or ""):
             return gr.skip()
 
+        # Relabelling the tab re-renders the whole tab bar; do it only when the count moved.
+        previous_parts = str(previous_signature or "").split("|")
+        label_changed = len(previous_parts) < 2 or previous_parts[1] != str(waiting_count)
         return (
             gr.update(value=summary_text),
             gr.update(value=active_text),
             gr.update(value=waiting_table),
             gr.update(choices=choices, value=valid_selected),
-            gr.update(label=f"⏳ Queue ({waiting_count})"),
+            gr.update(label=f"⏳ Queue ({waiting_count})") if label_changed else gr.skip(),
             signature,
         )
 
@@ -157,14 +162,6 @@ def queue_tab(queue_tab_component) -> None:
         queue=False,
         show_progress="hidden",
     )
-    queue_timer.tick(
-        fn=refresh_queue,
-        inputs=[waiting_selector, queue_sync_signature],
-        outputs=refresh_outputs,
-        queue=False,
-        show_progress="hidden",
-    )
-
     delete_btn.click(
         fn=delete_selected,
         inputs=[waiting_selector],
@@ -191,3 +188,9 @@ def queue_tab(queue_tab_component) -> None:
         queue=False,
         show_progress="hidden",
     )
+
+    return {
+        "refresh": refresh_queue,
+        "inputs": [waiting_selector, queue_sync_signature],
+        "outputs": refresh_outputs,
+    }

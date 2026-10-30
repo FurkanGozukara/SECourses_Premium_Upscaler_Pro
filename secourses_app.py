@@ -3,6 +3,8 @@ import sys
 import json
 import string
 import argparse
+import tempfile
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict
@@ -75,6 +77,7 @@ from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
 from ui.ltx25_tab import ltx25_tab
+from ui.open_h3_tab import open_h3_tab
 from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.health_tab import health_tab
@@ -82,12 +85,23 @@ from ui.queue_tab import queue_tab
 from ui.changelog_tab import changelog_tab
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 from ui.model_tab_common import sync_signature as _sync_signature
+from ui.theme import (
+    DESIGN_CSS,
+    RUN_HISTORY_CLEANUP_HEAD,
+    build_theme,
+    button_hue_css,
+    front_state_components,
+    hero_header,
+    live_poller,
+    trim_progress_tracking,
+)
 
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "8.6"
-APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – https://www.patreon.com/posts/150202809"
+APP_VERSION = "9.0"
+PATREON_URL = "https://www.patreon.com/posts/150202809"
+APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
 
 # --------------------------------------------------------------------- #
@@ -227,107 +241,14 @@ def _build_launch_allowed_paths(output_dir: str | Path, temp_dir: str | Path) ->
     return sorted(allowed_paths)
 
 
-# --------------------------------------------------------------------- #
-# Per-tab unique button colors (V6 modernization)
-# --------------------------------------------------------------------- #
-# Every button inside a tab gets a distinct hue via elem_classes
-# ("sec-btn-<hue>"). The classes only override colors; sizing, radius,
-# transitions and the sweep/pulse animations still come from the existing
-# .action-btn* rules, so nothing else about the design changes.
-# (dark stop, mid stop, light stop) per hue - readable in dark AND light mode.
-_SEC_BTN_HUES = {
-    "red":     ("#991b1b", "#dc2626", "#f87171"),
-    "crimson": ("#4c0519", "#be123c", "#fb7185"),
-    "rose":    ("#9f1239", "#e11d48", "#fda4af"),
-    "pink":    ("#9d174d", "#db2777", "#f9a8d4"),
-    "fuchsia": ("#86198f", "#c026d3", "#e879f9"),
-    "purple":  ("#6b21a8", "#9333ea", "#c084fc"),
-    "violet":  ("#5b21b6", "#7c3aed", "#a78bfa"),
-    "indigo":  ("#3730a3", "#4f46e5", "#818cf8"),
-    "blue":    ("#1e40af", "#2563eb", "#60a5fa"),
-    "sky":     ("#075985", "#0284c7", "#38bdf8"),
-    "cyan":    ("#155e75", "#0891b2", "#22d3ee"),
-    "teal":    ("#115e59", "#0d9488", "#2dd4bf"),
-    "emerald": ("#065f46", "#059669", "#34d399"),
-    "green":   ("#166534", "#16a34a", "#4ade80"),
-    "lime":    ("#3f6212", "#65a30d", "#a3e635"),
-    "yellow":  ("#854d0e", "#ca8a04", "#facc15"),
-    "amber":   ("#92400e", "#d97706", "#fbbf24"),
-    "orange":  ("#9a3412", "#ea580c", "#fb923c"),
-    "bronze":  ("#78350f", "#b45309", "#d6a05a"),
-    "slate":   ("#334155", "#475569", "#94a3b8"),
-}
-
-
-def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    value = hex_color.lstrip("#")
-    return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
-
-
-def _build_sec_btn_css() -> str:
-    """Generate the sec-btn-<hue> color classes appended after the action-btn rules."""
-    rules = []
-    for name, (dark, mid, light) in _SEC_BTN_HUES.items():
-        r, g, b = _hex_to_rgb(mid)
-        lr, lg, lb = _hex_to_rgb(light)
-        rules.append(
-            f"""
-    .sec-btn-{name} button,
-    button.sec-btn-{name} {{
-      background: linear-gradient(135deg, {dark} 0%, {mid} 55%, {light} 100%) !important;
-      border-color: rgba({lr}, {lg}, {lb}, 0.72) !important;
-      color: #f8fafc !important;
-      text-shadow: 0 1px 2px rgba(2, 6, 23, 0.45);
-      box-shadow: 0 10px 24px rgba({r}, {g}, {b}, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
-    }}
-    .sec-btn-{name} button:hover,
-    button.sec-btn-{name}:hover {{
-      box-shadow: 0 13px 30px rgba({r}, {g}, {b}, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
-      border-color: rgba({lr}, {lg}, {lb}, 0.95) !important;
-    }}"""
-        )
-    return "\n".join(rules)
-
-
-# Light theme corrections: the main tab bar was designed dark-first; give it a
-# proper light appearance without touching the dark look users already have.
-_LIGHT_THEME_CSS = """
-    /* NOTE: Gradio 6 injects custom CSS twice (raw + auto-prefixed with
-       .gradio-container .contain, which has higher specificity). body:not(.dark)
-       selectors cannot receive that prefix, so these light-mode overrides need
-       !important to beat the prefixed dark-first rules. */
-    body:not(.dark) #secourses-main-tabs .tab-wrapper {
-      border: 1px solid rgba(37, 99, 235, 0.22) !important;
-      background: linear-gradient(130deg, rgba(219, 234, 254, 0.55), rgba(204, 251, 241, 0.45) 48%, rgba(209, 250, 229, 0.5)) !important;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 8px 18px rgba(15, 23, 42, 0.08) !important;
-    }
-    body:not(.dark) #secourses-main-tabs .tab-container button,
-    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button {
-      border: 1px solid rgba(100, 116, 139, 0.35) !important;
-      background: linear-gradient(160deg, rgba(255, 255, 255, 0.92), rgba(226, 232, 240, 0.85)) !important;
-      color: #0f172a !important;
-      box-shadow: 0 3px 8px rgba(15, 23, 42, 0.08) !important;
-    }
-    body:not(.dark) #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected),
-    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button:hover:not(:disabled):not(.selected) {
-      border-color: rgba(14, 165, 233, 0.66) !important;
-      background: linear-gradient(160deg, rgba(224, 242, 254, 0.95), rgba(240, 249, 255, 0.9)) !important;
-    }
-    body:not(.dark) #secourses-main-tabs .tab-container button.selected,
-    body:not(.dark) #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected {
-      color: #f0fdfa !important;
-      border-color: rgba(13, 148, 136, 0.9) !important;
-      background: linear-gradient(145deg, rgba(37, 99, 235, 0.92), rgba(13, 148, 136, 0.92)) !important;
-      box-shadow: 0 8px 18px rgba(13, 148, 136, 0.28) !important;
-    }
-    body:not(.dark) .health-banner {
-      color: #0f172a !important;
-    }
-"""
 
 
 def main(argv=None):
     launch_cli_args = _parse_launch_cli_args(argv)
+    # Gradio resolves its upload folder once per component, a slow realpath on Windows
+    # (1.8 s for this UI). Resolving it once gives every component the identical path.
+    if not os.environ.get("GRADIO_TEMP_DIR"):
+        os.environ["GRADIO_TEMP_DIR"] = str((Path(tempfile.gettempdir()) / "gradio").resolve())
     share_enabled = launch_cli_args.share
 
     # Initialize health check data
@@ -376,31 +297,7 @@ def main(argv=None):
     except Exception:
         health_text = "Health check failed to initialize. Run Health Check tab for details."
 
-    # Ultra-modern theme with maximum readability (Gradio 6.2.0)
-    # Using Soft theme + Google Fonts for best readability
-    modern_theme = gr.themes.Soft(
-        primary_hue="indigo",
-        secondary_hue="blue",
-        neutral_hue="slate",
-        font=gr.themes.GoogleFont("Inter"),  # Most readable UI font
-        font_mono=gr.themes.GoogleFont("JetBrains Mono")  # Best code font
-    ).set(
-        # Enhanced readability settings
-        body_text_size="16px",
-        body_text_weight="400",
-        button_large_text_size="18px",
-        button_large_text_weight="600",
-        button_large_padding="16px 28px",
-        button_border_width="2px",
-        button_primary_shadow="0 2px 8px rgba(0,0,0,0.1)",
-        button_primary_shadow_hover="0 4px 12px rgba(0,0,0,0.15)",
-        input_border_width="2px",
-        input_shadow="0 1px 3px rgba(0,0,0,0.05)",
-        block_label_text_size="16px",
-        block_label_text_weight="600",
-        block_title_text_size="18px",
-        block_title_text_weight="700",
-    )
+    modern_theme = build_theme()
 
     # --------------------------------------------------------------------- #
     # Global VRAM OOM banner styling (big + flashing)
@@ -1222,137 +1119,8 @@ def main(argv=None):
       max-height: 230px;
       overflow: auto;
     }
-    /* Main navigation tabs (Gradio Tabs.svelte): always visible in two rows */
-    #secourses-main-tabs {
-      --main-tab-col-count: 6;
-      --main-tab-gap: 6px;
-      --main-tab-min-height: 46px;
-      --main-tab-row-slack: 16px;
-    }
-    #secourses-main-tabs .tab-wrapper {
-      position: relative;
-      display: block;
-      height: auto;
-      min-height: 0;
-      align-items: stretch;
-      justify-content: flex-start;
-      padding: 10px 10px 12px;
-      border: 1px solid rgba(59, 130, 246, 0.26);
-      border-radius: 14px;
-      background: linear-gradient(130deg, rgba(15, 23, 42, 0.42), rgba(14, 116, 144, 0.20) 48%, rgba(5, 150, 105, 0.20));
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 18px rgba(2, 6, 23, 0.20);
-    }
-    #secourses-main-tabs .tab-container {
-      height: auto;
-      overflow: visible;
-      display: flex;
-      flex-wrap: wrap;
-      align-items: stretch;
-      gap: var(--main-tab-gap);
-    }
-    #secourses-main-tabs .tab-container::after {
-      bottom: -1px;
-      border-radius: 9999px;
-      background: linear-gradient(90deg, rgba(59, 130, 246, 0.68), rgba(16, 185, 129, 0.68));
-      opacity: 0.7;
-    }
-    #secourses-main-tabs .tab-container.visually-hidden {
-      position: absolute !important;
-      left: 0 !important;
-      top: 0 !important;
-      width: 100% !important;
-      height: auto !important;
-      margin: 0 !important;
-      padding: 0 !important;
-      clip: auto !important;
-      white-space: normal !important;
-      overflow: visible !important;
-      visibility: hidden !important;
-      pointer-events: none !important;
-    }
-    #secourses-main-tabs .tab-container button,
-    #secourses-main-tabs .overflow-menu .overflow-dropdown button {
-      flex: 0 0 calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
-      max-width: calc((100% - (var(--main-tab-gap) * (var(--main-tab-col-count) - 1)) - var(--main-tab-row-slack)) / var(--main-tab-col-count));
-      min-width: 0;
-      min-height: var(--main-tab-min-height);
-      height: auto;
-      margin: 0;
-      padding: 6px 4px;
-      line-height: 1.24;
-      white-space: normal;
-      text-align: center;
-      justify-content: center;
-      border: 1px solid rgba(148, 163, 184, 0.30);
-      border-radius: 12px;
-      background: linear-gradient(160deg, rgba(15, 23, 42, 0.56), rgba(30, 41, 59, 0.44));
-      box-shadow: 0 4px 11px rgba(2, 6, 23, 0.14);
-      font-weight: 740;
-      font-size: 13.5px;
-    }
-    #secourses-main-tabs .tab-container button:hover:not(:disabled):not(.selected),
-    #secourses-main-tabs .overflow-menu .overflow-dropdown button:hover:not(:disabled):not(.selected) {
-      transform: translateY(-1px);
-      border-color: rgba(125, 211, 252, 0.66);
-      background: linear-gradient(160deg, rgba(14, 116, 144, 0.44), rgba(15, 23, 42, 0.58));
-    }
-    #secourses-main-tabs .tab-container button.selected,
-    #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected {
-      color: #e0f2fe;
-      border-color: rgba(45, 212, 191, 0.92);
-      background: linear-gradient(145deg, rgba(30, 64, 175, 0.72), rgba(13, 148, 136, 0.76));
-      box-shadow: 0 8px 18px rgba(15, 118, 110, 0.32);
-    }
-    #secourses-main-tabs .tab-container button.selected::after,
-    #secourses-main-tabs .overflow-menu .overflow-dropdown button.selected::after {
-      left: 14%;
-      width: 72%;
-      bottom: 3px;
-      height: 3px;
-      border-radius: 999px;
-      background-color: rgba(240, 253, 250, 0.96);
-    }
-    #secourses-main-tabs .overflow-menu.hide {
-      display: none !important;
-    }
-    #secourses-main-tabs .overflow-menu {
-      display: block !important;
-      width: 100%;
-      margin-top: var(--main-tab-gap);
-    }
-    #secourses-main-tabs .overflow-menu > button {
-      display: none !important;
-    }
-    #secourses-main-tabs .overflow-menu .overflow-dropdown,
-    #secourses-main-tabs .overflow-menu .overflow-dropdown.hide {
-      position: static !important;
-      display: flex !important;
-      flex-wrap: wrap !important;
-      align-items: stretch;
-      gap: var(--main-tab-gap);
-      width: 100%;
-      margin: 0 !important;
-      padding: 0 !important;
-      border: 0 !important;
-      background: transparent !important;
-      box-shadow: none !important;
-    }
 
     @media (max-width: 768px) {
-      #secourses-main-tabs {
-        --main-tab-col-count: 4;
-        --main-tab-gap: 5px;
-        --main-tab-min-height: 42px;
-        --main-tab-row-slack: 12px;
-      }
-      #secourses-main-tabs .tab-wrapper {
-        padding: 8px 8px 10px;
-      }
-      #secourses-main-tabs .tab-container button,
-      #secourses-main-tabs .overflow-menu .overflow-dropdown button {
-        padding: 5px 4px;
-        font-size: 12px;
-      }
       .action-btn button,
       button.action-btn {
         border-radius: 12px !important;
@@ -1366,9 +1134,9 @@ def main(argv=None):
       }
     }
     """
-    # V6: unique per-tab button colors + light-theme corrections (appended last
-    # so they win the cascade at equal specificity without extra !important).
-    CUSTOM_CSS = CUSTOM_CSS + _build_sec_btn_css() + _LIGHT_THEME_CSS
+    # Per-hue button colours and the light/dark design layer come last so they win the
+    # cascade over the component rules above at equal specificity.
+    CUSTOM_CSS = CUSTOM_CSS + button_hue_css() + DESIGN_CSS
     CUSTOM_HEAD = """
     <script>
     (() => {
@@ -1478,6 +1246,8 @@ def main(argv=None):
         flashvsr_models = get_flashvsr_model_names()
         sparkvsr_models = get_sparkvsr_model_names(BASE_DIR)
         ltx25_models = get_ltx25_model_names(BASE_DIR)
+        from shared.open_h3_constants import OPENH3_DIT_NAMES
+        open_h3_models = list(OPENH3_DIT_NAMES)
         rife_models = get_rife_model_names(BASE_DIR)
 
         all_models = sorted(list({
@@ -1486,6 +1256,7 @@ def main(argv=None):
             *flashvsr_models,
             *sparkvsr_models,
             *ltx25_models,
+            *open_h3_models,
             *rife_models,
         }))
         if not all_models:
@@ -1707,6 +1478,7 @@ def main(argv=None):
                 "flashvsr_settings": startup_preset.get("flashvsr", {}),
                 "sparkvsr_settings": startup_preset.get("sparkvsr", {}),
                 "ltx25_settings": startup_preset.get("ltx25", {}),
+                "open_h3_settings": startup_preset.get("open_h3", {}),
                 "rtx_settings": startup_preset.get("rtx", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
@@ -1795,6 +1567,30 @@ def main(argv=None):
         if all(str(value) != str(initial_global_gpu_value) for _label, value in initial_gpu_choices):
             initial_gpu_choices.append((describe_gpu_selection(initial_global_gpu_value), initial_global_gpu_value))
 
+        # Live queue/OOM watcher: polls a server function (no Gradio event per tick) and
+        # fires one refresh event only when something changed. Placed first in the layout
+        # because Gradio looks components up by walking the tree in order.
+        def sec_live_snapshot(_arg=None):
+            from shared.oom_alert import vram_oom_sequence
+            from shared.processing_queue import get_processing_queue_manager
+
+            snap = get_processing_queue_manager().snapshot()
+            active = [item.get("job_id") for item in snap.get("active_jobs", [])]
+            waiting = sorted(item.get("job_id") for item in snap.get("waiting", []))
+            busy = bool(active or waiting)
+            return {
+                "active": len(active),
+                "waiting": len(waiting),
+                "ids": active + waiting,
+                # queue tables show waiting/running times; refresh them every 10 s while busy
+                "bucket": int(time.time() // 10) if busy else 0,
+                "oom": vram_oom_sequence(),
+            }
+
+        live_watch = live_poller(sec_live_snapshot)
+
+        hero = hero_header(APP_VERSION, FAVICON_PATH, PATREON_URL)
+
         # Top status row: left = global GPU selector, right = health banner
         with gr.Row(equal_height=True, elem_classes="top-status-row"):
             with gr.Column(scale=1):
@@ -1808,18 +1604,14 @@ def main(argv=None):
             with gr.Column(scale=1):
                 health_banner = gr.Markdown(f'<div class="health-banner">{health_text}</div>')
 
-        # VRAM OOM banner (shown only on VRAM OOM)
-        # NOTE: We update this via a Timer tick because gr.State change events can be
-        # inconsistent across Gradio versions/environments.
+        # VRAM OOM banner (shown only on VRAM OOM). Besides shared_state.change, the live
+        # watcher refreshes it when a handler recorded an OOM without returning the state.
         oom_banner = gr.HTML(value="", visible=False)
         oom_dismiss_btn = gr.Button("Dismiss VRAM Alert", variant="secondary", size="sm", visible=False, elem_classes=["action-btn", "sec-btn-slate"])
-        # 5s keeps VRAM alerts timely while quartering idle queue traffic vs the old 2s poll.
-        oom_timer = gr.Timer(value=5.0, active=True)
         health_sync_signature = gr.State(value="")
         oom_sync_signature = gr.State(value="")
         global_sync_signature = gr.State(value="")
         gpu_selector_sync_signature = gr.State(value="")
-        gr.Markdown(f"# {APP_TITLE}")
 
         # Global settings tab (rendered LAST for a cleaner workflow)
         def render_global_settings_tab():
@@ -1848,7 +1640,8 @@ def main(argv=None):
                     choices=["dark", "light"],
                     value=theme_mode_default,
                     label="Theme",
-                    info="Select the Gradio UI theme mode."
+                    info="Select the Gradio UI theme mode (also switchable from the header).",
+                    elem_id="secourses-theme-radio",
                 )
                 theme_mode_radio.change(
                     fn=None,
@@ -1984,6 +1777,7 @@ def main(argv=None):
                     "preset_status": preset_status,
                     "global_status": global_status,
                     "mode_radio": mode_radio,
+                    "theme_radio": theme_mode_radio,
                 }
 
 
@@ -2057,12 +1851,13 @@ def main(argv=None):
         tab_sync_flashvsr = gr.State(value="")
         tab_sync_sparkvsr = gr.State(value="")
         tab_sync_ltx25 = gr.State(value="")
+        tab_sync_open_h3 = gr.State(value="")
         tab_sync_rtx = gr.State(value="")
         tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
 
         # Self-contained tabs following SECourses pattern
-        with gr.Tabs(elem_id="secourses-main-tabs", elem_classes=["secourses-main-tabs"]):
+        with gr.Tabs(elem_id="secourses-main-tabs", elem_classes=["secourses-main-tabs"], overflow_behavior="wrap"):
             with gr.Tab("🎬 SeedVR2", render_children=True) as tab_seedvr2:
                 seedvr2_ui = seedvr2_tab(
                     preset_manager=preset_manager,
@@ -2123,6 +1918,26 @@ def main(argv=None):
                 fn=_make_tab_sync("flashvsr"),
                 inputs=[shared_state, tab_sync_flashvsr],
                 outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🌀 Open-H3 Regenerate", render_children=True) as tab_open_h3:
+                open_h3_ui = open_h3_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir,
+                )
+            tab_open_h3.select(
+                fn=_make_tab_sync("open_h3"),
+                inputs=[shared_state, tab_sync_open_h3],
+                outputs=open_h3_ui["inputs_list"] + [open_h3_ui["preset_dropdown"], open_h3_ui["preset_status"], tab_sync_open_h3],
                 queue=False,
                 show_progress="hidden",
                 trigger_mode="always_last",
@@ -2276,7 +2091,7 @@ def main(argv=None):
             )
 
             with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
-                queue_tab(tab_queue)
+                queue_ui = queue_tab(tab_queue)
 
             with gr.Tab("🏥 Health Check", render_children=True):
                 health_tab(
@@ -2301,6 +2116,16 @@ def main(argv=None):
                 show_progress="hidden",
                 trigger_mode="always_last",
             )
+
+        # Header theme toggle -> Global Settings Theme radio (frontend only, no server call).
+        hero.click(
+            fn=None,
+            inputs=None,
+            outputs=[global_ui["theme_radio"]],
+            js="() => (document.body.classList.contains('dark') ? 'dark' : 'light')",
+            queue=False,
+            show_progress="hidden",
+        )
 
         # Update health banner on load and changes
         def update_health_banner(state, previous_signature: str = ""):
@@ -2426,11 +2251,21 @@ def main(argv=None):
             outputs=[global_ui["global_status"], global_ui["mode_radio"], shared_state, global_sync_signature],
         )
 
-        # Polling fallback (most reliable): refresh OOM banner visibility periodically
-        oom_timer.tick(
-            fn=update_oom_banner,
-            inputs=[shared_state, oom_sync_signature],
-            outputs=[oom_banner, oom_dismiss_btn, oom_sync_signature],
+        def live_refresh(selected_jobs, queue_signature, state, oom_signature):
+            queue_part = queue_ui["refresh"](selected_jobs, queue_signature)
+            if not isinstance(queue_part, tuple):
+                queue_part = (gr.skip(),) * len(queue_ui["outputs"])
+            oom_part = update_oom_banner(state, oom_signature)
+            if not isinstance(oom_part, tuple):
+                oom_part = (gr.skip(),) * 3
+            return (*queue_part, *oom_part)
+
+        live_watch.click(
+            fn=live_refresh,
+            inputs=queue_ui["inputs"] + [shared_state, oom_sync_signature],
+            outputs=queue_ui["outputs"] + [oom_banner, oom_dismiss_btn, oom_sync_signature],
+            queue=False,
+            show_progress="hidden",
         )
 
         # Allow user to dismiss the banner without restarting
@@ -2441,6 +2276,8 @@ def main(argv=None):
     # default_concurrency_limit lifts the per-event serial bottleneck for light UI
     # events (sync/preview/refresh); GPU jobs stay serialized through their shared
     # concurrency_id="app_processing_queue" lane.
+    trim_progress_tracking(demo)
+    front_state_components(demo)
     demo.queue(default_concurrency_limit=4)
     launch_allowed_paths = _build_launch_allowed_paths(output_dir=active_output_dir, temp_dir=active_temp_dir)
     launch_kwargs = {
@@ -2454,7 +2291,13 @@ def main(argv=None):
         "share": share_enabled,
         "theme": modern_theme,
         "css": CUSTOM_CSS,
-        "head": CUSTOM_HEAD + theme_bootstrap_head,
+        "head": RUN_HISTORY_CLEANUP_HEAD + CUSTOM_HEAD + theme_bootstrap_head,
+        # Run history serialises every event's inputs and outputs into localStorage on each
+        # call (hundreds of settings here); False also deletes this app's saved runs.
+        "run_history": False,
+        # The UI's events are undocumented endpoints (see trim_progress_tracking), so the
+        # footer's API docs link would open an empty page.
+        "footer_links": ["gradio", "settings"],
         "favicon_path": str(FAVICON_PATH),
     }
     if launch_cli_args.server_name:

@@ -11,6 +11,29 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.0 — 30 October 2026 — NEW: Open-H3 Regenerate Upscaler & a Faster, Redesigned Interface",
+        """
+**A new generative upscaler joins the app, and the whole interface is redesigned and much faster.**
+
+- **NEW: 🌀 Open-H3 Regenerate tab** (right next to FlashVSR+) — the MiniMax H3 video model with NVIDIA's Open-H3-Regenerate-2K adapters, running on our own standalone engine (no ComfyUI needed). Your video is encoded at a small draft size, upscaled in latent space onto the target size and regenerated in a few diffusion steps, so it adds real new detail (skin, fabric, foliage, hair) instead of only sharpening.
+  - **Target sizes:** 2K (1440p, the trained target), 1080p, 4K, 768p (refine only) or a custom upscale factor, always keeping the aspect ratio.
+  - **Models:** FL2VA Pruned INT8 ConvRot (recommended default), FP8 Scaled, W6A8 and BF16; text encoders Qwen3-VL 32B NVFP4 (default), INT8 ConvRot and BF16; the fast Sol VAE decoder. Everything downloads on your first click into the `OpenH3_Models` folder (about 55 GB for the default set). `Models_Downloader.py` has a new Open-H3 option too.
+  - **Regenerate strength (Start Sigma), default 0.8:** keeps every subject, object and colour faithful while adding detail. Higher values change more; 0 uses the original release schedule.
+  - Steps, seed, adapter strengths, sparse attention, token budget (auto from your free VRAM or manual), window length with seamless cross-faded overlaps, source or 24 fps timing, audio handling and start/end frame are all adjustable. **Preview First Frame** checks the look in about a minute and **Preview Window Plan** shows how the video will be split before you spend GPU time.
+  - All the shared features of the other upscalers: images and videos, batch folders (all files run in one engine session, so the models load only once), scene chunking (also one engine session for all chunks), presets, image slider and side-by-side comparison video, queue, GPU selection, audio passthrough, face restoration, Global RIFE, auto transfer to input, resume folders and run metadata.
+  - **Never uses shared GPU memory** (on Windows that is about 20x slower). The new **Save VRAM (GB)** option (default 2 GB, like ComfyUI's `--reserve-vram`) keeps that much VRAM free, and the engine never asks for more than the rest. When a step needs more, it automatically moves just enough DiT blocks to system RAM and redoes that window, so the run still completes, with as many blocks as possible kept on the GPU for speed. **Max DiT Blocks on GPU (Block Swap)** lets you lower VRAM use further.
+  - **Optional: run each stage as a separate process** (first option under Open-H3 Models). Text encoding, VAE encode + latent upscale, DiT refine and VAE decode each run in their own process and pass their results to the next one through files, so a finished stage keeps no RAM or VRAM.
+  - The FFN Chunk Tokens setting now really takes effect, and free VRAM is measured correctly on Windows even when other apps use the same GPU.
+- **Redesigned interface for both dark and light themes:** a new header with a one-click theme switch, every tab visible in a tidy grid, clear panels and borders, easy-to-read labels and help text, coloured buttons that look right in both themes, and readable health-check and sizing cards in light mode.
+- **Much faster and smoother** (measured in Chrome):
+  - Switching tabs paints in 30–120 ms instead of 340–390 ms, and the 0.5–4.4 second freezes after a switch are gone.
+  - The page no longer works in the background while idle (before, two timers kept it about 8% busy all the time).
+  - The page downloads 60% less data (1.8 MB instead of 4.3 MB) and opens about 25% faster.
+  - Preset save and load finish in about 0.1–0.4 seconds instead of 1.2–1.5 seconds, and each setting change sends fewer requests.
+  - The app itself starts about 0.7 seconds faster.
+""",
+    ),
+    (
         "V8.6 — 13 October 2026 — RIFE Chunk Merge Fixes",
         """
 **Fixed RIFE runs that stopped at the very end with "Merge failed" or "Merged video timeline does not match the source", and RIFE outputs that silently lost frames.**

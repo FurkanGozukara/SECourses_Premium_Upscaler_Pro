@@ -126,13 +126,10 @@ def flashvsr_tab(
     def _vae_mode_note(mode_value: str) -> str:
         mode_norm = str(mode_value or "full").strip().lower()
         if mode_norm == "full":
-            return (
-                "**Mode note:** In `full` mode, the selected **VAE Model** directly changes the active decoder "
-                "(quality/VRAM/speed tradeoff is real here)."
-            )
+            return "**Decoder:** `full` mode decodes with the selected **VAE Model**."
         return (
-            "**Mode note:** In `tiny` / `tiny-long`, decoding is TCDecoder-based. "
-            "Changing **VAE Model** has limited effect on VRAM/decoder behavior in this backend path."
+            "**Decoder:** `tiny` / `tiny-long` decode with FlashVSR's TC decoder, so **VAE Model** "
+            "applies only to `full` mode."
         )
 
     def _compute_dit_tile_count_text(
@@ -347,14 +344,15 @@ def flashvsr_tab(
                             label="VAE Model",
                             choices=list(FLASHVSR_VAE_OPTIONS),
                             value=(
-                                str(_value("vae_model", "Wan2.2"))
-                                if str(_value("vae_model", "Wan2.2")) in set(FLASHVSR_VAE_OPTIONS)
-                                else "Wan2.2"
+                                str(_value("vae_model", "LightVAE_W2.1"))
+                                if str(_value("vae_model", "LightVAE_W2.1")) in set(FLASHVSR_VAE_OPTIONS)
+                                else "LightVAE_W2.1"
                             ),
                             info=(
-                                "Choose quality vs VRAM tradeoff: Wan2.1/Wan2.2 = highest quality; "
-                                "LightVAE/LightTAE = much lower VRAM and faster."
+                                "Full mode decoder. LightVAE_W2.1 (default) = closest to the original, least flicker, "
+                                "fastest. Wan2.1 = full Wan VAE: crisper but invents more detail, more VRAM."
                             ),
+                            interactive=str(_value("mode", "full")).strip().lower() == "full",
                         )
                         vae_mode_note = gr.Markdown(
                             _vae_mode_note(str(_value("mode", "full"))),
@@ -526,7 +524,7 @@ def flashvsr_tab(
                     tiled_vae = gr.Checkbox(
                         label="Enable VAE Tiling",
                         value=bool(_value("tiled_vae", False)),
-                        info="Splits VAE processing into tiles to reduce VRAM. Default OFF."
+                        info="Decodes in tiles: in full mode the VAE (lower VRAM), in tiny modes the TC decoder."
                     )
                     
                     tiled_dit = gr.Checkbox(
@@ -932,10 +930,9 @@ def flashvsr_tab(
             gr.Markdown("""
             #### FlashVSR Stable Guide
 
-            **VAE selection**
-            - `Wan2.1` / `Wan2.2`: best quality, highest VRAM demand.
-            - `LightVAE_W2.1`: lower VRAM + faster; strong default for 8-16GB GPUs.
-            - `TAE_W2.2` / `LightTAE_HY1.5`: strong temporal consistency and low VRAM variants.
+            **Decoder**
+            - `full` mode decodes with the selected VAE: `Wan2.1` (full Wan VAE) or `LightVAE_W2.1` (quarter width, less VRAM).
+            - `tiny` / `tiny-long` decode with FlashVSR's TC decoder; the VAE choice does not apply there.
 
             **Important backend limits**
             - FlashVSR supports only **2x** or **4x** upscale factors.
@@ -2123,9 +2120,10 @@ def flashvsr_tab(
     )
 
     mode.change(
-        fn=lambda m: gr.update(value=_vae_mode_note(m)),
+        fn=lambda m: (gr.update(value=_vae_mode_note(m)),
+                      gr.update(interactive=str(m or "").strip().lower() == "full")),
         inputs=[mode],
-        outputs=[vae_mode_note],
+        outputs=[vae_mode_note, vae_model],
         queue=False,
         show_progress="hidden",
     )

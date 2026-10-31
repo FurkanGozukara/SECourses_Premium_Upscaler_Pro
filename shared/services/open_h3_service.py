@@ -95,7 +95,7 @@ OPENH3_FPS_MODES = [
     "Resample to 24 fps (H3 reference)",
 ]
 OPENH3_AUDIO_MODES = [
-    "Encoded silence (reference)",
+    "Encoded silence (NVIDIA reference)",
     "Source soundtrack",
 ]
 OPENH3_SINK_OPTIONS = ["exact_kv_and_rows", "exact_kv", "off"]
@@ -401,7 +401,10 @@ def open_h3_defaults() -> Dict[str, Any]:
         "lora_strength": 1.0,
         "curve_strength": 1.0,
         "sparse_attention": True,
-        "sparse_tau": 1.2,
+        # Upstream Sol-Attn quality preset (NVlabs/Sana PR #564): first refine step dense, then sparse at tau 1.0.
+        # Measured: same structure as dense attention (37 dB), 23% faster refine; sparse first steps reshape objects.
+        "sparse_tau": 1.0,
+        "sparse_dense_steps": 1,
         "sparse_end_percent": 0.9,
         "dense_blocks": "0,1,49",
         "sink_conditioning": "exact_kv_and_rows",
@@ -414,7 +417,8 @@ def open_h3_defaults() -> Dict[str, Any]:
         "reserve_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "max_gpu_blocks": 50,
         "fps_mode": OPENH3_FPS_MODES[0],
-        "audio_mode": OPENH3_AUDIO_MODES[0],
+        # The refine attends to this audio; real speech keeps mouths in sync (measured +0.65 dB on the mouth).
+        "audio_mode": OPENH3_AUDIO_MODES[1],
         "start_frame": 0,
         "end_frame": -1,
         "keep_latents": False,
@@ -478,6 +482,7 @@ OPENH3_ORDER: List[str] = [
     "resume_run_dir",
     "keep_only_output_files",
     "auto_tune_on_run",
+    "sparse_dense_steps",
 ]
 
 
@@ -523,7 +528,8 @@ def _enforce_open_h3_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -
     cfg["lora_strength"] = max(-2.0, min(2.0, _to_float(cfg.get("lora_strength"), 1.0)))
     cfg["curve_strength"] = max(-2.0, min(2.0, _to_float(cfg.get("curve_strength"), 1.0)))
 
-    cfg["sparse_tau"] = max(0.0, min(4.0, _to_float(cfg.get("sparse_tau"), 1.2)))
+    cfg["sparse_tau"] = max(0.0, min(4.0, _to_float(cfg.get("sparse_tau"), 1.0)))
+    cfg["sparse_dense_steps"] = max(-1, min(8, _to_int(cfg.get("sparse_dense_steps"), 1)))
     cfg["sparse_end_percent"] = max(0.0, min(1.0, _to_float(cfg.get("sparse_end_percent"), 0.9)))
     cfg["dense_blocks"] = re.sub(r"[^0-9,\- ]", "", str(cfg.get("dense_blocks") or ""))[:200]
     sink = str(cfg.get("sink_conditioning") or "exact_kv_and_rows").strip()

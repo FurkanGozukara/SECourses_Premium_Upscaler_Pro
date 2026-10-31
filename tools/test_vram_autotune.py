@@ -199,6 +199,25 @@ class FlashVSRPlannerTests(unittest.TestCase):
         self.assertTrue(tp.fits)
         self.assertTrue(tp.updates["tiled_dit"])
 
+    def test_decoder_and_int8_calibration_points(self):
+        # Allocated peaks, 480x270 x4 (1080p), 81 frames untiled (benchmarks: fdec v2_* / v_tiny_tc_1080p).
+        mp = flash_plan.out_mp(480, 270, 4)
+        for mode, precision, measured in (("tiny", "bf16", 21.25), ("tiny", "int8_convrot", 20.26),
+                                          ("full", "bf16", 22.22), ("full", "int8_convrot", 21.23)):
+            est = flash_plan.peak_gb(mp, 81, 3, mode, precision, "LightVAE_W2.1")
+            self.assertGreaterEqual(est + 0.2, measured, (mode, precision, est))
+            self.assertLess(est, measured + 1.5, (mode, precision, est))
+
+    def test_full_mode_decoder_tiling(self):
+        light = flash_plan.plan({"scale": 4, "mode": "full", "vae_model": "LightVAE_W2.1"}, in_w=320, in_h=180,
+                                frames=81, budget=budget(32.0))
+        wan = flash_plan.plan({"scale": 4, "mode": "full", "vae_model": "Wan2.1"}, in_w=320, in_h=180,
+                              frames=81, budget=budget(32.0))
+        tiny = flash_plan.plan({"scale": 4, "mode": "tiny"}, in_w=320, in_h=180, frames=81, budget=budget(32.0))
+        self.assertFalse(light.updates["tiled_vae"])
+        self.assertTrue(wan.updates["tiled_vae"])  # the Wan2.1 VAE needs ~8 GB per megapixel untiled
+        self.assertNotIn("tiled_vae", tiny.updates)
+
     def test_calibration_points(self):
         self.assertGreaterEqual(flash_plan.peak_gb(flash_plan.out_mp(480, 270, 4), 45, 3, "full") + 0.2, 21.00)
         self.assertGreaterEqual(flash_plan.peak_gb(flash_plan.tile_mp(256, 480, 270, 4), 45, 3, "full") + 0.2, 11.75)

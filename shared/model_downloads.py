@@ -49,10 +49,7 @@ _SEED_INT8_CACHE_NAMES = {
 }
 _FLASH_VAE_FILENAMES = {
     "Wan2.1": "Wan2.1_VAE.pth",
-    "Wan2.2": "Wan2.2_VAE.pth",
     "LightVAE_W2.1": "lightvaew2_1.pth",
-    "TAE_W2.2": "taew2_2.safetensors",
-    "LightTAE_HY1.5": "lighttaehy1_5.pth",
 }
 
 
@@ -231,7 +228,7 @@ def ensure_flashvsr_model(
     base_dir: Path,
     version: str,
     precision: str,
-    vae_model: str,
+    vae_model: str | None,
     on_progress: ProgressCallback = None,
 ) -> tuple[bool, str]:
     version = "1.1" if str(version).strip() in {"1.1", "11"} else "1.0"
@@ -241,12 +238,14 @@ def ensure_flashvsr_model(
     int8_cache_root = Path(base_dir) / "FlashVSR_plus" / "models"
     model_dir = models_root / model_dir_name
     int8_convrot = str(precision or "").strip().lower() == "int8_convrot"
+    vae_model = vae_model if vae_model in _FLASH_VAE_FILENAMES else ("LightVAE_W2.1" if vae_model else None)
     required = [
         model_dir / "LQ_proj_in.ckpt",
         model_dir / "TCDecoder.ckpt",
-        model_dir / _FLASH_VAE_FILENAMES.get(vae_model, "Wan2.1_VAE.pth"),
         flash_root / "posi_prompt.pth",
     ]
+    if vae_model:  # full mode decodes with this VAE
+        required.insert(2, model_dir / _FLASH_VAE_FILENAMES[vae_model])
     if int8_convrot:
         required.append(int8_cache_root / f"{model_dir_name}_int8_convrot.safetensors")
     else:
@@ -257,7 +256,11 @@ def ensure_flashvsr_model(
     if cache_ready and _all_files_exist(required):
         return True, ""
 
-    args = ["--ensure-flashvsr", version, "--flashvsr-vae", vae_model]
+    args = ["--ensure-flashvsr", version]
+    if vae_model:
+        args += ["--flashvsr-vae", vae_model]
+    else:
+        args.append("--flashvsr-no-vae")
     if int8_convrot:
         args.append("--int8-convrot")
     ok, error = run_model_downloader(base_dir, args, on_progress)

@@ -363,6 +363,15 @@ def build_rtx_super_resolution_callbacks(
         s["audio_codec"] = seed_controls_local.get("audio_codec_val") or "copy"
         s["audio_bitrate"] = seed_controls_local.get("audio_bitrate_val") or ""
         s["save_metadata"] = bool(seed_controls_local.get("save_metadata_val", True))
+        # Output tab video encoding: the RTX runner encodes with FFmpeg using these (H.264 by default).
+        output_settings_local = seed_controls_local.get("output_settings") or {}
+        for key in ("video_codec", "video_quality", "video_preset", "pixel_format", "h265_tune",
+                    "av1_film_grain", "av1_film_grain_denoise"):
+            value = seed_controls_local.get(f"{key}_val")
+            if value is None and isinstance(output_settings_local, dict):
+                value = output_settings_local.get(key)
+            if value is not None:
+                s[key] = value
         return s
 
     def _apply_face_restore_if_enabled(

@@ -67,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_sparse", action="store_true")
     p.add_argument("--sparse_tau", type=float, default=1.2)
     p.add_argument("--sparse_end_percent", type=float, default=0.9)
+    p.add_argument("--sparse_dense_steps", type=int, default=-1,
+                   help="-1: sparse inside the start/end percent window; N >= 0: first N refine steps dense, the rest sparse")
+    p.add_argument("--second_pass_sigma", type=float, default=0.0,
+                   help="> 0: refine each window a second time at the same size from this noise level "
+                        "(experimental: at 4K a 0.7 + 0.6 ladder added grain and changed objects, so it is off)")
     p.add_argument("--dense_blocks", default="0,1,49")
     p.add_argument("--sparse_min_tokens", type=int, default=12288)
     p.add_argument("--sparse_extra_tokens", type=int, default=256)
@@ -123,6 +128,7 @@ def main() -> int:
         max_window_frames=args.max_window_frames, overlap_frames=args.overlap_frames, fps_mode=args.fps_mode,
         audio_mode=args.audio_mode, start_frame=args.start_frame, end_frame=args.end_frame,
         sparse_attention=not args.no_sparse, sparse_tau=args.sparse_tau, sparse_end_percent=args.sparse_end_percent,
+        sparse_dense_steps=args.sparse_dense_steps, second_pass_sigma=args.second_pass_sigma,
         dense_blocks=args.dense_blocks, sparse_min_tokens=args.sparse_min_tokens,
         sparse_extra_tokens=args.sparse_extra_tokens, sink_conditioning=args.sink_conditioning,
         ffn_chunk_tokens=args.ffn_chunk_tokens, reserve_vram_gb=args.reserve_vram_gb,

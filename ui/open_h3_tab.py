@@ -421,7 +421,7 @@ def open_h3_tab(
                     sparse_attention = gr.Checkbox(
                         label="Sparse Attention (Sol-Attn)",
                         value=bool(_value("sparse_attention", True)),
-                        info="About 3.9x faster refine than dense attention with the same look (reference: on).",
+                        info="Faster refine than dense attention with the same structure (2K, 49 frames: 34 s vs 44 s).",
                     )
                     attention_backend = gr.Dropdown(
                         label="Dense Attention Backend",
@@ -435,8 +435,17 @@ def open_h3_tab(
                         minimum=0.0,
                         maximum=4.0,
                         step=0.05,
-                        value=float(_value("sparse_tau", 1.2) or 1.2),
-                        info="Higher = sparser and faster. Reference 1.2.",
+                        value=float(_value("sparse_tau", 1.0) or 0.0),
+                        info="Higher = sparser and faster. Upstream quality preset 1.0, fast preset 1.75.",
+                    )
+                    sparse_dense_steps = gr.Slider(
+                        label="Sol-Attn Dense Steps",
+                        minimum=-1,
+                        maximum=8,
+                        step=1,
+                        value=int(_value("sparse_dense_steps", 1)),
+                        info=("First N refine steps run dense, the rest sparse. 1 = upstream quality preset (same "
+                              "structure as dense). 0 = all sparse (fast preset, objects can reshape). -1 = use End Percent."),
                     )
                     sparse_end_percent = gr.Slider(
                         label="Sol-Attn End Percent",
@@ -444,7 +453,7 @@ def open_h3_tab(
                         maximum=1.0,
                         step=0.01,
                         value=float(_value("sparse_end_percent", 0.9) or 0.9),
-                        info="Steps above this sigma window run sparse (0.9 covers all three steps).",
+                        info="Only with Dense Steps -1: steps above this sigma window run sparse.",
                     )
                 with gr.Row():
                     dense_blocks = gr.Textbox(
@@ -485,7 +494,8 @@ def open_h3_tab(
                         label="Audio Conditioning",
                         choices=list(OPENH3_AUDIO_MODES),
                         value=_choice("audio_mode", OPENH3_AUDIO_MODES, OPENH3_AUDIO_MODES[0]),
-                        info="Clean audio stream the refine attends to. The output soundtrack is always the source audio.",
+                        info=("Audio the refine attends to. Source soundtrack keeps talking mouths in sync (default; "
+                              "videos without audio use silence). The output soundtrack is always the source audio."),
                     )
                 with gr.Row():
                     start_frame = gr.Number(
@@ -768,6 +778,7 @@ def open_h3_tab(
         batch_enable, batch_input, batch_output,
         resume_run_dir, keep_only_output_files,
         auto_tune_on_run,
+        sparse_dense_steps,
     ]
 
     if len(inputs_list) != len(OPENH3_ORDER):

@@ -4,6 +4,7 @@ RTX Super Resolution runner backed by NVIDIA Maxine nvvfx Python bindings.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -686,61 +687,59 @@ def run_rtx_superres(
                 elapsed_seconds=max(0.0, time.time() - start_ts),
             )
 
-        # Build sink.
+        # Build sink: FFmpeg with the Output tab's codec settings (H.264 by default). OpenCV's MP4 writer
+        # produced MPEG-4 Part 2 ("mp4v"), a lower-quality codec many players and editors handle poorly, and is
+        # only used when ffmpeg is missing.
         if output_path and Path(output_path).suffix.lower() in VIDEO_EXTENSIONS:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            video_writer = cv2.VideoWriter(str(output_path), fourcc, float(output_fps), (out_w, out_h))
-            if not video_writer.isOpened():
-                with suppress(Exception):
-                    video_writer.release()
-                video_writer = None
-                with suppress(Exception):
-                    Path(output_path).unlink(missing_ok=True)
-                ffmpeg_exe = shutil.which("ffmpeg")
-                if ffmpeg_exe:
-                    ffmpeg_cmd = [
-                        ffmpeg_exe,
-                        "-y",
-                        "-f",
-                        "rawvideo",
-                        "-pix_fmt",
-                        "bgr24",
-                        "-s:v",
-                        f"{out_w}x{out_h}",
-                        "-r",
-                        f"{float(output_fps):.8f}",
-                        "-i",
-                        "-",
-                        "-an",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "fast",
-                        "-crf",
-                        "18",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-movflags",
-                        "+faststart",
-                        str(output_path),
-                    ]
-                    ffmpeg_writer = subprocess.Popen(
-                        ffmpeg_cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    log("[RTX] OpenCV MP4 writer unavailable; using the cross-platform FFmpeg fallback.")
-                else:
+            from .video_codec_options import build_ffmpeg_video_encode_args
+
+            ffmpeg_exe = shutil.which("ffmpeg")
+            if ffmpeg_exe:
+                codec_key = str(settings.get("video_codec") or "h264").strip().lower()
+                codec_key = {"libx264": "h264", "x264": "h264", "avc": "h264", "libx265": "h265", "x265": "h265",
+                             "hevc": "h265", "libsvtav1": "av1", "svtav1": "av1", "libvpx-vp9": "vp9"}.get(codec_key, codec_key)
+                if codec_key not in ("h264", "h265", "av1", "vp9") or (
+                        codec_key == "vp9" and Path(output_path).suffix.lower() != ".webm"):
+                    codec_key = "h264"  # ProRes / VP9 need .mov / .webm containers; the MP4 path stays H.264
+                encode_args = build_ffmpeg_video_encode_args(
+                    codec=codec_key,
+                    quality=_to_int(settings.get("video_quality"), 18),
+                    pixel_format=str(settings.get("pixel_format") or "yuv420p"),
+                    preset=str(settings.get("video_preset") or "medium"),
+                    h265_tune=str(settings.get("h265_tune") or "none"),
+                    av1_film_grain=_to_int(settings.get("av1_film_grain"), 8),
+                    av1_film_grain_denoise=_bool(settings.get("av1_film_grain_denoise"), False),
+                    audio_codec="none",
+                )
+                ffmpeg_cmd = [
+                    ffmpeg_exe, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s:v", f"{out_w}x{out_h}",
+                    "-r", f"{float(output_fps):.8f}", "-i", "-", *encode_args, "-movflags", "+faststart",
+                    str(output_path),
+                ]
+                ffmpeg_writer = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                log(f"[RTX] Encoding {codec_key.upper()} with FFmpeg ({' '.join(encode_args[:6])}).")
+            else:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                video_writer = cv2.VideoWriter(str(output_path), fourcc, float(output_fps), (out_w, out_h))
+                if not video_writer.isOpened():
+                    with suppress(Exception):
+                        video_writer.release()
                     return RTXSuperResResult(
                         returncode=1,
                         output_path=None,
                         log=(
-                            f"Failed to create an MP4 writer for {output_path}. "
-                            "OpenCV video encoding is unavailable and ffmpeg was not found in PATH."
+                            f"Failed to create a video writer for {output_path}: "
+                            "ffmpeg was not found in PATH and OpenCV video encoding is unavailable."
                         ),
                         elapsed_seconds=max(0.0, time.time() - start_ts),
                     )
+                log("[RTX] ffmpeg not found: falling back to OpenCV's MPEG-4 writer (lower quality; install ffmpeg).")
 
         def write_video_frame(frame_bgr) -> None:
             if video_writer is not None:
@@ -922,7 +921,7 @@ def run_rtx_superres(
         if ffmpeg_writer is not None:
             if ffmpeg_writer.stdin is not None:
                 ffmpeg_writer.stdin.close()
-            ffmpeg_returncode = ffmpeg_writer.wait(timeout=120)
+            ffmpeg_returncode = ffmpeg_writer.wait(timeout=3600)  # slow presets (AV1, 8K) finish after stdin closes
             ffmpeg_writer = None
             if ffmpeg_returncode != 0:
                 return RTXSuperResResult(

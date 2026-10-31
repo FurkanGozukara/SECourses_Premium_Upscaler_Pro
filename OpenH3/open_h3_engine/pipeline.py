@@ -84,6 +84,8 @@ class OpenH3Settings:
     sparse_tau: float = 1.2
     sparse_start_percent: float = 0.0
     sparse_end_percent: float = 0.9
+    sparse_dense_steps: int = -1       # -1 = start/end percent window; N >= 0 = first N refine steps dense, rest sparse
+    second_pass_sigma: float = 0.0     # > 0: refine the refined latent again at the same size from this noise level
     dense_blocks: str = "0,1,49"
     sparse_min_tokens: int = 12288
     sparse_extra_tokens: int = 256
@@ -389,10 +391,21 @@ class OpenH3Pipeline:
 
     @torch.no_grad()
     def _refine(self, model, dtype, base_options, patch, context, tags, video0: torch.Tensor,
-                audio0: torch.Tensor, seed: int, step_cb) -> torch.Tensor:
+                audio0: torch.Tensor, seed: int, step_cb, start_sigma=None) -> torch.Tensor:
         s = self.s
         device = self.device
-        sigmas = torch.tensor(core.refine_sigmas(int(s.steps), float(s.start_sigma)), dtype=torch.float32)
+        start = float(s.start_sigma) if start_sigma is None else float(start_sigma)
+        sigmas = torch.tensor(core.refine_sigmas(int(s.steps), start), dtype=torch.float32)
+        if patch is not None and int(s.sparse_dense_steps) >= 0:
+            # Step-based window (Open-H3 sol_engine presets): the first N steps dense, every later step sparse.
+            k = int(s.sparse_dense_steps)
+            patch.sigma_end = 0.0
+            if k <= 0:
+                patch.sigma_start = 1.0
+            elif k < len(sigmas) - 1:
+                patch.sigma_start = float(sigmas[k - 1] + sigmas[k]) / 2.0
+            else:
+                patch.sigma_start = -1.0
         generator = torch.manual_seed(int(seed))  # comfy.sample.prepare_noise: video stream first
         noise = torch.randn(video0.size(), dtype=torch.float32, generator=generator, device="cpu")
         x0 = video0.to(device, torch.float32)
@@ -744,15 +757,20 @@ def run_many(pipelines: List["OpenH3Pipeline"], progress: Optional[OpenH3Progres
         with torch.no_grad():
             for key, (context, tags) in contexts.items():
                 ctx_dev[key] = (model.preprocess_text_embeds(context.to(device, dtype)), tags)
-        total_steps = sum((len(core.refine_sigmas(int(p.s.steps), float(p.s.start_sigma))) - 1) * len(info[5].windows)
-                          for _i, p, info in jobs)
+        def _steps_per_window(ps):
+            n = len(core.refine_sigmas(int(ps.steps), float(ps.start_sigma))) - 1
+            if float(ps.second_pass_sigma) > 0:
+                n += len(core.refine_sigmas(int(ps.steps), float(ps.second_pass_sigma))) - 1
+            return n
+
+        total_steps = sum(_steps_per_window(p.s) * len(info[5].windows) for _i, p, info in jobs)
         done = [0]
         t0 = time.time()
         for i, p, info in jobs:
             plan = info[5]
             latents, audio = encoded.pop(i)
             context_dev, tags = ctx_dev[str(p.s.prompt or "")]
-            steps = len(core.refine_sigmas(int(p.s.steps), float(p.s.start_sigma))) - 1
+            steps = _steps_per_window(p.s)
             outs = []
             try:
                 for w_index, latent in enumerate(latents):
@@ -774,6 +792,14 @@ def run_many(pipelines: List["OpenH3Pipeline"], progress: Optional[OpenH3Progres
                         try:
                             out = p._refine(model, dtype, options, patch, context_dev, tags, latent, audio[w_index],
                                             int(p.s.seed) + w_index, _cb)
+                            if float(p.s.second_pass_sigma) > 0:
+                                # same size again from a lower noise level (Open-H3 4K ladder: 0.7, then 0.6)
+                                if patch is not None:
+                                    patch.reset()
+                                first_steps = len(core.refine_sigmas(int(p.s.steps), float(p.s.start_sigma))) - 1
+                                out = p._refine(model, dtype, options, patch, context_dev, tags, out, audio[w_index],
+                                                int(p.s.seed) + w_index, lambda st: _cb(first_steps + st),
+                                                start_sigma=float(p.s.second_pass_sigma))
                             break
                         except BaseException as exc:
                             if not loader_mod.is_oom(exc):

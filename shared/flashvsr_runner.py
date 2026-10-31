@@ -277,15 +277,10 @@ def _sanitize_attention(value: Any) -> str:
 
 
 def _sanitize_vae_model(value: Any) -> str:
-    valid = {
-        "wan2.1": "Wan2.1",
-        "wan2.2": "Wan2.2",
-        "lightvae_w2.1": "LightVAE_W2.1",
-        "tae_w2.2": "TAE_W2.2",
-        "lighttae_hy1.5": "LightTAE_HY1.5",
-    }
-    text = str(value or "Wan2.1").strip()
-    return valid.get(text.lower(), "Wan2.1")
+    # Only these decode FlashVSR's Wan2.1 latents; Wan2.2 / TAE / LightTAE names from older settings use the default.
+    valid = {"wan2.1": "Wan2.1", "lightvae_w2.1": "LightVAE_W2.1"}
+    text = str(value or "LightVAE_W2.1").strip()
+    return valid.get(text.lower(), "LightVAE_W2.1")
 
 
 def _parse_int(value: Any, default: int) -> int:
@@ -591,7 +586,7 @@ def run_flashvsr(
         model_name = flashvsr_internal_to_model_name(version_internal)
         mode = _sanitize_mode(settings.get("mode", "tiny"))
         requested_precision = _sanitize_precision(settings.get("precision", settings.get("dtype", "auto")))
-        vae_model = _sanitize_vae_model(settings.get("vae_model", "Wan2.1"))
+        vae_model = _sanitize_vae_model(settings.get("vae_model", "LightVAE_W2.1"))
         attention_mode = _sanitize_attention(settings.get("attention_mode", settings.get("attention", "sparse_sage_attention")))
         device_arg, visible_gpu, gpu_note = _resolve_flashvsr_device(settings.get("device", "auto"))
         if _bool(settings.get("auto_tune_on_run"), False):
@@ -618,7 +613,7 @@ def run_flashvsr(
                 base_dir,
                 version_ui,
                 precision,
-                vae_model,
+                vae_model if mode == "full" else None,  # tiny modes decode with the TC decoder
                 on_progress,
             )
             if not download_ok:
@@ -646,15 +641,6 @@ def run_flashvsr(
             log(
                 "[FlashVSR] Disabled unload_dit for tiled tiny mode because Keep Models on CPU is off. "
                 "This avoids CPU weights being reused by the next CUDA tile."
-            )
-
-        # Runtime guardrail: full mode + tiled_vae can produce severe color/noise corruption.
-        if mode == "full" and tiled_vae:
-            tiled_vae = False
-            settings["tiled_vae"] = False
-            log(
-                "[FlashVSR] Disabled tiled_vae for full mode due to known corruption risk "
-                "(rainbow/noise artifacts on some systems)."
             )
 
         tile_size = max(32, min(1024, _parse_int(settings.get("tile_size"), 256)))

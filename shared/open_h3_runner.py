@@ -100,7 +100,7 @@ def fps_mode(settings: Dict[str, Any]) -> str:
 
 
 def audio_mode(settings: Dict[str, Any]) -> str:
-    value = str(settings.get("audio_mode") or "").strip().lower()
+    value = str(settings.get("audio_mode") or "source").strip().lower()
     return "source" if "source" in value else "silence"
 
 
@@ -279,8 +279,10 @@ def build_command(python_exe: str, script_path: Path, settings: Dict[str, Any], 
         "--audio_mode", audio_mode(settings),
         "--start_frame", str(max(0, _parse_int(settings.get("start_frame"), 0))),
         "--end_frame", str(_parse_int(settings.get("end_frame"), -1)),
-        "--sparse_tau", str(_parse_float(settings.get("sparse_tau"), 1.2)),
+        "--sparse_tau", str(_parse_float(settings.get("sparse_tau"), 1.0)),
         "--sparse_end_percent", str(_parse_float(settings.get("sparse_end_percent"), 0.9)),
+        "--sparse_dense_steps", str(_parse_int(settings.get("sparse_dense_steps"), 1)),
+        "--second_pass_sigma", str(max(0.0, min(1.0, _parse_float(settings.get("second_pass_sigma"), 0.0)))),
         "--dense_blocks", str(settings.get("dense_blocks") or ""),
         "--sink_conditioning", str(settings.get("sink_conditioning") or "exact_kv_and_rows"),
         "--ffn_chunk_tokens", str(max(0, _parse_int(settings.get("ffn_chunk_tokens"), 32768))),

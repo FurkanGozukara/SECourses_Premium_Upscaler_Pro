@@ -195,9 +195,9 @@ def _normalize_flashvsr_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         cfg["attention_mode"] = "sdpa" if att_raw == "sdpa" else "sparse_sage_attention"
     cfg["attention"] = cfg["attention_mode"]
-    vae_raw = str(cfg.get("vae_model", "Wan2.1") or "Wan2.1").strip()
-    if vae_raw not in {"Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"}:
-        vae_raw = "Wan2.1"
+    vae_raw = str(cfg.get("vae_model", "LightVAE_W2.1") or "LightVAE_W2.1").strip()
+    if vae_raw not in {"Wan2.1", "LightVAE_W2.1"}:  # other names cannot decode FlashVSR latents
+        vae_raw = "LightVAE_W2.1"
     cfg["vae_model"] = vae_raw
     cfg["codec"] = str(cfg.get("codec", "libx264") or "libx264").strip() or "libx264"
     try:

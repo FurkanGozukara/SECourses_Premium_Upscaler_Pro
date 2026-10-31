@@ -267,7 +267,8 @@ def _safe_ui_video_preview_path(video_path: Optional[str]) -> Optional[str]:
         return video_path
 
 
-FLASHVSR_VAE_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
+# Decoder VAEs for full mode (tiny modes use the TC decoder). Only these read FlashVSR's Wan2.1 latents.
+FLASHVSR_VAE_OPTIONS = ["Wan2.1", "LightVAE_W2.1"]
 FLASHVSR_PRECISION_OPTIONS = ["auto", "bf16", "fp16", "int8_convrot"]
 FLASHVSR_ATTENTION_OPTIONS = ["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"]
 FLASHVSR_CODEC_OPTIONS = ["libx264", "libx265", "h264_nvenc"]
@@ -342,7 +343,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_tile_size = model_meta.default_tile_size
         default_overlap = model_meta.default_overlap
         default_attention = "flash_attention_2"
-        default_vae = "Wan2.2"
+        default_vae = "LightVAE_W2.1"  # measured best decoder (fidelity, flicker, speed) on two clips
         mode = model_meta.mode
         scale = int(model_meta.scale)
         frame_chunk_size = 241
@@ -355,7 +356,7 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         default_tile_size = 256
         default_overlap = 24
         default_attention = "flash_attention_2"
-        default_vae = "Wan2.2"
+        default_vae = "LightVAE_W2.1"  # measured best decoder (fidelity, flicker, speed) on two clips
         version = "1.1"
         mode = "full"
         scale = 4
@@ -511,8 +512,8 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     }
     cfg["attention_mode"] = att_map.get(att_raw, "flash_attention_2")
 
-    vae_model = str(cfg.get("vae_model", defaults.get("vae_model", "Wan2.2"))).strip()
-    cfg["vae_model"] = vae_model if vae_model in FLASHVSR_VAE_OPTIONS else str(defaults.get("vae_model", "Wan2.2"))
+    vae_model = str(cfg.get("vae_model", defaults.get("vae_model", "LightVAE_W2.1"))).strip()
+    cfg["vae_model"] = vae_model if vae_model in FLASHVSR_VAE_OPTIONS else "LightVAE_W2.1"
 
     cfg["tiled_vae"] = _to_bool(cfg.get("tiled_vae"), _to_bool(defaults.get("tiled_vae", True), True))
     cfg["tiled_dit"] = _to_bool(cfg.get("tiled_dit"), _to_bool(defaults.get("tiled_dit", False), False))

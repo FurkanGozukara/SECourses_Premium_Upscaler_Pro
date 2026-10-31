@@ -82,18 +82,18 @@ class ModelDownloadBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             model_downloads, "run_model_downloader", return_value=(True, "")
         ) as run:
-            ok, _ = model_downloads.ensure_flashvsr_model(
-                Path(tmp), "1.1", "int8_convrot", "Wan2.2"
-            )
-        self.assertTrue(ok)
+            base = Path(tmp)
+            self.assertTrue(model_downloads.ensure_flashvsr_model(base, "1.1", "int8_convrot", "LightVAE_W2.1")[0])
+            # Wan2.2 / TAE names cannot decode FlashVSR latents: they map to the default LightVAE_W2.1.
+            model_downloads.ensure_flashvsr_model(base, "1.1", "bf16", "Wan2.2")
+            # Tiny modes decode with the TC decoder and need no VAE.
+            model_downloads.ensure_flashvsr_model(base, "1.1", "bf16", None)
         self.assertEqual(
-            run.call_args.args[1],
+            [call.args[1] for call in run.call_args_list],
             [
-                "--ensure-flashvsr",
-                "1.1",
-                "--flashvsr-vae",
-                "Wan2.2",
-                "--int8-convrot",
+                ["--ensure-flashvsr", "1.1", "--flashvsr-vae", "LightVAE_W2.1", "--int8-convrot"],
+                ["--ensure-flashvsr", "1.1", "--flashvsr-vae", "LightVAE_W2.1"],
+                ["--ensure-flashvsr", "1.1", "--flashvsr-no-vae"],
             ],
         )
 
@@ -137,14 +137,14 @@ class ModelDownloadBridgeTests(unittest.TestCase):
             for name in (
                 "LQ_proj_in.ckpt",
                 "TCDecoder.ckpt",
-                "Wan2.2_VAE.pth",
+                "Wan2.1_VAE.pth",
                 "diffusion_pytorch_model_streaming_dmd.safetensors",
             ):
                 (flash_dir / name).touch()
             (flash_root / "posi_prompt.pth").touch()
             self.assertTrue(
                 model_downloads.ensure_flashvsr_model(
-                    base, "1.1", "int8_convrot", "Wan2.2"
+                    base, "1.1", "int8_convrot", "Wan2.1"
                 )[0]
             )
 

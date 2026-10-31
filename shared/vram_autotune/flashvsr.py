@@ -5,7 +5,10 @@ instantly from measured memory formulas (no test runs).
 Quality: frames per pass (Frame Chunk Size). FlashVSR streams a video with a KV cache of recent
 frames; every chunk restarts that memory and pads its tail, so the whole clip in one pass is best.
 Then DiT tiling OFF (tiles are diffused separately and feather-blended); when tiling is needed,
-the largest tiles with a wider overlap. KV Ratio 3 keeps the most temporal history.
+the fewest tiles (fewest seams) with a wider overlap, at the smallest tile size that keeps that tile
+grid: a larger tile in the same grid only repeats work in the overlap (320x480 input, 2 tiles: 448 px
+took 146 s and 22.4 GB, 320 px 75 s and 16.7 GB, the same picture within run-to-run noise).
+KV Ratio 3 keeps the most temporal history.
 Speed: models stay on the GPU (no CPU offload, no DiT unload between steps).
 
 Memory (PyTorch allocated, RTX 5090, native allocator; benchmarks/vram/flashvsr.jsonl):
@@ -38,7 +41,10 @@ FRAME_GB_PER_MP = 0.006    # upscaled frames kept on the GPU, per frame per mega
 INT8_WEIGHT_SAVING_GB = 1.0
 LIGHTVAE_GB_PER_MP = 0.44  # full mode, LightVAE decoded per step (Wan2.1 is tiled instead)
 SAFETY_GB = 0.6
-SAFETY_FRACTION = 0.15     # reserved ran 1.18-1.19x allocated in calibration
+# Reserved runs 1.18-1.26x allocated (1.26x with the LightVAE decoded each step). At 0.15 a 320x480 x4
+# portrait clip (120 frames, INT8, LightVAE) was planned untiled at a 28.6 GB cap and ran out of VRAM;
+# it passed at 29.0, 29.4 and 30.0 GB caps (benchmarks/vram/flashvsr.jsonl, v92_*). 0.20 plans it at 29.8 GB.
+SAFETY_FRACTION = 0.20
 MIN_TILE = 128
 TILE_CHOICES = tuple(range(1024, MIN_TILE - 1, -32))
 TILED_OVERLAP = 48         # wider overlap = smoother tile seams (24 is the minimum default)
@@ -61,6 +67,16 @@ def frames_in_pass(frames: int) -> int:
 
 def out_mp(in_w: int, in_h: int, scale: int) -> float:
     return _pad128(in_w * scale) * _pad128(in_h * scale) / 1e6
+
+
+def tile_overlap(tile: int) -> int:
+    return min(TILED_OVERLAP, max(8, tile // 4))
+
+
+def tile_grid(tile: int, overlap: int, in_w: int, in_h: int) -> Tuple[int, int]:
+    """Rows and columns of DiT tiles, as the FlashVSR engine lays them out (calculate_tile_coords)."""
+    stride = max(1, tile - overlap)
+    return (max(1, math.ceil(max(1, in_h - overlap) / stride)), max(1, math.ceil(max(1, in_w - overlap) / stride)))
 
 
 def tile_mp(tile: int, in_w: int, in_h: int, scale: int) -> float:
@@ -123,7 +139,7 @@ def choose(in_w: int, in_h: int, scale: int, total_frames: int, cap_gb: float, k
         frames = min(total, ram_frames_limit(in_w, in_h, scale, tiled), MAX_PASS_FRAMES)
         while frames > 21 and _with_margin(peak_gb(mp, frames, kv_ratio, mode, precision, vae_model)) > cap_gb:
             frames = max(21, int(frames * 0.85))
-        overlap = min(TILED_OVERLAP, max(8, tile // 4)) if tiled else 24
+        overlap = tile_overlap(tile) if tiled else 24
         cand = FlashChoice(frames=frames, tiled=tiled, tile=tile if tiled else 256, overlap=overlap,
                            gb=peak_gb(mp, frames, kv_ratio, mode, precision, vae_model))
         # Prefer the longest pass; among equal passes the first (untiled, then largest tile) wins.
@@ -131,6 +147,18 @@ def choose(in_w: int, in_h: int, scale: int, total_frames: int, cap_gb: float, k
             best = cand
         if cand.frames >= total:
             break
+    if best is not None and best.tiled:
+        # Same tile grid (same seams) and seam overlap at the smallest tile: less repeated work in the
+        # overlaps, less VRAM. Smaller tiles never need more memory, so the pass length still fits.
+        rows, cols = tile_grid(best.tile, best.overlap, in_w, in_h)
+        for tile in sorted(t for t in TILE_CHOICES if t < best.tile):
+            overlap = tile_overlap(tile)
+            r, c = tile_grid(tile, overlap, in_w, in_h)
+            if overlap >= best.overlap and r <= rows and c <= cols:
+                best = FlashChoice(frames=best.frames, tiled=True, tile=tile, overlap=overlap,
+                                   gb=peak_gb(tile_mp(tile, in_w, in_h, scale), best.frames, kv_ratio, mode,
+                                              precision, vae_model))
+                break
     if best is not None and best.frames < total:
         why = "model limit" if best.frames >= MAX_PASS_FRAMES else "VRAM/RAM limit"
         notes.append(f"The clip is split into passes of {best.frames} frames ({why}).")
@@ -177,7 +205,8 @@ def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget:
     if not image:
         out.lines.append("Frame Chunk Size " + ("0 (whole clip in one pass)" if whole else str(choice.frames)))
     out.lines.append("DiT tiling OFF (full frame)" if not choice.tiled else
-                     f"DiT tiling ON: {choice.tile}px tiles, {choice.overlap}px overlap (largest that fits)")
+                     f"DiT tiling ON: {choice.tile}px tiles, {choice.overlap}px overlap "
+                     f"({'x'.join(map(str, tile_grid(choice.tile, choice.overlap, in_w, in_h)))} tiles, the fewest that fit)")
     if mode == "full":
         out.lines.append(f"Decoder {vae_model}" + (" in tiles (untiled it needs about 8 GB per output megapixel)"
                                                     if speed.get("tiled_vae") else " untiled"))

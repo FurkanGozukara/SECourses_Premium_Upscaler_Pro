@@ -11,6 +11,22 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.2 — 1 November 2026 — Fixes: FlashVSR+ Auto Tune, Variable-Frame-Rate Videos, Faster Model Downloads, GAN Architectures",
+        """
+**A fix release from a full test of every tab: FlashVSR+ Auto Tune no longer plans runs that run out of VRAM, phone and screen recordings upscale with the right timing, big model downloads start at once, and cancelling a job never touches an older run.**
+
+- **Fixed: FlashVSR+ Auto Tune could plan a run that ran out of VRAM part-way** on big outputs close to the GPU's limit (a 1280x1920 portrait video on a 32 GB GPU stopped at 22% and restarted in tiles). It now keeps the extra room the LightVAE decoder really needs (measured with portrait and landscape videos), so the plan fits the first time.
+- **FlashVSR+ tiles are up to 2x faster.** When the frame needs DiT tiles, Auto Tune still picks the fewest tiles (fewest seams) but now at the smallest tile size that keeps that count; larger tiles only repeated work in the overlaps. That portrait video: 2 tiles in 75 s instead of 146 s, with the same picture and 5.7 GB less VRAM.
+- **Fixed: SparkVSR stopped with a timing error on phone and screen recordings with a variable frame rate.** The app read their nominal rate (for example 30 fps for a clip that really plays at 24), so the upscaled video came out shorter than its sound. Every tab now reads the real average rate of such videos; normal constant-rate videos are unchanged.
+- **Model downloader (new in the V9.2 zip): large files start at once.** Before the first byte, an 8 GB model sat for about 40 seconds while Windows filled its empty download file with zeros; that wait is gone. The RIFE download no longer fetches stray macOS `.DS_Store` files.
+- **Fixed: the GAN tab left an extra `_upscaled` copy of each image in your input folder** when face restoration was on. Everything now stays in the run's output folder.
+- **The GAN tab now names each model's architecture** (DAT, ESRGAN, HAT, RCAN, SPAN, OmniSR and more) instead of "unknown". It reads only the tensor names in the model file, so the tab still opens instantly; models you have not downloaded yet show the architecture they will use.
+- **Face Restoration:** choosing CodeFormer silently skipped restoration (that backend is not available yet); it now uses GFPGAN and says so.
+- **Fixed: cancelling a job before its first chunk finished saved a "cancelled_partial" video made from an older, finished run** (with the new input's sound) inside that run's folder. Cancel now only saves what the cancelled job itself finished.
+- Cancelling a SeedVR2 run now says "Cancelled by user" instead of a long Windows exit code, the Auto Tune result window no longer spills past its border, and the Windows installer no longer prints a warning about the scene detection package.
+""",
+    ),
+    (
         "V9.1 — 30 October 2026 — Instant Auto Tune & Save VRAM for Every Upscaler, Never Shared GPU Memory",
         """
 **Auto Tune is now instant on all six AI upscalers, and no upscaler ever spills into shared GPU memory again.**

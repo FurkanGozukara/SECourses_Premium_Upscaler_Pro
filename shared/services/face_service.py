@@ -241,8 +241,12 @@ def build_face_callbacks(
         m = (model_choice or "").strip().lower()
         if not m or m == "auto":
             return "auto", None
-        if m in ("gfpgan", "codeformer"):
+        if m == "gfpgan":
             return m, None
+        if m == "codeformer":
+            # The CodeFormer backend is a placeholder that returns the image unchanged, so
+            # picking it silently skipped restoration; GFPGAN (auto) restores instead.
+            return "auto", "⚠️ CodeFormer is not available yet. Using GFPGAN instead."
         # UI may expose future backends; keep safe fallback.
         return "auto", f"⚠️ Unsupported face restoration model '{model_choice}'. Falling back to auto."
 

@@ -513,11 +513,12 @@ def recent_output_run_dirs(
     limit: int = 20,
 ) -> list[Path]:
     """
-    Return recent candidate run directories from the output root.
+    Return recent unfinished run directories from the output root (cancel salvage candidates).
 
     Priority:
     1) Explicit `last_run_dir` (if provided and exists)
     2) Most-recent subdirectories under `output_root` (mtime desc)
+    Directories of finished runs (with run_summary.json) are skipped.
     """
     out: list[Path] = []
     seen: set[str] = set()
@@ -528,6 +529,11 @@ def recent_output_run_dirs(
                 return
             p = Path(path_like)
             if not p.exists() or not p.is_dir():
+                return
+            # Finished runs carry run_summary.json. Callers salvage a cancelled job's partial output
+            # from these folders, and a finished run's chunks must never be taken for it (a cancel
+            # before the first chunk finished wrote "cancelled_partial.mp4" into a day-old run).
+            if (p / "run_summary.json").exists():
                 return
             key = str(p.resolve())
             if key in seen:

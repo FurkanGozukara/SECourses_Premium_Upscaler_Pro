@@ -221,7 +221,28 @@ def get_media_duration_seconds(path: str) -> Optional[float]:
 
 
 def get_media_fps(path: str) -> Optional[float]:
-    """Return frames per second for a video using ffprobe."""
+    """Return frames per second for a video using ffprobe.
+
+    Variable-frame-rate videos (phone and screen recordings, trimmed clips) report a
+    nominal ``r_frame_rate`` that is higher than their real rate: a clip with 120 frames
+    over 5 s reports 30 fps. Upscalers write their frames at a constant rate, so the
+    nominal rate made such outputs shorter than the input and its audio. When the
+    average rate differs from the nominal one by more than 1 %, the average is returned:
+    the frame count over the real duration, which keeps picture and sound in sync.
+    """
+
+    def _rate(raw: Any) -> Optional[float]:
+        try:
+            text = str(raw or "").strip()
+            if "/" in text:
+                num, den = text.split("/", 1)
+                value = float(num) / float(den)
+            else:
+                value = float(text)
+            return value if value > 0 and value == value and value != float("inf") else None
+        except Exception:
+            return None
+
     try:
         proc = subprocess.run(
             [
@@ -231,9 +252,9 @@ def get_media_fps(path: str) -> Optional[float]:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=r_frame_rate",
+                "stream=r_frame_rate,avg_frame_rate",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 str(path),
             ],
             capture_output=True,
@@ -241,11 +262,14 @@ def get_media_fps(path: str) -> Optional[float]:
             timeout=20,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            rate = first_ffprobe_value(proc.stdout)
-            if "/" in rate:
-                num, den = rate.split("/", 1)
-                return float(num) / float(den)
-            return float(rate)
+            import json as _json
+
+            streams = (_json.loads(proc.stdout or "{}").get("streams") or [{}])
+            nominal = _rate(streams[0].get("r_frame_rate"))
+            average = _rate(streams[0].get("avg_frame_rate"))
+            if nominal and average and abs(nominal - average) > 0.01 * nominal:
+                return average
+            return nominal or average
     except Exception:
         return None
     return None

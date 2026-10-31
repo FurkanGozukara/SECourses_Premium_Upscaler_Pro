@@ -194,6 +194,37 @@ class FlashVSRPlannerTests(unittest.TestCase):
         self.assertFalse(tp.updates["tiled_dit"])
         self.assertEqual(tp.updates["frame_chunk_size"], 0)
 
+    def test_portrait_lightvae_keeps_reserved_headroom(self):
+        # 320x480 x4 (1280x1920), 120 frames, INT8 + LightVAE: planned untiled at a 28.6 GB cap it ran out
+        # of VRAM (reserved runs ~1.26x allocated); it passed at 29.0-30.0 GB caps.
+        settings = {"scale": 4, "mode": "full", "precision": "int8_convrot", "vae_model": "LightVAE_W2.1"}
+        for limit_gb, tiled in ((29.27, True), (30.7, False)):
+            gpu = common.GpuMemory(index=0, name="Test GPU", uuid="GPU-test-0", total_gb=31.8, reserved_gb=0.0,
+                                   used_gb=31.8 - limit_gb - 1.5, free_gb=limit_gb + 1.5)
+            b = common.VramBudget(gpu=gpu, save_gb=1.5, overhead_gb=flash_plan.FLASHVSR_PROCESS_OVERHEAD_GB)
+            tp = flash_plan.plan(settings, in_w=320, in_h=480, frames=120, budget=b)
+            self.assertEqual(tp.updates["tiled_dit"], tiled, (limit_gb, tp.updates))
+            self.assertEqual(tp.updates["frame_chunk_size"], 0)
+            self.assertLessEqual(tp.estimate_gb, limit_gb)
+            if tiled:
+                # 2 tiles either way; 320 px instead of 448 px halved the time (75 s vs 146 s).
+                self.assertEqual(tp.updates["tile_size"], 320)
+                self.assertEqual(flash_plan.tile_grid(320, tp.updates["overlap"], 320, 480), (2, 1))
+
+    def test_smallest_tile_keeps_the_grid(self):
+        for total in GPU_SIZES_GB:
+            for wh in INPUTS:
+                w, h = wh[0] // 2, wh[1] // 2
+                choice, _ = flash_plan.choose(w, h, 4, 120, total - 3.0, 3.0, "full", "int8_convrot")
+                if choice is None or not choice.tiled:
+                    continue
+                rows, cols = flash_plan.tile_grid(choice.tile, choice.overlap, w, h)
+                for smaller in (t for t in flash_plan.TILE_CHOICES if t < choice.tile):
+                    ov = flash_plan.tile_overlap(smaller)
+                    if ov >= choice.overlap:
+                        r, c = flash_plan.tile_grid(smaller, ov, w, h)
+                        self.assertTrue(r > rows or c > cols, (total, wh, choice.tile, smaller))
+
     def test_small_gpu_tiles(self):
         tp = flash_plan.plan({"scale": 4, "mode": "full"}, in_w=480, in_h=270, frames=120, budget=budget(12.0))
         self.assertTrue(tp.fits)

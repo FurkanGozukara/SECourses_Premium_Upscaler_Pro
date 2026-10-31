@@ -103,7 +103,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.1"
+APP_VERSION = "9.2"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -515,6 +515,16 @@ def main(argv=None):
       background: linear-gradient(160deg, rgba(15, 23, 42, 0.96), rgba(30, 64, 175, 0.82));
       box-shadow: 0 18px 48px rgba(2, 6, 23, 0.55);
       padding: 14px 14px 12px 14px;
+    }
+    /* Gradio 6 puts a Group's elem_classes on its inner wrapper too: keep only the outer card,
+       or a second 560 px card sits 15 px inside it and spills past its right edge. */
+    .autotune-modal-card .autotune-modal-card {
+      width: auto !important;
+      border: 0 !important;
+      border-radius: 0 !important;
+      background: none !important;
+      box-shadow: none !important;
+      padding: 0 !important;
     }
     .autotune-modal-title .md p,
     .autotune-modal-title .prose p {

@@ -1647,6 +1647,9 @@ def _process_single_file(
                 status = "Cancelled - partial upscale complete"
             elif output_path:
                 status = f"Chunked upscale produced partial output ({rc})"
+            elif runner_canceled:
+                # A cancelled CLI exits with a Windows code such as 3221225786 (Ctrl+C exit).
+                status = "Cancelled by user"
             else:
                 status = f"Chunked upscale ended early ({rc})"
             output_video = output_path if output_path and output_path.lower().endswith(".mp4") else None

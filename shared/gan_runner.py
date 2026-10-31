@@ -463,7 +463,14 @@ def _run_gan_image(
                 gpu_device=_resolve_cuda_device_id(settings),
             )
             if restored:
+                pre_restore = result.output_path
                 result.output_path = restored
+                # The upscaled image before restoration is an intermediate of this run.
+                if str(restored) != str(pre_restore) and Path(restored).exists():
+                    try:
+                        Path(pre_restore).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         return result
 
@@ -1119,8 +1126,13 @@ def _run_with_spandrel_image(
             output_path = Path(video_frame_dir) / output_filename
             output_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            # Single image processing - save next to input with _upscaled suffix and collision safety
-            output_path = collision_safe_path(input_path.with_stem(f"{input_path.stem}_upscaled").with_suffix(f".{output_format}"))
+            # Single image processing - save into this run's output folder (next to the input only
+            # when no run folder exists) with an _upscaled suffix and collision safety. Writing next
+            # to the input left files in the user's own folder (and fails on read-only folders).
+            run_dir = str(settings.get("_run_dir") or "").strip()
+            out_dir = Path(run_dir) if run_dir else input_path.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_path = collision_safe_path((out_dir / f"{input_path.stem}_upscaled").with_suffix(f".{output_format}"))
         
         save_kwargs: Dict[str, Any] = {}
         if output_format in {"jpg", "jpeg", "webp"}:

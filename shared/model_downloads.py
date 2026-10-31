@@ -30,6 +30,24 @@ DOWNLOADABLE_GAN_MODELS = (
     "RealESRGAN_x4plus_anime_6B.safetensors",
 )
 
+# Architecture of each downloadable GAN model as spandrel detects it (checked on the
+# files, 31 October 2026); the GAN tab shows it before a model is downloaded.
+DOWNLOADABLE_GAN_ARCHITECTURES = {
+    "2x-AnimeSharpV4_Fast_RCAN_PU.safetensors": "RCAN",
+    "2xLiveActionV1_SPAN_490000.pth": "SPAN",
+    "2xNomosUni_span_multijpg_ldl.pth": "SPAN",
+    "2x_AniScale2_Omni_i16_40K.pth": "OmniSR",
+    "4x-AnimeSharp.safetensors": "ESRGAN",
+    "4x-UltraSharp.safetensors": "ESRGAN",
+    "4x-UltraSharpV2.safetensors": "DAT",
+    "4xNomos2_hq_dat2.safetensors": "DAT",
+    "4xRealWebPhoto_v4_dat2.safetensors": "DAT",
+    "HAT-L_SRx4_ImageNet-pretrain.safetensors": "HAT",
+    "Kim2091-4x-UltraSharp.safetensors": "ESRGAN",
+    "RealESRGAN_x4plus.safetensors": "ESRGAN",
+    "RealESRGAN_x4plus_anime_6B.safetensors": "ESRGAN",
+}
+
 DOWNLOADABLE_RIFE_MODELS = (
     "4.14",
     "4.15",

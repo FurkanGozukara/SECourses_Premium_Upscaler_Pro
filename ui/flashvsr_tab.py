@@ -432,7 +432,7 @@ def flashvsr_tab(
                     "**Auto Tune (instant, no test runs):** reads your GPU's total and in-use VRAM, the input's size and "
                     "length, the output size, version and mode, then sets the longest **Frame Chunk Size** that fits "
                     "(the whole clip in one pass when possible: every chunk restarts FlashVSR's temporal memory), "
-                    "**DiT tiling OFF** when the full frame fits (otherwise the largest tiles with a wider overlap), "
+                    "**DiT tiling OFF** when the full frame fits (otherwise the fewest tiles, with a wider overlap), "
                     "**KV Ratio 3** and no CPU offloading for speed. It keeps `Save VRAM (GB)` free. Every run is "
                     "capped at GPU total - in use - Save VRAM, so it never uses shared GPU memory."
                 )

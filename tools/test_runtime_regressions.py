@@ -57,6 +57,91 @@ class AutoTuneModalTests(unittest.TestCase):
         warning.assert_called_once()
 
 
+class MediaFpsTests(unittest.TestCase):
+    """Variable-frame-rate videos must report their real (average) rate, or outputs come out shorter than the audio."""
+
+    def _fps(self, r_rate, avg_rate):
+        from shared import path_utils
+
+        payload = '{"streams": [{"r_frame_rate": "%s", "avg_frame_rate": "%s"}]}' % (r_rate, avg_rate)
+        done = types.SimpleNamespace(returncode=0, stdout=payload)
+        with mock.patch.object(path_utils.subprocess, "run", return_value=done):
+            return path_utils.get_media_fps("clip.mp4")
+
+    def test_vfr_clip_uses_the_average_rate(self):
+        # 120 frames over 5.033 s with a nominal 30 fps (a trimmed phone/screen recording).
+        self.assertAlmostEqual(self._fps("30/1", "3600/151"), 3600 / 151, places=6)
+
+    def test_cfr_clips_keep_their_nominal_rate(self):
+        self.assertAlmostEqual(self._fps("24000/1001", "24000/1001"), 24000 / 1001, places=6)
+        self.assertEqual(self._fps("25/1", "25/1"), 25.0)
+
+    def test_missing_average_falls_back_to_nominal(self):
+        self.assertEqual(self._fps("30/1", "0/0"), 30.0)
+
+
+class CancelSalvageTests(unittest.TestCase):
+    def test_finished_runs_are_never_salvage_candidates(self):
+        from shared.output_run_manager import recent_output_run_dirs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            finished = root / "0030"
+            (finished / "processed_chunks").mkdir(parents=True)
+            (finished / "run_summary.json").write_text("{}", encoding="utf-8")
+            running = root / "0045"
+            (running / "processed_chunks").mkdir(parents=True)
+            found = recent_output_run_dirs(root, last_run_dir=str(finished), limit=30)
+            self.assertEqual([p.name for p in found], ["0045"])
+
+
+class GanArchitectureDetectTests(unittest.TestCase):
+    """The GAN tab names a model's architecture from its tensor names, without importing torch."""
+
+    DAT_KEYS = ("conv_first.weight", "before_RG.1.weight", "layers.0.blocks.0.ffn.sg.conv.weight",
+                "layers.0.blocks.0.attn.qkv.weight", "conv_last.weight")
+    SPAN_KEYS = ("conv_1.sk.weight", "block_1.c1_r.sk.weight", "conv_cat.weight", "upsampler.0.weight")
+
+    def test_safetensors_header_is_enough(self):
+        import json
+        import struct
+
+        from shared.gan_arch_detect import detect_gan_architecture
+
+        header = {k: {"dtype": "F32", "shape": [1], "data_offsets": [4 * i, 4 * i + 4]}
+                  for i, k in enumerate(self.DAT_KEYS)}
+        blob = json.dumps(header).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "4x-Test_dat.safetensors"
+            path.write_bytes(struct.pack("<Q", len(blob)) + blob + b"\0" * 4 * len(self.DAT_KEYS))
+            self.assertEqual(detect_gan_architecture(path), "DAT")
+
+    def test_pth_keys_are_read_without_running_the_pickle(self):
+        from shared.gan_arch_detect import detect_gan_architecture
+
+        esrgan = {"params_ema": {"module.model.0.weight": torch.zeros(1),
+                                 "module.model.1.sub.0.RDB1.conv1.0.weight": torch.zeros(1)}}
+        span = {k: torch.zeros(1) for k in self.SPAN_KEYS}
+        with tempfile.TemporaryDirectory() as tmp:
+            zipped = Path(tmp) / "4x-Test_esrgan.pth"
+            torch.save(esrgan, zipped)
+            legacy = Path(tmp) / "2x-Test_span.pth"
+            torch.save(span, legacy, _use_new_zipfile_serialization=False)
+            self.assertEqual(detect_gan_architecture(zipped), "ESRGAN")
+            self.assertEqual(detect_gan_architecture(legacy), "SPAN")
+
+    def test_gan_tab_metadata_names_the_architecture(self):
+        from shared.services.gan_service import get_gan_model_metadata_lightweight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "models").mkdir()
+            torch.save({k: torch.zeros(1) for k in self.SPAN_KEYS}, Path(tmp) / "models" / "2x-Local_span.pth")
+            self.assertEqual(get_gan_model_metadata_lightweight("2x-Local_span.pth", Path(tmp)).architecture, "SPAN")
+            # Not downloaded yet: the architecture recorded for the downloadable model.
+            meta = get_gan_model_metadata_lightweight("4x-UltraSharpV2.safetensors", Path(tmp))
+            self.assertEqual(meta.architecture, "DAT")
+
+
 class FlashVSRCompatibilityTests(unittest.TestCase):
     def test_legacy_cli_falls_back_without_unsupported_int8_argument(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -43,7 +43,8 @@ from shared.comparison_video_service import maybe_generate_input_vs_output_compa
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
-from shared.model_downloads import DOWNLOADABLE_GAN_MODELS
+from shared.model_downloads import DOWNLOADABLE_GAN_ARCHITECTURES, DOWNLOADABLE_GAN_MODELS
+from shared.gan_arch_detect import detect_gan_architecture
 
 
 GAN_MODEL_EXTS = {".pth", ".safetensors"}
@@ -182,6 +183,17 @@ def get_gan_model_metadata_lightweight(filename: str, base_dir: Path):
             tags = [str(tag) for tag in raw_tags if str(tag).strip()]
     except Exception:
         pass
+
+    if architecture == "unknown" and name:
+        # Read the tensor names of the model file (no torch import); models that are
+        # not downloaded yet use the architecture recorded for them.
+        for folder_name in ("models", "Image_Upscale_Models"):
+            detected = detect_gan_architecture(Path(base_dir) / folder_name / Path(name).name)
+            if detected:
+                architecture = detected
+                break
+        else:
+            architecture = DOWNLOADABLE_GAN_ARCHITECTURES.get(Path(name).name, architecture)
 
     return SimpleNamespace(
         name=name,

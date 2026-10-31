@@ -973,7 +973,7 @@ def seedvr2_tab(
 
             # Model management buttons with clarification
             gr.Markdown("""
-            ** Model Unloading (Subprocess Mode):**
+            **Model Unloading (Subprocess Mode):**
             - In subprocess mode (current), models are automatically unloaded after each run
             - These buttons force CUDA cache clearing for manual VRAM management
             - **In-app mode** (when implemented) will cache models between runs - then these buttons will actually unload persistent models
@@ -1037,13 +1037,13 @@ def seedvr2_tab(
                 "  -  **Automatic vcvars wrapper** on Windows (enables torch.compile when VS Build Tools installed)\n"
                 "  -  **Full cancellation support** with proper cleanup\n"
                 "  -  **100% VRAM/RAM cleanup** after each run\n"
-                "- ** In-app (EXPERIMENTAL - NOT RECOMMENDED FOR SEEDVR2):**\n"
+                "- **In-app (EXPERIMENTAL - NOT RECOMMENDED FOR SEEDVR2):**\n"
                 "  - **SeedVR2 Limitation**: Models reload each run (CLI design) - **NO speed benefit**\n"
                 "  - **Cannot cancel** mid-process (no subprocess to kill)\n"
                 "  - **vcvars must be pre-activated** before app start (cannot activate after Python loaded)\n"
                 "  - **May work for GAN/RIFE** but SeedVR2 gains nothing from in-app mode\n\n"
-                "** IMPORTANT:** Cancel button only works in **subprocess mode**. In-app mode runs cannot be cancelled mid-process.\n\n"
-                "** SeedVR2 Recommendation:** **Always use subprocess mode**. In-app provides no benefits for SeedVR2 due to CLI architecture (models reload each run). Switch modes in Global Settings tab."
+                "**IMPORTANT:** Cancel button only works in **subprocess mode**. In-app mode runs cannot be cancelled mid-process.\n\n"
+                "**SeedVR2 Recommendation:** **Always use subprocess mode**. In-app provides no benefits for SeedVR2 due to CLI architecture (models reload each run). Switch modes in Global Settings tab."
             )
             gr.Markdown("**Comparison:** Native Gradio ImageSlider with download and fullscreen support for images. Custom HTML5 slider for videos.")
 

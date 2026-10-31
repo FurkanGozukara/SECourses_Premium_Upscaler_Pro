@@ -18,7 +18,7 @@ GPU memory. Runs past the cap end with `oom: true` (a normal CUDA out-of-memory 
 | `ltx25.jsonl` | `LTX25/ltx25_engine/planner.py` | non-block weights 4.55 + fixed 3.0 (two streaming block buffers, tiled VAE) + 0.25 MB per sequence token (video tokens x 1.25 + 2048); blocks that do not fit stream from RAM |
 | `rtx.jsonl` | `rtx.py` | whole process 0.6 + 0.06 per output MP + 0.3 per input MP (0.75 GB for 1080p output, 3.0 GB for 8K; the SDK allocates outside PyTorch) |
 
-Planners add a safety margin (8-15% plus 0.6 GB) because the cap limits *reserved* memory, which the
+Planners add a safety margin (8-20% plus 0.6 GB) because the cap limits *reserved* memory, which the
 allocator keeps above allocated (1.2-1.4x). Near the cap, fragmentation decides: `seedvr2.jsonl` holds boundary runs
 (`bnd_*`, `frag_*`) where a planned batch failed with 4 GB stranded in split blocks and passed with
 `max_split_size_mb:512`, which the launcher adds when a plan uses more than 80% of its budget (`speed_*`: it

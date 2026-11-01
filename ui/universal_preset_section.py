@@ -332,7 +332,7 @@ def universal_preset_section(
     with gr.Accordion("📦 Universal Preset (All Tabs)", open=open_accordion):
         gr.Markdown("""
         **Save/Load affects ALL tabs simultaneously.**  
-        One preset contains Global Settings, SeedVR2, GAN, RIFE, FlashVSR+, Open-H3 Regenerate, LTX 2.5, SparkVSR, RTX Super Resolution, Face, Resolution, and Output settings.
+        One preset contains Global Settings, SeedVR2, GAN, RIFE, FlashVSR, Open-H3 Regenerate, LTX 2.5, SparkVSR, RTX Super Resolution, Face, Resolution, and Output settings.
         """)
         
         preset_dropdown = gr.Dropdown(

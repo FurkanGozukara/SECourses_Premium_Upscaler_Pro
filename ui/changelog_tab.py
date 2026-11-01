@@ -11,6 +11,60 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.4 — 1 November 2026 — SeedVR2 W4A8 Default and 2x Faster INT8, New FlashVSR+ Turbo, Faster RIFE Without Ghost Frames, Faster GAN Video, LTX 2.5 Sparse Attention",
+        """
+**Every upscaler was checked against its upstream project and its forks, and everything that measured better on real test videos is in. SeedVR2's main model step now runs about 2x faster than BF16 with both the new default W4A8 model and the fixed INT8 ConvRot path, at the same quality, the new FlashVSR+ Turbo beats FlashVSR v1.1 on every test clip, RIFE is up to 2.4x faster with no ghost frames at scene cuts, and GAN video upscaling is 2.5-3.6x faster.**
+
+How it was measured: test videos (a detailed 1080p robot clip, fast-motion ski footage and a face clip) were downscaled, upscaled back and compared with the originals (PSNR in dB, higher = closer to the original), on an RTX 5090 and an RTX 3090.
+
+**Run `Windows_Install_and_Update.bat` once after updating:** it installs the new GAN architecture library and NVIDIA's video effects package 0.2.0.0 (needed for Frame Generation, 10-bit and HDR10 in the RTX tab).
+
+**SeedVR2**
+- **New default model: 7B Sharp W4A8.** The same quality as 7B Sharp INT8 ConvRot (within 0.1 dB on every test, and the zoomed crops look the same), the smallest download (4.8 GB) and the least VRAM (4.5 GB of model weights instead of 8.1 GB). Main model step:
+  - RTX 5090, 720p ski clip: **4.5 s** (plain BF16: 9.0 s).
+  - RTX 3090, same settings for every model: 720p ski **11.5 s**, 1080p robot **20.5 s** (BF16: 28.4 s and 50.2 s).
+  - New preset in the model downloader; the app also fetches it when first needed. Saved presets keep the model they name.
+- **RTX 20-series, GTX 16 and older cards** run 7B Sharp INT8 ConvRot automatically (W4A8 needs an RTX 30-series card or newer), with a note in the log, and Auto Tune plans for that model.
+- **INT8 ConvRot is about 2x faster than BF16 again.** It had been running its layers in FP32, which made it slower than BF16 and used about 35% more memory; it now uses the fast INT8 kernels. RTX 5090 main model step: 13.1 → **4.7 s** on the 720p ski clip and 28.6 → **10.0 s** on the 1080p robot clip (BF16: 9.0 s and 28.1 s), with the same quality.
+- **Auto Tune is accurate for every model.** Re-measured on an RTX 5090 and an RTX 3090, every phase estimate is now within -2% to +6% of the measured peak. It also counts the colour correction after decoding, frees cached memory before it and holds the run to its estimate, so the GPU memory a run uses matches the number it shows (test in the app: 17.6 GB used for a 19.7 GB estimate; before, 22.1 GB for 19.5 GB). Before, it also overestimated BF16 and W4A8 by 17-25% (so 24 GB cards got BlockSwap they did not need) and underestimated 3B INT8 on 24 GB cards by 14% (that run ran out of VRAM).
+- **Faster and lighter with every model:** the main model needs 0.7-3.6 GB less VRAM and its step is 22-29% faster, video VAE encode and decode are 43-47% faster (about a quarter off a whole 1080p run), and single images need 31-49% less VAE memory.
+- **GPUs without BF16 support (RTX 20-series, GTX 16):** the 7B model came out visibly distorted (25.7 dB); it now matches the BF16 result (34.1 dB vs 34.4 dB).
+- **Fixed: Prepend Frames left the extra frames in the output.** A 61-frame video came out 65 frames long with the picture 4 frames late (133 ms out of sync with the sound); it is now exact, and a 900-frame video in 6 chunks keeps 900 frames and 30.000 s.
+- **Fixed:** with torch.compile and model caching on, the second file of a batch crashed; seeds above 4,294,967,295 and negative seeds crashed (the same seed still gives the same picture).
+- In-process mode finishes the 1080p test in 67 s instead of 115 s, and with BlockSwap it now frees its RAM after decoding (11.2 → 2.8 GB).
+
+**FlashVSR (the tab was "FlashVSR+")**
+- **New models: FlashVSR+ Turbo and FlashVSR+ Base** (the official FlashVSR+ release), next to FlashVSR v1.1. **Turbo beat v1.1 on all three test clips:** robot 31.6 vs 30.2 dB, ski 27.1 vs 25.7 dB, faces 26.0 vs 23.5 dB, with less flicker. Its colours stay true to the source (v1.1 shifts them darker and more saturated) and faces are sharper. 4K output runs without tiles in 64 s instead of 113 s, and a 900-frame clip runs in one pass in 98 s instead of 118 s. Base scores below Turbo and needs more VRAM.
+- Each FlashVSR+ model downloads once (about 3.4 GB, BF16) and Auto Tune plans for it from measured VRAM. FlashVSR+ always runs in BF16: INT8 ConvRot was about 40% slower with no VRAM saving.
+- **Fixed: tiled runs had a black 1-pixel border** on every frame.
+- **Fixed: videos were saved about half a brightness level too dark** (pixel values were cut off instead of rounded); rounding adds +0.3 to +0.4 dB.
+- FlashVSR v1.1 needs about 1 GB less VRAM at 1080p, with the same output.
+
+**RIFE frame interpolation and RTX**
+- **RIFE is up to 2.4x faster:** 81 → 192 fps at 320x180 (2x), +18% at 1080p (2x), +26% at 4K (2x), +34% at 1080p (4x).
+- **No more ghost frames at scene cuts,** also when the RIFE tab splits a long video into chunks. The new cut detection found all 22 cuts in the test clips (the old one found 1); on a long clip with 12 cuts, blended ghost frames went from 11 to 0, and chunked runs now give exactly the right number of frames.
+- **Fixed: the frames RIFE generates were slightly darker,** so 2x videos pulsed in brightness every other frame.
+- **Exact frame rates:** 24, 23.976 or 25 fps → 60 fps now gives exactly the right number of frames with 65-86% less judder; the sound stays in sync and the video is encoded once instead of twice.
+- RIFE no longer replaces real frames with blends in slow shots (+0.9 to +1.1 dB on those frames).
+- **New: NVIDIA Frame Generation** as an interpolation choice in the RIFE tab and Global RIFE (RTX 40 and 50 series): 2-4x faster than RIFE up to 1080p at about the same quality.
+- **RTX Super Resolution: fixed colours.** HD videos were decoded with the wrong colour standard (robot test 38.1 → 44.0 dB), and outputs now keep the source's colour information. 5.6% faster at 1080p → 4K.
+- **New RTX options:** 10-bit output (8x less banding in gradients, 30-50% slower), HDR10 output with TrueHDR and VSR strength. The STREAMING levels now say in the UI that they sharpen strongly (they score far below High Bitrate on clean video). RIFE also gets duplicate-frame removal for animation.
+
+**LTX 2.5**
+- **Sparse attention on by default:** sampling is 9-14% faster with the same picture.
+- **Sharper last frames:** extra tail frames improve the end of each video (+0.4 dB robot, +1.7 dB faces); they are skipped when they would need a whole extra chunk.
+- **Faster decoding:** Auto Tune now plans the tail frames too and picks larger VAE decode tiles when VRAM allows, and the last chunk frees the transformer before decoding, so the large tiles fit (241-frame test: 8.5 → 6.4 s). If VRAM still runs short, it falls back to 512 px tiles.
+- **Fixed: the NVFP4 model download was an older checkpoint.** It now matches the official release, and the app replaces an old copy automatically. Every LTX file is now checked by size and checksum, so outdated copies (including an outdated Gemma text encoder) are replaced.
+- **New optional Refine: Restore** for old, faded or sepia archive footage: it restores detail and colour. It changes the colours of normal colour video, so leave it off there.
+
+**GAN upscalers and face restoration**
+- **Video upscaling is 2.5-3.6x faster:** models that support it now run in FP16 automatically.
+- **Tiled upscaling fixed:** 1080p → 4K took 220 s and now takes 17 s, without seams.
+- **More architectures load and run:** SMoSR, SST, DIS, FIGSR, GaterV3, GateRv2 and more, and UltraSharpV2 runs 2.8x faster in FP32. Output pixel values are rounded instead of cut off.
+- **Face restoration:** "auto" now uses GFPGAN v1.4 (+0.9 to +1.7 dB on faces over v1.3), **CodeFormer really runs now**, and the strength slider really blends. Videos were restored twice, which made hair edges glow; they are now restored once and look natural (face test: 79.7 → 12.9 s).
+""",
+    ),
+    (
         "V9.2 — 1 November 2026 — Fixes: FlashVSR+ Auto Tune, Variable-Frame-Rate Videos, Faster Model Downloads, GAN Architectures",
         """
 **A fix release from a full test of every tab: FlashVSR+ Auto Tune no longer plans runs that run out of VRAM, phone and screen recordings upscale with the right timing, big model downloads start at once, and cancelling a job never touches an older run.**

@@ -126,13 +126,18 @@ class SeedVR2PlannerTests(unittest.TestCase):
         self.assertEqual(tp.updates["blocks_to_swap"], 0)
 
     def test_matches_calibration_points(self):
-        # Allocated GiB measured on an RTX 5090 (benchmarks/vram/seedvr2.jsonl); estimates must not undershoot by > 0.2.
+        # Allocated GiB measured on an RTX 5090; estimates must not undershoot by > 0.2. DiT: INT8 ConvRot after the
+        # autocast-dtype fix (results/WP-SEEDVR2 v5090: 720p 61f 14.45, 1080p 49f BlockSwap 9 17.85), BF16 720p 61f 21.62;
+        # the earlier unchunked peaks hold for compiled DiTs.
         geo = seed_plan.Geometry(1920, 1088, 1920, 1088)
-        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo, 21, 0) + 0.2, 17.10)
+        geo720 = seed_plan.Geometry(1280, 720, 1280, 720)
+        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo720, 61, 0) + 0.2, 14.45)
+        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo, 49, 9) + 0.2, 17.85)
+        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, False, geo720, 61, 0) + 0.2, 21.62)
+        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo, 21, 0, compiled=True) + 0.2, 17.10)
         self.assertGreaterEqual(seed_plan.decode_peak_gb(geo, 21, True, 1024) + 0.2, 18.05)
         self.assertGreaterEqual(seed_plan.encode_peak_gb(geo, 21, True, 1024) + 0.2, 11.26)
-        geo720 = seed_plan.Geometry(1280, 720, 1280, 720)
-        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo720, 85, 0) + 0.2, 22.20)
+        self.assertGreaterEqual(seed_plan.dit_peak_gb(self.MODEL, True, geo720, 85, 0, compiled=True) + 0.2, 22.20)
         self.assertGreaterEqual(seed_plan.decode_peak_gb(geo720, 45, False, 0) + 0.2, 16.39)
 
     def test_impossible_budget_reports_instead_of_crashing(self):

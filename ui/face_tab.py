@@ -7,7 +7,8 @@ import gradio as gr
 from typing import Dict, Any
 
 from shared.services.face_service import (
-    build_face_callbacks, FACE_ORDER, get_available_backends_lightweight
+    build_face_callbacks, FACE_ORDER, FACE_MODEL_CHOICES, get_available_backends_lightweight,
+    normalize_face_model_choice,
 )
 from shared.models.seedvr2_meta import get_seedvr2_model_names
 from ui.media_preview import preview_updates
@@ -102,6 +103,15 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
             merged_defaults[key] = value
     
     values = [merged_defaults.get(k, defaults.get(k, "")) for k in FACE_ORDER]
+    # Older presets may hold "restoreformer" (never implemented); it maps to auto.
+    values[FACE_ORDER.index("restoration_model")] = normalize_face_model_choice(
+        values[FACE_ORDER.index("restoration_model")]
+    )
+    # Every pipeline's face pass follows the Face tab's model choice from startup on.
+    service["apply_face_model_env"](
+        values[FACE_ORDER.index("restoration_model")],
+        values[FACE_ORDER.index("codeformer_fidelity")],
+    )
     # Layout
     gr.Markdown("### 👤 Face Restoration Settings")
     gr.Markdown("*Configure face enhancement applied after upscaling across all models*")
@@ -271,8 +281,8 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                 **⚠️ No Face Restoration Models Available**
                 
                 Please install one of the following:
-                - **GFPGAN**: `pip install gfpgan`
-                - **CodeFormer**: Coming soon
+                - **GFPGAN**: `pip install gfpgan` (with facexlib)
+                - **CodeFormer**: needs facexlib and basicsr (installed with the app)
                 
                 Until installed, face restoration will be skipped.
                 """)
@@ -287,7 +297,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     label="Face Restoration Backend (Info Only)",
                     choices=backend_choices,
                     value="auto",
-                    info="'auto' uses first available backend. GFPGAN is recommended. This is informational - configure in Face Restoration tab.",
+                    info="'auto' uses the Restoration Model chosen in the Face Restoration tab. This is informational - configure it there.",
                     interactive=False
                 )
                 
@@ -296,7 +306,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                 def update_backend_info(backend):
                     if backend == "auto":
                         if available_backends:
-                            return f"**Auto**: Will use {available_backends[0]} (first available)"
+                            return "**Auto**: uses the Restoration Model chosen in the Face Restoration tab (auto there = GFPGAN v1.4)"
                         else:
                             return "**Auto**: No backends available - face restoration will be skipped"
                     elif backend == "gfpgan":
@@ -307,13 +317,17 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                         - GPU accelerated
                         - Best for realistic faces
                         """
+                    elif backend == "gfpgan_v1.4":
+                        return """
+                        **GFPGAN v1.4**
+                        - Newer GFPGAN weights: more facial detail than v1.3
+                        - Same speed and VRAM as v1.3
+                        """
                     elif backend == "codeformer":
                         return """
                         **CodeFormer**
-                        - Advanced face restoration
-                        - Better for heavily degraded faces
-                        - Controllable fidelity
-                        - Coming soon
+                        - Strong restoration of heavily degraded faces
+                        - Controllable fidelity (CodeFormer Fidelity slider)
                         """
                     return ""
                 
@@ -363,9 +377,10 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
             with gr.Group():
                 restoration_model = gr.Dropdown(
                     label="Restoration Model",
-                    choices=["gfpgan", "restoreformer", "codeformer", "auto"],
+                    choices=list(FACE_MODEL_CHOICES),
                     value=values[4],  # FACE_ORDER index 4 = restoration_model
-                    info="'auto' selects best model based on input quality"
+                    info="Used by this tab and by every upscaler's face restoration pass. "
+                         "gfpgan = GFPGAN v1.3, gfpgan_v1.4 = GFPGAN v1.4, codeformer = CodeFormer. 'auto' = GFPGAN v1.4 (v1.3 when v1.4 cannot be downloaded)."
                 )
 
                 face_strength = gr.Slider(
@@ -373,6 +388,13 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     minimum=0.0, maximum=1.0, step=0.05,
                     value=values[5],  # FACE_ORDER index 5 = face_strength
                     info="How strongly to apply face restoration (0 = no change, 1 = maximum enhancement)"
+                )
+
+                codeformer_fidelity = gr.Slider(
+                    label="CodeFormer Fidelity",
+                    minimum=0.0, maximum=1.0, step=0.05,
+                    value=values[22] if len(values) > 22 else 0.7,  # FACE_ORDER index 22 = codeformer_fidelity
+                    info="CodeFormer only: 0 = strongest restoration (more invented detail), 1 = closest to the input face"
                 )
 
                 restore_blindly = gr.Checkbox(
@@ -502,6 +524,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
         face_padding, face_landmarks, color_correction, gpu_acceleration, batch_face_processing,
         output_quality, preserve_original, artifact_reduction, save_face_masks
         , standalone_input_path, standalone_output_override, standalone_batch_enable, standalone_batch_input, standalone_batch_output
+        , codeformer_fidelity
     ]
 
     # Wire up callbacks
@@ -523,6 +546,16 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
         show_progress="hidden",
         trigger_mode="always_last",
     )
+    # Model and CodeFormer fidelity apply to every pipeline's face pass immediately.
+    for _face_model_control in (restoration_model, codeformer_fidelity):
+        _face_model_control.change(
+            fn=lambda model_val, fidelity_val: service["apply_face_model_env"](model_val, fidelity_val),
+            inputs=[restoration_model, codeformer_fidelity],
+            outputs=[],
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+        )
 
     def _queued_waiting_output(state, ticket_id: str, position: int):
         safe_state = state or {}

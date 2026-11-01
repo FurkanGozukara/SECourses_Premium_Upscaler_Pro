@@ -21,7 +21,7 @@ from .path_utils import (
     resolve_output_location,
     detect_input_type,
 )
-from .face_restore import restore_image, restore_video
+from .face_restore import face_restore_session, restore_array, restore_image, restore_video
 from .image_io import load_image_rgb_pil
 from .command_logger import get_command_logger
 from .model_downloads import ensure_gan_model
@@ -58,6 +58,9 @@ REAL_ESRGAN_MODELS = {
 }
 
 _IMAGE_OUTPUT_EXTS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"}
+
+# (model path, size, mtime) -> metadata; avoids a second full spandrel load per run.
+_SPANDREL_META_CACHE: Dict[Tuple[str, int, int], "GanModelMetadata"] = {}
 
 
 def _normalize_video_codec_key(codec_raw: Any) -> str:
@@ -199,17 +202,28 @@ class GanModelRegistry:
             return None
 
         try:
+            st = model_path.stat()
+            cache_key = (str(model_path.resolve()), st.st_size, st.st_mtime_ns)
+            cached = _SPANDREL_META_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+        except OSError:
+            cache_key = None
+
+        try:
             import spandrel
             model_descriptor = spandrel.ModelLoader().load_from_file(str(model_path))
             
-            # Extract metadata from spandrel
-            scale = getattr(model_descriptor.model, 'scale', 4)
+            # Extract metadata from spandrel. The descriptor's scale is authoritative; some
+            # networks keep a different internal `scale` attribute (SMoSR 4x reported 8x,
+            # a 2x RealPLKSR reported 4x).
+            scale = getattr(model_descriptor, 'scale', None) or getattr(model_descriptor.model, 'scale', 4)
             if hasattr(scale, '__iter__'):
                 scale = scale[0] if len(scale) > 0 else 4
             
             arch_name = model_descriptor.architecture.name if hasattr(model_descriptor, 'architecture') else "unknown"
-            
-            return GanModelMetadata(
+
+            meta = GanModelMetadata(
                 name=model_path.stem,
                 scale=int(scale),
                 architecture=arch_name,
@@ -218,6 +232,9 @@ class GanModelRegistry:
                 description=f"Detected via spandrel: {arch_name}",
                 supports_multi_gpu=False  # Most GAN models don't support multi-GPU well
             )
+            if cache_key is not None:
+                _SPANDREL_META_CACHE[cache_key] = meta
+            return meta
         except Exception as e:
             # Spandrel failed, fall back to other methods
             return None
@@ -387,6 +404,13 @@ def run_gan_upscale(
         return result
     
     finally:
+        # Free the GAN model and cached activations so other tabs get the VRAM back.
+        try:
+            from .gan_inference import release_gan_models
+
+            release_gan_models()
+        except Exception:
+            pass
         # Log command to executed_commands folder
         execution_time = time.time() - start_time
         try:
@@ -453,8 +477,14 @@ def _run_gan_image(
                 on_progress, cancel_event
             )
 
-        # Apply face restoration if requested
-        if settings.get("face_restore") and result.returncode == 0 and result.output_path:
+        # Apply face restoration if requested. Video frames are restored in place by
+        # _run_gan_video (deleting the pre-restore frame here would drop it from the encode).
+        if (
+            settings.get("face_restore")
+            and not settings.get("_video_frame_output_dir")
+            and result.returncode == 0
+            and result.output_path
+        ):
             if on_progress:
                 on_progress("Applying face restoration...\n")
             restored = restore_image(
@@ -598,148 +628,139 @@ def _run_gan_video(
             if on_progress:
                 on_progress(line)
 
-        # Real batching path: load Spandrel model once and run N frames per forward pass.
+        # Real batching path: load the spandrel model once (shared.gan_inference: half precision
+        # when the model supports it, VRAM-aware tiling) and run N frames per forward pass.
         # Fallback to legacy per-frame inference if unavailable or if a batch fails.
         use_spandrel_batch = False
-        spandrel_model = None
-        spandrel_device = None
-        spandrel_torch = None
-        spandrel_image_cls = None
+        gan_entry = None
+        face_on = bool(settings.get("face_restore"))
+        face_strength = settings.get("face_strength", 0.5)
+        face_gpu = _resolve_cuda_device_id(settings)
+        tile_size = settings.get("tile_size", 0)
+        tile_overlap = settings.get("overlap", 32)
         if _gan_registry and _gan_registry._spandrel_available:
             try:
-                import spandrel
                 import torch
-                from PIL import Image
+                from .gan_inference import load_gan_model, resolve_device
 
                 model_path = base_dir / "models" / model_name
                 if not model_path.exists():
                     model_path = base_dir / "Image_Upscale_Models" / model_name
-                spandrel_model = spandrel.ModelLoader().load_from_file(str(model_path))
-
-                if torch.cuda.is_available():
-                    cuda_id = _resolve_cuda_device_id(settings)
-                    if cuda_id != "":
-                        try:
-                            did = int(cuda_id)
-                            if 0 <= did < torch.cuda.device_count():
-                                spandrel_device = torch.device(f"cuda:{did}")
-                            else:
-                                spandrel_device = torch.device("cuda")
-                        except Exception:
-                            spandrel_device = torch.device("cuda")
-                    else:
-                        spandrel_device = torch.device("cpu")
-                else:
-                    spandrel_device = torch.device("cpu")
-
-                spandrel_model = spandrel_model.to(spandrel_device)
-                if hasattr(spandrel_model, "eval"):
-                    spandrel_model.eval()
-
-                spandrel_torch = torch
-                spandrel_image_cls = Image
+                gan_entry = load_gan_model(
+                    model_path,
+                    resolve_device(_resolve_cuda_device_id(settings)),
+                    settings.get("gan_precision", "auto"),
+                )
                 use_spandrel_batch = True
-
-                if on_progress and batch_size > 1:
+                if on_progress:
                     on_progress(
-                        f"Using real batch inference (batch_size={batch_size}, device={spandrel_device})"
+                        f"GAN inference: device={gan_entry.device}, precision={gan_entry.dtype_name}, "
+                        f"batch_size={batch_size}, tile={tile_size or 'auto'}"
                     )
             except Exception as e:
                 use_spandrel_batch = False
-                if on_progress and batch_size > 1:
+                if on_progress:
                     on_progress(f"Warning: batched inference unavailable; using per-frame fallback ({e})")
 
-        for i in range(0, total_frames, batch_size):
-            if cancel_event and cancel_event.is_set():
-                break
+        from concurrent.futures import ThreadPoolExecutor
+        from .image_io import imwrite as _imwrite_png
 
-            batch_frames = frame_files[i:i+batch_size]
+        frame_writer = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gan_png")
+        pending_writes: List[Any] = []
+        failed_writes = 0
 
-            batch_done = False
-            if use_spandrel_batch and spandrel_model is not None and spandrel_torch is not None and spandrel_image_cls is not None:
-                try:
-                    frame_tensors = []
-                    frame_indices = []
-                    for frame_path in batch_frames:
-                        img_array = np.array(load_image_rgb_pil(frame_path)).astype(np.float32) / 255.0
-                        frame_tensors.append(
-                            spandrel_torch.from_numpy(img_array).permute(2, 0, 1)
-                        )
-                        frame_indices.append(int(re.search(r'(\d+)', frame_path.stem).group(1)))
+        def _finish_frame(frame_rgb: np.ndarray, out_path: Path) -> None:
+            """Face-restore (in memory) and queue the PNG write of one upscaled RGB frame."""
+            nonlocal failed_writes
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            if face_on:
+                frame_bgr = restore_array(frame_bgr, strength=face_strength, gpu_device=face_gpu)
+            pending_writes.append(
+                frame_writer.submit(_imwrite_png, out_path, frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            )
+            # Bounded queue: never hold more than a few frames in RAM waiting for the disk.
+            while len(pending_writes) > 8 or (pending_writes and pending_writes[0].done()):
+                if not pending_writes.pop(0).result():
+                    failed_writes += 1
 
-                    if frame_tensors:
-                        input_tensor = spandrel_torch.stack(frame_tensors, dim=0).to(spandrel_device)
-                        with spandrel_torch.no_grad():
-                            output_tensor = spandrel_model(input_tensor)
+        with face_restore_session():
+            for i in range(0, total_frames, batch_size):
+                if cancel_event and cancel_event.is_set():
+                    break
 
-                        if isinstance(output_tensor, (list, tuple)):
-                            output_tensor = output_tensor[0]
-                        elif isinstance(output_tensor, dict):
-                            output_tensor = (
-                                output_tensor.get("output")
-                                or output_tensor.get("out")
-                                or (next(iter(output_tensor.values())) if output_tensor else None)
+                batch_frames = frame_files[i:i+batch_size]
+
+                batch_done = False
+                if use_spandrel_batch and gan_entry is not None:
+                    try:
+                        from .gan_inference import to_uint8_hwc, upscale_tensor
+
+                        frame_tensors = []
+                        frame_indices = []
+                        for frame_path in batch_frames:
+                            img_array = np.asarray(load_image_rgb_pil(frame_path), dtype=np.float32) / 255.0
+                            frame_tensors.append(torch.from_numpy(img_array).permute(2, 0, 1))
+                            frame_indices.append(int(re.search(r'(\d+)', frame_path.stem).group(1)))
+
+                        if frame_tensors:
+                            output_tensor = upscale_tensor(
+                                gan_entry,
+                                torch.stack(frame_tensors, dim=0),
+                                tile_size=tile_size,
+                                overlap=tile_overlap,
+                                log=on_progress,
+                                cancel_event=cancel_event,
                             )
-                        if output_tensor is None:
-                            raise RuntimeError("Spandrel model returned no output tensor")
+                            for out_idx, frame_index in enumerate(frame_indices):
+                                out_path = frames_up_dir / f"frame_{frame_index:0{png_padding}d}_out.png"
+                                _finish_frame(to_uint8_hwc(output_tensor[out_idx]), out_path)
 
-                        output_tensor = output_tensor.detach().cpu()
-                        for out_idx, frame_index in enumerate(frame_indices):
-                            out_frame = output_tensor[out_idx].permute(1, 2, 0).numpy()
-                            out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
-                            out_img = spandrel_image_cls.fromarray(out_frame)
-                            out_path = frames_up_dir / f"frame_{frame_index:0{png_padding}d}_out.png"
-                            out_img.save(out_path, format="PNG")
+                                processed_count += 1
+                                progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
+                                if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
+                                    last_reported_pct = progress_pct
+                                    _emit_frame_progress(processed_count, total_frames)
+                            batch_done = True
+                    except Exception as e:
+                        batch_done = False
+                        use_spandrel_batch = False
+                        if on_progress:
+                            on_progress(f"Warning: batched pass failed; retrying this batch per-frame ({e})")
 
-                            if settings.get("face_restore"):
-                                restored = restore_image(
-                                    str(out_path),
-                                    strength=settings.get("face_strength", 0.5),
-                                    gpu_device=_resolve_cuda_device_id(settings),
-                                )
-                                if restored:
-                                    try:
-                                        if Path(restored).resolve() != out_path.resolve():
-                                            shutil.copy2(restored, out_path)
-                                    except Exception:
-                                        pass
+                if batch_done:
+                    continue
 
-                            processed_count += 1
-                            progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
-                            if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
-                                last_reported_pct = progress_pct
-                                _emit_frame_progress(processed_count, total_frames)
-                        batch_done = True
-                except Exception as e:
-                    batch_done = False
-                    use_spandrel_batch = False
-                    if on_progress and batch_size > 1:
-                        on_progress(f"Warning: batched pass failed; retrying this batch per-frame ({e})")
+                # Legacy fallback path: process each frame independently.
+                for frame_path in batch_frames:
+                    frame_settings = settings.copy()
+                    frame_settings["input_path"] = str(frame_path)
+                    frame_settings["_video_frame_output_dir"] = str(frames_up_dir)
+                    frame_settings["_video_frame_index"] = int(re.search(r'(\d+)', frame_path.stem).group(1))
+                    frame_settings["_video_frame_padding"] = png_padding
 
-            if batch_done:
-                continue
+                    result = _run_gan_image(
+                        frame_path, model_name, frame_settings, base_dir, temp_dir,
+                        output_dir, metadata, None, cancel_event
+                    )
+                    if face_on and result.returncode == 0 and result.output_path and Path(result.output_path).exists():
+                        frame_out = Path(result.output_path)
+                        upscaled = load_image_rgb_pil(frame_out)
+                        _finish_frame(np.asarray(upscaled, dtype=np.uint8), frame_out)
 
-            # Legacy fallback path: process each frame independently.
-            for frame_path in batch_frames:
-                frame_settings = settings.copy()
-                frame_settings["input_path"] = str(frame_path)
-                frame_settings["_video_frame_output_dir"] = str(frames_up_dir)
-                frame_settings["_video_frame_index"] = int(re.search(r'(\d+)', frame_path.stem).group(1))
-                frame_settings["_video_frame_padding"] = png_padding
+                    processed_count += 1
+                    progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
+                    if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
+                        last_reported_pct = progress_pct
+                        _emit_frame_progress(processed_count, total_frames)
 
-                result = _run_gan_image(
-                    frame_path, model_name, frame_settings, base_dir, temp_dir,
-                    output_dir, metadata, None, cancel_event
-                )
+                    if result.returncode != 0 and on_progress:
+                        on_progress(f"Warning: Frame {frame_path.name} failed")
 
-                processed_count += 1
-                progress_pct = int((processed_count / total_frames) * 100) if total_frames > 0 else 0
-                if on_progress and (progress_pct != last_reported_pct or processed_count == total_frames):
-                    last_reported_pct = progress_pct
-                    _emit_frame_progress(processed_count, total_frames)
-
-                if result.returncode != 0 and on_progress:
-                    on_progress(f"Warning: Frame {frame_path.name} failed")
+        frame_writer.shutdown(wait=True)
+        failed_writes += sum(1 for f in pending_writes if not f.result())
+        pending_writes.clear()
+        if failed_writes and on_progress:
+            on_progress(f"Warning: {failed_writes} upscaled frame(s) could not be written")
 
         def _probe_video_codec_and_fps(path: Path) -> Tuple[Optional[str], Optional[float]]:
             try:
@@ -1018,18 +1039,9 @@ def _run_gan_video(
         if not ok:
             raise RuntimeError("Frame-to-video encoding failed")
 
-        # Apply face restoration to video if requested
-        if settings.get("face_restore") and Path(output_path).exists():
-            if on_progress:
-                on_progress("Applying face restoration to video")
-            restored = restore_video(
-                output_path,
-                strength=settings.get("face_strength", 0.5),
-                on_progress=on_progress,
-                gpu_device=_resolve_cuda_device_id(settings),
-            )
-            if restored:
-                output_path = restored
+        # Face restoration (when requested) already ran on every upscaled frame above, on the
+        # lossless PNGs. A second restore_video pass here restored the faces twice and added
+        # another lossy encode.
         output_path = str(
             _enforce_output_codec_and_fps(
                 Path(output_path),
@@ -1060,53 +1072,42 @@ def _run_with_spandrel_image(
     on_progress: Optional[Callable[[str], None]] = None,
     cancel_event=None
 ) -> GanResult:
-    """Use spandrel for model loading and inference"""
+    """Use spandrel for model loading and inference (shared.gan_inference: precision + tiling)"""
     try:
-        import spandrel
         import torch
         from PIL import Image
-        
-        if on_progress:
-            on_progress("Loading model with spandrel...\n")
+        from .gan_inference import load_gan_model, resolve_device, to_uint8_hwc, upscale_tensor
 
         # Support both `models/` (current) and `Image_Upscale_Models/` (legacy).
         model_path = base_dir / "models" / model_name
         if not model_path.exists():
             model_path = base_dir / "Image_Upscale_Models" / model_name
-        model = spandrel.ModelLoader().load_from_file(str(model_path))
-        
+        # Respect globally-selected GPU when CUDA is available.
+        device = resolve_device(_resolve_cuda_device_id(settings))
+        entry = load_gan_model(model_path, device, settings.get("gan_precision", "auto"))
+        if on_progress and not settings.get("_video_frame_output_dir"):
+            on_progress(f"Loaded model with spandrel: device={entry.device}, precision={entry.dtype_name}\n")
+
         # Load image (16-bit grayscale and float files must not clip to white)
         img = load_image_rgb_pil(input_path)
-        img_array = np.array(img).astype(np.float32) / 255.0
+        img_array = np.asarray(img, dtype=np.float32) / 255.0
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)
-        
-        # Respect globally-selected GPU when CUDA is available.
-        if torch.cuda.is_available():
-            cuda_id = _resolve_cuda_device_id(settings)
-            if cuda_id != "":
-                try:
-                    did = int(cuda_id)
-                    if 0 <= did < torch.cuda.device_count():
-                        device = torch.device(f"cuda:{did}")
-                    else:
-                        device = torch.device("cuda")
-                except Exception:
-                    device = torch.device("cuda")
-            else:
-                device = torch.device("cpu")
-        else:
-            device = torch.device("cpu")
-        model = model.to(device)
-        img_tensor = img_tensor.to(device)
-        
-        # Inference
-        with torch.no_grad():
-            output_tensor = model(img_tensor)
-        
-        # Convert back to image
-        output_array = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        output_array = np.clip(output_array * 255.0, 0, 255).astype(np.uint8)
-        output_img = Image.fromarray(output_array)
+
+        # Inference (whole image, or tiles when it does not fit / a tile size is set)
+        output_tensor = upscale_tensor(
+            entry,
+            img_tensor,
+            tile_size=settings.get("tile_size", 0),
+            overlap=settings.get("overlap", 32),
+            log=on_progress,
+            cancel_event=cancel_event,
+        )
+        for note in entry.notes:
+            if on_progress and not settings.get("_video_frame_output_dir"):
+                on_progress(f"GAN precision note: {note}\n")
+
+        # Convert back to image (rounded, not truncated)
+        output_img = Image.fromarray(to_uint8_hwc(output_tensor[0]))
         
         # Save output with proper directory and naming based on context.
         # "auto" must be resolved to a real image extension before writing.

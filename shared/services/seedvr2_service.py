@@ -345,10 +345,13 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
     
     # Get model metadata if specific model is provided
     model_meta = None
-    # Default to 7B sharp fp16 model (best quality with edge enhancement)
+    # Default: 7B Sharp W4A8 ConvRot (fastest, lowest-VRAM 7B; on GPUs older than RTX 30 the run
+    # switches to 7B Sharp INT8 ConvRot automatically, see shared.models.seedvr2_w4a8).
     available_models = get_seedvr2_model_names()
     default_model = (
-        "seedvr2_ema_7b_sharp_fp16.safetensors"
+        "seedvr2_7b_sharp_convrot_w4a8.safetensors"
+        if "seedvr2_7b_sharp_convrot_w4a8.safetensors" in available_models
+        else "seedvr2_ema_7b_sharp_fp16.safetensors"
         if "seedvr2_ema_7b_sharp_fp16.safetensors" in available_models
         else (
             "seedvr2_ema_7b_fp16.safetensors"

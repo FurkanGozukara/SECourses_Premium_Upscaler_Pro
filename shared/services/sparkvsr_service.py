@@ -1143,12 +1143,12 @@ def build_sparkvsr_callbacks(
                             if restored_final and restored_final.exists():
                                 return restored_final
                         except Exception as face_exc:
-                            _auto_ref_log(on_progress, f"FlashVSR+ reference face-restore warning: {face_exc}")
+                            _auto_ref_log(on_progress, f"FlashVSR reference face-restore warning: {face_exc}")
                     return final
-            _auto_ref_log(on_progress, f"FlashVSR+ reference failed: {str(getattr(result, 'log', ''))[-240:]}")
+            _auto_ref_log(on_progress, f"FlashVSR reference failed: {str(getattr(result, 'log', ''))[-240:]}")
             return None
         except Exception as exc:
-            _auto_ref_log(on_progress, f"FlashVSR+ reference generation failed: {exc}")
+            _auto_ref_log(on_progress, f"FlashVSR reference generation failed: {exc}")
             return None
 
     def _estimate_auto_ref_source_frame_count(source_input: str) -> Optional[int]:

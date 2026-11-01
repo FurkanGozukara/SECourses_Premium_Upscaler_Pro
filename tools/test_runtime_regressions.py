@@ -334,7 +334,7 @@ class RTXSuperResolutionRegressionTests(unittest.TestCase):
 
     def test_installer_requirements_include_nvidia_vfx(self):
         requirements = (ROOT.parent / "requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("nvidia-vfx==0.1.0.1", requirements)
+        self.assertIn("nvidia-vfx==0.2.0.0", requirements)
 
 
 class SparkVSRTemporalDecodeRegressionTests(unittest.TestCase):

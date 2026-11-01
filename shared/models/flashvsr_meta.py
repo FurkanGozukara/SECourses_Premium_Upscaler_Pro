@@ -6,6 +6,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
+_PLUS_ALIASES = {
+    "plus_turbo": {"plus-turbo", "plus_turbo", "flashvsr+ turbo", "flashvsr-plus-turbo", "flashvsr_plus_turbo"},
+    "plus_base": {"plus-base", "plus_base", "flashvsr+ base", "flashvsr-plus-base", "flashvsr_plus_base"},
+}
+# UI value -> label. FlashVSR+ is the official OpenImagingLab release (Turbo / Base presets).
+FLASHVSR_VERSION_CHOICES = [
+    ("FlashVSR v1.1", "1.1"),
+    ("FlashVSR v1.0", "1.0"),
+    ("FlashVSR+ Turbo", "plus-turbo"),
+    ("FlashVSR+ Base", "plus-base"),
+]
+
+
 def flashvsr_version_to_internal(version: Any) -> str:
     """
     Normalize FlashVSR version to internal/CLI form.
@@ -13,21 +26,38 @@ def flashvsr_version_to_internal(version: Any) -> str:
     Supported inputs:
     - "10", "v10", "1.0", "v1.0", "FlashVSR"
     - "11", "v11", "1.1", "v1.1", "FlashVSR-v1.1"
+    - "plus-turbo" / "plus-base" (official FlashVSR+ presets) -> "plus_turbo" / "plus_base"
     """
     raw = str(version or "").strip().lower()
     if raw in {"11", "v11", "1.1", "v1.1", "flashvsr-v1.1"}:
         return "11"
+    for internal, names in _PLUS_ALIASES.items():
+        if raw in names or raw == f"v{internal}":
+            return internal
     return "10"
 
 
 def flashvsr_version_to_ui(version: Any) -> str:
-    """Normalize FlashVSR version to UI form: '1.0' or '1.1'."""
-    return "1.1" if flashvsr_version_to_internal(version) == "11" else "1.0"
+    """Normalize FlashVSR version to UI form: '1.0', '1.1', 'plus-turbo' or 'plus-base'."""
+    internal = flashvsr_version_to_internal(version)
+    if internal.startswith("plus_"):
+        return internal.replace("_", "-")
+    return "1.1" if internal == "11" else "1.0"
+
+
+def flashvsr_is_plus(version: Any) -> bool:
+    """True for the official FlashVSR+ presets (separate engine; pipeline mode and VAE do not apply)."""
+    return flashvsr_version_to_internal(version).startswith("plus_")
 
 
 def flashvsr_internal_to_model_name(version_internal: Any) -> str:
-    """Convert internal version ('10'/'11') to CLI model name."""
-    return "FlashVSR-v1.1" if str(version_internal) == "11" else "FlashVSR"
+    """Convert internal version ('10'/'11'/'plus_turbo'/'plus_base') to CLI model name."""
+    value = str(version_internal)
+    if value == "plus_turbo":
+        return "FlashVSR-Plus-Turbo"
+    if value == "plus_base":
+        return "FlashVSR-Plus-Base"
+    return "FlashVSR-v1.1" if value == "11" else "FlashVSR"
 
 
 @dataclass

@@ -4,7 +4,8 @@ Torch-free GAN architecture detection for the GAN tab.
 The tab must not import torch/spandrel at startup, so it reads only the tensor
 names of a model file (the safetensors JSON header, or the pickle of a .pth with
 every class stubbed out, which never runs code from the file) and matches them
-against spandrel 0.4.2's own key conditions, in spandrel's registry order.
+against the key conditions of the app's spandrel build (0.4.2 plus the chaiNNer-C
+architectures, see requirements.txt), in spandrel's registry order.
 The runner still loads the model with spandrel; this is only the label.
 """
 
@@ -66,8 +67,15 @@ _ARCH_CONDITIONS = (
     )]),
     ("CRAFT", [("conv_first.weight", "layers.0.residual_group.hf_blocks.0.attn.temperature")]),
     ("SPAN", [("conv_1.sk.weight", "block_1.c1_r.sk.weight", "conv_cat.weight", "upsampler.0.weight")]),
+    ("GateRv2", [("in_to_dim.weight", "encode.0.gated.0.gamma0", "latent.0.norm.scale", "decode.0.gated.0.gamma0", "decode.0.shor.weight")]),
     ("RealCUGAN", [("unet1.conv1.conv.0.weight", "unet2.conv1.conv.0.weight", "unet2.conv_bottom.weight")]),
     ("SAFMN", [("to_feat.weight", "feats.0.safm.mfr.0.weight", "to_img.0.weight")]),
+    ("LAWFFT", [(
+        ("in_to_dim.weight", "in_to_dim.1.weight"),
+        "body.0.residual.0.token_mix.1.local.0.kernel_gen.1.bias",
+        "body.0.residual.0.token_mix.1.att.to_hidden.bias",
+        "body.0.residual.0.channel_mix1.1.project_in.bias",
+    )]),
     ("ATD", [(
         "relative_position_index_SA",
         "conv_first.weight",
@@ -88,6 +96,22 @@ _ARCH_CONDITIONS = (
         ("feats.1.channe_mixer.0.weight", "feats.1.channel_mixer.0.weight"),
     )]),
     ("MoSR", [("gblocks.0.weight", "gblocks.1.norm.weight", "gblocks.1.fc1.weight", "gblocks.1.conv.weight")]),
+    ("GaterV3", [(
+        "in_to_dim.weight",
+        "span_block0.c1_r.sk.weight",
+        "span_block0.c3_r.eval_conv.weight",
+        "span_end.c3_r.eval_conv.weight",
+        "sisr_end_conv.eval_conv.weight",
+        "sisr_cat_conv.weight",
+        ("dim_to_in.weight", "dim_to_in.MetaUpsample"),
+    )]),
+    ("SMoSR", [(
+        "short.weight",
+        "blocks_1.0.body.0.eval_conv.weight",
+        "blocks_1.0.body.4.eval_conv.weight",
+        "end_block.0.body.0.eval_conv.weight",
+        "end_block.1.eval_conv.weight",
+    )]),
     ("RCAN", [(
         ("head.0.weight", "head.1.weight"),
         "tail.1.weight",
@@ -100,6 +124,73 @@ _ARCH_CONDITIONS = (
         "groups.0.blocks.0.inter.cg.1.weight",
         "upsampler.MetaUpsample",
     )]),
+    # chaiNNer-C architectures (spandrel 0.4.2+c11 build), registry order.
+    ("DRFT", [(
+        "conv_first.weight",
+        "conv_after_body.weight",
+        "layers.0.residual_group.blocks.0.attn.neural_bias.bias_mlp_qk.0.weight",
+        "layers.0.residual_group.blocks.0.ffn.fc_gate_value.weight",
+        "layers.0.residual_group.ocab.relative_position_bias_table",
+    )]),
+    ("DUAL", [(
+        "mean",
+        ("stem.weight", "stem.direct.expand.weight"),
+        "groups.0.layers.0.attention.relative_bias",
+        "groups.0.layers.0.attention.qkv.weight",
+        "groups.0.conv.experts",
+        "final_norm.norm.weight",
+        "xr.query.weight",
+    )]),
+    ("SST", [(
+        "proj.weight",
+        "body.0.0.norm_attn.weight",
+        "body.0.0.attn.to_qkv.weight",
+        "body.0.0.ffn.agg.weight",
+        "upsampler.up_conv.weight",
+    )]),
+    ("SST-Real", [(
+        "model.proj_in.weight",
+        "model.proj_lr.weight",
+        "model.map_noise.mlp.0.weight",
+        "model.proj_body.0.adaLN_modulation.weight",
+        "model.up_i.0.weight",
+    )]),
+    ("WSR", [(
+        ("stem.sk.weight", "stem.weight"),
+        ("context_stem.sk.weight", "context_stem.weight"),
+        "merge.weight",
+        "gates.0.project.weight",
+        "gates.0.local_scale",
+        "reconstruct.weight",
+    )]),
+    ("FIGSR", [(
+        "in_to_dim.weight",
+        "gfisr_body_half_2.0.norm.rms",
+        "gfisr_body_half_2.0.conv.fu.fdc.weight",
+        "cat_to_dim.weight",
+        "upscale.MetaUpsample",
+    )]),
+    ("GFISRv2", [(
+        ("in_to_dim.weight", "in_to_dim.1.weight"),
+        "gfisr_body.0.gamma",
+        "gfisr_body.0.norm.offset",
+        "gfisr_body.0.conv.pconv.fdc.weight",
+        "upscale.MetaUpsample",
+    )]),
+    ("SRResNet", [
+        ("conv_input.weight", "conv_mid.weight", "bn_mid.weight", "conv_output.weight", "residual.0.conv1.weight"),
+        ("model.0.weight", "model.1.sub.0.res.0.weight", "model.2.weight", "model.5.weight"),
+        ("conv_first.weight", "body.0.conv1.weight", "upconv1.weight", "conv_hr.weight", "conv_last.weight"),
+    ]),
+    ("SwinUNet", [(
+        "unet.patch.0.weight",
+        "unet.swin1.block.0.attn.qkv.weight",
+        "unet.down1.conv.weight",
+        "unet.up1.proj.weight",
+    )]),
+    ("DIS", [
+        ("head.weight", "head_act.weight", "fusion.weight", "tail.weight", ("body.0.conv1.weight", "body.0.dw_conv.depthwise.weight")),
+    ]),
 )
 
 # Same unwrapping as spandrel's canonicalize_state_dict.

@@ -80,6 +80,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vram_mode", default="auto",
                    choices=["auto", "gpu_only", "highvram", "lowvram", "novram"])
     p.add_argument("--plan_only", action="store_true", help="Print the chunk plan and exit")
+
+    # Options added 2026-11-01 (defaults keep the earlier output).
+    p.add_argument("--tail_pad_frames", type=int, default=0)
+    p.add_argument("--guide_encode", default="tiled", choices=["tiled", "untiled", "auto"])
+    p.add_argument("--spatial_tiling", default="off", choices=["off", "on", "auto"])
+    p.add_argument("--spatial_tile_width", type=int, default=1536)
+    p.add_argument("--spatial_tile_height", type=int, default=1024)
+    p.add_argument("--spatial_tile_overlap", type=float, default=0.5)
+    p.add_argument("--spatial_tile_blend", default="trapezoid", choices=["trapezoid", "gaussian"])
+    p.add_argument("--mode", default="x2", choices=["x2", "refine"])
+    p.add_argument("--preclean_lora", default="")
+    p.add_argument("--preclean_strength", type=float, default=1.0)
+    p.add_argument("--preclean_prompt", default="")
+    p.add_argument("--preclean_negative_prompt", default="")
+    p.add_argument("--sparse_attention", action="store_true")
+    p.add_argument("--sparse_taus", default="1.2")
+    p.add_argument("--sparse_dense_steps", type=int, default=0)
+    p.add_argument("--sparse_min_tokens", type=int, default=12288)
     return p
 
 
@@ -103,19 +121,32 @@ def main() -> int:
         frames_u8, fps, _ = read_video_frames(args.input)
         total = frames_u8.shape[0]
         h, w = frames_u8.shape[1], frames_u8.shape[2]
-        budget = args.max_latent_tokens
+        guide_ratio = 1.0 if args.mode == "refine" else 0.25
+        notes = {}
         if args.token_budget_mode == "auto":
             import comfy.model_management as mm
 
-            budget, reason = planner_mod.auto_token_budget(
-                total, w, h,
-                free_vram_bytes=int(mm.get_free_memory(mm.get_torch_device())),
-                weight_resident_bytes=0,
-                reserve_gb=args.reserve_vram_gb,
-                bytes_per_token=args.bytes_per_token,
-            )
-            emit(f"[Plan] auto budget {budget} ({reason})")
-        plan = planner_mod.plan_chunks(total, w, h, budget, args.max_chunk_frames, args.overlap_frames)
+            free = int(mm.get_free_memory(mm.get_torch_device()))
+
+            def _budget(frames):
+                value, reason = planner_mod.auto_token_budget(
+                    frames, w, h, free_vram_bytes=free, weight_resident_bytes=0,
+                    reserve_gb=args.reserve_vram_gb, bytes_per_token=args.bytes_per_token,
+                    guide_token_ratio=guide_ratio,
+                )
+                notes[frames] = f"[Plan] auto budget {value} ({reason})"
+                return value
+        else:
+            def _budget(frames):
+                return args.max_latent_tokens
+        plan, pad_used = planner_mod.plan_with_tail_pad(
+            total, w, h, args.tail_pad_frames, _budget, args.max_chunk_frames, args.overlap_frames)
+        if plan.total_frames in notes:
+            emit(notes[plan.total_frames])
+        if pad_used:
+            emit(f"[Plan] Tail padding: {pad_used} repeated last frames are generated and trimmed")
+        elif args.tail_pad_frames:
+            emit(f"[Plan] Tail padding skipped: {args.tail_pad_frames} more frames would add a chunk")
         for line in plan.summary(args.steps).splitlines():
             emit(f"[Plan] {line}")
         return 0
@@ -158,9 +189,25 @@ def main() -> int:
         keep_audio=not args.no_audio,
         reserve_vram_gb=args.reserve_vram_gb,
         bytes_per_token=args.bytes_per_token,
+        tail_pad_frames=args.tail_pad_frames,
+        guide_encode=args.guide_encode,
+        spatial_tiling=args.spatial_tiling,
+        spatial_tile_width=args.spatial_tile_width,
+        spatial_tile_height=args.spatial_tile_height,
+        spatial_tile_overlap=args.spatial_tile_overlap,
+        spatial_tile_blend=args.spatial_tile_blend,
+        mode=args.mode,
+        preclean_lora_path=args.preclean_lora,
+        preclean_strength=args.preclean_strength,
+        preclean_prompt=args.preclean_prompt,
+        preclean_negative_prompt=args.preclean_negative_prompt,
+        sparse_attention=args.sparse_attention,
+        sparse_taus=args.sparse_taus,
+        sparse_dense_steps=args.sparse_dense_steps,
+        sparse_min_tokens=args.sparse_min_tokens,
     )
 
-    emit(f"[LTX25] Starting pixel spatial 2x upscale | {Path(args.input).name}")
+    emit(f"[LTX25] Starting {'refine (IC-LoRA ' + Path(args.ic_lora).name + ')' if args.mode == 'refine' else 'pixel spatial 2x'} upscale | {Path(args.input).name}")
     emit(f"[LTX25] Transformer: {Path(args.transformer).name}")
     emit(f"[LTX25] Schedule: {args.schedule} | steps {args.steps} | cfg {args.cfg} | sampler {args.sampler} | seed {args.seed}")
     started = time.time()

@@ -165,12 +165,140 @@ def choose(in_w: int, in_h: int, scale: int, total_frames: int, cap_gb: float, k
     return best, notes
 
 
+# --- FlashVSR+ (official Turbo / Base presets) -------------------------------------------------------------
+# One stream over the whole clip: memory does not grow with the clip length (decoded in segments), so the plan
+# only chooses KV-cache residency and, when the frame does not fit, DiT tiles. The TC decoder always runs serial:
+# its parallel executor took 17.6 GB instead of 5.7-6.8 GB at 720p and was not faster (results/WP-FLASHVSR/calib).
+# Peak PyTorch-RESERVED GB per padded output megapixel, measured on the RTX 5090 (bf16, decode_every 16,
+# temporal compression 4, serial decoder); linear between points, beyond the last point with the steeper of the
+# last-segment and the average slope. Turbo 4K untiled without KV offload and Base 4K untiled ran out of memory
+# at a 28.4 GB cap.
+PLUS_PRESETS = {"plus-turbo": "turbo", "plus-base": "base"}
+PLUS_RESERVED_GB = {  # (padded output MP, reserved GB)
+    ("turbo", "never"): ((0.983, 6.75), (2.212, 11.05), (3.932, 15.38)),
+    ("turbo", "always"): ((3.932, 14.47), (8.356, 26.76)),
+    ("base", "never"): ((0.983, 8.04), (2.212, 17.94), (3.932, 19.60)),
+    ("base", "always"): ((3.932, 14.47),),
+}
+PLUS_INT8_EXTRA_GB = 1.1        # INT8 ConvRot adds activation transients (Turbo 1080p 12.16 vs 11.05 GB reserved)
+PLUS_TC_FACTOR = {4: 1.0, 2: 1.45, 1: 1.45}  # non-weight memory vs temporal compression 4 (robot 1080p: 14.17 vs 11.05)
+PLUS_WEIGHTS_GB = 3.6
+PLUS_MARGIN = 1.10
+PLUS_PINNED_RAM_SHARE = 0.25  # pinned host memory granted reliably (Base 4K needs ~36 GB: allocation failed on 96 GB)
+
+
+def plus_kv_offload_gb(mp: float, preset: str) -> float:
+    """Pinned RAM the KV offload needs: per offloaded layer K+V of 3 windows x 2 latent frames (bf16)."""
+    layers = 5 if preset == "turbo" else 30
+    tokens = mp * 1e6 / 256.0 * 6
+    return layers * 2 * tokens * 1536 * 2 / 1e9
+
+
+def _interp(points, mp: float) -> float:
+    pts = sorted(points)
+    x0, y0 = pts[0]
+    if mp <= x0:
+        return PLUS_WEIGHTS_GB + (y0 - PLUS_WEIGHTS_GB) * mp / x0
+    for (xa, ya), (xb, yb) in zip(pts, pts[1:]):
+        if mp <= xb:
+            return ya + (yb - ya) * (mp - xa) / (xb - xa)
+    if len(pts) == 1:
+        return PLUS_WEIGHTS_GB + (y0 - PLUS_WEIGHTS_GB) * mp / x0
+    (xa, ya), (xb, yb) = pts[-2], pts[-1]
+    slope = max((yb - ya) / (xb - xa), (yb - y0) / max(1e-6, xb - x0))
+    return yb + slope * (mp - xb)
+
+
+def plus_peak_gb(mp: float, preset: str, precision: str, kv: str, temporal_compression: int = 4) -> float:
+    """Estimated reserved GB of one FlashVSR+ stream (untiled frame or one tile), with margin."""
+    kv = "always" if kv == "always" else "never"
+    gb = _interp(PLUS_RESERVED_GB[(preset, kv)], mp)
+    if kv == "always":
+        gb = min(gb, _interp(PLUS_RESERVED_GB[(preset, "never")], mp))
+    gb = PLUS_WEIGHTS_GB + (gb - PLUS_WEIGHTS_GB) * PLUS_TC_FACTOR.get(int(temporal_compression), 1.45)
+    if precision == "int8_convrot":
+        gb += PLUS_INT8_EXTRA_GB
+    return gb * PLUS_MARGIN
+
+
+def _plus_ram_gb() -> float:
+    try:
+        import psutil
+
+        return float(psutil.virtual_memory().total) / 1e9
+    except Exception:
+        return 64.0
+
+
+def plan_plus(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget: VramBudget,
+              image: bool = False) -> TunePlan:
+    out = TunePlan(budget=budget)
+    preset = PLUS_PRESETS[str(settings.get("version")).strip().lower()]
+    scale = 2 if str(settings.get("scale", "4")).strip() == "2" else 4
+    precision = str(settings.get("precision") or "bf16").strip().lower()
+    try:
+        tc = int(settings.get("temporal_compression") or 4)
+    except Exception:
+        tc = 4
+    cap = budget.limit_gb - FLASHVSR_PROCESS_OVERHEAD_GB
+    mp = out_mp(in_w, in_h, scale)
+    pinned_cap = _plus_ram_gb() * PLUS_PINNED_RAM_SHARE
+    speed = {"keep_models_on_cpu": False, "force_offload": False, "unload_dit": False, "plus_tiny_decoder": "serial"}
+    out.lines.append(f"FlashVSR+ {preset.title()}: input {in_w}x{in_h} x{scale} -> {in_w * scale}x{in_h * scale} "
+                     f"(works at {_pad128(in_w * scale)}x{_pad128(in_h * scale)}), "
+                     + ("single image" if image else f"{frames} frame(s)") + f", temporal compression {tc}, "
+                     "one stream over the whole clip")
+    for kv in ("never", "always"):
+        if kv == "always" and plus_kv_offload_gb(mp, preset) > pinned_cap:
+            continue
+        gb = plus_peak_gb(mp, preset, precision, kv, tc)
+        if gb <= cap:
+            out.updates = {"tiled_dit": False, "plus_kv_offload": kv, **speed}
+            out.estimate_gb = gb + FLASHVSR_PROCESS_OVERHEAD_GB
+            out.lines.append("DiT tiling OFF (full frame), KV cache " + (
+                "of the full-attention layers in pinned RAM between steps" if kv == "always" else "on the GPU"))
+            return out
+    tile_pick = None
+    for tile in TILE_CHOICES:
+        if tile >= max(in_w, in_h):
+            continue
+        gb = plus_peak_gb(tile_mp(tile, in_w, in_h, scale), preset, precision, "never", tc)
+        if gb <= cap:
+            tile_pick = (tile, gb)
+            break
+    if tile_pick is None:
+        out.fits = False
+        out.warnings.append(f"Even {MIN_TILE}px FlashVSR+ tiles do not fit the {max(0.0, cap):.1f} GB budget.")
+        out.updates = {"tiled_dit": True, "tile_size": MIN_TILE, "overlap": 24, "plus_kv_offload": "never", **speed}
+        return out
+    tile, gb = tile_pick
+    overlap = tile_overlap(tile)
+    rows, cols = tile_grid(tile, overlap, in_w, in_h)
+    for smaller in sorted(t for t in TILE_CHOICES if t < tile):  # same grid, less repeated work in the overlaps
+        ov = tile_overlap(smaller)
+        r, c = tile_grid(smaller, ov, in_w, in_h)
+        if ov >= overlap and r <= rows and c <= cols:
+            tile, overlap = smaller, ov
+            gb = plus_peak_gb(tile_mp(tile, in_w, in_h, scale), preset, precision, "never", tc)
+            break
+    chunk = min(max(1, int(frames)), ram_frames_limit(in_w, in_h, scale, True), MAX_PASS_FRAMES)
+    out.updates = {"tiled_dit": True, "tile_size": tile, "overlap": overlap, "plus_kv_offload": "never",
+                   "frame_chunk_size": 0 if chunk >= frames else chunk, **speed}
+    out.estimate_gb = gb + FLASHVSR_PROCESS_OVERHEAD_GB
+    out.lines.append(f"DiT tiling ON: {tile}px tiles, {overlap}px overlap "
+                     f"({'x'.join(map(str, tile_grid(tile, overlap, in_w, in_h)))} tiles); each frame chunk "
+                     f"of {chunk} frames streams per tile")
+    return out
+
+
 def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget: Optional[VramBudget],
          image: bool = False) -> TunePlan:
     out = TunePlan(budget=budget)
     if budget is None:
         out.warnings.append("No NVIDIA GPU selected or detected; settings left unchanged.")
         return out
+    if str(settings.get("version") or "").strip().lower() in PLUS_PRESETS:
+        return plan_plus(settings, in_w=in_w, in_h=in_h, frames=frames, budget=budget, image=image)
     scale = 2 if str(settings.get("scale", "4")).strip() == "2" else 4
     mode = str(settings.get("mode") or "full").strip().lower()
     precision = str(settings.get("precision") or "bf16").strip().lower()

@@ -1,5 +1,5 @@
 """
-FlashVSR+ Tab - Self-contained modular implementation
+FlashVSR Tab - Self-contained modular implementation
 Real-time diffusion-based streaming video super-resolution
 UPDATED: Now uses Universal Preset System
 """
@@ -21,7 +21,7 @@ from shared.services.flashvsr_service import (
     canonical_flashvsr_scale,
 )
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
-from shared.models.flashvsr_meta import flashvsr_version_to_ui
+from shared.models.flashvsr_meta import FLASHVSR_VERSION_CHOICES, flashvsr_version_to_ui
 from shared.path_utils import get_media_dimensions, normalize_path
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
 from ui.universal_preset_section import (
@@ -85,7 +85,7 @@ def flashvsr_tab(
     output_dir: Path
 ):
     """
-    Self-contained FlashVSR+ tab following SECourses modular pattern.
+    Self-contained FlashVSR tab following SECourses modular pattern.
     """
 
     # Build service callbacks
@@ -322,10 +322,16 @@ def flashvsr_tab(
                             value=str(int(_initial_scale_state))
                         )
                         version = gr.Dropdown(
-                            label="Model Version",
-                            choices=["1.0", "1.1"],
+                            label="Model",
+                            choices=list(FLASHVSR_VERSION_CHOICES),
                             value=flashvsr_version_to_ui(_value("version", "1.1")),
-                            info="1.1 = latest recommended model folder (`FlashVSR-v1.1`), 1.0 = legacy (`FlashVSR`)."
+                            info=(
+                                "FlashVSR v1.1 (`FlashVSR-v1.1`, v1.0 = legacy). FlashVSR+ Turbo / Base = the official "
+                                "FlashVSR+ release: one stream over the whole clip (no chunk restarts), reward-tuned "
+                                "detail; Turbo uses hybrid local attention (less VRAM at high resolution, the better "
+                                "default); Base needs more VRAM. FlashVSR+ ignores Pipeline Mode / VAE Model, decodes with "
+                                "the TC decoder and runs in BF16 (INT8 gave it no VRAM saving and was slower)."
+                            ),
                         )
                         mode = gr.Dropdown(
                             label="Pipeline Mode",
@@ -358,6 +364,21 @@ def flashvsr_tab(
                             _vae_mode_note(str(_value("mode", "full"))),
                             elem_classes=["resolution-info"],
                         )
+                        with gr.Row():
+                            temporal_compression = gr.Dropdown(
+                                label="FlashVSR+ Temporal Compression",
+                                choices=[4, 2, 1],
+                                value=int(_value("temporal_compression", 4) or 4) if int(_value("temporal_compression", 4) or 4) in (1, 2, 4) else 4,
+                                info="FlashVSR+ only. Input frames per latent frame: 4 = default; 2 or 1 keep more detail in large motion (about 2x / 4x the work).",
+                            )
+                            decode_every = gr.Slider(
+                                label="FlashVSR+ Decode Every (latent frames)",
+                                minimum=4,
+                                maximum=64,
+                                step=4,
+                                value=int(_value("decode_every", 16) or 16),
+                                info="FlashVSR+ only. The clip streams through the model once; every N latent frames (4N video frames) are decoded and written, so RAM stays bounded on long clips.",
+                            )
 
                     with gr.Column(scale=2):
                         input_image_preview = gr.Image(
@@ -960,6 +981,8 @@ def flashvsr_tab(
         save_vram_gb,
         keep_only_output_files,
         auto_tune_on_run,
+        temporal_compression,
+        decode_every,
     ]
 
     # Development validation: inputs_list must stay aligned with FLASHVSR_ORDER
@@ -1715,7 +1738,7 @@ def flashvsr_tab(
         if not isinstance(merged, tuple) or len(merged) < 7:
             safe_state = live_state if isinstance(live_state, dict) else {}
             return (
-                gr.update(value="ERROR: Invalid FlashVSR+ payload"),
+                gr.update(value="ERROR: Invalid FlashVSR payload"),
                 "",
                 gr.update(value="", visible=False),
                 gr.update(value=None, visible=False),
@@ -1742,7 +1765,7 @@ def flashvsr_tab(
         )
 
         if (status_text or log_tail) and not is_terminal:
-            title = _compact_single_line(status_text or "FlashVSR+ processing...", max_len=96)
+            title = _compact_single_line(status_text or "FlashVSR processing...", max_len=96)
             subtitle = log_tail or "Processing..."
             progress_update = _queue_status_indicator(title, subtitle, spinning=True)
         else:
@@ -1840,7 +1863,7 @@ def flashvsr_tab(
         queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
         queue_resource_keys, queue_resource_label = resolve_queue_gpu_resources(queued_state, queued_global_settings)
         ticket = queue_manager.submit(
-            "FlashVSR+",
+            "FlashVSR",
             "Upscale",
             resource_keys=queue_resource_keys,
             resource_label=queue_resource_label,

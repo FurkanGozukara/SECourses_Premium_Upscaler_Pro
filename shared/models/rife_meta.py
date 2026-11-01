@@ -16,6 +16,43 @@ _RIFE_DISCOVERY_CACHE_TTL_SEC = 20.0
 _RIFE_DISCOVERY_CACHE_LOCK = Lock()
 _RIFE_DISCOVERY_CACHE: dict[str, tuple[float, tuple[tuple[str, float], ...], List[str]]] = {}
 
+# NVIDIA RTX Video Frame Generation (nvidia-vfx 0.2+, RTX 40/50 series) is offered in the RIFE
+# model lists; the name selects its quality mode.
+NVFG_MODELS = {
+    "NVIDIA-FrameGen-High": "HIGH",
+    "NVIDIA-FrameGen-Medium": "MEDIUM",
+    "NVIDIA-FrameGen-Low": "LOW",
+}
+_NVFG_MODELS_LOWER = {k.lower(): v for k, v in NVFG_MODELS.items()}
+_NVFG_SUPPORT_CACHE: dict[str, bool] = {}
+
+
+def rife_nvfg_mode(model_name) -> Optional[str]:
+    """Frame Generation mode for an NVIDIA-FrameGen-* model name, else None."""
+    return _NVFG_MODELS_LOWER.get(str(model_name or "").strip().lower())
+
+
+def nvfg_supported() -> bool:
+    """nvidia-vfx 0.2+ installed and an Ada (RTX 40) or newer GPU present (no torch import)."""
+    if "ok" in _NVFG_SUPPORT_CACHE:
+        return _NVFG_SUPPORT_CACHE["ok"]
+    ok = False
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        parts = [int(p) for p in _pkg_version("nvidia-vfx").split(".")[:2]]
+        if tuple(parts) >= (0, 2):
+            from shared.gpu_utils import get_gpu_info
+
+            ok = any(
+                g.compute_capability is not None and tuple(g.compute_capability) >= (8, 9)
+                for g in (get_gpu_info() or [])
+            )
+    except Exception:
+        ok = False
+    _NVFG_SUPPORT_CACHE["ok"] = ok
+    return ok
+
 
 @dataclass
 class RifeModel:
@@ -155,6 +192,36 @@ def _get_rife_models() -> List[RifeModel]:
             notes="Recommended latest quality model when available."
         ),
         
+        RifeModel(
+            name="NVIDIA-FrameGen-High",
+            version="nvfg",
+            variant="standard",
+            estimated_vram_gb=2.0,
+            supports_fp16=False,
+            compile_compatible=False,
+            notes=("NVIDIA RTX Video Frame Generation, High mode (RTX 40/50 series only). Built-in "
+                   "shot-change detection; FP16/FP32 and Spatial Scale do not apply. Measured on RTX 5090: "
+                   "about 2-3x faster than RIFE 4.26 up to 1080p with equal or slightly better accuracy."),
+        ),
+        RifeModel(
+            name="NVIDIA-FrameGen-Medium",
+            version="nvfg",
+            variant="standard",
+            estimated_vram_gb=2.0,
+            supports_fp16=False,
+            compile_compatible=False,
+            notes="NVIDIA RTX Video Frame Generation, Medium mode (RTX 40/50 series only). Faster than High, near-identical accuracy in tests.",
+        ),
+        RifeModel(
+            name="NVIDIA-FrameGen-Low",
+            version="nvfg",
+            variant="standard",
+            estimated_vram_gb=2.0,
+            supports_fp16=False,
+            compile_compatible=False,
+            notes="NVIDIA RTX Video Frame Generation, Low mode (RTX 40/50 series only).",
+        ),
+
         # Anime-specific variant
         RifeModel(
             name="rife-anime",
@@ -267,10 +334,11 @@ def get_rife_model_names(base_dir: Path = None) -> List[str]:
     Returns:
         List of installed model names.
     """
+    extra = list(NVFG_MODELS) if nvfg_supported() else []
     if base_dir:
         installed = _discover_rife_models_from_layout(Path(base_dir))
-        return sorted(set(installed).union(DOWNLOADABLE_RIFE_MODELS))
-    return list(DOWNLOADABLE_RIFE_MODELS)
+        return sorted(set(installed).union(DOWNLOADABLE_RIFE_MODELS)) + extra
+    return list(DOWNLOADABLE_RIFE_MODELS) + extra
 
 
 def get_rife_default_model() -> str:

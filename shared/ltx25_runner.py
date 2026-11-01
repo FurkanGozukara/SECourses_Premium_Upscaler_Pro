@@ -30,6 +30,11 @@ from .ltx25_constants import (
     LTX25_AUDIO_VAE_FILE,
     LTX25_IC_LORA_FILE,
     LTX25_MODELS_DIRNAME,
+    LTX25_PRECLEAN_LORAS,
+    LTX25_PRECLEAN_PROMPTS,
+    LTX25_REFINE_LORAS,
+    LTX25_REFINE_NEGATIVE,
+    LTX25_REFINE_PROMPTS,
     LTX25_TE_FILES,
     LTX25_TE_INT8,
     LTX25_TRANSFORMER_FILES,
@@ -264,6 +269,32 @@ def _resolve_schedule(settings: Dict[str, Any], model_name: str) -> str:
     return "distilled" if ltx25_is_distilled(model_name) else "dev"
 
 
+def _refine_lora_name(settings: Dict[str, Any]) -> Optional[str]:
+    """'Refine: Restore 1.0' -> 'Restore 1.0'; None for the x2 mode."""
+    mode = str(settings.get("ltx_mode") or "").strip()
+    if mode.startswith("Refine:"):
+        name = mode.split(":", 1)[1].strip()
+        if name in LTX25_REFINE_LORAS:
+            return name
+    return None
+
+
+def _preclean_name(settings: Dict[str, Any]) -> Optional[str]:
+    name = str(settings.get("preclean") or "").strip()
+    return name if name in LTX25_PRECLEAN_LORAS else None
+
+
+def _extra_lora_files(settings: Dict[str, Any]) -> List[str]:
+    files = []
+    refine = _refine_lora_name(settings)
+    if refine:
+        files.append(LTX25_REFINE_LORAS[refine][0])
+    pre = _preclean_name(settings)
+    if pre:
+        files.append(LTX25_PRECLEAN_LORAS[pre])
+    return files
+
+
 def _resolve_model_files(
     base_dir: Path,
     settings: Dict[str, Any],
@@ -302,7 +333,54 @@ def _resolve_model_files(
         "audio_vae": models_dir / LTX25_AUDIO_VAE_FILE,
         "ic_lora": models_dir / LTX25_IC_LORA_FILE,
     }
+    refine = _refine_lora_name(settings)
+    if refine:
+        paths["ic_lora"] = models_dir / LTX25_REFINE_LORAS[refine][0]
+    pre = _preclean_name(settings)
+    if pre:
+        paths["preclean_lora"] = models_dir / LTX25_PRECLEAN_LORAS[pre]
     return paths, notes, None
+
+
+def _option_args(settings: Dict[str, Any], paths: Dict[str, Path]) -> List[str]:
+    """CLI flags for the options added 2026-11-01; only set options are passed (defaults = earlier output)."""
+    args: List[str] = []
+    tail = _parse_int(settings.get("tail_pad_frames"), 0)
+    if tail > 0:
+        args += ["--tail_pad_frames", str(tail)]
+    guide = str(settings.get("guide_encode") or "").strip().lower()
+    refine = _refine_lora_name(settings)
+    if refine and not guide:
+        guide = "auto"
+    if guide in {"untiled", "auto"}:
+        args += ["--guide_encode", guide]
+    tiling = str(settings.get("spatial_tiling") or "").strip().lower()
+    if refine:
+        _file, tile_w, tile_h = LTX25_REFINE_LORAS[refine]
+        args += ["--mode", "refine", "--spatial_tiling", tiling if tiling in {"on", "auto"} else "on",
+                 # The LoRA's trained window (Refine Details 1024x576, Restore 960x544), Gaussian fusion weights.
+                 "--spatial_tile_blend", "gaussian",
+                 "--spatial_tile_width", str(tile_w), "--spatial_tile_height", str(tile_h)]
+    elif tiling in {"on", "auto"}:
+        args += ["--spatial_tiling", tiling,
+                 "--spatial_tile_blend", str(settings.get("spatial_tile_blend") or "trapezoid"),
+                 "--spatial_tile_width", str(_parse_int(settings.get("spatial_tile_width"), 1536)),
+                 "--spatial_tile_height", str(_parse_int(settings.get("spatial_tile_height"), 1024))]
+    if tiling in {"on", "auto"} or refine:
+        args += ["--spatial_tile_overlap", str(_parse_float(settings.get("spatial_tile_overlap"), 0.5))]
+    pre = _preclean_name(settings)
+    if pre and paths.get("preclean_lora"):
+        prompt = str(settings.get("preclean_prompt") or "").strip() or LTX25_PRECLEAN_PROMPTS[pre]
+        args += ["--preclean_lora", str(paths["preclean_lora"]),
+                 "--preclean_strength", str(_parse_float(settings.get("preclean_strength"), 1.0)),
+                 "--preclean_prompt", prompt]
+    if _bool(settings.get("sparse_attention"), False):
+        args.append("--sparse_attention")
+        if settings.get("sparse_taus"):
+            args += ["--sparse_taus", str(settings.get("sparse_taus"))]
+        if settings.get("sparse_dense_steps") is not None:
+            args += ["--sparse_dense_steps", str(_parse_int(settings.get("sparse_dense_steps"), 0))]
+    return args
 
 
 def _build_ltx25_command(
@@ -365,7 +443,8 @@ def _build_ltx25_command(
         "--encode_tile_overlap",
         str(max(0, _parse_int(settings.get("encode_tile_overlap"), 64))),
         "--decode_tile_size",
-        str(max(64, _parse_int(settings.get("decode_tile_size"), 512))),
+        # 0 = the engine picks the decode tiles from the VRAM free at decode time (Auto Tune).
+        "0" if _bool(settings.get("decode_tile_auto"), False) else str(max(64, _parse_int(settings.get("decode_tile_size"), 512))),
         "--decode_tile_overlap",
         str(max(0, _parse_int(settings.get("decode_tile_overlap"), 64))),
         "--decode_temporal_size",
@@ -400,6 +479,17 @@ def _build_ltx25_command(
         cmd += ["--bytes_per_token", str(_parse_float(settings.get("bytes_per_token"), 250_000.0))]
     if str(settings.get("audio_codec") or "").strip().lower() == "none":
         cmd.append("--no_audio")
+    refine = _refine_lora_name(settings)
+    if refine:
+        # Refine LoRAs: the cards' euler sampler and a rendering-only prompt unless the user wrote one.
+        def _set(flag: str, value: str) -> None:
+            cmd[cmd.index(flag) + 1] = value
+        if str(settings.get("sampler") or "euler_ancestral") == "euler_ancestral":
+            _set("--sampler", "euler")
+        # The x2 prompt asks for a 2x re-render; a refine LoRA wants a generic rendering prompt (cards).
+        _set("--positive_prompt", str(settings.get("refine_prompt") or "").strip() or LTX25_REFINE_PROMPTS[refine])
+        _set("--negative_prompt", str(settings.get("refine_negative_prompt") or "").strip() or LTX25_REFINE_NEGATIVE)
+    cmd += _option_args(settings, paths)
     return cmd
 
 
@@ -658,6 +748,7 @@ def _run_ltx25_once(
                 str(settings.get("video_vae") or ""),
                 on_progress,
                 cancel_event=cancel_event,
+                extra_files=_extra_lora_files(settings),
             )
             if not download_ok:
                 if cancel_event is not None and cancel_event.is_set():

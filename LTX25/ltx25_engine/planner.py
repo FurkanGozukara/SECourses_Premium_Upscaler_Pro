@@ -120,13 +120,17 @@ def plan_chunks(
     token_budget: int,
     max_chunk_frames: int = 121,
     overlap_frames: int = 1,
+    scale: int = 2,
 ) -> ChunkPlan:
-    """Port of LTX25PrepareVideoChunks geometry + slicing (no tensors involved)."""
+    """Port of LTX25PrepareVideoChunks geometry + slicing (no tensors involved).
+
+    scale 2 is the x2 upscale; scale 1 plans a same-size pass (the optional pre-clean pass)."""
     total_frames = max(1, int(total_frames))
+    scale = max(1, int(scale))
     padded_width = math.ceil(width / 32) * 32
     padded_height = math.ceil(height / 32) * 32
-    generation_width = padded_width * 2
-    generation_height = padded_height * 2
+    generation_width = padded_width * scale
+    generation_height = padded_height * scale
     spatial_tokens = (generation_width // 32) * (generation_height // 32)
 
     requested_valid = round_down_8n1(min(int(max_chunk_frames), one_chunk_length(total_frames)))
@@ -158,8 +162,8 @@ def plan_chunks(
         padded_height=padded_height,
         generation_width=generation_width,
         generation_height=generation_height,
-        output_width=width * 2,
-        output_height=height * 2,
+        output_width=width * scale,
+        output_height=height * scale,
         spatial_tokens=spatial_tokens,
         latent_frames=latent_frames,
         chunk_length=chunk_length,
@@ -181,6 +185,8 @@ def auto_token_budget(
     reserve_gb: float = 1.0,
     bytes_per_token: float = BYTES_PER_TOKEN,
     base_overhead_bytes: float = ACTIVATION_BASE_BYTES + NON_BLOCK_WEIGHT_BYTES,
+    scale: int = 2,
+    guide_token_ratio: float = 0.25,
 ) -> Tuple[int, str]:
     """
     Choose the largest safe token budget for the available VRAM, preferring a
@@ -193,7 +199,8 @@ def auto_token_budget(
     """
     padded_w = math.ceil(width / 32) * 32
     padded_h = math.ceil(height / 32) * 32
-    spatial_tokens = ((padded_w * 2) // 32) * ((padded_h * 2) // 32)
+    scale = max(1, int(scale))
+    spatial_tokens = ((padded_w * scale) // 32) * ((padded_h * scale) // 32)
 
     usable = float(free_vram_bytes) - float(weight_resident_bytes)
     usable -= reserve_gb * (1024 ** 3) + base_overhead_bytes
@@ -202,7 +209,7 @@ def auto_token_budget(
         return max(4096, spatial_tokens * 2), "minimum (weights consume nearly all VRAM)"
 
     # tokens the sampler actually attends to = budget * 1.25 (+ ~1.2k text tokens)
-    max_video_tokens = int(usable / (bytes_per_token * 1.25 * ACTIVATION_SAFETY))
+    max_video_tokens = int(usable / (bytes_per_token * (1.0 + float(guide_token_ratio)) * ACTIVATION_SAFETY))
     max_video_tokens = max(4096, max_video_tokens)
 
     single = one_chunk_length(total_frames)
@@ -215,6 +222,75 @@ def auto_token_budget(
     return max_video_tokens, (
         f"largest budget that fits VRAM (single chunk would need {needed_single} tokens)"
     )
+
+
+def plan_with_tail_pad(
+    total_frames: int,
+    width: int,
+    height: int,
+    tail_pad: int,
+    budget_for_frames,
+    max_chunk_frames: int = 121,
+    overlap_frames: int = 1,
+    scale: int = 2,
+) -> Tuple[ChunkPlan, int]:
+    """The engine's tail-padding rule: plan with `tail_pad` extra frames (generated and trimmed) unless that would
+    add a chunk; budget_for_frames(frames) -> token budget. Returns (plan, padding actually used). The live plan,
+    Auto Tune and the engine use this so they plan the same window."""
+    plain = plan_chunks(total_frames, width, height, int(budget_for_frames(total_frames)),
+                        max_chunk_frames=max_chunk_frames, overlap_frames=overlap_frames, scale=scale)
+    tail_pad = max(0, int(tail_pad or 0))
+    if not tail_pad:
+        return plain, 0
+    padded = plan_chunks(total_frames + tail_pad, width, height, int(budget_for_frames(total_frames + tail_pad)),
+                         max_chunk_frames=max_chunk_frames, overlap_frames=overlap_frames, scale=scale)
+    if padded.chunk_count > plain.chunk_count:
+        return plain, 0
+    return padded, tail_pad
+
+
+# VAE decode tile sets and their peak allocation during the decode, VAE weights included (GiB), for up to 8 and for
+# 19 latent frames per temporal window (RTX 5090 VAE-alone bench, worst of 1080p / 4K; 19-frame values for 1536 /
+# 2048 px carry +15 / +25 %). Larger tiles decode 1.4-2.2x faster and stay within 47 dB of the 512 px decode.
+_GIB = 1024 ** 3
+DECODE_TILE_DEFAULT = (512, 64, 128, 32)
+DECODE_TILE_SETS = (
+    ((2048, 256, 256, 64), 10.76 * _GIB, 12.1 * _GIB),
+    ((1536, 192, 256, 64), 7.89 * _GIB, 10.8 * _GIB),
+    ((1024, 128, 256, 64), 6.48 * _GIB, 8.71 * _GIB),
+)
+# Inside the pipeline the decode needed far more than the VAE-alone bench: with 9.3 GiB available, 1024 px tiles
+# (6.48 GiB on the bench) ran out of memory (acceptance run, 2026-11-01 22:1x). Hence x1.6 + 1 GiB.
+DECODE_SAFETY = 1.6
+DECODE_MARGIN_BYTES = 1.0 * _GIB
+
+
+def decode_tile_need(need_short: float, need_long: float, latent_frames: int) -> float:
+    """Peak for this many latent frames: the bench's two points (8 and 19 latent frames), linear between them and
+    extended up to 32 (the 256-frame temporal window holds at most 32 latent frames)."""
+    t = min(max(int(latent_frames), 1), 32)
+    if t <= 8:
+        return float(need_short)
+    return float(need_short) + (float(need_long) - float(need_short)) * (t - 8) / 11.0
+
+
+def decode_available_bytes(cap_bytes: float, reserved_bytes: float, device_free_bytes: float,
+                           save_bytes: float) -> int:
+    """VRAM the decode may still take: under this process's cap (which already keeps Save VRAM free) minus what it
+    has reserved, and under the device's free memory minus Save VRAM (other processes). Save VRAM is never counted
+    as available (budget_free_bytes adds it back for block planning, where the caller subtracts it)."""
+    return max(0, int(min(float(cap_bytes) - float(reserved_bytes), float(device_free_bytes) - float(save_bytes))))
+
+
+def choose_decode_tiles(available_bytes: float, latent_frames: int, safety: float = DECODE_SAFETY,
+                        margin_bytes: float = DECODE_MARGIN_BYTES) -> Tuple[int, int, int, int]:
+    """Largest tile set whose estimated peak (x safety + margin) fits `available_bytes`, the VRAM this process may
+    still allocate (its cap minus what it holds, Save VRAM already excluded); else the 512 px default."""
+    for tiles, need_short, need_long in DECODE_TILE_SETS:
+        need = decode_tile_need(need_short, need_long, latent_frames)
+        if float(available_bytes) >= need * float(safety) + float(margin_bytes):
+            return tiles
+    return DECODE_TILE_DEFAULT
 
 
 def pad_frames_to_grid(frames: "torch.Tensor", padded_width: int, padded_height: int) -> "torch.Tensor":

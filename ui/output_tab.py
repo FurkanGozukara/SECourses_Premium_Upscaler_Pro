@@ -484,7 +484,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         direct_video_a_label = gr.Textbox(
                             label="Video A Label",
                             value="Video A",
-                            placeholder="FlashVSR+",
+                            placeholder="FlashVSR",
                         )
                         direct_video_b_label = gr.Textbox(
                             label="Video B Label",

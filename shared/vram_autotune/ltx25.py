@@ -47,8 +47,18 @@ def _run_fps(settings: Dict[str, Any]) -> float:
     return float(info.fps) if info is not None and info.fps else 24.0
 
 
+# Refine mode (Refine Details / Restore IC-LoRAs): one temporal extent past 97 frames loses detail and colour
+# drifts (Restore card, measured on a 545-frame clip), so longer clips run as 97-frame windows.
+REFINE_MAX_CHUNK_FRAMES = 97
+
+
 def tuned_values(settings: Dict[str, Any]) -> Dict[str, Any]:
-    return {"token_budget_mode": TOKEN_BUDGET_AUTO, "max_chunk_frames": max_chunk_frames(_run_fps(settings))}
+    frames = max_chunk_frames(_run_fps(settings))
+    if str(settings.get("ltx_mode") or "").startswith("Refine:"):
+        frames = min(frames, REFINE_MAX_CHUNK_FRAMES)
+    # VAE decode tiles follow the VRAM free at decode time (engine `--decode_tile_size 0`): 1024-2048 px tiles with
+    # 256-frame windows decoded 1.4-2.2x faster than 512 px on an RTX 5090, within 47 dB of it (seams only).
+    return {"token_budget_mode": TOKEN_BUDGET_AUTO, "max_chunk_frames": frames, "decode_tile_auto": True}
 
 
 def plan(settings: Dict[str, Any], base_dir: Path, budget: Optional[VramBudget]) -> TunePlan:
@@ -64,8 +74,10 @@ def plan(settings: Dict[str, Any], base_dir: Path, budget: Optional[VramBudget])
         line = line.replace("[Plan] ", "").strip()
         if line and not line.startswith("[Live]"):
             out.lines.append(line)
+    why = ("the refine LoRAs' 97-frame window" if str(settings.get("ltx_mode") or "").startswith("Refine:")
+           else "20 s, the model's position range")
     out.lines.append(f"Token budget Auto (single chunk preferred), longest chunk {out.updates['max_chunk_frames']} frames "
-                     "(20 s, the model's position range); transformer blocks that do not fit stream from RAM.")
+                     f"({why}); transformer blocks that do not fit stream from RAM.")
     if budget is not None and budget.limit_gb < 9.0:
         out.warnings.append(f"Only {budget.limit_gb:.1f} GB is available for this run; LTX 2.5 needs about 9 GB "
                             "(a 12 GB GPU at Save VRAM 1.5: 8 and 10 GB cards stopped with an out-of-memory error, "
@@ -81,7 +93,8 @@ def auto_apply(settings: Dict[str, Any], log: Optional[Callable[[str], None]] = 
     updates = tuned_values(settings)
     settings.update(updates)
     if log:
-        log(f"[LTX25 Auto Tune] Token budget Auto (single chunk preferred), longest chunk {updates['max_chunk_frames']} frames (20 s); chunk "
+        why = "refine window" if str(settings.get("ltx_mode") or "").startswith("Refine:") else "20 s"
+        log(f"[LTX25 Auto Tune] Token budget Auto (single chunk preferred), longest chunk {updates['max_chunk_frames']} frames ({why}); chunk "
             "length and block streaming are sized from the VRAM free at engine start (Save VRAM "
             f"{settings.get('reserve_vram_gb')} GB kept free).")
     return updates

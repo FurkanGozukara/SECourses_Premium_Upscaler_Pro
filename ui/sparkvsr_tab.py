@@ -321,7 +321,7 @@ def sparkvsr_tab(
         except Exception:
             _label = f"GAN: {_gan_model}"
         spark_auto_ref_choices.append((_label, f"GAN::{_gan_model}"))
-    spark_auto_ref_choices.append(("FlashVSR+", "FlashVSR+"))
+    spark_auto_ref_choices.append(("FlashVSR v1.1", "FlashVSR+"))  # stored value kept for presets
     spark_auto_ref_values = {str(v) for _, v in spark_auto_ref_choices}
     auto_reference_upscaler_value = str(_value("auto_reference_upscaler", "SeedVR2") or "SeedVR2").strip()
     if (
@@ -669,7 +669,7 @@ def sparkvsr_tab(
                         label="Reference Frame Upscaler",
                         choices=spark_auto_ref_choices,
                         value=auto_reference_upscaler_value,
-                        info="Default is SeedVR2. GAN models use the selected GAN weight; FlashVSR+ is available as the final option.",
+                        info="Default is SeedVR2. GAN models use the selected GAN weight; FlashVSR v1.1 is available as the final option.",
                         scale=1,
                     )
                 with gr.Accordion("Local Reference Backends", open=False):

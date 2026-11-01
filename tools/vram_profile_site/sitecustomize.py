@@ -29,8 +29,11 @@ def _dump():
         }
         for d in range(torch.cuda.device_count()):
             try:
+                props = torch.cuda.get_device_properties(d)
                 rec["devices"].append({
                     "device": d,
+                    "name": props.name,
+                    "uuid": str(getattr(props, "uuid", "")),
                     "peak_reserved_gb": round(torch.cuda.max_memory_reserved(d) / gib, 4),
                     "peak_allocated_gb": round(torch.cuda.max_memory_allocated(d) / gib, 4),
                 })

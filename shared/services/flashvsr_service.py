@@ -1,6 +1,6 @@
 """
-FlashVSR+ Service Module
-Handles FlashVSR+ processing logic, presets, and callbacks
+FlashVSR Service Module
+Handles FlashVSR processing logic, presets, and callbacks
 """
 
 import queue
@@ -64,7 +64,7 @@ from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
 from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
 
-# Cancel event for FlashVSR+ processing
+# Cancel event for FlashVSR processing
 _flashvsr_cancel_event = threading.Event()
 
 
@@ -416,6 +416,9 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "pre_downscale_then_upscale": True,
         "save_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "auto_tune_on_run": True,
+        # FlashVSR+ (official Turbo / Base) only
+        "temporal_compression": 4,
+        "decode_every": 16,
     }
 
 
@@ -467,6 +470,8 @@ FLASHVSR_ORDER: List[str] = [
     "save_vram_gb",
     "keep_only_output_files",
     "auto_tune_on_run",
+    "temporal_compression",
+    "decode_every",
 ]
 
 
@@ -558,6 +563,9 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg["frame_chunk_size"] = max(0, _to_int(cfg.get("frame_chunk_size"), 0))
     cfg["save_vram_gb"] = clamp_save_vram_gb(cfg.get("save_vram_gb"), defaults.get("save_vram_gb", DEFAULT_SAVE_VRAM_GB))
     cfg["auto_tune_on_run"] = _to_bool(cfg.get("auto_tune_on_run", defaults.get("auto_tune_on_run", True)), True)
+    tc = _to_int(cfg.get("temporal_compression"), 4)
+    cfg["temporal_compression"] = tc if tc in (1, 2, 4) else 4
+    cfg["decode_every"] = max(4, min(64, (_to_int(cfg.get("decode_every"), 16) // 4) * 4))
 
     cfg["fps"] = max(0.0, _to_float(cfg.get("fps"), 0.0))
     codec = str(cfg.get("codec", defaults.get("codec", "libx264")) or "libx264").strip()
@@ -633,7 +641,7 @@ def build_flashvsr_callbacks(
     temp_dir: Path,
     output_dir: Path,
 ):
-    """Build FlashVSR+ callback functions for the UI."""
+    """Build FlashVSR callback functions for the UI."""
     defaults = flashvsr_defaults()
 
     def refresh_presets(model_name: str, select_name: Optional[str] = None):
@@ -802,7 +810,7 @@ def build_flashvsr_callbacks(
                 settings["resume_run_dir"] = ""
             settings["device"] = "cpu" if global_gpu_device == "cpu" else str(global_gpu_device)
             
-            # Apply FlashVSR+ guardrails (single GPU, tile validation, etc.)
+            # Apply FlashVSR guardrails (single GPU, tile validation, etc.)
             settings = _enforce_flashvsr_guardrails(settings, defaults)
             if preview_only:
                 settings["batch_enable"] = False
@@ -1346,7 +1354,7 @@ def build_flashvsr_callbacks(
             
             # Initialize progress
             if progress:
-                progress(0, desc="Initializing FlashVSR+...")
+                progress(0, desc="Initializing FlashVSR...")
 
             video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".flv", ".wmv"}
             image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -1514,7 +1522,7 @@ def build_flashvsr_callbacks(
                     )
                     return
 
-                # Universal chunking (Resolution tab) applies to FlashVSR+ batch runs too.
+                # Universal chunking (Resolution tab) applies to FlashVSR batch runs too.
                 auto_chunk = bool(seed_controls.get("auto_chunk", True))
                 chunk_size_sec = float(seed_controls.get("chunk_size_sec", 0) or 0)
                 chunk_overlap_sec = 0.0 if auto_chunk else float(seed_controls.get("chunk_overlap_sec", 0) or 0)
@@ -1567,7 +1575,7 @@ def build_flashvsr_callbacks(
                 if progress:
                     progress(0, desc=f"Batch: {len(items)} item(s) queued")
                 logs.append(f"Batch queued: {len(items)} item(s). Output: {batch_root}")
-                yield _batch_live_payload(f"Starting FlashVSR+ batch ({len(items)} item(s))")
+                yield _batch_live_payload(f"Starting FlashVSR batch ({len(items)} item(s))")
 
                 for idx, item in enumerate(items, 1):
                     if _flashvsr_cancel_event.is_set():
@@ -1662,7 +1670,7 @@ def build_flashvsr_callbacks(
                             batch_root,
                             item_input.name,
                             input_path=str(item_input),
-                            model_label="FlashVSR+",
+                            model_label="FlashVSR",
                             mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                             overwrite_existing=overwrite_existing,
                         )
@@ -1860,7 +1868,7 @@ def build_flashvsr_callbacks(
                                 item_settings.get("_original_input_path_before_preprocess") or item_path,
                                 outp,
                                 seed_controls,
-                                label_output="FlashVSR+",
+                                label_output="FlashVSR",
                                 on_progress=None,
                             )
                             if comp_vid_path:
@@ -1879,7 +1887,7 @@ def build_flashvsr_callbacks(
                             logs.append(f"✅ [{idx}/{len(items)}] {Path(item_path).name} → {Path(outp).name}")
                     else:
                         if getattr(result, "returncode", 0) != 0:
-                            maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=getattr(result, "log", ""), settings=item_settings)
+                            maybe_set_vram_oom_alert(state, model_label="FlashVSR", text=getattr(result, "log", ""), settings=item_settings)
                         logs.append(f"❌ [{idx}/{len(items)}] {Path(item_path).name} failed")
 
                     # Log run summary per-item
@@ -1975,7 +1983,7 @@ def build_flashvsr_callbacks(
                     except Exception:
                         pass
 
-                status = f"✅ FlashVSR+ batch complete ({len(outputs)}/{len(items)} succeeded, {len(items) - len(outputs)} failed)"
+                status = f"✅ FlashVSR batch complete ({len(outputs)}/{len(items)} succeeded, {len(items) - len(outputs)} failed)"
                 vid_upd, img_upd = _media_updates(last_output_path)
                 yield (
                     status,
@@ -2117,7 +2125,7 @@ def build_flashvsr_callbacks(
                             output_override_raw=settings.get("output_override"),
                             input_path=settings["input_path"],
                             original_filename=settings.get("_original_filename") or Path(settings["input_path"]).name,
-                            model_label="FlashVSR+",
+                            model_label="FlashVSR",
                             mode="subprocess",
                         )
                         run_dir = Path(run_paths.run_dir)
@@ -2226,7 +2234,7 @@ def build_flashvsr_callbacks(
                     )
                     return
             
-            # Run FlashVSR+ in thread with cancel support
+            # Run FlashVSR in thread with cancel support
             result_holder = {}
             process_handle = {"proc": None}  # Store subprocess handle
             
@@ -2595,8 +2603,8 @@ def build_flashvsr_callbacks(
             if "error" in result_holder:
                 if progress:
                     progress(0, desc="Error")
-                if maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=result_holder.get("error", ""), settings=settings):
-                    show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR+", duration=None)
+                if maybe_set_vram_oom_alert(state, model_label="FlashVSR", text=result_holder.get("error", ""), settings=settings):
+                    show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR", duration=None)
                 yield (
                     ("🚫 Out of VRAM (GPU) — see banner above" if state.get("alerts", {}).get("oom", {}).get("visible") else "❌ Processing failed"),
                     f"Error: {result_holder['error']}",
@@ -2623,7 +2631,7 @@ def build_flashvsr_callbacks(
             
             # Update progress to 100%
             if progress:
-                progress(1.0, desc="FlashVSR+ complete!")
+                progress(1.0, desc="FlashVSR complete!")
             
             # Apply face restoration if enabled (per-run toggle OR global setting)
             output_path = result.output_path
@@ -2642,7 +2650,7 @@ def build_flashvsr_callbacks(
                     max_edge=settings.get("max_target_resolution", 0),
                     pre_downscale_then_upscale=settings.get("pre_downscale_then_upscale", True),
                     settings=settings,
-                    label="FlashVSR+ final sizing",
+                    label="FlashVSR final sizing",
                     on_log=lambda x: log_buffer.append(x) if x else None,
                 )
                 if output_path_new and output_path_new != output_path:
@@ -2758,7 +2766,7 @@ def build_flashvsr_callbacks(
                     settings.get("_original_input_path_before_preprocess") or input_path,
                     output_path,
                     seed_controls,
-                    label_output="FlashVSR+",
+                    label_output="FlashVSR",
                     on_progress=(lambda m: log_buffer.append(m.strip()) if m else None),
                 )
                 if comp_vid_path:
@@ -2834,12 +2842,12 @@ def build_flashvsr_callbacks(
                 )
             if chunk_count > 0:
                 status = (
-                    f"✅ FlashVSR+ chunked upscale complete ({chunk_count} chunks)"
+                    f"✅ FlashVSR chunked upscale complete ({chunk_count} chunks)"
                     if result.returncode == 0
                     else f"⚠️ Chunked upscale exited with code {result.returncode}"
                 )
             else:
-                status = "✅ FlashVSR+ upscaling complete" if result.returncode == 0 else f"⚠️ Exited with code {result.returncode}"
+                status = "✅ FlashVSR upscaling complete" if result.returncode == 0 else f"⚠️ Exited with code {result.returncode}"
             if preview_only:
                 if result.returncode == 0:
                     status = "Preview complete"
@@ -2848,9 +2856,9 @@ def build_flashvsr_callbacks(
                 else:
                     status = "Preview failed"
 
-            if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=result.log, settings=settings):
+            if result.returncode != 0 and maybe_set_vram_oom_alert(state, model_label="FlashVSR", text=result.log, settings=settings):
                 status = "Out of VRAM (GPU) - see banner above"
-                show_vram_oom_modal(state, title="Out of VRAM (GPU) - FlashVSR+", duration=None)
+                show_vram_oom_modal(state, title="Out of VRAM (GPU) - FlashVSR", duration=None)
 
             # Keep run folder self-documented for both video and image runs.
             try:
@@ -2899,8 +2907,8 @@ def build_flashvsr_callbacks(
         except Exception as e:
             if progress:
                 progress(0, desc="Critical error")
-            if maybe_set_vram_oom_alert(state, model_label="FlashVSR+", text=str(e), settings=locals().get("settings")):
-                show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR+", duration=None)
+            if maybe_set_vram_oom_alert(state, model_label="FlashVSR", text=str(e), settings=locals().get("settings")):
+                show_vram_oom_modal(state, title="Out of VRAM (GPU) — FlashVSR", duration=None)
             yield (
                 "❌ Critical error",
                 f"Error: {str(e)}",
@@ -2912,9 +2920,9 @@ def build_flashvsr_callbacks(
             )
 
     def cancel_action():
-        """Cancel FlashVSR+ processing"""
+        """Cancel FlashVSR processing"""
         _flashvsr_cancel_event.set()
-        return gr.update(value="⏹️ Cancellation requested - FlashVSR+ will stop at next checkpoint"), "Cancelling..."
+        return gr.update(value="⏹️ Cancellation requested - FlashVSR will stop at next checkpoint"), "Cancelling..."
 
     def open_outputs_folder_flashvsr():
         """Open outputs folder - delegates to shared utility (no code duplication)"""

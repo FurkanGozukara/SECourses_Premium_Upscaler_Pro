@@ -323,7 +323,7 @@ class RifeRobustMergeTests(unittest.TestCase):
         self.assertTrue(any("frame-stream fallback (frames=21, decoder=ffmpeg)" in m for m in messages), messages)
         self.assertEqual(chunking._probe_chunk_nb_frames(output), 21)
 
-    def test_target_fps_above_the_multiplier_raises_interpolation(self):
+    def test_target_fps_is_rendered_directly_at_exact_timesteps(self):
         video = self.tmp / "video24.mp4"
         _run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
@@ -336,12 +336,24 @@ class RifeRobustMergeTests(unittest.TestCase):
             settings = {"fps_multiplier": "x2", "model": "4.26", **extra}
             return runner._build_rife_cmd(Path("inference_video.py"), str(video), self.tmp / "o.mp4", settings)
 
-        # x2 of 24 fps is 48 fps: a 60 fps target needs x4 (96 fps) resampled down to 60.
+        # 24 -> 60 fps: inference_video.py interpolates each output frame at its own timestep, so the
+        # multiplier is no longer raised to x4 (96 fps) and resampled down with dropped frames.
         cmd = build(fps_override=60.0)
-        self.assertEqual(cmd[cmd.index("--multi") + 1], "4")
+        self.assertNotIn("--multi", cmd)
         self.assertEqual(float(cmd[cmd.index("--fps") + 1]), 60.0)
         self.assertNotIn("--multi", build(fps_override=30.0))
         self.assertNotIn("--multi", build())
+        self.assertEqual(build(fps_multiplier="x4")[build(fps_multiplier="x4").index("--multi") + 1], "4")
+        # The app keeps the upstream 128-pixel grid (64 was not faster in the 2026-11 repeats).
+        self.assertNotIn("--pad", cmd)
+        # NVIDIA Frame Generation is chosen through the model name.
+        fg = build(model="NVIDIA-FrameGen-High", fp16_mode=True)
+        self.assertEqual(fg[fg.index("--engine") + 1], "nvfg")
+        self.assertEqual(fg[fg.index("--nvfg-mode") + 1], "HIGH")
+        self.assertNotIn("--fp16", fg)
+        # The flow scale is snapped to the values inference_video.py accepts.
+        self.assertEqual(build(scale=0.6)[build(scale=0.6).index("--scale") + 1], "0.5")
+        self.assertNotIn("--scale", build(scale=1.2))
 
     def test_run_rife_never_lets_rife_shorten_the_video(self):
         base = self.tmp / "app"

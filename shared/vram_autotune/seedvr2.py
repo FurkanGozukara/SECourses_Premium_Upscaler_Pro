@@ -36,8 +36,10 @@ from .common import (
 )
 
 # Non-allocator VRAM of a SeedVR2 run: the CLI parent's CUDA context plus the phase
-# child's context and kernels (split-phase mode runs both at once).
-SEEDVR2_PROCESS_OVERHEAD_GB = 1.2
+# child's context and kernels (split-phase mode runs both at once). nvidia-smi totals minus the
+# PyTorch reserved peak, 2026-11-01: 1.0 GB on the RTX 5090, up to 1.43 GB on the RTX 3090 (W4A8 with
+# comfy_kitchen's kernels loaded).
+SEEDVR2_PROCESS_OVERHEAD_GB = 1.45
 
 MAX_BATCH = 601  # mirrors shared.ui_validators.SEEDVR2_MAX_BATCH_SIZE (kept import-free)
 VAE_TILE_CHOICES = (1024, 896, 768, 640, 512, 384, 256)
@@ -52,30 +54,73 @@ SAFETY_FRACTION = 0.08
 _DIT_WEIGHT_GB = {
     ("3b", "fp16"): 6.3, ("3b", "fp8"): 3.2, ("3b", "q8"): 3.4, ("3b", "q4"): 1.9, ("3b", "int8"): 3.4,
     ("7b", "fp16"): 15.4, ("7b", "fp8"): 8.3, ("7b", "q8"): 8.3, ("7b", "q4"): 4.6, ("7b", "int8"): 8.1,
+    ("7b", "w4a8"): 4.45, ("3b", "w4a8"): 1.9,
 }
 _ARCH = {
-    # blocks; PyTorch-allocated GiB per 1k latent tokens (measured 7B: 0.176 at 720p and 1080p);
-    # fixed DiT-phase extra GiB on top of the weights (text embeddings, RoPE tables, buffers)
-    "7b": {"blocks": 36, "gb_per_ktok": 0.176, "extra_gb": 0.30},
-    "3b": {"blocks": 32, "gb_per_ktok": 0.137, "extra_gb": 0.50},  # Q4: 8.89 / 15.44 GB at 49k / 98k tokens
+    # blocks; PyTorch-allocated GiB per 1k latent tokens; fixed DiT-phase extra GiB on top of the weights
+    # (text embeddings, RoPE tables, buffers). The engine runs the MLP and RoPE in token chunks and frees
+    # the pre-window QKV (2026-11-01, benchmarks/vram/seedvr2.jsonl `r4_*`, INT8 ConvRot runs): 0.144 (7B) /
+    # 0.12 (3B) per 1k tokens. torch.compile'd DiTs run unchunked: the earlier fit (0.176 / 0.137) applies.
+    "7b": {"blocks": 36, "gb_per_ktok": 0.144, "gb_per_ktok_compiled": 0.176, "extra_gb": 0.30},
+    "3b": {"blocks": 32, "gb_per_ktok": 0.12, "gb_per_ktok_compiled": 0.137, "extra_gb": 0.50},
 }
-BLOCK_SHARE = 0.93  # share of DiT weights inside the swappable transformer blocks
+# Activation slope by weight format (2026-11-01, RTX 5090 + RTX 3090 runs, results/WP-SEEDVR2 "W4A8 default
+# + 3090 speed"): BF16, W4A8 and INT8 ConvRot all need 0.104-0.105 GB per 1k latent tokens on the 7B and
+# 0.117 on the 3B at 720p-1080p (INT8 needed 0.140 / 0.147 until its Linear layers stopped returning float32
+# under autocast, 2026-11-01 23:00). 4K batches need about 5 % more per token (W4A8 0.109-0.110 on both GPUs),
+# so every value carries that 5 %: 720p-1080p estimates sit 1-5 % above the measured peaks, 4K within 1-2 %.
+_GB_PER_KTOK = {
+    ("7b", "int8"): 0.110, ("7b", "fp16"): 0.110, ("7b", "w4a8"): 0.111,
+    ("7b", "fp8"): 0.110, ("7b", "q8"): 0.110, ("7b", "q4"): 0.110,
+    ("3b", "int8"): 0.123, ("3b", "fp16"): 0.123, ("3b", "fp8"): 0.123, ("3b", "q8"): 0.123, ("3b", "q4"): 0.123,
+}
+# Share of each checkpoint inside the swappable transformer blocks (measured on the files: 7B BF16 0.990,
+# 7B INT8 ConvRot 0.981, 7B W4A8 0.965, 3B BF16 0.982; the rest is the embeddings and output head).
+_BLOCK_SHARE = {"fp16": 0.99, "int8": 0.98, "w4a8": 0.965}
+BLOCK_SHARE = 0.97  # other formats
 
 # --- VAE (shared by every DiT model; ema_vae_fp16) ---------------------------------------------
-# Allocated GiB = base + per-megapixel-of-tile slope, fitted on 5 tile sizes (0.26-1.05 MP, within
-# 0.3 GiB): encode 3.85 + 7.1/MP, decode 3.4 + 14.0/MP, for batches of 17+ frames (4+ latent
-# frames fill a temporal slice). Shorter batches use about 55-75% of the slope.
-VAE_ENC_BASE_GB = 3.85
-VAE_ENC_GB_PER_MP = 7.1
-VAE_DEC_BASE_GB = 3.4
-VAE_DEC_GB_PER_MP = 14.0
-VAE_FRAME_GB_PER_MP = 0.006  # per frame per megapixel kept for the whole batch (fp16 RGB frames)
+# Allocated GiB = base + per-megapixel-of-tile slope + the batch's frames, for batches of 17+ frames
+# (4+ latent frames fill a temporal slice); shorter batches use about 55-75% of the slope. Refitted
+# 2026-11-01 with the fused VAE path on 12 tile sizes 0.26-2.06 MP (RTX 3090 sweep + RTX 5090 runs,
+# results/WP-SEEDVR2 "W4A8 default + 3090 speed"): encode 1.75 + 9.0/MP (-3.5..+13 %, most at 512 px tiles),
+# decode 1.65 + 15.9/MP (-0.9..+3.4 %); the batch's frames add 0.005 (encode) / 0.001 (decode) GB per frame-MP.
+# The earlier 3.85 + 7.1/MP encode undershot untiled 1080p by 7 % and overshot 512-768 px tiles by 10-50 %.
+VAE_ENC_BASE_GB = 1.75
+VAE_ENC_GB_PER_MP = 9.0
+VAE_DEC_BASE_GB = 1.65
+VAE_DEC_GB_PER_MP = 15.9
+VAE_ENC_FRAME_GB_PER_MP = 0.005  # per frame per megapixel of the batch kept by the phase
+VAE_DEC_FRAME_GB_PER_MP = 0.001
+VAE_FRAME_GB_PER_MP = VAE_ENC_FRAME_GB_PER_MP  # earlier name
+# Single images (one frame): measured separately (2026-11-01, robot 1080p 2.09 MP and face 720p 0.92 MP,
+# untiled; results/WP-SEEDVR2): encode 5.86 / 3.61 GB, decode 7.62 / 4.97 GB with the 3D convs, and
+# 3.52 / 1.84 and 5.25 / 2.61 GB with the default single-frame 2D path; a 4K image (8.29 MP) took encode
+# 14.90 / 12.44 GB and decode 23.76 / 19.31 GB (3D / 2D). The video terms above (fitted on 17+ frame
+# batches) overestimated images 2.6-3.8x. The default single-frame 2D path (SEEDVR2_VAE_2D_SINGLE_FRAME,
+# on unless set to 0) uses the 2D terms (fitted through all three sizes within 0.05 GB); the 3D terms
+# apply when it is switched off.
+VAE_IMG_ENC_BASE_GB = 1.85
+VAE_IMG_ENC_GB_PER_MP = 1.95
+VAE_IMG_DEC_BASE_GB = 2.65
+VAE_IMG_DEC_GB_PER_MP = 2.56
+VAE_IMG2D_ENC_BASE_GB = 0.52
+VAE_IMG2D_ENC_GB_PER_MP = 1.44
+VAE_IMG2D_DEC_BASE_GB = 0.53
+VAE_IMG2D_DEC_GB_PER_MP = 2.27
+
+
+def _image_2d_path() -> bool:
+    return os.environ.get("SEEDVR2_VAE_2D_SINGLE_FRAME", "1").strip() != "0"
+
 
 def _model_key(model_name: str, int8: bool) -> Tuple[str, str]:
     name = Path(str(model_name or "")).name.lower()
     size = "3b" if re.search(r"(?:^|[._-])3b(?:[._-]|$)", name) else "7b"
     if name.endswith(".gguf"):
         prec = "q4" if "q4" in name else "q8"
+    elif "w4a8" in name:
+        prec = "w4a8"  # prequantized; the INT8 ConvRot switch does not apply
     elif int8:
         prec = "int8"
     elif "fp8" in name:
@@ -148,15 +193,17 @@ def latent_frames(frames: int) -> int:
 
 
 def dit_peak_gb(model_name: str, int8: bool, geo: Geometry, frames: int, swap: int,
-                model_dir: Optional[str] = None, weights: Optional[float] = None) -> float:
-    size, _ = _model_key(model_name, int8)
+                model_dir: Optional[str] = None, weights: Optional[float] = None,
+                compiled: bool = False) -> float:
+    size, prec = _model_key(model_name, int8)
     arch = _ARCH[size]
     weights = dit_weight_gb(model_name, int8, model_dir) if weights is None else weights
-    per_block = weights * BLOCK_SHARE / arch["blocks"]
+    per_block = weights * _BLOCK_SHARE.get(prec, BLOCK_SHARE) / arch["blocks"]
     swap = max(0, min(int(swap), arch["blocks"]))
     resident = weights - swap * per_block + (per_block if swap else 0.0)  # one block in flight
     tokens_k = latent_frames(frames) * geo.tokens_per_latent_frame() / 1000.0
-    return resident + arch["gb_per_ktok"] * tokens_k + arch["extra_gb"]
+    slope = arch["gb_per_ktok_compiled"] if compiled else _GB_PER_KTOK.get((size, prec), arch["gb_per_ktok"])
+    return resident + slope * tokens_k + arch["extra_gb"]
 
 
 def _tile_mp(geo: Geometry, tiled: bool, tile: int) -> float:
@@ -173,13 +220,43 @@ def _slice_share(frames: int) -> float:
 
 
 def encode_peak_gb(geo: Geometry, frames: int, tiled: bool, tile: int) -> float:
+    if int(frames) <= 1:
+        if _image_2d_path():
+            return VAE_IMG2D_ENC_BASE_GB + VAE_IMG2D_ENC_GB_PER_MP * _tile_mp(geo, tiled, tile)
+        return VAE_IMG_ENC_BASE_GB + VAE_IMG_ENC_GB_PER_MP * _tile_mp(geo, tiled, tile)
     return (VAE_ENC_BASE_GB + VAE_ENC_GB_PER_MP * _tile_mp(geo, tiled, tile) * _slice_share(frames)
-            + VAE_FRAME_GB_PER_MP * geo.mp * round_up_4n1(frames))
+            + VAE_ENC_FRAME_GB_PER_MP * geo.mp * round_up_4n1(frames))
 
 
 def decode_peak_gb(geo: Geometry, frames: int, tiled: bool, tile: int) -> float:
+    if int(frames) <= 1:
+        if _image_2d_path():
+            return VAE_IMG2D_DEC_BASE_GB + VAE_IMG2D_DEC_GB_PER_MP * _tile_mp(geo, tiled, tile)
+        return VAE_IMG_DEC_BASE_GB + VAE_IMG_DEC_GB_PER_MP * _tile_mp(geo, tiled, tile)
     return (VAE_DEC_BASE_GB + VAE_DEC_GB_PER_MP * _tile_mp(geo, tiled, tile) * _slice_share(frames)
-            + VAE_FRAME_GB_PER_MP * geo.mp * round_up_4n1(frames))
+            + VAE_DEC_FRAME_GB_PER_MP * geo.mp * round_up_4n1(frames))
+
+
+# --- Phase 4 (post-processing, in the decode process after the decoder) ---------------------------
+# Colour correction runs on each whole batch of output frames in float32. Allocated GB per frame-megapixel
+# of the batch, measured 2026-11-01 on the RTX 3090 (720p 61f, 1080p 25f, 4K 9f, 720p-4K images): lab
+# 0.043 (0.13 per frame-MP while a batch holds at most 16.7 M pixels: exact sort-based matcher), wavelet 0.041,
+# adain 0.040, hsv 0.105, wavelet_adaptive 0.14, none 0.006. The decoder's cached blocks are released
+# before Phase 4 (generation_phases.py), so the decode process peaks at the larger of the two phases.
+POST_GB_PER_FRAME_MP = {"lab": 0.0435, "wavelet": 0.042, "adain": 0.041, "hsv": 0.106, "wavelet_adaptive": 0.142,
+                        "none": 0.0065}
+POST_LAB_EXACT_GB_PER_FRAME_MP = 0.132
+POST_LAB_EXACT_MAX_PIXELS = 16_777_216  # SeedVR2/src/utils/color_fix.py LAB_SORT_MATCH_MAX_ELEMENTS
+POST_BASE_GB = 0.05
+
+
+def post_peak_gb(geo: Geometry, frames: int, method: str = "lab") -> float:
+    method = str(method or "lab").strip().lower()
+    frames = max(1, int(frames))
+    fmp = geo.out_w * geo.out_h * frames / 1e6
+    if method == "lab" and geo.out_w * geo.out_h * frames <= POST_LAB_EXACT_MAX_PIXELS:
+        return POST_BASE_GB + POST_LAB_EXACT_GB_PER_FRAME_MP * fmp
+    return POST_BASE_GB + POST_GB_PER_FRAME_MP.get(method, max(POST_GB_PER_FRAME_MP.values())) * fmp
 
 
 def _with_margin(gb: float) -> float:
@@ -197,10 +274,11 @@ class SeedVR2Choice:
     dit_gb: float
     enc_gb: float
     dec_gb: float
+    post_gb: float = 0.0
 
     @property
     def peak_gb(self) -> float:
-        return max(self.dit_gb, self.enc_gb, self.dec_gb)
+        return max(self.dit_gb, self.enc_gb, self.dec_gb, self.post_gb)
 
 
 def _vae_choice(fn, geo: Geometry, frames: int, cap: float) -> Optional[Tuple[bool, int, float]]:
@@ -240,7 +318,8 @@ def balanced_batch(frames: int, batch: int, overlap: int = 0) -> int:
 
 def choose(model_name: str, int8: bool, geo: Geometry, frames_wanted: int, cap_gb: float,
            model_dir: Optional[str] = None, image: bool = False,
-           overlap: int = 0) -> Tuple[Optional[SeedVR2Choice], List[str]]:
+           overlap: int = 0, compiled: bool = False,
+           color_correction: str = "lab") -> Tuple[Optional[SeedVR2Choice], List[str]]:
     """Fewest batches (largest batch that fits), split evenly, then the least BlockSwap, then the least
     VAE tiling."""
     notes: List[str] = []
@@ -249,15 +328,16 @@ def choose(model_name: str, int8: bool, geo: Geometry, frames_wanted: int, cap_g
 
     def fit(batch: int) -> Optional[SeedVR2Choice]:
         for swap in range(0, blocks + 1):
-            dit = dit_peak_gb(model_name, int8, geo, batch, swap, model_dir, weights)
+            dit = dit_peak_gb(model_name, int8, geo, batch, swap, model_dir, weights, compiled=compiled)
             if _with_margin(dit) > cap_gb:
                 continue
             enc = _vae_choice(encode_peak_gb, geo, batch, cap_gb)
             dec = _vae_choice(decode_peak_gb, geo, batch, cap_gb)
-            if enc is None or dec is None:
-                return None  # VAE cannot fit this batch at any tile; try a smaller batch
+            post = post_peak_gb(geo, batch, color_correction)
+            if enc is None or dec is None or _with_margin(post) > cap_gb:
+                return None  # VAE / post-processing cannot fit this batch; try a smaller batch
             return SeedVR2Choice(batch=batch, swap=swap, enc_tiled=enc[0], enc_tile=enc[1], dec_tiled=dec[0],
-                                 dec_tile=dec[1], dit_gb=dit, enc_gb=enc[2], dec_gb=dec[2])
+                                 dec_tile=dec[1], dit_gb=dit, enc_gb=enc[2], dec_gb=dec[2], post_gb=post)
         return None
 
     top = 1 if image else min(MAX_BATCH, max(5, round_up_4n1(frames_wanted)))
@@ -283,14 +363,26 @@ def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget:
         out.warnings.append("No NVIDIA GPU selected or detected; settings left unchanged.")
         return out
     model = str(settings.get("dit_model") or "")
-    int8 = bool(settings.get("int8_convrot")) and not model.lower().endswith(".gguf")
+    int8 = bool(settings.get("int8_convrot")) and not model.lower().endswith(".gguf") and "w4a8" not in model.lower()
+    fallback_reason = None
+    if "w4a8" in Path(model).name.lower():
+        # W4A8 needs compute capability 8.0+ and comfy_kitchen's CUDA backend; otherwise the run
+        # switches to 7B Sharp INT8 ConvRot (shared.models.seedvr2_w4a8), so plan for that model.
+        from shared.models.seedvr2_w4a8 import effective_model
+
+        model, int8, fallback_reason = effective_model(model, False, str(budget.gpu.index))
     geo = geometry_from_cli(in_w, in_h, int(settings.get("resolution") or 1080), int(settings.get("max_resolution") or 0))
     cap = (budget.limit_gb - SEEDVR2_PROCESS_OVERHEAD_GB) * max(0.3, min(1.0, float(cap_scale)))
     overlap = max(0, int(float(settings.get("temporal_overlap") or 0)))
-    choice, notes = choose(model, int8, geo, frames, cap, settings.get("model_dir"), image=image, overlap=overlap)
+    compiled = bool(settings.get("compile_dit"))
+    choice, notes = choose(model, int8, geo, frames, cap, settings.get("model_dir"), image=image, overlap=overlap,
+                           compiled=compiled, color_correction=str(settings.get("color_correction") or "lab"))
     out.lines.append(f"Output {geo.out_w}x{geo.out_h} (model works at {geo.width}x{geo.height}), "
                      + ("single image" if image else f"{frames} frame(s) per run") + f", model {Path(model).name}"
                      + (" + INT8 ConvRot" if int8 else ""))
+    if fallback_reason:
+        out.lines.append(f"W4A8 cannot run here ({fallback_reason}): planned for the 7B Sharp INT8 ConvRot "
+                         "model the run switches to")
     out.lines.extend(notes)
     if choice is None:
         out.fits = False
@@ -328,7 +420,11 @@ def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget:
     out.lines.append(f"BlockSwap {choice.swap}" + (" (all DiT blocks stay on the GPU)" if choice.swap == 0 else " (needed to fit)"))
     out.lines.append("VAE encode " + (f"tiled {choice.enc_tile}px" if choice.enc_tiled else "untiled")
                      + ", VAE decode " + (f"tiled {choice.dec_tile}px" if choice.dec_tiled else "untiled"))
-    out.lines.append(f"Phase peaks: encode {choice.enc_gb:.1f} GB, DiT {choice.dit_gb:.1f} GB, decode {choice.dec_gb:.1f} GB")
+    out.lines.append(f"Phase peaks: encode {choice.enc_gb:.1f} GB, DiT {choice.dit_gb:.1f} GB, decode {choice.dec_gb:.1f} GB, "
+                     f"post-processing {choice.post_gb:.1f} GB")
+    out.lines.append(f"The run is capped at the estimate below (PyTorch would otherwise keep freed memory cached up to "
+                     f"the {budget.limit_gb:.1f} GB limit); if it ever runs out there, it retries once with the whole "
+                     f"limit. Never shared GPU memory.")
     return out
 
 
@@ -360,6 +456,11 @@ def auto_apply(settings: Dict[str, Any], input_path: str, log: Optional[Callable
     settings.update(tp.updates)
     if cap_scale >= 1.0:
         mark_tightness(settings, tp)
+    # The run's allocator is capped at this estimate (shared.runner; SECOURSES_AUTOTUNE_CAP=0 restores the whole
+    # budget), so VRAM in use stays at the estimate instead of filling the budget with cached blocks (RTX 5090,
+    # 720p 61 frames: 22.1 GB in use with the whole budget, 19.4-20.0 GB capped, same speed); the cap adds
+    # max_split_size_mb (an OOM at the cap without it), and an OOM there retries once with the whole budget.
+    settings["_vram_cap_gb"] = round(tp.estimate_gb, 2) if (tp.fits and tp.estimate_gb > 0) else None
     if log:
         for line in tp.report("[SeedVR2 Auto Tune]").splitlines():
             log(line)

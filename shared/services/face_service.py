@@ -27,11 +27,41 @@ def _face_backend_available(module_name: str) -> bool:
 def get_available_backends_lightweight() -> List[str]:
     """Avoid importing face_restore/cv2/numpy during Gradio startup."""
     backends: List[str] = []
-    if _face_backend_available("gfpgan"):
-        backends.append("gfpgan")
-    if _face_backend_available("codeformer"):
+    has_facexlib = _face_backend_available("facexlib")
+    if has_facexlib and _face_backend_available("gfpgan"):
+        backends.extend(["gfpgan", "gfpgan_v1.4"])
+    # CodeFormer's network ships with the app (shared/face_archs); detection uses facexlib.
+    if has_facexlib and _face_backend_available("basicsr"):
         backends.append("codeformer")
     return backends
+
+
+FACE_MODEL_CHOICES: List[str] = ["auto", "gfpgan", "gfpgan_v1.4", "codeformer"]
+
+
+def normalize_face_model_choice(value: Any) -> str:
+    """UI/preset value -> one of FACE_MODEL_CHOICES (older names such as "restoreformer" become "auto")."""
+    token = str(value or "auto").strip().lower().replace(" ", "")
+    aliases = {
+        "gfpganv1.3": "gfpgan", "gfpgan_v1.3": "gfpgan", "gfpgan1.3": "gfpgan",
+        "gfpganv1.4": "gfpgan_v1.4", "gfpgan1.4": "gfpgan_v1.4",
+    }
+    token = aliases.get(token, token)
+    return token if token in FACE_MODEL_CHOICES else "auto"
+
+
+def apply_face_model_env(restoration_model: Any = None, codeformer_fidelity: Any = None) -> None:
+    """Face tab choices -> process env read by shared.face_restore for every pipeline's face pass."""
+    import os
+
+    if restoration_model is not None:
+        os.environ["SECOURSES_FACE_MODEL"] = normalize_face_model_choice(restoration_model)
+    if codeformer_fidelity is not None:
+        try:
+            fidelity = max(0.0, min(1.0, float(codeformer_fidelity)))
+        except Exception:
+            fidelity = 0.7
+        os.environ["SECOURSES_CODEFORMER_FIDELITY"] = f"{fidelity:g}"
 
 
 def restore_image(*args, **kwargs):
@@ -78,6 +108,8 @@ def face_defaults(models: List[str]) -> Dict[str, Any]:
         "batch_input_path": "",
         "batch_output_path": "",
         "backend": default_backend,  # Keep for backward compatibility with old presets
+        # CodeFormer fidelity: 0 = strongest restoration, 1 = closest to the input face.
+        "codeformer_fidelity": 0.7,
     }
 
 
@@ -107,6 +139,7 @@ FACE_ORDER: List[str] = [
     "batch_enable",           # 19: batch_enable (standalone)
     "batch_input_path",       # 20: batch_input_path (standalone)
     "batch_output_path",      # 21: batch_output_path (standalone)
+    "codeformer_fidelity",    # 22: codeformer_fidelity (Restoration tab)
 ]
 
 
@@ -181,6 +214,13 @@ def build_face_callbacks(
                 global_settings["face_strength"] = float(values[strength_idx])
             except Exception:
                 pass
+            try:
+                apply_face_model_env(
+                    values[FACE_ORDER.index("restoration_model")],
+                    values[FACE_ORDER.index("codeformer_fidelity")],
+                )
+            except Exception:
+                pass
 
             # Return values + status message (status is LAST)
             
@@ -238,17 +278,11 @@ def build_face_callbacks(
         """
         Returns (backend_for_runtime, warning_message_if_any).
         """
-        m = (model_choice or "").strip().lower()
-        if not m or m == "auto":
-            return "auto", None
-        if m == "gfpgan":
-            return m, None
-        if m == "codeformer":
-            # The CodeFormer backend is a placeholder that returns the image unchanged, so
-            # picking it silently skipped restoration; GFPGAN (auto) restores instead.
-            return "auto", "⚠️ CodeFormer is not available yet. Using GFPGAN instead."
-        # UI may expose future backends; keep safe fallback.
-        return "auto", f"⚠️ Unsupported face restoration model '{model_choice}'. Falling back to auto."
+        m = normalize_face_model_choice(model_choice)
+        raw = (model_choice or "").strip().lower()
+        if m == "auto" and raw not in ("", "auto"):
+            return "auto", f"⚠️ Unsupported face restoration model '{model_choice}'. Falling back to auto."
+        return m, None
 
     def _ensure_out_dir(path_val: str) -> Path:
         p = Path(normalize_path(path_val)) if path_val else Path.cwd() / "outputs"
@@ -313,6 +347,11 @@ def build_face_callbacks(
         strength = max(0.0, min(1.0, strength))
 
         use_gpu = bool(settings.get("gpu_acceleration", True))
+        try:
+            fidelity = max(0.0, min(1.0, float(settings.get("codeformer_fidelity", 0.7))))
+        except Exception:
+            fidelity = 0.7
+        apply_face_model_env(settings.get("restoration_model", "auto"), fidelity)
 
         # Output dirs
         out_dir = _ensure_out_dir(global_settings.get("output_dir") or "")
@@ -384,6 +423,7 @@ def build_face_callbacks(
                             use_gpu=use_gpu,
                             output_path=str(out_path),
                             gpu_device=face_gpu_device,
+                            fidelity=fidelity,
                         )
                         last_img = restored or None
                         output_paths.append(str(restored or out_path))
@@ -395,6 +435,7 @@ def build_face_callbacks(
                             use_gpu=use_gpu,
                             output_path=str(out_path),
                             gpu_device=face_gpu_device,
+                            fidelity=fidelity,
                         )
                         last_vid = restored or None
                         output_paths.append(str(restored or out_path))
@@ -474,6 +515,7 @@ def build_face_callbacks(
                 use_gpu=use_gpu,
                 output_path=str(out_path),
                 gpu_device=face_gpu_device,
+                fidelity=fidelity,
             )
             out_img = restored or str(out_path)
         elif itype == "video":
@@ -484,6 +526,7 @@ def build_face_callbacks(
                 use_gpu=use_gpu,
                 output_path=str(out_path),
                 gpu_device=face_gpu_device,
+                fidelity=fidelity,
             )
             out_vid = restored or str(out_path)
         else:
@@ -516,6 +559,7 @@ def build_face_callbacks(
     return {
         "defaults": defaults,
         "order": FACE_ORDER,
+        "apply_face_model_env": apply_face_model_env,
         "refresh_presets": refresh_presets,
         "save_preset": save_preset,
         "load_preset": load_preset,

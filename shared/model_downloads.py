@@ -102,6 +102,7 @@ def _valid_int8_cache(path: Path, family: str) -> bool:
     markers = {
         "seedvr2": ("seedvr2_int8_convrot", "seedvr2-dit-int8-convrot-v2"),
         "flashvsr": ("flashvsr_int8_convrot", "flashvsr-dit-int8-convrot-v2"),
+        "flashvsr_plus": ("flashvsr_int8_convrot", "flashvsr-plus-dit-int8-convrot-v1"),
         "sparkvsr": ("sparkvsr_int8_convrot", "sparkvsr-transformer-int8-convrot-v3"),
     }
     marker_key, format_value = markers[family]
@@ -221,6 +222,8 @@ def ensure_seedvr2_model(
     models_dir = Path(base_dir) / "SeedVR2" / "models"
     model_filename = Path(str(model_filename or "")).name
     vae_path = models_dir / "ema_vae_fp16.safetensors"
+    if "w4a8" in model_filename.lower():
+        int8_convrot = False  # already quantized (W4A8 ConvRot); the engine skips INT8 conversion
     if int8_convrot:
         cache_name = _SEED_INT8_CACHE_NAMES.get(model_filename)
         cache_path = models_dir / cache_name if cache_name else Path()
@@ -249,6 +252,8 @@ def ensure_flashvsr_model(
     vae_model: str | None,
     on_progress: ProgressCallback = None,
 ) -> tuple[bool, str]:
+    if str(version).strip().lower() in {"plus-turbo", "plus-base"}:
+        return _ensure_flashvsr_plus_model(base_dir, str(version).strip().lower(), precision, on_progress)
     version = "1.1" if str(version).strip() in {"1.1", "11"} else "1.0"
     model_dir_name = "FlashVSR-v1.1" if version == "1.1" else "FlashVSR"
     flash_root = Path(base_dir) / "ComfyUI-FlashVSR_Stable"
@@ -290,6 +295,26 @@ def ensure_flashvsr_model(
         )
         return True, ""
     return ok, error
+
+
+def _ensure_flashvsr_plus_model(base_dir: Path, version: str, precision: str,
+                                on_progress: ProgressCallback = None) -> tuple[bool, str]:
+    """Official FlashVSR+ preset: BF16 LQ projector + (BF16 DiT or INT8 ConvRot cache), TC decoder, prompt."""
+    model_dir_name = "FlashVSR-Plus-Turbo" if version == "plus-turbo" else "FlashVSR-Plus-Base"
+    flash_root = Path(base_dir) / "ComfyUI-FlashVSR_Stable"
+    model_dir = flash_root / "models" / model_dir_name
+    cache = Path(base_dir) / "FlashVSR_plus" / "models" / f"{model_dir_name}_int8_convrot.safetensors"
+    int8_convrot = str(precision or "").strip().lower() == "int8_convrot"
+    tcd_ready = (model_dir / "TCDecoder.ckpt").is_file() or (flash_root / "models" / "FlashVSR-v1.1" / "TCDecoder.ckpt").is_file()
+    required = [model_dir / "lq_proj_in.safetensors", flash_root / "posi_prompt.pth"]
+    dit_ready = (model_dir / "dit.safetensors").is_file()
+    weights_ready = (_valid_int8_cache(cache, "flashvsr_plus") or dit_ready) if int8_convrot else dit_ready
+    if tcd_ready and weights_ready and _all_files_exist(required):
+        return True, ""  # with only the BF16 DiT the CLI builds the INT8 cache once
+    args = ["--ensure-flashvsr", version]
+    if int8_convrot:
+        args.append("--int8-convrot")
+    return run_model_downloader(base_dir, args, on_progress)
 
 
 def ensure_sparkvsr_model(
@@ -336,8 +361,10 @@ def ensure_ltx25_model(
     video_vae: str,
     on_progress: ProgressCallback = None,
     cancel_event=None,
+    extra_files: Sequence[str] = (),
 ) -> tuple[bool, str]:
-    """Ensure every file the selected LTX 2.5 variant needs exists in LTX25_Models."""
+    """Ensure every file the selected LTX 2.5 variant needs exists in LTX25_Models and is the released copy
+    (a stale local copy is verified against the repository and replaced)."""
     from shared.ltx25_constants import (
         LTX25_ALWAYS_FILES_TUPLE,
         LTX25_MODELS_DIRNAME,
@@ -362,9 +389,16 @@ def ensure_ltx25_model(
         models_dir / te_file,
         models_dir / vae_file,
         *(models_dir / name for name in LTX25_ALWAYS_FILES_TUPLE),
+        *(models_dir / name for name in extra_files if name),
     ]
     if _all_files_exist(required):
-        return True, ""
+        stale = [path.name for path in required if not _ltx25_file_current(Path(base_dir), path, on_progress)]
+        if not stale:
+            return True, ""
+        _emit(
+            "[Model Downloader] LTX 2.5: " + ", ".join(stale)
+            + " differ from the released files; verifying them against the repository", on_progress,
+        )
     args = [
         "--ensure-ltx25",
         model_name,
@@ -373,7 +407,67 @@ def ensure_ltx25_model(
         "--ltx25-vae",
         video_vae if video_vae in LTX25_VAE_FILES else LTX25_VAE_CONV,
     ]
+    extras = [name for name in extra_files if name]
+    if extras:
+        args += ["--ltx25-extra", ",".join(extras)]
     return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
+
+
+def _ltx25_file_current(base_dir: Path, path: Path, on_progress: ProgressCallback = None) -> bool:
+    """True when the local LTX 2.5 file is the released one: its size matches and the downloader's verified-file
+    cache holds the released sha256 for this exact file (size and mtime). Files without a pinned release are
+    accepted. A file of the right size that was never verified is hashed here once and recorded, so a copy newer
+    than the mirror is never replaced by an older mirror file."""
+    from shared.ltx25_constants import LTX25_FILE_SHA256
+
+    pinned = LTX25_FILE_SHA256.get(path.name)
+    if not pinned:
+        return True
+    size, sha256 = pinned
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if int(stat.st_size) != int(size):
+        return False
+    cache = Path(base_dir).resolve().parent / "download_cache" / "verified_files_cache.json"
+    try:
+        records = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    for key, record in (records or {}).items():
+        if not isinstance(record, dict) or not str(key).endswith("/" + path.name):
+            continue
+        if (record.get("sha256") == sha256 and int(record.get("size") or -1) == int(stat.st_size)
+                and abs(float(record.get("mtime") or 0.0) - stat.st_mtime) < 1.0):
+            return True
+    if any(isinstance(r, dict) and str(k).endswith("/" + path.name) and int(r.get("size") or -1) == int(stat.st_size)
+           and abs(float(r.get("mtime") or 0.0) - stat.st_mtime) < 1.0 for k, r in (records or {}).items()):
+        return False  # this exact file was verified with another digest: stale
+    _emit(f"[Model Downloader] Verifying {path.name} against the released sha256 (once)...", on_progress)
+    import hashlib
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(64 * 1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return False
+    if digest.hexdigest() != sha256:
+        return False
+    try:
+        records = dict(records or {})
+        records[f"app-pinned/{path.name}"] = {
+            "sha256": sha256, "algorithm": "sha256", "size": int(stat.st_size), "mtime": stat.st_mtime,
+            "verified_at": time.time(),
+        }
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return True
 
 
 def ensure_open_h3_model(
@@ -426,6 +520,18 @@ def ensure_gan_model(
     if any((Path(base_dir) / folder / model_filename).is_file() for folder in ("models", "Image_Upscale_Models")):
         return True, ""
     return run_model_downloader(base_dir, ["--ensure-gan", model_filename], on_progress)
+
+
+def ensure_face_model(
+    base_dir: Path,
+    model_filename: str,
+    on_progress: ProgressCallback = None,
+) -> tuple[bool, str]:
+    """Face restoration weights (GFPGAN / CodeFormer) into the app's gfpgan/weights folder."""
+    model_filename = Path(str(model_filename or "")).name
+    if (Path(base_dir) / "gfpgan" / "weights" / model_filename).is_file():
+        return True, ""
+    return run_model_downloader(base_dir, ["--ensure-face", model_filename], on_progress)
 
 
 def ensure_rife_model(

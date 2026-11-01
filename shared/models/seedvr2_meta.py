@@ -152,6 +152,16 @@ def _built_ins() -> List[SeedVR2Model]:
             estimated_vram_gb=8.0, max_resolution=2160,
             notes="GGUF Q8_0 sharp variant. Strong detail with lower VRAM, no compile/multi-GPU."
         ),
+        SeedVR2Model(
+            name="seedvr2_7b_sharp_convrot_w4a8.safetensors",
+            size="7B", precision="w4a8_convrot", variant="sharp",
+            preferred_attention="flash_attn_2", supports_multi_gpu=True,
+            compile_compatible=False,
+            estimated_vram_gb=6.0, max_resolution=4096,
+            default_batch_size=5,
+            notes="Sharp 7B with 4-bit weights / 8-bit activations (ConvRot, comfy-kitchen kernels). "
+                  "Lowest-VRAM and fastest 7B; quality on par with INT8 ConvRot in our tests."
+        ),
     ]
 
 
@@ -231,7 +241,8 @@ def get_seedvr2_model_names() -> List[str]:
     """
     # Preferred models to display (in order of preference)
     preferred_models = [
-        "seedvr2_ema_7b_sharp_fp16.safetensors",  # Default
+        "seedvr2_7b_sharp_convrot_w4a8.safetensors",  # Default (INT8 ConvRot fallback on GPUs before RTX 30)
+        "seedvr2_ema_7b_sharp_fp16.safetensors",
         "seedvr2_ema_7b_fp16.safetensors",
         "seedvr2_ema_3b_fp16.safetensors",
         "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",

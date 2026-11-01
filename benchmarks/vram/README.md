@@ -12,7 +12,7 @@ GPU memory. Runs past the cap end with `oom: true` (a normal CUDA out-of-memory 
 
 | File | Planner | Fitted terms (GiB, PyTorch allocated) |
 |---|---|---|
-| `seedvr2.jsonl` | `seedvr2.py` | DiT 7B INT8: 8.38 + 0.176 per 1k latent tokens, BlockSwap 0.21 per block; VAE encode 3.85 + 7.1 per tile-MP, decode 3.4 + 14.0 per tile-MP |
+| `seedvr2.jsonl` | `seedvr2.py` | DiT: weights + GB per 1k latent tokens by format: 7B INT8 ConvRot 0.144, 7B BF16 / W4A8 / FP8 / GGUF 0.106-0.107, 3B INT8 0.15, 3B BF16 / GGUF 0.12 (0.176 / 0.137 with torch.compile); BlockSwap frees one block's share of the weights (blocks hold 96.5-99 % of each checkpoint). VAE (fused path): encode 1.75 + 9.0 per tile-MP, decode 1.2 + 15.8 per tile-MP, plus 0.005 / 0.0113 per frame-MP of the batch; single images (2D path) encode 0.52 + 1.44 per MP, decode 0.53 + 2.27 per MP. Refitted 2026-11-01 on RTX 5090 and RTX 3090 runs planned by the Auto Tune button (measured peaks within -4..+4 % on DiT and decode) |
 | `flashvsr.jsonl` | `flashvsr.py` | 3.4 + 7.7 per padded output MP (or tile MP) + 6 MB per MP per frame; kv_ratio 3 to 1 saves 24% of the per-MP term |
 | `sparkvsr.jsonl` | `sparkvsr.py` | transformer BF16 10.4 + 0.076 per 1k tokens, INT8 ConvRot 6.3 + 0.170 per 1k tokens, tokens = (frames/8 + 1) x (H/16) x (W/16); one process (no stage isolation) +0.9 GB |
 | `ltx25.jsonl` | `LTX25/ltx25_engine/planner.py` | non-block weights 4.55 + fixed 3.0 (two streaming block buffers, tiled VAE) + 0.25 MB per sequence token (video tokens x 1.25 + 2048); blocks that do not fit stream from RAM |

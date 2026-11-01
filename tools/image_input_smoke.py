@@ -59,7 +59,10 @@ def _synthetic_master(width: int, height: int) -> np.ndarray:
     img = np.clip(np.dstack([b, g, r]), 0.0, 1.0)
     cv2.circle(img, (width // 3, height // 2), height // 4, (0.95, 0.85, 0.1), -1)
     cv2.rectangle(img, (width // 2, height // 4), (width - width // 8, height - height // 4), (0.2, 0.1, 0.9), -1)
-    cv2.putText(img, "16BIT", (width // 2 + 6, height // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (1.0, 1.0, 1.0), 2)
+    # OpenCV 5 draws text on 8-bit images only: draw the label as a mask, then paint it white.
+    label = np.zeros((height, width), np.uint8)
+    cv2.putText(label, "16BIT", (width // 2 + 6, height // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2)
+    img[label > 0] = 1.0
     return (img * 65535.0 + 0.5).astype(np.uint16)
 
 

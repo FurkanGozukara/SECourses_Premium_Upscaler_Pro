@@ -12,7 +12,7 @@ from shared.services.rife_service import (
     build_rife_callbacks, RIFE_ORDER
 )
 from shared.models import get_rife_model_names
-from shared.models.rife_meta import get_rife_default_model
+from shared.models.rife_meta import get_rife_default_model, rife_nvfg_mode
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -81,6 +81,7 @@ def rife_tab(
                 str(model_name).strip().lower().startswith("rife")
                 or str(model_name).strip().lower() in {"anime", "rife-anime"}
                 or str(model_name).strip().lower().replace("v", "", 1).replace(".", "", 1).isdigit()
+                or rife_nvfg_mode(model_name) is not None
             )
         }
     )
@@ -303,7 +304,7 @@ def rife_tab(
                                 label="Spatial Scale Factor",
                                 minimum=0.5, maximum=4.0, step=0.1,
                                 value=_value("scale", 1.0),
-                                info="Scale video resolution. 1.0 = original size, 2.0 = double resolution. Can combine with interpolation. >1.0 significantly increases processing time."
+                                info="Resolution at which RIFE estimates motion (output size is unchanged): 0.5 for 4K or very fast motion, 1.0 normal, 2.0 for small or low-resolution video. Snapped to 0.25 / 0.5 / 1 / 2 / 4."
                             )
                             
                             uhd_mode = gr.Checkbox(
@@ -345,6 +346,20 @@ def rife_tab(
                                 value=_value("exp", 1),
                                 precision=0,
                                 info="Exponential frame generation depth. 1 = direct interpolation, 2+ = recursive. Higher = smoother but exponentially slower. Use 1 for most cases."
+                            )
+
+                        with gr.Row(equal_height=True):
+                            _scene_value = str(_value("scene_detect", "content") or "content").strip().lower()
+                            scene_detect = gr.Dropdown(
+                                label="Scene-Cut Detection",
+                                choices=[("Content (recommended)", "content"), ("SSIM (original RIFE)", "ssim"), ("Off", "none")],
+                                value=_scene_value if _scene_value in {"content", "ssim", "none"} else "content",
+                                info="Frames across a hard cut are held instead of blended into a ghost. Content compares structure, colour and the luma change against the neighbouring frames; the original SSIM check misses most cuts in small or letterboxed videos."
+                            )
+                            dedup_frames = gr.Checkbox(
+                                label="Remove Duplicate Frames (animation)",
+                                value=bool(_value("dedup_frames", False)),
+                                info="Animation often holds each drawing for 2-3 frames. Duplicates are skipped and motion is interpolated across the whole gap, so the result moves on every output frame. Leave off for live action."
                             )
 
                         gr.Markdown(
@@ -582,7 +597,7 @@ def rife_tab(
     # ============================================================================
     # RIFE PRESET INPUT LIST - MUST match RIFE_ORDER in rife_service.py
     # Adding controls? Update rife_defaults(), RIFE_ORDER, and this list in sync.
-    # Current count: 33 components
+    # Current count: 35 components
     # ============================================================================
 
     inputs_list = [
@@ -619,6 +634,8 @@ def rife_tab(
         output_quality_rife,  # 30: output_quality
         concat_videos,        # 31: concat_videos
         resume_run_dir,       # 32: resume_run_dir
+        scene_detect,         # 33: scene_detect
+        dedup_frames,         # 34: dedup_frames
     ]
     
     # Development validation

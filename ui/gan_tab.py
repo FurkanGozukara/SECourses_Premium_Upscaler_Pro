@@ -269,7 +269,7 @@ def gan_tab(
                         label="Tile Size",
                         value=_value("tile_size", 0),
                         precision=0,
-                        info="Process image in tiles to reduce VRAM usage. 0 = process whole image. Try 512 for 8GB GPUs, 1024 for 12GB+."
+                        info="Process images and frames in tiles to reduce VRAM usage. 0 = automatic: whole image when it fits in VRAM, otherwise the largest tiles that fit. Or set a size such as 512 (8 GB GPUs) or 1024 (12 GB+)."
                     )
                     overlap = gr.Number(
                         label="Tile Overlap",
@@ -282,6 +282,12 @@ def gan_tab(
                         minimum=1, maximum=16, step=1,
                         value=int(_value("batch_size", 1) or 1),
                         info="Frames processed simultaneously for videos. Higher is faster but uses more VRAM."
+                    )
+                    gan_precision = gr.Dropdown(
+                        label="Precision",
+                        choices=["auto", "fp16", "bf16", "fp32"],
+                        value=str(_value("gan_precision", "auto") or "auto"),
+                        info="auto = FP16 when the model supports it and a quick check matches FP32 output, otherwise FP32. FP32 = slowest, exact."
                     )
 
             gr.Markdown("#### Quality and Performance")
@@ -567,7 +573,7 @@ def gan_tab(
     # ============================================================================
     # GAN PRESET INPUT LIST - MUST match GAN_ORDER in gan_service.py
     # Adding controls? Update gan_defaults(), GAN_ORDER, and this list in sync.
-    # Current count: 23 components (model-specific controls + vNext sizing + resume path + batch cleanup)
+    # Current count: 24 components (model-specific controls + vNext sizing + resume path + batch cleanup + precision)
     # ============================================================================
     
     inputs_list = [
@@ -583,6 +589,8 @@ def gan_tab(
         auto_transfer_output_to_input,
         # Batch cleanup behavior
         keep_only_output_files,
+        # Inference precision (auto / fp16 / bf16 / fp32)
+        gan_precision,
     ]
     
     # Development validation

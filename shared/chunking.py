@@ -1480,6 +1480,61 @@ def _manifest_overlap_frames(manifest: Optional[Dict[str, Any]], chunk_count: in
     return overlaps
 
 
+def _rife_timeline_segments(
+    manifest: Optional[Dict[str, Any]], chunk_count: int
+) -> Optional[List[Tuple[int, Optional[int], int]]]:
+    """
+    RIFE chunk segments on the whole-video timeline, from the split manifest:
+    (global first frame, global frame where the next chunk takes over or None for the last
+    chunk, global last frame). Every chunk must reach the next chunk's first frame, which is
+    the context for interpolating up to it. None when the manifest cannot describe this.
+    """
+    if not manifest or not manifest.get("timeline_is_cfr") or not manifest.get("timeline_fps_rational"):
+        return None
+    chunks = manifest.get("chunks") or []
+    if len(chunks) != chunk_count or chunk_count < 2:
+        return None
+    try:
+        starts = [int(c["start_frame"]) for c in chunks]
+        ends = [int(c["end_frame"]) for c in chunks]
+    except Exception:
+        return None
+    if starts[0] != 0 or any(b <= a for a, b in zip(starts, starts[1:])):
+        return None
+    if any(st >= en for st, en in zip(starts, ends)):
+        return None
+    if any(ends[i] < starts[i + 1] + 1 for i in range(chunk_count - 1)):
+        return None
+    return [(starts[i], starts[i + 1] if i + 1 < chunk_count else None, ends[i] - 1) for i in range(chunk_count)]
+
+
+def _rife_segment_frame_counts(
+    segments: List[Tuple[int, Optional[int], int]], source_rate: Fraction, output_rate: Fraction
+) -> List[int]:
+    """Output frames each segment owns: k with k / output_rate * source_rate in [start, end)."""
+    per_source = Fraction(output_rate) / Fraction(source_rate)
+    counts: List[int] = []
+    for start, end, last in segments:
+        first_k = math.ceil(Fraction(start) * per_source)
+        last_k = (math.ceil(Fraction(end) * per_source) - 1) if end is not None else math.floor(Fraction(last) * per_source)
+        counts.append(max(0, last_k - first_k + 1))
+    return counts
+
+
+def _probe_rate_fraction(path: Path) -> Optional[Fraction]:
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        value = Fraction(first_ffprobe_value(proc.stdout) or "0")
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
 # Models whose chunk output was verified to contain exactly as many frames as the chunk
 # input at exactly the source frame rate. For these a per-chunk mismatch is a hard error.
 # Other models are checked the same way but only warned about (their frame handling was
@@ -4397,6 +4452,29 @@ def chunk_and_process(
             base_overlaps = [0] * boundary_count
 
         if str(model_type or "").strip().lower() == "rife" and any(base_overlaps):
+            # Chunks rendered with --timeline-start/--timeline-end hold disjoint parts of the
+            # whole-video output grid: concatenate them as they are (exact count, no shift).
+            try:
+                seg_manifest = _load_split_manifest(input_chunks_dir)
+                segments = _rife_timeline_segments(seg_manifest, len(paths))
+                out_rate_fraction = _probe_rate_fraction(Path(paths[0])) if segments else None
+                if segments and out_rate_fraction:
+                    expected_counts = _rife_segment_frame_counts(
+                        segments, Fraction(str(seg_manifest["timeline_fps_rational"])), out_rate_fraction
+                    )
+                    seg_counts = [_probe_chunk_nb_frames(Path(path)) for path in paths]
+                    if all(seg_counts) and [int(c) for c in seg_counts] == expected_counts:
+                        _emit_diag(
+                            "RIFE merge: every chunk rendered its own segment of the whole-video timeline "
+                            f"(frames {expected_counts}, total {sum(expected_counts)}); concatenating without overlap removal.\n"
+                        )
+                        return 0
+                    _emit_diag(
+                        f"RIFE merge: chunk frame counts {seg_counts} differ from the timeline segments "
+                        f"{expected_counts}; using the overlap plan.\n"
+                    )
+            except Exception as seg_exc:
+                _emit_diag(f"RIFE merge: timeline segment check skipped ({seg_exc}).\n")
             input_overlap_plan = list(base_overlaps)
             try:
                 input_rate = float(get_media_fps(str(chunk_paths[0])) or get_media_fps(input_path) or 0.0)
@@ -5087,6 +5165,18 @@ def chunk_and_process(
             return 1, msg, "", len(chunk_paths)
         _emit_overall_progress("Reference prepass complete; starting chunk processing", force=True)
 
+    rife_segments = None
+    rife_source_rate = None
+    if str(model_type or "").strip().lower() == "rife" and output_format != "png" and len(chunk_paths) > 1:
+        rife_manifest = _load_split_manifest(input_chunks_dir)
+        rife_segments = _rife_timeline_segments(rife_manifest, len(chunk_paths))
+        if rife_segments:
+            rife_source_rate = str(rife_manifest.get("timeline_fps_rational") or "") or None
+            on_progress(
+                "RIFE chunk timing: every chunk renders its own segment of the whole-video frame grid "
+                "(no boundary trimming at merge).\n"
+            )
+
     for idx, chunk in enumerate(chunk_paths[start_chunk_idx:], start_chunk_idx + 1):
         current_chunk_index = int(idx)
         current_chunk_inner_fraction = 0.0
@@ -5138,6 +5228,13 @@ def chunk_and_process(
         # video), so RIFE renders video-only chunks and skips its own audio step entirely.
         if model_type == "rife" and output_format != "png":
             chunk_settings["no_audio"] = True
+        if model_type == "rife" and rife_segments:
+            seg_start, seg_end, _seg_last = rife_segments[idx - 1]
+            chunk_settings["_rife_timeline_start"] = int(seg_start)
+            if seg_end is not None:
+                chunk_settings["_rife_timeline_end"] = int(seg_end)
+            if rife_source_rate:
+                chunk_settings["_rife_source_rate"] = rife_source_rate
         # Direct per-chunk outputs to the run folder (processed_chunks/).
         if output_format == "png":
             chunk_settings["output_override"] = str(processed_chunks_dir / f"{chunk.stem}_upscaled")

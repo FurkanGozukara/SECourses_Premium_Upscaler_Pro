@@ -315,6 +315,8 @@ def gan_defaults(base_dir: Path) -> Dict[str, Any]:
         "create_subfolders": False,
         "resume_run_dir": "",
         "auto_transfer_output_to_input": False,
+        # Inference precision: auto = FP16 when the model supports it (checked against FP32).
+        "gan_precision": "auto",
     }
 
 
@@ -358,6 +360,8 @@ GAN_ORDER: List[str] = [
     "auto_transfer_output_to_input",
     # Batch-only postprocessing: remove non-output artifacts after completion.
     "keep_only_output_files",
+    # Inference precision (auto / fp16 / bf16 / fp32).
+    "gan_precision",
 ]
 
 

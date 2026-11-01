@@ -104,6 +104,9 @@ def rife_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         "video_codec": "libx264",
         "output_quality": 23,
         "concat_videos": "",
+        # Interpolation options (2026-11)
+        "scene_detect": "content",
+        "dedup_frames": False,
         "_recommended_uhd_threshold": recommended_uhd,  # Store for validation
     }
 
@@ -111,7 +114,7 @@ def rife_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
 """
  RIFE PRESET ORDER - MUST match inputs_list in ui/rife_tab.py
 Adding controls? Update rife_defaults(), RIFE_ORDER, and inputs_list in sync.
-Current count: 33 components
+Current count: 35 components
 """
 
 RIFE_ORDER: List[str] = [
@@ -149,6 +152,8 @@ RIFE_ORDER: List[str] = [
     "output_quality",
     "concat_videos",
     "resume_run_dir",
+    "scene_detect",
+    "dedup_frames",
 ]
 
 

@@ -45,6 +45,8 @@ from shared.models.ltx25_meta import (
     ltx25_sampling_defaults,
 )
 from shared.ltx25_constants import (
+    LTX25_MODE_NAMES,
+    LTX25_MODE_X2,
     LTX25_MODEL_NAMES,
     LTX25_TE_INT8,
     LTX25_TE_NAMES,
@@ -254,34 +256,55 @@ def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
     planner = _planner_module(base_dir)
     lines: List[str] = []
     manual_mode = str(settings.get("token_budget_mode") or "").strip().lower().startswith("manual")
+    # Refine mode encodes its guide at the output size (factor 1): every frame carries a full guide.
+    guide_ratio = 1.0 if str(settings.get("ltx_mode") or "").startswith("Refine:") else 0.25
+    budget_note: Dict[int, str] = {}
     if manual_mode:
-        budget = int(settings.get("max_latent_tokens") or 18000)
+        def _budget(frames: int) -> int:
+            return int(settings.get("max_latent_tokens") or 18000)
     else:
         free_bytes, vram_label = _free_vram_bytes_for_plan(str(settings.get("device") or ""))
         if free_bytes <= 0:
-            budget = int(settings.get("max_latent_tokens") or 18000)
+            fallback = int(settings.get("max_latent_tokens") or 18000)
             lines.append(
-                f"[Plan] auto budget unavailable ({vram_label}) - using Manual value {budget}"
+                f"[Plan] auto budget unavailable ({vram_label}) - using Manual value {fallback}"
             )
-        else:
-            budget, reason = planner.auto_token_budget(
-                total_frames,
-                width,
-                height,
-                free_vram_bytes=int(free_bytes),
-                weight_resident_bytes=0,
-                reserve_gb=clamp_save_vram_gb(settings.get("reserve_vram_gb")),
-            )
-            lines.append(f"[Plan] auto budget {budget} ({reason}) | {vram_label}")
 
-    plan = planner.plan_chunks(
+            def _budget(frames: int) -> int:
+                return fallback
+        else:
+            def _budget(frames: int) -> int:
+                value, reason = planner.auto_token_budget(
+                    frames,
+                    width,
+                    height,
+                    free_vram_bytes=int(free_bytes),
+                    weight_resident_bytes=0,
+                    reserve_gb=clamp_save_vram_gb(settings.get("reserve_vram_gb")),
+                    guide_token_ratio=guide_ratio,
+                )
+                budget_note[frames] = f"[Plan] auto budget {value} ({reason}) | {vram_label}"
+                return value
+
+    # The engine generates Tail Padding Frames past the last frame and trims them, unless that adds a chunk;
+    # plan the same window it will run.
+    tail_pad = max(0, int(settings.get("tail_pad_frames") or 0))
+    plan, pad_used = planner.plan_with_tail_pad(
         total_frames,
         width,
         height,
-        budget,
+        tail_pad,
+        _budget,
         max_chunk_frames=int(settings.get("max_chunk_frames") or 121),
         overlap_frames=int(settings.get("overlap_frames") or 1),
     )
+    if plan.total_frames in budget_note:
+        lines.append(budget_note[plan.total_frames])
+    if pad_used:
+        lines.append(f"[Plan] Tail padding: {pad_used} repeated last frames are generated and trimmed "
+                     f"({total_frames} + {pad_used} = {plan.total_frames} frames planned)")
+    elif tail_pad:
+        lines.append(f"[Plan] Tail padding skipped: {tail_pad} more frames would add a chunk")
     steps = int(settings.get("steps") or 8)
     lines.extend(f"[Plan] {line}" for line in plan.summary(steps).splitlines())
     if frames_estimated:
@@ -407,6 +430,14 @@ def ltx25_defaults() -> Dict[str, Any]:
         "resume_run_dir": "",
         "keep_only_output_files": False,
         "auto_tune_on_run": True,
+        # Options added 2026-11-01 (upstream scan); defaults chosen by the A/B runs (WP-LTX RESULTS.md).
+        "ltx_mode": LTX25_MODE_X2,
+        "tail_pad_frames": 8,
+        "spatial_tiling": "off",
+        "spatial_tile_width": 1536,
+        "spatial_tile_height": 1024,
+        "spatial_tile_overlap": 0.5,
+        "sparse_attention": True,
     }
 
 
@@ -451,6 +482,13 @@ LTX25_ORDER: List[str] = [
     "resume_run_dir",
     "keep_only_output_files",
     "auto_tune_on_run",
+    "ltx_mode",
+    "tail_pad_frames",
+    "spatial_tiling",
+    "spatial_tile_width",
+    "spatial_tile_height",
+    "spatial_tile_overlap",
+    "sparse_attention",
 ]
 
 
@@ -557,6 +595,17 @@ def _enforce_ltx25_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -> 
     # Paths.
     for key in ("input_path", "output_override", "batch_input_path", "batch_output_path", "resume_run_dir"):
         cfg[key] = str(cfg.get(key, defaults.get(key, "")) or "").strip()
+
+    # Options added 2026-11-01.
+    mode = str(cfg.get("ltx_mode") or defaults.get("ltx_mode") or LTX25_MODE_X2)
+    cfg["ltx_mode"] = mode if mode in set(LTX25_MODE_NAMES) else LTX25_MODE_X2
+    cfg["tail_pad_frames"] = max(0, min(32, _to_int(cfg.get("tail_pad_frames"), int(defaults.get("tail_pad_frames", 8)))))
+    tiling = str(cfg.get("spatial_tiling") or defaults.get("spatial_tiling") or "off").strip().lower()
+    cfg["spatial_tiling"] = tiling if tiling in {"off", "auto", "on"} else "off"
+    cfg["spatial_tile_width"] = max(512, min(4096, _to_int(cfg.get("spatial_tile_width"), 1536) // 32 * 32))
+    cfg["spatial_tile_height"] = max(512, min(4096, _to_int(cfg.get("spatial_tile_height"), 1024) // 32 * 32))
+    cfg["spatial_tile_overlap"] = max(0.25, min(0.75, _to_float(cfg.get("spatial_tile_overlap"), 0.5)))
+    cfg["sparse_attention"] = _to_bool(cfg.get("sparse_attention"), _to_bool(defaults.get("sparse_attention", False), False))
 
     # Single-GPU guardrail (mirrors SparkVSR).
     device_str = str(cfg.get("device", defaults.get("device", "auto")) or "auto").strip()

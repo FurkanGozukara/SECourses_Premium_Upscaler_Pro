@@ -170,7 +170,7 @@ def seedvr2_tab(
 
             # Ensure we always have at least one model choice (fallback to placeholder)
             if not available_models:
-                available_models = ["seedvr2_ema_7b_sharp_fp16.safetensors"]
+                available_models = ["seedvr2_7b_sharp_convrot_w4a8.safetensors"]
                 dit_model_value = available_models[0]
             else:
                 dit_model_value = values[4] if len(values) > 4 else available_models[0]
@@ -195,7 +195,7 @@ def seedvr2_tab(
                             label="SeedVR2 Model",
                             choices=available_models,
                             value=dit_model_value,
-                            info="3B models are faster, 7B models higher quality. 'sharp' variants enhance edges. fp16 recommended for best speed/quality balance.",
+                            info="Default: 7B Sharp W4A8, 4-bit weights: the fastest and lowest-VRAM 7B (GPUs older than RTX 30 switch to 7B Sharp INT8 ConvRot automatically). 3B models are faster, 7B models higher quality; 'sharp' variants enhance edges.",
                         )
                         model_cache_msg = gr.Markdown("", visible=False)
 
@@ -303,7 +303,7 @@ def seedvr2_tab(
                     label="Prepend Frames",
                     value=values[16],  # Was 19, now 16
                     precision=0,
-                    info="Prepend N copies of first frame for temporal stability. Helps reduce artifacts at video start. Try 2-4."
+                    info="Prepend N warm-up frames (the first frames mirrored) for temporal stability; they are removed from the output. Helps reduce artifacts at video start. Try 2-4."
                 )
                 temporal_overlap = gr.Number(
                     label="Temporal Overlap",
@@ -524,7 +524,7 @@ def seedvr2_tab(
                 int8_convrot = gr.Checkbox(
                     label="INT8 ConvRot (DiT)",
                     value=bool(values[56]) if len(values) > 56 else False,
-                    info="Hadamard-rotated INT8 DiT weights: about half the DiT weight VRAM of BF16 and faster on RTX 2000 or newer GPUs. The prebuilt cache downloads on first use; local generation remains the fallback. Better quality than FP8. Not for GGUF models; disables Compile DiT.",
+                    info="Hadamard-rotated INT8 DiT weights for the BF16 models: about half the DiT weight VRAM of BF16 and about twice as fast (comfy_kitchen INT8 kernels). The prebuilt cache downloads on first use; local generation remains the fallback. Better quality than FP8. Not for GGUF or W4A8 models (already quantized); disables Compile DiT.",
                     scale=1,
                 )
                 compile_backend = gr.Dropdown(

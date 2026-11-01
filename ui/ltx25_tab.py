@@ -28,7 +28,7 @@ from shared.models.ltx25_meta import (
     get_ltx25_model_names,
     ltx25_sampling_defaults,
 )
-from shared.ltx25_constants import LTX25_TE_NAMES, LTX25_VAE_NAMES
+from shared.ltx25_constants import LTX25_MODE_NAMES, LTX25_TE_NAMES, LTX25_VAE_NAMES
 from shared.path_utils import get_media_dimensions, normalize_path
 from ui.universal_preset_section import (
     universal_preset_section,
@@ -462,6 +462,44 @@ def ltx25_tab(
                         value=int(_value("decode_temporal_overlap", 32) or 32),
                     )
 
+            with gr.Accordion("🧪 Quality & Speed Options", open=False):
+                with gr.Row():
+                    ltx_mode = gr.Dropdown(
+                        label="Mode",
+                        choices=list(LTX25_MODE_NAMES),
+                        value=str(_value("ltx_mode", LTX25_MODE_NAMES[0])) if str(_value("ltx_mode", LTX25_MODE_NAMES[0])) in set(LTX25_MODE_NAMES) else LTX25_MODE_NAMES[0],
+                        info="Pixel Spatial x2 = the 2x upscaler (default). Refine: Restore = the Restore IC-LoRA on a lanczos 2x canvas in "
+                             "960x544 windows (tiled fusion, euler): for archive footage (monochrome, sepia, tape, low-bitrate scans); it "
+                             "re-colours and rebuilds the image, so it changes the colours of normal colour video.",
+                    )
+                with gr.Row():
+                    tail_pad_frames = gr.Slider(
+                        label="Tail Padding Frames", minimum=0, maximum=16, step=8,
+                        value=int(_value("tail_pad_frames", 8) if _value("tail_pad_frames", 8) is not None else 8),
+                        info="Repeat the last frame this many times, generate and trim: the last frames of an LTX generation lose about "
+                             "10 % detail; 8 frames restored it (+8-13 %) for about 14 % more sampling on a 49-frame clip.",
+                    )
+                with gr.Row():
+                    spatial_tiling = gr.Dropdown(
+                        label="Spatial Transformer Tiling", choices=["off", "auto", "on"],
+                        value=str(_value("spatial_tiling", "off") or "off"),
+                        info="Run each step as overlapping windows blended on one canvas. Measured on the x2 upscaler: 2.1-2.2x slower at "
+                             "1440p and 4K with no visible gain (and a fine crosshatch at 1440p), so it stays off; Refine mode always tiles.",
+                    )
+                    spatial_tile_width = gr.Number(label="Tile Width (px)", value=int(_value("spatial_tile_width", 1536) or 1536), precision=0)
+                    spatial_tile_height = gr.Number(label="Tile Height (px)", value=int(_value("spatial_tile_height", 1024) or 1024), precision=0)
+                    spatial_tile_overlap = gr.Slider(
+                        label="Tile Overlap", minimum=0.25, maximum=0.75, step=0.05,
+                        value=float(_value("spatial_tile_overlap", 0.5) or 0.5),
+                    )
+                with gr.Row():
+                    sparse_attention = gr.Checkbox(
+                        label="Sparse Attention (Sol-Attn)",
+                        value=bool(_value("sparse_attention", True)),
+                        info="Sol-Attn block-sparse self-attention on every step (block 0, cross-attention and the guide tokens stay exact): "
+                             "9-14 % faster sampling on an RTX 5090 with the same output quality; GPUs without the kernel run dense.",
+                    )
+
             with gr.Accordion("🎬 Input Handling", open=False):
                 with gr.Row():
                     pre_resize_longer_edge = gr.Number(
@@ -756,6 +794,9 @@ def ltx25_tab(
         batch_enable, batch_input, batch_output,
         resume_run_dir, keep_only_output_files,
         auto_tune_on_run,
+        ltx_mode, tail_pad_frames,
+        spatial_tiling, spatial_tile_width, spatial_tile_height, spatial_tile_overlap,
+        sparse_attention,
     ]
 
     # Development validation: inputs_list must stay aligned with LTX25_ORDER

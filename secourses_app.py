@@ -103,7 +103,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.3"
+APP_VERSION = "9.4"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1918,7 +1918,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("⚡ FlashVSR+", render_children=True) as tab_flashvsr:
+            with gr.Tab("⚡ FlashVSR", render_children=True) as tab_flashvsr:
                 flashvsr_ui = flashvsr_tab(
                     preset_manager=preset_manager,
                     runner=runner,

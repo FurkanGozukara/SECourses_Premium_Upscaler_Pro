@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .common import TunePlan, VramBudget, resolve_budget
 
 LEVELS = ("ULTRA", "HIGH", "MEDIUM", "LOW")
-FAMILIES = ("HIGHBITRATE", "DENOISE", "DEBLUR")
+FAMILIES = ("HIGHBITRATE", "DENOISE", "DEBLUR", "STREAMING")
+# Families whose SDK level set differs from LEVELS (nvidia-vfx 0.2: STREAMING has only these two).
+FAMILY_LEVELS = {"STREAMING": ("ULTRA", "MEDIUM")}
 
 # Whole-process GB = base + per megapixel of model output + per megapixel of model input, measured
 # in a separate process with the Windows per-process counters (benchmarks/vram/rtx.jsonl): 0.75 GB
@@ -27,6 +29,20 @@ _GB_PER_OUT_MP = {"ULTRA": 0.06, "HIGH": 0.06, "MEDIUM": 0.06, "LOW": 0.06, "BIC
 _GB_PER_IN_MP = 0.30
 PROCESS_OVERHEAD_GB = 0.0  # included in the measured base
 SAFETY = 1.15
+# nvidia-vfx 0.2.0.0 re-measurement (2026-11, benchmarks/vram/rtx.jsonl "v020_*"): the levels above are
+# unchanged (1080p -> 4K HBU 1.68 GB, -> 8K 2.98 GB); STREAMING_ULTRA = HBU, STREAMING_MEDIUM 1.30 GB.
+# TrueHDR at the output size adds 0.44 GB at 4K and the 10-bit (RGB10A2) path 0.09 GB.
+_HDR_GB_PER_OUT_MP = 0.06
+_TEN_BIT_GB_PER_OUT_MP = 0.015
+
+
+def extra_gb_per_out_mp(settings: Optional[Dict[str, Any]]) -> float:
+    s = settings or {}
+
+    def on(key: str) -> bool:
+        return str(s.get(key, False)).strip().lower() in {"1", "true", "yes", "on"}
+
+    return (_HDR_GB_PER_OUT_MP if on("rtx_hdr_output") else 0.0) + (_TEN_BIT_GB_PER_OUT_MP if on("rtx_10bit") else 0.0)
 
 
 def family_of(quality: str) -> str:
@@ -40,7 +56,7 @@ def family_of(quality: str) -> str:
 def ladder(quality: str) -> List[str]:
     fam = family_of(quality)
     if fam:
-        return [f"{fam}_{lvl}" for lvl in LEVELS]
+        return [f"{fam}_{lvl}" for lvl in FAMILY_LEVELS.get(fam, LEVELS)]
     return list(LEVELS) + ["BICUBIC"]
 
 
@@ -49,19 +65,19 @@ def _level(quality: str) -> str:
     return q.split("_", 1)[1] if family_of(q) else (q if q in _BASE_GB else "ULTRA")
 
 
-def estimate_gb(quality: str, in_w: int, in_h: int, out_w: int, out_h: int) -> float:
+def estimate_gb(quality: str, in_w: int, in_h: int, out_w: int, out_h: int, extra_per_out_mp: float = 0.0) -> float:
     lvl = _level(quality)
     out_mp = max(1, out_w) * max(1, out_h) / 1e6
     in_mp = max(1, in_w) * max(1, in_h) / 1e6
-    return (_BASE_GB[lvl] + _GB_PER_OUT_MP[lvl] * out_mp + _GB_PER_IN_MP * in_mp) * SAFETY + PROCESS_OVERHEAD_GB
+    return (_BASE_GB[lvl] + (_GB_PER_OUT_MP[lvl] + extra_per_out_mp) * out_mp + _GB_PER_IN_MP * in_mp) * SAFETY + PROCESS_OVERHEAD_GB
 
 
 def choose(quality: str, in_w: int, in_h: int, out_w: int, out_h: int,
-           budget: Optional[VramBudget]) -> Tuple[Optional[str], float]:
+           budget: Optional[VramBudget], extra_per_out_mp: float = 0.0) -> Tuple[Optional[str], float]:
     """Highest level of the user's family that fits; (None, need) when even the lowest does not."""
     need = 0.0
     for q in ladder(quality):
-        need = estimate_gb(q, in_w, in_h, out_w, out_h)
+        need = estimate_gb(q, in_w, in_h, out_w, out_h, extra_per_out_mp)
         if budget is None or need <= budget.limit_gb:
             return q, need
     return None, need
@@ -71,7 +87,7 @@ def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, model_out_w: int, mo
          budget: Optional[VramBudget]) -> TunePlan:
     out = TunePlan(budget=budget)
     current = str(settings.get("quality_preset") or "HIGHBITRATE_ULTRA").upper()
-    picked, need = choose(current, in_w, in_h, model_out_w, model_out_h, budget)
+    picked, need = choose(current, in_w, in_h, model_out_w, model_out_h, budget, extra_gb_per_out_mp(settings))
     fam = family_of(current) or "standard upscale"
     out.lines.append(f"Model output {model_out_w}x{model_out_h} from {in_w}x{in_h} ({fam.title()} family)")
     if picked is None:
@@ -103,7 +119,7 @@ def check_or_pick(settings: Dict[str, Any], *, in_w: int, in_h: int, model_out_w
             log(f"[RTX Auto Tune] {tp.updates['quality_preset']} for {model_out_w}x{model_out_h}, about "
                 f"{tp.estimate_gb:.1f} GB" + (f" of {budget.limit_gb:.1f} GB available" if budget else ""))
         return True, ""
-    need = estimate_gb(current, in_w, in_h, model_out_w, model_out_h)
+    need = estimate_gb(current, in_w, in_h, model_out_w, model_out_h, extra_gb_per_out_mp(settings))
     if budget is not None and need > budget.limit_gb:
         return False, (f"{current} at {model_out_w}x{model_out_h} needs about {need:.1f} GB but only "
                        f"{budget.limit_gb:.1f} GB is free after Save VRAM; it would spill into shared GPU memory. "

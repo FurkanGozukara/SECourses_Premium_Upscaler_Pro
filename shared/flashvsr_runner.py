@@ -19,6 +19,7 @@ from .command_logger import get_command_logger
 from .model_downloads import ensure_flashvsr_model
 from .models.flashvsr_meta import (
     flashvsr_internal_to_model_name,
+    flashvsr_is_plus,
     flashvsr_version_to_internal,
     flashvsr_version_to_ui,
 )
@@ -141,11 +142,23 @@ def _resolve_flashvsr_root(base_dir: Path) -> Path:
 
 
 def _expected_flashvsr_model_dir_name(version_internal: str) -> str:
+    if str(version_internal).startswith("plus_"):
+        return flashvsr_internal_to_model_name(version_internal)  # FlashVSR-Plus-Turbo / FlashVSR-Plus-Base
     return "FlashVSR-v1.1" if str(version_internal) == "11" else "FlashVSR"
 
 
 def _missing_required_model_files(model_dir: Path, *, require_source: bool = True) -> List[str]:
     missing: List[str] = []
+    if model_dir.name.startswith("FlashVSR-Plus-"):
+        # Official FlashVSR+: BF16 LQ projector (+ DiT unless the INT8 cache is used); the TC decoder is
+        # byte-identical to v1.1's and is shared from the FlashVSR-v1.1 folder when present.
+        if not (model_dir / "lq_proj_in.safetensors").exists():
+            missing.append("lq_proj_in.safetensors")
+        if not (model_dir / "TCDecoder.ckpt").exists() and not (model_dir.parent / "FlashVSR-v1.1" / "TCDecoder.ckpt").exists():
+            missing.append("TCDecoder.ckpt")
+        if require_source and not (model_dir / "dit.safetensors").exists():
+            missing.append("dit.safetensors")
+        return missing
     for name in _FLASHVSR_REQUIRED_FILES:
         if not (model_dir / name).exists():
             missing.append(name)
@@ -184,9 +197,10 @@ def _ensure_local_flashvsr_model_layout(
     missing = _missing_required_model_files(target_dir, require_source=not int8_convrot)
     if int8_convrot:
         cache_path = (int8_cache_root or models_root) / f"{target_name}_int8_convrot.safetensors"
-        source_path = target_dir / _FLASHVSR_SOURCE_WEIGHT
+        source_name = "dit.safetensors" if target_name.startswith("FlashVSR-Plus-") else _FLASHVSR_SOURCE_WEIGHT
+        source_path = target_dir / source_name
         if not cache_path.is_file() and not source_path.is_file():
-            missing.append(f"{cache_path.name} or {_FLASHVSR_SOURCE_WEIGHT}")
+            missing.append(f"{cache_path.name} or {source_name}")
     if missing:
         return (
             False,
@@ -584,6 +598,7 @@ def run_flashvsr(
         version_internal = flashvsr_version_to_internal(raw_version)
         version_ui = flashvsr_version_to_ui(raw_version)
         model_name = flashvsr_internal_to_model_name(version_internal)
+        plus_model = flashvsr_is_plus(raw_version)
         mode = _sanitize_mode(settings.get("mode", "tiny"))
         requested_precision = _sanitize_precision(settings.get("precision", settings.get("dtype", "auto")))
         vae_model = _sanitize_vae_model(settings.get("vae_model", "LightVAE_W2.1"))
@@ -604,6 +619,11 @@ def run_flashvsr(
         precision, precision_note = _resolve_flashvsr_cli_precision(requested_precision, flashvsr_script)
         if precision_note:
             log(precision_note)
+        if plus_model and precision == "int8_convrot":
+            # Measured on FlashVSR+ (RTX 5090, 720p-1080p): INT8 ConvRot kept the picture (within 0.006 dB) but ran
+            # about 40% slower and reserved as much or more VRAM (activation transients), so FlashVSR+ runs in BF16.
+            precision = "bf16"
+            log("[FlashVSR] FlashVSR+ runs in BF16: INT8 ConvRot gives it no VRAM saving and is slower.")
         cli_supports_int8_cache_dir = _flashvsr_cli_supports_option(flashvsr_script, "--int8_cache_dir")
 
         models_root = _resolve_models_root(base_dir, settings)
@@ -613,7 +633,7 @@ def run_flashvsr(
                 base_dir,
                 version_ui,
                 precision,
-                vae_model if mode == "full" else None,  # tiny modes decode with the TC decoder
+                vae_model if (mode == "full" and not plus_model) else None,  # tiny modes / FlashVSR+ use the TC decoder
                 on_progress,
             )
             if not download_ok:
@@ -654,6 +674,13 @@ def run_flashvsr(
         if overlap >= tile_size:
             overlap = max(8, tile_size - 8)
 
+        temporal_compression = _parse_int(settings.get("temporal_compression"), 4)
+        temporal_compression = temporal_compression if temporal_compression in (1, 2, 4) else 4
+        decode_every = max(4, (_parse_int(settings.get("decode_every"), 16) // 4) * 4)
+        plus_kv_offload = str(settings.get("plus_kv_offload") or "auto").strip().lower()
+        plus_kv_offload = plus_kv_offload if plus_kv_offload in {"auto", "never", "always"} else "auto"
+        plus_tiny_decoder = str(settings.get("plus_tiny_decoder") or "auto").strip().lower()
+        plus_tiny_decoder = plus_tiny_decoder if plus_tiny_decoder in {"auto", "serial", "parallel"} else "auto"
         sparse_ratio = max(1.5, min(2.0, _parse_float(settings.get("sparse_ratio"), 2.0)))
         kv_ratio = max(1.0, min(3.0, _parse_float(settings.get("kv_ratio"), 3.0)))
         local_range = 9 if _parse_int(settings.get("local_range"), 11) == 9 else 11
@@ -890,6 +917,14 @@ def run_flashvsr(
                 "--models_dir",
                 str(models_root),
             ]
+            if plus_model:
+                # Official FlashVSR+: one stream over the whole clip; pipeline mode and VAE do not apply.
+                local_cmd.extend([
+                    "--temporal_compression", str(temporal_compression),
+                    "--decode_every", str(decode_every),
+                    "--plus_kv_offload", plus_kv_offload,
+                    "--plus_tiny_decoder", plus_tiny_decoder,
+                ])
             if run_precision == "int8_convrot" and cli_supports_int8_cache_dir:
                 local_cmd.extend(
                     ["--int8_cache_dir", str(base_dir / "FlashVSR_plus" / "models")]

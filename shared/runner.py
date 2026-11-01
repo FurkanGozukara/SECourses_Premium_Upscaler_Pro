@@ -31,6 +31,8 @@ from .command_logger import get_command_logger
 from .video_codec_options import build_ffmpeg_video_encode_args
 from .processing_queue import queue_resource_keys_for_gpu_selection
 from .model_downloads import ensure_rife_model, ensure_seedvr2_model
+from .models.seedvr2_w4a8 import apply_w4a8_fallback
+from .models.rife_meta import rife_nvfg_mode
 from .vram_autotune.common import apply_vram_cap_env, is_tight
 from .vram_autotune.seedvr2 import SEEDVR2_PROCESS_OVERHEAD_GB, auto_apply as seedvr2_auto_apply
 
@@ -503,6 +505,16 @@ class Runner:
         if not input_path:
             raise ValueError("Input path is required.")
 
+        # W4A8 (the default model) needs comfy_kitchen's CUDA kernels on compute capability 8.0+;
+        # otherwise this run uses the 7B Sharp INT8 ConvRot model and Auto Tune plans with its numbers.
+        fallback_note = apply_w4a8_fallback(
+            settings, settings.get("cuda_device") or os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "")
+        )
+        if fallback_note:
+            print(fallback_note, flush=True)
+            if on_progress:
+                on_progress(fallback_note + "\n")
+
         selected_model = str(settings.get("dit_model") or "")
         selected_path = self._resolve_seedvr2_model_file(selected_model, settings)
         default_models_dir = (self.base_dir / "SeedVR2" / "models").resolve()
@@ -632,6 +644,22 @@ class Runner:
             # tighter budget and run again instead of failing; the cap still prevents
             # any spill into shared GPU memory.
             # -----------------------------------------------------------------
+            if (_truthy(settings.get("auto_tune_on_run")) and not self._canceled and settings.get("_vram_cap_gb")
+                    and result.returncode != 0 and _is_cuda_oom_text(result.log or "")):
+                retry_msg = ("\n[SeedVR2 Auto Tune] Out of VRAM at the estimate cap; retrying the same settings with "
+                             "the whole Save VRAM budget.\n")
+                print(retry_msg, flush=True)
+                if on_progress:
+                    on_progress(retry_msg)
+                retry_settings = settings.copy()
+                retry_settings["_vram_cap_gb"] = None
+                retry_cmd = self._build_seedvr2_cmd(
+                    cli_path, retry_settings, format_for_cli, preview_only, output_override=cli_output_arg
+                )
+                previous_log = result.log or ""
+                result = self._run_seedvr2_subprocess(cli_path, retry_cmd, predicted_output, retry_settings, on_progress)
+                result = RunResult(result.returncode, result.output_path, previous_log + "\n" + (result.log or ""))
+                settings = retry_settings
             if _truthy(settings.get("auto_tune_on_run")) and not self._canceled:
                 for cap_scale in (0.85, 0.7):
                     if result.returncode == 0 or not _is_cuda_oom_text(result.log or ""):
@@ -909,6 +937,8 @@ class Runner:
             log=lambda m: log_output(m + "\n"),
             tag="SeedVR2",
             settings_tight=is_tight(settings),
+            limit_override_gb=(settings.get("_vram_cap_gb") if _truthy(settings.get("auto_tune_on_run"))
+                               and os.environ.get("SECOURSES_AUTOTUNE_CAP", "1").strip() != "0" else None),
         )
 
         # Constrain visible GPU(s) before CLI startup to prevent stray contexts on GPU 0.
@@ -1915,6 +1945,10 @@ class Runner:
 
         # Explicit high-value aliases for common GGUF additions.
         alias_fallbacks: Dict[str, List[str]] = {
+            "seedvr2_7b_sharp_convrot_w4a8.safetensors": [
+                "seedvr2_ema_7b_sharp_fp16.safetensors",
+                "seedvr2_ema_7b_sharp-Q8_0.gguf",
+            ],
             "seedvr2_ema_7b_sharp-q8_0.gguf": [
                 "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
                 "seedvr2_ema_7b_sharp_fp16.safetensors",
@@ -2376,7 +2410,7 @@ class Runner:
         if not input_path:
             raise ValueError("Input path is required for RIFE.")
 
-        if not str(settings.get("model_dir") or "").strip():
+        if not str(settings.get("model_dir") or "").strip() and not rife_nvfg_mode(settings.get("model")):
             download_ok, download_error = ensure_rife_model(
                 self.base_dir,
                 str(settings.get("model") or "4.26"),
@@ -3186,7 +3220,14 @@ class Runner:
 
         # Processing parameters
         if settings.get("scale") and settings["scale"] != 1.0:
-            cmd.extend(["--scale", str(settings["scale"])])
+            # inference_video.py accepts only these flow scales (the UI slider allows any 0.1 step).
+            try:
+                scale_val = float(settings["scale"])
+            except Exception:
+                scale_val = 1.0
+            scale_val = min((0.25, 0.5, 1.0, 2.0, 4.0), key=lambda v: abs(v - scale_val))
+            if scale_val != 1.0:
+                cmd.extend(["--scale", str(scale_val)])
         # RIFE default is x2; avoid passing "--multi 1" (some builds reject it) and
         # be tolerant of legacy string values like "x2".
         try:
@@ -3208,29 +3249,38 @@ class Runner:
         if exp_val != 1:
             multi_val = 2 ** max(0, exp_val)  # inference_video.py lets --exp override --multi
 
-        # RIFE can only lower its interpolated rate to a target FPS; a target above
-        # input_fps * multiplier silently stays at the multiplier's rate. Interpolate to the
-        # next power of two that reaches the target and let RIFE resample down to it.
+        # A target FPS is rendered directly: inference_video.py interpolates every output frame
+        # at its own timestep (24 -> 60 fps needs no 96 fps file, no ffmpeg frame dropping and
+        # no second encode). Models without timestep input raise their multiplier there.
         try:
             target_fps = float(settings.get("fps_override") or 0.0)
         except Exception:
             target_fps = 0.0
-        if target_fps > 0 and not settings.get("img_mode"):
+
+        nvfg_mode = rife_nvfg_mode(settings.get("model"))
+        if nvfg_mode:
+            cmd.extend(["--engine", "nvfg", "--nvfg-mode", nvfg_mode])
+            if "--fp16" in cmd:
+                cmd.remove("--fp16")
+        # RIFE 4.25 / 4.26 would accept a 64-pixel grid (inference_video.py --pad 64), but on an
+        # RTX 5090 the upstream 128 grid was as fast or faster (interleaved repeats, 2026-11), so the
+        # app keeps 128.
+        scene_detect = str(settings.get("scene_detect") or "").strip().lower()
+        if scene_detect in {"ssim", "content", "hash", "none"}:
+            cmd.extend(["--scene-detect", scene_detect])
+        if settings.get("dedup_frames"):
+            cmd.append("--dedup")
+        # Chunked runs (shared/chunking.py): render only this chunk's part of the whole-video
+        # output grid, so the merged chunks equal a single run.
+        if settings.get("_rife_timeline_start") is not None and not settings.get("img_mode"):
             try:
-                input_fps = float(get_media_fps(input_path) or 0.0)
-            except Exception:
-                input_fps = 0.0
-            if input_fps > 0 and input_fps * max(1, multi_val) < target_fps - 1e-6:
-                needed = 2
-                while input_fps * needed < target_fps - 1e-6 and needed < 64:
-                    needed *= 2
-                if on_progress:
-                    on_progress(
-                        f"RIFE: target {target_fps:g} fps needs x{needed} interpolation from "
-                        f"{input_fps:.3f} fps; using x{needed} instead of x{multi_val}.\n"
-                    )
-                multi_val = needed
-                exp_val = 1
+                cmd.extend(["--timeline-start", str(int(settings["_rife_timeline_start"]))])
+                if settings.get("_rife_timeline_end") is not None:
+                    cmd.extend(["--timeline-end", str(int(settings["_rife_timeline_end"]))])
+                if settings.get("_rife_source_rate"):
+                    cmd.extend(["--source-rate", str(settings["_rife_source_rate"])])
+            except (TypeError, ValueError):
+                pass
 
         if multi_val > 1 and multi_val != 2:
             cmd.extend(["--multi", str(int(multi_val))])

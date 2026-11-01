@@ -188,6 +188,11 @@ def load_transformer(
     real_missing = [m for m in missing if not m.endswith(".comfy_quant")]
     if real_missing:
         log.info(f"Transformer: {len(real_missing)} missing keys, e.g. {real_missing[:5]}")
+    if getattr(model, "keyframes_abs_pos_embedding", "absent") is None:
+        # Lightricks re-released the checkpoints on 2026-08-16 with this marker on the single-pixel-frame
+        # tokens; an older copy still runs, without it. The downloader replaces it on the next model check.
+        emit("Note: this transformer predates the 2026-08-16 release (no keyframes_abs_pos_embedding); "
+             "the model downloader replaces it with the current file")
     if unexpected:
         log.info(f"Transformer: {len(unexpected)} unexpected keys ignored")
     return model, quant_config, config
@@ -281,6 +286,78 @@ def apply_ic_lora(
         patched += 1
     emit(f"IC LoRA applied to {patched} layers (strength {strength}, ref downscale {ref_downscale:g})")
     return patched, ref_downscale
+
+
+class LoraPatchSet:
+    """A LoRA held as runtime weight_function patches on every target (quantized or not), so it can be
+    switched on and off between passes (the pre-clean pass and the x2 pass use different LoRAs)."""
+
+    def __init__(self, entries, ref_downscale: float, name: str):
+        self.entries = entries          # [(module, _LoraWeightPatch)]
+        self.ref_downscale = float(ref_downscale)
+        self.name = name
+        self.enabled = False
+
+    def enable(self) -> None:
+        if self.enabled:
+            return
+        for module, patch in self.entries:
+            module.weight_function = list(getattr(module, "weight_function", []) or []) + [patch]
+        self.enabled = True
+
+    def disable(self) -> None:
+        if not self.enabled:
+            return
+        for module, patch in self.entries:
+            module.weight_function = [p for p in (getattr(module, "weight_function", []) or []) if p is not patch]
+        self.enabled = False
+
+
+def load_lora_patches(model: nn.Module, lora_path: str, strength: float = 1.0,
+                      on_progress: Optional[Callable[[str], None]] = None) -> LoraPatchSet:
+    """Like apply_ic_lora, but never bakes: every target gets a switchable weight_function patch."""
+    emit = on_progress or (lambda s: None)
+    lora_sd, lora_meta = comfy.utils.load_torch_file(str(lora_path), safe_load=True, return_metadata=True)
+    try:
+        ref_downscale = float((lora_meta or {}).get("reference_downscale_factor", 1.0))
+    except (TypeError, ValueError):
+        ref_downscale = 1.0
+    pairs: Dict[str, Dict[str, torch.Tensor]] = {}
+    for key, tensor in lora_sd.items():
+        name = key
+        for prefix in ("diffusion_model.", "transformer."):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        if name.endswith(".lora_A.weight"):
+            pairs.setdefault(name[: -len(".lora_A.weight")], {})["a"] = tensor
+        elif name.endswith(".lora_B.weight"):
+            pairs.setdefault(name[: -len(".lora_B.weight")], {})["b"] = tensor
+    modules = dict(model.named_modules())
+    entries = []
+    for target, ab in pairs.items():
+        if "a" not in ab or "b" not in ab:
+            continue
+        module = modules.get(target)
+        if module is None:
+            log.warning(f"IC LoRA target not found in model: {target}")
+            continue
+        entries.append((module, _LoraWeightPatch(ab["a"].to(torch.bfloat16), ab["b"].to(torch.bfloat16), strength)))
+    import os as _os
+    emit(f"IC LoRA {_os.path.basename(str(lora_path))}: {len(entries)} layers as switchable patches "
+         f"(strength {strength}, ref downscale {ref_downscale:g})")
+    return LoraPatchSet(entries, ref_downscale, _os.path.basename(str(lora_path)))
+
+
+def read_lora_downscale(lora_path: str) -> float:
+    """reference_downscale_factor from the LoRA header only (no weights)."""
+    try:
+        with open(lora_path, "rb") as handle:
+            n = int.from_bytes(handle.read(8), "little")
+            meta = json.loads(handle.read(n)).get("__metadata__", {}) or {}
+        return float(meta.get("reference_downscale_factor", 1.0))
+    except Exception:
+        return 1.0
 
 
 def place_transformer(

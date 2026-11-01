@@ -155,6 +155,15 @@ def _quality_preset_details(preset_val: str) -> str:
             "- Preserves texture/detail with lighter cleanup than aggressive denoise modes.\n"
             "- Works with normal upscale factors."
         )
+    if raw.startswith("STREAMING_"):
+        level = raw.split("_", 1)[1] if "_" in raw else "ULTRA"
+        return (
+            f"**{raw}**\n\n"
+            f"- Mode: AI upscale tuned for broadcast and webcam streams (`{level}`).\n"
+            "- Needs an RTX 30 series (Ampere) or newer GPU; older GPUs use the standard level instead.\n"
+            "- Adds strong edge sharpening and contrast; on clean video it looks harsher than ULTRA / High Bitrate.\n"
+            "- Works with normal upscale factors."
+        )
     if raw == "BICUBIC":
         return (
             "**BICUBIC**\n\n"
@@ -893,6 +902,30 @@ def rtx_super_resolution_tab(
                 ),
                 elem_classes=["resolution-info"],
             )
+            with gr.Row():
+                vsr_strength = gr.Slider(
+                    label="VSR Strength",
+                    minimum=0.0, maximum=1.0, step=0.05,
+                    value=float(_value("vsr_strength", 1.0) if _value("vsr_strength", 1.0) is not None else 1.0),
+                    info="How much of the AI enhancement is applied (1.0 = full, the NVIDIA default). Lower keeps more of the plain upscale.",
+                )
+                rtx_10bit = gr.Checkbox(
+                    label="10-bit Processing",
+                    value=bool(_value("rtx_10bit", False)),
+                    info="Feeds and reads the SDK in packed 10-bit (RGB10A2) and encodes 10-bit video / 16-bit PNG. Reduces banding in smooth gradients.",
+                )
+            with gr.Row():
+                rtx_hdr_output = gr.Checkbox(
+                    label="HDR10 Output (RTX Video HDR)",
+                    value=bool(_value("rtx_hdr_output", False)),
+                    info="Converts the upscaled SDR video to HDR10 (BT.2020, PQ) with NVIDIA TrueHDR and encodes H.265 10-bit (or AV1) with HDR10 metadata. Needs an HDR display to view. Video output only.",
+                )
+                rtx_hdr_luminance = gr.Slider(
+                    label="HDR Peak Brightness (nits)",
+                    minimum=400, maximum=2000, step=50,
+                    value=int(_value("rtx_hdr_luminance", 1000) or 1000),
+                    info="Target peak luminance of the HDR10 output; also written as MaxCLL.",
+                )
 
             with gr.Row():
                 output_override = gr.Textbox(
@@ -1071,6 +1104,7 @@ def rtx_super_resolution_tab(
         output_format, face_restore_after_upscale, resume_run_dir,
         auto_transfer_output_to_input, streaming_chunk_size_frames, resume_partial_chunks,
         save_vram_gb, auto_tune_on_run,
+        vsr_strength, rtx_10bit, rtx_hdr_output, rtx_hdr_luminance,
     ]
 
     if len(inputs_list) != len(RTX_ORDER):

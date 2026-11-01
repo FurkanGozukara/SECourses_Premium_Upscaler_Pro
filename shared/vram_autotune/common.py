@@ -244,6 +244,7 @@ def apply_vram_cap_env(
     log: Optional[Callable[[str], None]] = None,
     tag: str = "VRAM",
     settings_tight: Optional[bool] = None,
+    limit_override_gb: Optional[float] = None,
 ) -> Optional[VramBudget]:
     """Cap an engine subprocess (env is the child's environment) at total - in use - Save VRAM.
 
@@ -256,6 +257,16 @@ def apply_vram_cap_env(
     if not budgets:
         return None
     budget = min(budgets, key=lambda b: b.fraction)
+    full_limit = budget.limit_gb
+    try:
+        override = float(limit_override_gb) if limit_override_gb is not None else 0.0
+    except (TypeError, ValueError):
+        override = 0.0
+    if 0.0 < override < full_limit:
+        # Auto Tune's estimate for this run: the caching allocator would otherwise keep freed blocks up to the
+        # whole budget, so VRAM in use would read far above the estimate whenever the GPU has room.
+        budget = VramBudget(gpu=budget.gpu, save_gb=max(0.0, budget.gpu.free_gb - override),
+                            overhead_gb=budget.overhead_gb, notes=list(budget.notes))
     legacy = env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     current = env.get("PYTORCH_ALLOC_CONF") or legacy or ""
     # The cudaMallocAsync backend ignores the fraction (verified: 40 GB reserved on a 31.8 GB
@@ -267,6 +278,8 @@ def apply_vram_cap_env(
     # It costs speed (74 s -> 84.5 s on the same SeedVR2 run with room to spare: large blocks are no
     # longer reused), so it is only added when the run is close to its budget or its fit is unknown.
     tight = settings_tight if settings_tight is not None else True
+    if budget.limit_gb < full_limit - 1e-6:
+        tight = True  # capped at the estimate: keep fragmentation down (measured OOM at the cap without it)
     if tight and "max_split_size_mb" not in current and not os.environ.get("SECOURSES_NO_MAX_SPLIT"):
         current = f"{current},{MAX_SPLIT_SIZE_CONF}" if current else MAX_SPLIT_SIZE_CONF
     env["PYTORCH_ALLOC_CONF"] = merge_alloc_conf(current, budget.fraction)
@@ -277,6 +290,9 @@ def apply_vram_cap_env(
             f"[{tag}] {budget.describe()}; PyTorch capped at {budget.allocator_cap_gb:.1f} GB "
             f"(fraction {budget.fraction:.3f}), so it never spills into shared GPU memory."
         )
+        if budget.limit_gb < full_limit - 1e-6:
+            msg += (f" The cap follows Auto Tune's estimate for this run ({budget.limit_gb:.1f} of the "
+                    f"{full_limit:.1f} GB Save VRAM leaves).")
         if budget.limit_gb < budget.overhead_gb + MIN_ALLOCATOR_CAP_GB:
             msg += f" WARNING: only {budget.gpu.free_gb:.1f} GB is free; close other GPU apps or lower Save VRAM."
         log(msg)

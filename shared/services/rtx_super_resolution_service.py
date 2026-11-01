@@ -74,6 +74,8 @@ RTX_QUALITY_PRESETS: List[str] = [
     "HIGHBITRATE_HIGH",
     "HIGHBITRATE_MEDIUM",
     "HIGHBITRATE_LOW",
+    "STREAMING_ULTRA",
+    "STREAMING_MEDIUM",
 ]
 
 
@@ -141,6 +143,10 @@ def rtx_super_resolution_defaults() -> Dict[str, Any]:
         "resume_partial_chunks": False,
         "save_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "auto_tune_on_run": True,
+        "vsr_strength": 1.0,
+        "rtx_10bit": False,
+        "rtx_hdr_output": False,
+        "rtx_hdr_luminance": 1000,
     }
 
 
@@ -167,6 +173,10 @@ RTX_ORDER: List[str] = [
     "resume_partial_chunks",
     "save_vram_gb",
     "auto_tune_on_run",
+    "vsr_strength",
+    "rtx_10bit",
+    "rtx_hdr_output",
+    "rtx_hdr_luminance",
 ]
 
 
@@ -180,9 +190,12 @@ def _enforce_rtx_guardrails(cfg: Dict[str, Any], defaults: Optional[Dict[str, An
     out["upscale_factor"] = max(1.0, min(9.9, _to_float(out.get("upscale_factor"), 4.0)))
     out["max_resolution"] = max(0, min(8192, _to_int(out.get("max_resolution"), 3840)))
     out["save_vram_gb"] = clamp_save_vram_gb(out.get("save_vram_gb"), defaults.get("save_vram_gb", DEFAULT_SAVE_VRAM_GB))
+    out["vsr_strength"] = max(0.0, min(1.0, _to_float(out.get("vsr_strength"), 1.0)))
+    out["rtx_hdr_luminance"] = max(400, min(2000, _to_int(out.get("rtx_hdr_luminance"), 1000)))
     for key in ("use_resolution_tab", "pre_downscale_then_upscale", "non_blocking_inference",
                 "disable_auto_scene_detection_split", "face_restore_after_upscale", "auto_transfer_output_to_input",
-                "resume_partial_chunks", "batch_enable", "keep_only_output_files", "auto_tune_on_run"):
+                "resume_partial_chunks", "batch_enable", "keep_only_output_files", "auto_tune_on_run",
+                "rtx_10bit", "rtx_hdr_output"):
         out[key] = _to_bool(out.get(key), bool(defaults.get(key, False)))
     return out
 

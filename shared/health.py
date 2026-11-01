@@ -435,18 +435,23 @@ def _check_nvidia_vfx() -> Dict[str, Optional[str]]:
         presets = getattr(VideoSuperRes, "QualityLevel", None)
         if presets is None:
             return {"status": "error", "detail": "nvidia-vfx loaded, but VideoSuperRes.QualityLevel is unavailable"}
+        import nvvfx  # type: ignore
+
+        extras = [name for name, attr in (("Frame Generation", "VideoFrameGeneration"), ("TrueHDR", "TrueHDR"))
+                  if hasattr(nvvfx, attr)]
         return {
             "status": "ok",
             "detail": (
-                "NVIDIA VFX Python runtime is available for RTX Super Resolution "
-                f"on {platform.system()}"
+                f"NVIDIA VFX Python runtime {getattr(nvvfx, '__version__', '')} is available for RTX Super Resolution"
+                + (f" ({', '.join(extras)})" if extras else "")
+                + f" on {platform.system()}"
             ),
         }
     except Exception as exc:
         return {
             "status": "missing",
             "detail": (
-                "RTX Super Resolution runtime is missing. Install nvidia-vfx==0.1.0.1 "
+                "RTX Super Resolution runtime is missing. Install nvidia-vfx==0.2.0.0 "
                 "in the app venv (supported on Windows and Linux). "
                 f"Details: {exc}"
             ),

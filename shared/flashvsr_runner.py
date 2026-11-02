@@ -619,11 +619,6 @@ def run_flashvsr(
         precision, precision_note = _resolve_flashvsr_cli_precision(requested_precision, flashvsr_script)
         if precision_note:
             log(precision_note)
-        if plus_model and precision == "int8_convrot":
-            # Measured on FlashVSR+ (RTX 5090, 720p-1080p): INT8 ConvRot kept the picture (within 0.006 dB) but ran
-            # about 40% slower and reserved as much or more VRAM (activation transients), so FlashVSR+ runs in BF16.
-            precision = "bf16"
-            log("[FlashVSR] FlashVSR+ runs in BF16: INT8 ConvRot gives it no VRAM saving and is slower.")
         cli_supports_int8_cache_dir = _flashvsr_cli_supports_option(flashvsr_script, "--int8_cache_dir")
 
         models_root = _resolve_models_root(base_dir, settings)

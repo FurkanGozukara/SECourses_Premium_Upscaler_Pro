@@ -61,8 +61,8 @@ _BUILTIN_MODELS: List[Ltx25Model] = [
         default_sampler="euler_ancestral",
         schedule="distilled",
         notes=(
-            "Recommended default. ComfyUI-parity INT8 ConvRot kernels (Hadamard "
-            "rotation + MSE-optimized scales) give the best speed/quality balance."
+            "ComfyUI-parity INT8 ConvRot kernels (Hadamard rotation + MSE-optimized scales); "
+            "the automatic choice on GPUs older than RTX 30."
         ),
     ),
     Ltx25Model(
@@ -92,7 +92,8 @@ _BUILTIN_MODELS: List[Ltx25Model] = [
         default_cfg=1.0,
         default_sampler="euler_ancestral",
         schedule="distilled",
-        notes="Smallest download. INT4 weights with W4A8 mixed activation quantization.",
+        notes=("Default. Smallest download (15.4 GB): INT4 weights with W4A8 mixed activation quantization, within "
+               "0.11 dB of INT8 and 20-22 % faster where INT8 streams blocks. Needs RTX 30 or newer (else INT8)."),
     ),
     Ltx25Model(
         name=LTX25_DISTILLED_BF16,
@@ -220,8 +221,9 @@ def get_ltx25_model_names(base_dir: Optional[Path] = None) -> List[str]:
 
 
 def get_ltx25_default_model() -> str:
-    # User requirement: INT8 ConvRot is the recommended default on ALL platforms.
-    return LTX25_DISTILLED_INT8
+    # User decision (V9.5): INT4 W4A8 ConvRot is the default on all platforms (within 0.11 dB of INT8, 30 % smaller,
+    # 20-22 % faster where INT8 streams blocks); runs fall back to INT8 on GPUs older than RTX 30 (ltx25_runner).
+    return LTX25_DISTILLED_INT4
 
 
 def get_ltx25_metadata(model_name: str, base_dir: Optional[Path] = None) -> Optional[Ltx25Model]:

@@ -30,6 +30,7 @@ from shared.services.open_h3_service import (
 from shared.open_h3_constants import (
     OPENH3_DEFAULT_SEED,
     OPENH3_DIT_FILES,
+    OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
     OPENH3_DIT_NAMES,
     OPENH3_DIT_SIZES_GB,
@@ -68,9 +69,10 @@ from ui.model_tab_common import (
 )
 
 _DIT_NOTES = {
-    "FL2VA Pruned INT8 ConvRot": "Reference speed setup; INT8 kernels on every RTX GPU.",
+    "FL2VA Pruned INT8 ConvRot": "INT8 kernels on every RTX GPU (21 GB); the automatic choice on GPUs older than RTX 30.",
     "FL2VA Pruned FP8 Scaled": "FP8 weights; native FP8 math on RTX 40/50, emulated on older GPUs.",
-    "FL2VA Pruned W6A8": "Smallest download (6-bit weights).",
+    "FL2VA Pruned W6A8": "6-bit weights: same quality as INT8 (within 0.07 dB), about 4 GB less VRAM.",
+    "FL2VA Pruned W4A8": "Default. Smallest download (12.5 GB, 4-bit weights): within 0.16 dB of INT8, about 7.5 GB less VRAM, 37-40 % faster on 16-24 GB GPUs.",
     "FL2VA Pruned BF16": "Unquantized base; needs weight streaming below 48 GB VRAM.",
 }
 
@@ -324,7 +326,7 @@ def open_h3_tab(
                 model_name = gr.Dropdown(
                     label="MiniMax H3 Base (FL2VA)",
                     choices=list(OPENH3_DIT_NAMES),
-                    value=_choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_INT8),
+                    value=_choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT),
                     info="FL2VA is the reference base of the regenerate recipe. INT8 ConvRot = recommended.",
                 )
                 with gr.Row():
@@ -341,7 +343,7 @@ def open_h3_tab(
                         info="Sol = H3 encoder + NVIDIA's fast distilled decoder (default). Released = original decoder, slower.",
                     )
                 model_info_md = gr.Markdown(_build_model_info_md(
-                    _choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_INT8),
+                    _choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT),
                     _choice("text_encoder", OPENH3_TE_NAMES, OPENH3_TE_NVFP4),
                     _choice("video_vae", OPENH3_VAE_NAMES, OPENH3_VAE_SOL_FP16),
                 ))

@@ -13,15 +13,21 @@ OPENH3_MODELS_DIRNAME = "OpenH3_Models"
 OPENH3_DIT_INT8 = "FL2VA Pruned INT8 ConvRot"
 OPENH3_DIT_FP8 = "FL2VA Pruned FP8 Scaled"
 OPENH3_DIT_W6A8 = "FL2VA Pruned W6A8"
+OPENH3_DIT_W4A8 = "FL2VA Pruned W4A8"
 OPENH3_DIT_BF16 = "FL2VA Pruned BF16"
-OPENH3_DIT_NAMES = [OPENH3_DIT_INT8, OPENH3_DIT_FP8, OPENH3_DIT_W6A8, OPENH3_DIT_BF16]
+OPENH3_DIT_NAMES = [OPENH3_DIT_INT8, OPENH3_DIT_FP8, OPENH3_DIT_W6A8, OPENH3_DIT_W4A8, OPENH3_DIT_BF16]
 OPENH3_DIT_FILES = {
     OPENH3_DIT_INT8: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
     OPENH3_DIT_FP8: "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
     OPENH3_DIT_W6A8: "minimax_h3_fl2va_pruned_w6a8.safetensors",
+    OPENH3_DIT_W4A8: "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
     OPENH3_DIT_BF16: "minimax_h3_fl2va_pruned_bf16.safetensors",
 }
-OPENH3_DIT_SIZES_GB = {OPENH3_DIT_INT8: 21.0, OPENH3_DIT_FP8: 21.0, OPENH3_DIT_W6A8: 16.0, OPENH3_DIT_BF16: 40.2}
+# W4A8 / W6A8 need compute capability 8.0+ (comfy_kitchen); on older GPUs a run switches to INT8 ConvRot.
+OPENH3_DIT_DEFAULT = OPENH3_DIT_W4A8
+OPENH3_LOW_BIT_INT8_FALLBACK = {OPENH3_DIT_W4A8: OPENH3_DIT_INT8, OPENH3_DIT_W6A8: OPENH3_DIT_INT8}
+OPENH3_DIT_SIZES_GB = {OPENH3_DIT_INT8: 21.0, OPENH3_DIT_FP8: 21.0, OPENH3_DIT_W6A8: 16.0, OPENH3_DIT_W4A8: 12.5,
+                       OPENH3_DIT_BF16: 40.2}
 
 # Qwen3-VL-32B conditioning encoder (first 50 layers).
 OPENH3_TE_NVFP4 = "Qwen3-VL 32B NVFP4 AWQ"

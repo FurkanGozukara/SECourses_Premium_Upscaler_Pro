@@ -11,6 +11,38 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.5 — 2 November 2026 — W4A8 Default for LTX 2.5 and MiniMax Open-H3, FlashVSR INT8 Everywhere and Faster FlashVSR+, LTX Frame-Rate Fix",
+        """
+**The smallest models are now the defaults where they lose nothing measurable: W4A8 for SeedVR2, LTX 2.5 and MiniMax Open-H3, and INT8 ConvRot for FlashVSR on every platform. W4A8 keeps the quality of INT8 (within about 0.1 dB), downloads 30-40 % less and is 20-40 % faster whenever INT8 does not fit in your GPU's memory. FlashVSR+ is 12-15 % faster.**
+
+How it was measured: test videos (a detailed 1080p robot clip, fast-motion ski footage and a face clip) were downscaled, upscaled back and compared with the originals (PSNR in dB, higher = closer to the original) on an RTX 5090; 24 GB and 16 GB GPUs were simulated by limiting the usable memory.
+
+**New defaults**
+- **LTX 2.5: Distilled INT4 W4A8 ConvRot** (15.4 GB instead of 21.9 GB). Within 0.04-0.11 dB of INT8 on every test clip, with the same flicker. At 1080p even a 32 GB GPU could not keep the whole INT8 model in memory, so W4A8 is faster there too: the sampling step took **40.2 s instead of 50.6 s** on an RTX 5090 and **46.0 s instead of 58.7 s** on a 24 GB GPU.
+- **MiniMax Open-H3: the new FL2VA Pruned W4A8** (12.5 GB instead of 21.0 GB, about 7.5 GB less VRAM). Within 0.16 dB of INT8 either way, equally sharp in the zoomed crops. On 24 GB and 16 GB GPUs it keeps more (or all) of the model in memory: **14.5 s instead of 23.0 s** (24 GB) and **18-21 s instead of 29-34 s** (16 GB) for the same refine. The W6A8 option stays available (same quality as INT8, 4 GB less VRAM) but is not faster.
+- **SeedVR2** keeps the 7B Sharp W4A8 default.
+- **FlashVSR: INT8 ConvRot on every platform**, including FlashVSR+ Turbo and Base, which used to be forced to BF16. Same quality as BF16 (Turbo 37.248 vs 37.242 dB, Base 32.378 vs 32.382 dB), 0.5-1.1 GB less VRAM and slightly faster. Their INT8 files now download ready-made (1.7 GB) instead of being built on the first run.
+- **GPUs older than RTX 30** (and CPU mode) switch LTX 2.5 and MiniMax from W4A8 / W6A8 to INT8 ConvRot automatically, with a note in the log, the same way SeedVR2 already did. Your saved presets keep the model they name.
+- Auto Tune plans with the model you select: SeedVR2 and FlashVSR from measured sizes per precision, LTX 2.5 and MiniMax from the real size of the loaded model.
+
+**FlashVSR+**
+- **12-15 % faster:** its position encoding ran in slow double precision on every attention layer; it now uses a fused GPU kernel (Turbo 1080p: 13.1-14.1 s to 11.3-12.3 s) with the same picture.
+- INT8 ConvRot no longer carries an error-correction branch that cost speed and added no measurable quality, so INT8 is now about 4 % faster than BF16 (it used to be no faster).
+- Auto Tune no longer reserves 1.1 GB of extra VRAM for FlashVSR+ INT8 (it now uses less than BF16).
+
+**LTX 2.5**
+- **Fixed: finished upscales were rejected and deleted** when a video's nominal and average frame rates differed slightly (for example 29.87 vs 29.97 fps). Rendering and the final check now use the same source timing. If something else stops a result from being accepted, the rendered video is kept in the run's `recovery` folder instead of deleted, also during batch cleanup.
+
+**Model downloads**
+- Every precision the app offers downloads automatically on first use from public sources that need no login. MiniMax files are taken from the SECourses mirror first; the W4A8 file is checked against its exact size and checksum.
+- Fixed: SeedVR2 FP8 models with INT8 ConvRot failed on a fresh install; the source model now downloads and the INT8 file is built on first use.
+- `Models_Downloader.py`: the LTX 2.5 and Open-H3 default sets now download the W4A8 models (about 33 GB and 47 GB), the FlashVSR+ entries the INT8 files, and "ALL LTX 2.5 files" no longer fails on three files the app does not use.
+
+**INT8 ConvRot**
+- Slightly faster on small layers (FlashVSR, SparkVSR, SeedVR2 INT8): a per-layer correction matrix is now prepared once instead of on every step, with identical output.
+""",
+    ),
+    (
         "V9.4 — 1 November 2026 — SeedVR2 W4A8 Default and 2x Faster INT8, New FlashVSR+ Turbo, Faster RIFE Without Ghost Frames, Faster GAN Video, LTX 2.5 Sparse Attention",
         """
 **Every upscaler was checked against its upstream project and its forks, and everything that measured better on real test videos is in. SeedVR2's main model step now runs about 2x faster than BF16 with both the new default W4A8 model and the fixed INT8 ConvRot path, at the same quality, the new FlashVSR+ Turbo beats FlashVSR v1.1 on every test clip, RIFE is up to 2.4x faster with no ghost frames at scene cuts, and GAN video upscaling is 2.5-3.6x faster.**

@@ -764,9 +764,9 @@ def ltx25_tab(
             #### LTX 2.5 Upscaler Guide
 
             **Model defaults**
-            - `Distilled INT8 ConvRot` is the recommended default everywhere: ComfyUI-parity INT8 kernels, best speed/quality balance.
-            - `Distilled NVFP4` is fastest on RTX 50 (native FP4); older GPUs emulate it (same quality, slower).
-            - `Distilled INT4 W4A8 ConvRot` is the smallest download; `BF16` variants need weight streaming below 48GB VRAM.
+            - `Distilled INT4 W4A8 ConvRot` is the default: smallest download (15.4 GB), within 0.11 dB of INT8, and 20-22% faster wherever INT8 has to stream blocks from RAM (a 1080p chunk on a 32 GB GPU, any 24 GB GPU). GPUs older than RTX 30 switch to `Distilled INT8 ConvRot` automatically.
+            - `Distilled INT8 ConvRot`: ComfyUI-parity INT8 kernels (21.9 GB).
+            - `Distilled NVFP4` is fastest on RTX 50 (native FP4); older GPUs emulate it (same quality, slower). `BF16` variants need weight streaming below 48GB VRAM.
             - `Dev` variants run 20 steps at CFG 3 for maximum quality; `Distilled` variants run 8 steps at CFG 1.
             - Switching the model auto-fills Steps/CFG/Sampler (still fully editable afterwards).
 

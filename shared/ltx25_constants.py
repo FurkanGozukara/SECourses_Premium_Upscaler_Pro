@@ -161,6 +161,12 @@ LTX25_FILE_SHA256 = {
         (906080571, "62dce32f671429c0ca98fdba997cabb9925fcfe79bbf788c5aa62a3a4c4a5a93"),
 }
 
+# W4A8 needs compute capability 8.0+ (comfy_kitchen); on older GPUs a run switches to the same base in INT8 ConvRot.
+LTX25_W4A8_INT8_FALLBACK = {
+    LTX25_DISTILLED_INT4: LTX25_DISTILLED_INT8,
+    LTX25_DEV_INT4: LTX25_DEV_INT8,
+}
+
 # Distilled variants run the 8-step distilled sigma schedule by default;
 # Dev variants default to the 20-step quality schedule from the Auto
 # Resolution preset (cfg 3).

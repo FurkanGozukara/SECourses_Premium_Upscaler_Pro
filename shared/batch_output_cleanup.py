@@ -127,10 +127,13 @@ def keep_only_batch_outputs(
     batch_output_root: Path,
     output_paths: Iterable[str],
     on_log: Optional[Callable[[str], None]] = None,
+    *,
+    preserve_recovery: bool = False,
 ) -> Dict[str, int | str | List[str]]:
     """
     Flatten final outputs into the batch output folder root, then remove all
-    other generated artifacts.
+    other generated artifacts. With preserve_recovery, keep recovery folders in
+    place without counting their contents as successful outputs.
     """
     root = Path(batch_output_root)
     if not root.exists() or not root.is_dir():
@@ -231,6 +234,18 @@ def keep_only_batch_outputs(
         seen_outputs.add(key_norm)
         deduped_outputs.append(key)
     final_outputs = deduped_outputs
+
+    if preserve_recovery:
+        recovery_files: Set[Path] = set()
+        for recovery_dir in root_resolved.rglob("recovery"):
+            if not recovery_dir.is_dir() or not _is_within(recovery_dir, root_resolved):
+                continue
+            for recovery_file in recovery_dir.rglob("*"):
+                if recovery_file.is_file() and _is_within(recovery_file, root_resolved):
+                    recovery_files.add(recovery_file.resolve())
+        preserve_files.update(recovery_files)
+        if recovery_files and on_log:
+            on_log(f"Keep-only cleanup preserved {len(recovery_files)} recovery file(s).")
 
     stats = _cleanup_keep_files(root_resolved, preserve_files)
 

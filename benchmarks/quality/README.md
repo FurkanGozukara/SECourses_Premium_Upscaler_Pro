@@ -28,3 +28,13 @@ Same method (downscale, upscale back, compare with the original), RTX 5090.
 | Open-H3 4K | one refine from 0.8 / 0.7 then a same-size pass from 0.6 | second pass: 2.1x refine time, grain and invented objects | off |
 
 `flashvsr_decoder_results.jsonl` (quality, quality2, vram, vram2, acc) and `open_h3_quality_results.jsonl` (sparse, lips, ladder).
+
+# Low-bit DiTs: LTX 2.5 and MiniMax Open-H3 (2 November 2026)
+
+Same method (2x down, upscale back with the app's runners, compare with the originals), RTX 5090; 24 / 16 GB cards simulated with Save VRAM.
+Full tables, crop sheets and grid videos: `G:/SECourses_Premium_Upscaler_Pro_v8/upstream_scan_20261101/results/WP-LOWBIT/RESULTS.md`.
+
+| Model | Compared | Result |
+|---|---|---|
+| LTX 2.5 Distilled, 3 clips | INT8 ConvRot / INT4 W4A8 | W4A8 -0.04 to -0.11 dB, same flicker; 21.9 vs 15.4 GB file; INT8 streams 7 of 48 blocks even on 32 GB at 1080p, so W4A8 is 20 % (32 GB) / 22 % (24 GB) faster; equal at 16 GB |
+| MiniMax H3 FL2VA pruned, 3 clips | INT8 ConvRot / W6A8 / W4A8 | W6A8 -0.07 to +0.05 dB, W4A8 -0.16 to +0.15 dB; 21.0 / 16.0 / 12.5 GB; equal speed on 32 GB; W4A8 37-40 % faster on 24 / 16 GB cards, W6A8 slower than INT8 at 16 GB |

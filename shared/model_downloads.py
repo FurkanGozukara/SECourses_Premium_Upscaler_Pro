@@ -102,7 +102,7 @@ def _valid_int8_cache(path: Path, family: str) -> bool:
     markers = {
         "seedvr2": ("seedvr2_int8_convrot", "seedvr2-dit-int8-convrot-v2"),
         "flashvsr": ("flashvsr_int8_convrot", "flashvsr-dit-int8-convrot-v2"),
-        "flashvsr_plus": ("flashvsr_int8_convrot", "flashvsr-plus-dit-int8-convrot-v1"),
+        "flashvsr_plus": ("flashvsr_int8_convrot", "flashvsr-plus-dit-int8-convrot-v2"),
         "sparkvsr": ("sparkvsr_int8_convrot", "sparkvsr-transformer-int8-convrot-v3"),
     }
     marker_key, format_value = markers[family]

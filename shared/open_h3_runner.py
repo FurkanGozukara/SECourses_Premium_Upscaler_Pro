@@ -33,7 +33,9 @@ from .open_h3_constants import (
     OPENH3_AUDIO_VAE_FILE,
     OPENH3_CURVES_FILE,
     OPENH3_DIT_FILES,
+    OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
+    OPENH3_LOW_BIT_INT8_FALLBACK,
     OPENH3_LORA_FILE,
     OPENH3_MODELS_DIRNAME,
     OPENH3_RESOLUTIONS,
@@ -160,7 +162,7 @@ def _draft_size(settings: Dict[str, Any], src_w: int, src_h: int) -> str:
 def resolve_model_files(base_dir: Path, settings: Dict[str, Any]) -> Tuple[Optional[Dict[str, Path]], List[str], Optional[str]]:
     notes: List[str] = []
     models_dir = Path(base_dir) / OPENH3_MODELS_DIRNAME
-    dit_name = str(settings.get("model_name") or OPENH3_DIT_INT8).strip()
+    dit_name = str(settings.get("model_name") or OPENH3_DIT_DEFAULT).strip()
     dit_file = OPENH3_DIT_FILES.get(dit_name)
     if dit_file is None:
         return None, notes, f"Unknown Open-H3 model: {dit_name}"
@@ -454,12 +456,21 @@ def run_open_h3(
             input_path = normalize_path(settings.get("_effective_input_path") or settings.get("input_path") or "")
 
         seed_value = _resolve_seed(settings, log)
+        low_bit_int8 = OPENH3_LOW_BIT_INT8_FALLBACK.get(str(settings.get("model_name") or OPENH3_DIT_DEFAULT).strip())
+        if low_bit_int8 and not normalize_path(settings.get("model_path") or ""):
+            from .models.seedvr2_w4a8 import w4a8_fallback_reason
+
+            reason = w4a8_fallback_reason(settings.get("device"))
+            if reason:
+                log(f"[Open-H3] {settings.get('model_name') or OPENH3_DIT_DEFAULT} cannot run here ({reason}); "
+                    f"using {low_bit_int8} instead.")
+                settings["model_name"] = low_bit_int8
         if not normalize_path(settings.get("model_path") or ""):
             from .model_downloads import ensure_open_h3_model
 
             ok, error = ensure_open_h3_model(
                 base_dir,
-                str(settings.get("model_name") or OPENH3_DIT_INT8),
+                str(settings.get("model_name") or OPENH3_DIT_DEFAULT),
                 str(settings.get("text_encoder") or OPENH3_TE_NVFP4),
                 str(settings.get("video_vae") or OPENH3_VAE_SOL_FP16),
                 on_progress,
@@ -607,7 +618,7 @@ def run_open_h3_batch(
         if not normalize_path(base.get("model_path") or ""):
             from .model_downloads import ensure_open_h3_model
 
-            ok, error = ensure_open_h3_model(base_dir, str(base.get("model_name") or OPENH3_DIT_INT8),
+            ok, error = ensure_open_h3_model(base_dir, str(base.get("model_name") or OPENH3_DIT_DEFAULT),
                                              str(base.get("text_encoder") or OPENH3_TE_NVFP4),
                                              str(base.get("video_vae") or OPENH3_VAE_SOL_FP16),
                                              on_progress, cancel_event=cancel_event)

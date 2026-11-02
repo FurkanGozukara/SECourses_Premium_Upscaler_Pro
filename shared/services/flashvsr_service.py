@@ -41,7 +41,6 @@ from shared.models.flashvsr_meta import (
     flashvsr_version_to_internal,
     flashvsr_version_to_ui,
 )
-from shared.model_downloads import windows_int8_defaults_enabled
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
@@ -365,8 +364,9 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         tiled_vae = False
         tiled_dit = True
 
-    if windows_int8_defaults_enabled():
-        default_precision = "int8_convrot"
+    # User decision (V9.5): INT8 ConvRot is the FlashVSR default on every platform (small cache, same quality,
+    # about 1 GB less VRAM and slightly faster than BF16).
+    default_precision = "int8_convrot"
 
     return {
         "input_path": "",

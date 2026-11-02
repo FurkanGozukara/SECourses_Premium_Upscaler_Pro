@@ -180,7 +180,8 @@ PLUS_RESERVED_GB = {  # (padded output MP, reserved GB)
     ("base", "never"): ((0.983, 8.04), (2.212, 17.94), (3.932, 19.60)),
     ("base", "always"): ((3.932, 14.47),),
 }
-PLUS_INT8_EXTRA_GB = 1.1        # INT8 ConvRot adds activation transients (Turbo 1080p 12.16 vs 11.05 GB reserved)
+PLUS_INT8_EXTRA_GB = 0.0        # INT8 ConvRot planned like BF16: Turbo 1080p 10.24 vs 10.74 GB reserved (2026-11-02, after
+                                # the FP32-activation fix; the old FP32 path reserved 12.16 vs 11.05 GB)
 PLUS_TC_FACTOR = {4: 1.0, 2: 1.45, 1: 1.45}  # non-weight memory vs temporal compression 4 (robot 1080p: 14.17 vs 11.05)
 PLUS_WEIGHTS_GB = 3.6
 PLUS_MARGIN = 1.10

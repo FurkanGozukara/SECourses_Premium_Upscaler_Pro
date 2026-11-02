@@ -330,7 +330,8 @@ def flashvsr_tab(
                                 "FlashVSR+ release: one stream over the whole clip (no chunk restarts), reward-tuned "
                                 "detail; Turbo uses hybrid local attention (less VRAM at high resolution, the better "
                                 "default); Base needs more VRAM. FlashVSR+ ignores Pipeline Mode / VAE Model, decodes with "
-                                "the TC decoder and runs in BF16 (INT8 gave it no VRAM saving and was slower)."
+                                "the TC decoder and follows the Precision setting (INT8 ConvRot: slightly faster and "
+                                "0.5-1 GB less VRAM than BF16 at the same quality; its 1.7 GB INT8 cache downloads on first use)."
                             ),
                         )
                         mode = gr.Dropdown(
@@ -410,11 +411,11 @@ def flashvsr_tab(
                         label="Precision",
                         choices=list(FLASHVSR_PRECISION_OPTIONS),
                         value=(
-                            str(_value("precision", _value("dtype", "bf16")))
-                            if str(_value("precision", _value("dtype", "bf16"))) in set(FLASHVSR_PRECISION_OPTIONS)
-                            else "bf16"
+                            str(_value("precision", _value("dtype", "int8_convrot")))
+                            if str(_value("precision", _value("dtype", "int8_convrot"))) in set(FLASHVSR_PRECISION_OPTIONS)
+                            else "int8_convrot"
                         ),
-                        info="`bf16` remains the RunPod and Massed Compute default; the Windows launcher selects `int8_convrot`. INT8 downloads a prebuilt Hadamard-rotated DiT cache on first use; local generation remains the fallback. It uses about half the DiT weight VRAM with near-BF16 quality. Speed depends on GPU and resolution (FlashVSR is attention-bound, so expect VRAM savings rather than speedups)."
+                        info="`int8_convrot` is the default on every platform: same quality as BF16, about 1 GB less VRAM and 3-6% faster (FlashVSR spends most of its time in attention and decoding, not in the layers INT8 speeds up). It downloads a prebuilt Hadamard-rotated DiT cache on first use (1.7 GB); local generation remains the fallback."
                     )
                     
                     attention_mode = gr.Dropdown(

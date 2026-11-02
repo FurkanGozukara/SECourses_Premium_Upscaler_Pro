@@ -1542,6 +1542,7 @@ def build_ltx25_callbacks(
                             batch_root,
                             outputs,
                             on_log=lambda msg: logs.append(str(msg)),
+                            preserve_recovery=True,
                         )
                         flattened_outputs = cleanup_result.get("final_outputs")
                         if isinstance(flattened_outputs, list) and flattened_outputs:

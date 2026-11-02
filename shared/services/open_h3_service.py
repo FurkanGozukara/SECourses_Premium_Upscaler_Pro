@@ -42,6 +42,7 @@ from shared.logging_utils import RunLogger
 from shared.comparison_unified import create_unified_comparison
 from shared.open_h3_constants import (
     OPENH3_DEFAULT_SEED,
+    OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
     OPENH3_DIT_NAMES,
     OPENH3_TE_NAMES,
@@ -385,7 +386,7 @@ def open_h3_defaults() -> Dict[str, Any]:
         "input_path": "",
         "output_override": "",
         "output_format": "auto",
-        "model_name": OPENH3_DIT_INT8,
+        "model_name": OPENH3_DIT_DEFAULT,
         "text_encoder": OPENH3_TE_NVFP4,
         "video_vae": OPENH3_VAE_SOL_FP16,
         "isolated_stages": False,
@@ -509,7 +510,7 @@ def _enforce_open_h3_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -
                 "keep_only_output_files", "sparse_attention", "keep_latents"):
         cfg[key] = _to_bool(cfg.get(key), _to_bool(defaults.get(key, False), False))
 
-    cfg["model_name"] = _pick(cfg.get("model_name"), OPENH3_DIT_NAMES, OPENH3_DIT_INT8)
+    cfg["model_name"] = _pick(cfg.get("model_name"), OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT)
     cfg["text_encoder"] = _pick(cfg.get("text_encoder"), OPENH3_TE_NAMES, OPENH3_TE_NVFP4)
     cfg["video_vae"] = _pick(cfg.get("video_vae"), OPENH3_VAE_NAMES, OPENH3_VAE_SOL_FP16)
     cfg["prompt"] = str(cfg.get("prompt") if cfg.get("prompt") is not None else OPENH3_DEFAULT_PROMPT)[:6000]
@@ -634,7 +635,7 @@ def build_open_h3_callbacks(
 
         try:
             payload = _open_h3_dict_from_args(list(args))
-            model_name = str(payload.get("model_name") or OPENH3_DIT_INT8)
+            model_name = str(payload.get("model_name") or OPENH3_DIT_DEFAULT)
 
             preset_manager.save_preset_safe("open_h3", model_name, preset_name.strip(), payload)
             dropdown = refresh_presets(model_name, select_name=preset_name.strip())
@@ -654,7 +655,7 @@ def build_open_h3_callbacks(
         (inputs_list + [preset_status]).
         """
         try:
-            model_name = str(model_name or OPENH3_DIT_INT8)
+            model_name = str(model_name or OPENH3_DIT_DEFAULT)
             preset = preset_manager.load_preset_safe("open_h3", model_name, preset_name)
             if preset:
                 preset_manager.set_last_used("open_h3", model_name, preset_name)

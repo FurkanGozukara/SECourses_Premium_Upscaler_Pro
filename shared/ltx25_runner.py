@@ -40,6 +40,7 @@ from .ltx25_constants import (
     LTX25_TRANSFORMER_FILES,
     LTX25_VAE_CONV,
     LTX25_VAE_FILES,
+    LTX25_W4A8_INT8_FALLBACK,
     ltx25_is_distilled,
 )
 from .model_downloads import ensure_ltx25_model
@@ -122,7 +123,10 @@ def _probe_ltx25_video(path: Path, *, count_frames: bool) -> Optional[Dict[str, 
             "json",
             str(path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=1800,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
         if proc.returncode != 0:
             return None
         streams = (json.loads(proc.stdout or "{}").get("streams") or [])
@@ -136,6 +140,35 @@ def _probe_ltx25_video(path: Path, *, count_frames: bool) -> Optional[Dict[str, 
         return stream
     except Exception:
         return None
+
+
+def _ltx25_video_fps(stream: Optional[Dict[str, Any]]) -> float:
+    """Match the decoder's average-first timing, including small VFR differences."""
+    for field in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            value = float(Fraction(str((stream or {}).get(field))))
+            if math.isfinite(value) and value > 0:
+                return value
+        except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+            continue
+    return 0.0
+
+
+def _preserve_ltx25_output(
+    output_path: Path,
+    run_dir: Path,
+    log: Callable[[str], None],
+) -> None:
+    """Retain rejected work without leaving it under a resumable chunk name."""
+    try:
+        recovery_dir = Path(run_dir) / "recovery"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        recovery_path = collision_safe_path(recovery_dir / output_path.name)
+        output_path.rename(recovery_path)
+        log(f"[LTX25] Render retained for recovery: {recovery_path}")
+    except Exception as exc:
+        # A failed recovery move must never turn into deletion of expensive work.
+        log(f"[LTX25] Could not move render to recovery ({exc}); original retained at: {output_path}")
 
 
 def _validate_ltx25_video_output(
@@ -179,14 +212,7 @@ def _validate_ltx25_video_output(
     if output_frames != expected_frames:
         return False, f"decoded frame count mismatch {output_frames}/{expected_frames}"
 
-    def _rate(raw: Any) -> float:
-        try:
-            value = float(Fraction(str(raw)))
-            return value if math.isfinite(value) and value > 0 else 0.0
-        except Exception:
-            return 0.0
-
-    actual_fps = _rate(output.get("r_frame_rate")) or _rate(output.get("avg_frame_rate"))
+    actual_fps = _ltx25_video_fps(output)
     if actual_fps <= 0:
         return False, "output frame rate is unavailable"
     if expected_fps > 0 and abs(actual_fps - float(expected_fps)) > max(1e-6, 1e-4 * float(expected_fps)):
@@ -391,6 +417,8 @@ def _build_ltx25_command(
     input_path: str,
     output_file: Path,
     seed_value: int,
+    *,
+    output_fps: Optional[float] = None,
 ) -> List[str]:
     model_name = str(settings.get("model_name") or "").strip()
     schedule = _resolve_schedule(settings, model_name)
@@ -454,7 +482,7 @@ def _build_ltx25_command(
         "--pre_resize_longer_edge",
         str(max(0, _parse_int(settings.get("pre_resize_longer_edge"), 0))),
         "--fps_override",
-        str(max(0.0, _parse_float(settings.get("fps"), 0.0))),
+        str(float(output_fps)) if output_fps is not None else str(max(0.0, _parse_float(settings.get("fps"), 0.0))),
         "--start_frame",
         str(max(0, _parse_int(settings.get("start_frame"), 0))),
         "--end_frame",
@@ -734,6 +762,14 @@ def _run_ltx25_once(
 
         seed_value = _resolve_seed(settings, log)
 
+        low_bit_int8 = LTX25_W4A8_INT8_FALLBACK.get(str(settings.get("model_name") or "").strip())
+        if low_bit_int8 and not normalize_path(settings.get("model_path") or ""):
+            from .models.seedvr2_w4a8 import w4a8_fallback_reason
+
+            reason = w4a8_fallback_reason(settings.get("device"))
+            if reason:
+                log(f"[LTX 2.5] {settings.get('model_name')} cannot run here ({reason}); using {low_bit_int8} instead.")
+                settings["model_name"] = low_bit_int8
         model_name = str(settings.get("model_name") or "").strip()
         transformer_override = normalize_path(settings.get("model_path") or "")
         if not transformer_override:
@@ -772,9 +808,18 @@ def _run_ltx25_once(
                 "LTX 2.5 model files missing after download step:\n" + "\n".join(missing),
             )
 
-        input_fps = get_media_fps(input_path) or 30.0
+        # LTX decodes every source frame and writes CFR at its average rate. The
+        # shared UI helper can prefer nominal FPS for differences below 1%, which
+        # rejected complete VFR renders. Resolve once and give the exact same rate
+        # to the engine and validator; this is not a user FPS conversion request.
+        input_fps = (
+            _ltx25_video_fps(_probe_ltx25_video(Path(input_path), count_frames=False))
+            or get_media_fps(input_path)
+            or 30.0
+        )
         fps_override = max(0.0, _parse_float(settings.get("fps"), 0.0))
         output_fps = fps_override if fps_override > 0 else input_fps
+        log(f"[LTX25] Video timing: {output_fps:.9f} fps")
 
         base_name = settings.get("_original_filename") or Path(input_path).name
         base_stem = Path(str(base_name)).stem or "output"
@@ -817,7 +862,10 @@ def _run_ltx25_once(
         if chunk_seconds > 20.5:
             log(f"[LTX25] Max Chunk Frames is {chunk_seconds:.0f} s at {output_fps:g} fps: LTX 2.5's positions cover 20 s, "
                 "so longer chunks lose a little quality (Auto Tune keeps them at 20 s).")
-        cmd = _build_ltx25_command(python_exe, script_path, settings, paths, input_path, output_file, seed_value)
+        cmd = _build_ltx25_command(
+            python_exe, script_path, settings, paths, input_path, output_file, seed_value,
+            output_fps=output_fps,
+        )
 
         schedule = _resolve_schedule(settings, model_name)
         log(
@@ -828,7 +876,7 @@ def _run_ltx25_once(
         log(f"Command: {_format_command_for_log(cmd)}")
 
         env = _build_env(base_dir, visible_gpu, log)
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
         preexec_fn = None if os.name == "nt" else os.setsid
         proc = subprocess.Popen(
             cmd,
@@ -865,33 +913,36 @@ def _run_ltx25_once(
         output_valid = False
         output_detail = ""
         if output_path:
-            output_valid, output_detail = _validate_ltx25_video_output(
-                Path(input_path),
-                Path(output_path),
-                expected_fps=float(output_fps),
-                start_frame=max(0, _parse_int(settings.get("start_frame"), 0)),
-                end_frame=_parse_int(settings.get("end_frame"), -1),
-            )
+            try:
+                output_valid, output_detail = _validate_ltx25_video_output(
+                    Path(input_path),
+                    Path(output_path),
+                    expected_fps=float(output_fps),
+                    start_frame=max(0, _parse_int(settings.get("start_frame"), 0)),
+                    end_frame=_parse_int(settings.get("end_frame"), -1),
+                )
+            except Exception as exc:
+                output_detail = f"validation could not complete: {exc}"
 
         if returncode != 0:
             log(
                 f"LTX 2.5 exited with code {returncode}; refusing partial/stale output"
                 + (f" ({output_detail})." if output_detail else ".")
             )
-            # A non-zero engine exit is never a resumable completed chunk, even when
-            # ffmpeg happened to finalize a decodable prefix. Leaving it under the
-            # canonical chunk name lets the resume scanner pick up stale data later.
+            # Keep expensive work for manual recovery, away from completed chunks.
             if output_path:
-                with suppress(Exception):
-                    Path(output_path).unlink(missing_ok=True)
+                _preserve_ltx25_output(
+                    Path(output_path), Path(settings.get("_run_dir") or output_file.parent), log,
+                )
             result = Ltx25Result(returncode or 1, None, "\n".join(log_lines))
         elif not output_path:
             log("No LTX 2.5 output file generated.")
             result = Ltx25Result(returncode or 1, None, "\n".join(log_lines))
         elif not output_valid:
             log(f"LTX 2.5 output validation failed: {output_detail}")
-            with suppress(Exception):
-                Path(output_path).unlink(missing_ok=True)
+            _preserve_ltx25_output(
+                Path(output_path), Path(settings.get("_run_dir") or output_file.parent), log,
+            )
             result = Ltx25Result(1, None, "\n".join(log_lines))
         else:
             log(f"LTX 2.5 output validation passed: {output_detail}")

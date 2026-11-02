@@ -21,7 +21,7 @@ from shared.universal_preset import dict_to_values
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.path_utils import normalize_path
 from ui.media_preview import preview_updates
-from ui.shared_components import warn_cancel_confirmation
+from ui.shared_components import warn_cancel_confirmation, with_pre_run_output_signature
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
 from shared.queue_state import (
     snapshot_queue_state,
@@ -1273,22 +1273,16 @@ def gan_tab(
 
     gan_pre_run_output_signature = gr.State(value="")
 
-    upscale_btn.click(
-        fn=capture_latest_output_signature,
-        inputs=[shared_state],
-        outputs=[gan_pre_run_output_signature],
-        queue=False,
-        show_progress="hidden",
-    )
-
-    # Main processing with gr.Progress - include input_file upload
+    # Main processing with gr.Progress - include input_file upload. The job captures the current
+    # output signature as it starts, so auto-transfer only triggers on newly generated outputs.
     run_evt = upscale_btn.click(
-        fn=run_upscale_with_queue,
+        fn=with_pre_run_output_signature(run_upscale_with_queue, capture_latest_output_signature),
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
             status_box, log_box, progress_indicator, output_image, output_video,
             last_processed, image_slider, video_comparison_html, batch_gallery,
-            chunk_status, chunk_gallery, chunk_preview_video, shared_state
+            chunk_status, chunk_gallery, chunk_preview_video, shared_state,
+            gan_pre_run_output_signature,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",

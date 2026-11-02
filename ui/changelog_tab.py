@@ -11,6 +11,19 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.6 — 2 November 2026 — Queued Jobs Keep the Settings of Their Click, Video Previews Keep Loading in Long Sessions",
+        """
+**Two fixes found by a full test of a fresh installation, which also confirmed that it installs every library the app needs.**
+
+**Queued jobs use the settings you clicked with**
+- When you clicked Upscale while other jobs were running, the job read its settings only after two small preparation requests (the Auto Tune preview and the "Auto Transfer Output to Input" check) came back from the busy app. Anything you changed in those seconds, such as the model or precision for your next job, could end up in the job you had just queued.
+- The job now reads its settings at the moment you click, on every tab (SeedVR2, FlashVSR, Open-H3, LTX 2.5, SparkVSR, RTX Super Resolution and GAN). The Auto Tune preview still appears right after the click, and each job still re-tunes itself when it actually starts.
+
+**Video previews no longer stop loading**
+- After many runs in one browser tab, Chrome refused to open more videos, so previews, outputs and the comparison slider stayed on "Loading videos..." until the page was refreshed. Videos that leave the page now release their player at once, so long sessions keep working.
+""",
+    ),
+    (
         "V9.5 — 2 November 2026 — W4A8 Default for LTX 2.5 and MiniMax Open-H3, FlashVSR INT8 Everywhere and Faster FlashVSR+, LTX Frame-Rate Fix",
         """
 **The smallest models are now the defaults where they lose nothing measurable: W4A8 for SeedVR2, LTX 2.5 and MiniMax Open-H3, and INT8 ConvRot for FlashVSR on every platform. W4A8 keeps the quality of INT8 (within about 0.1 dB), downloads 30-40 % less and is 20-40 % faster whenever INT8 does not fit in your GPU's memory. FlashVSR+ is 12-15 % faster.**

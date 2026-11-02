@@ -91,6 +91,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 from ui.model_tab_common import sync_signature as _sync_signature
 from ui.theme import (
     DESIGN_CSS,
+    MEDIA_PLAYER_RELEASE_HEAD,
     RUN_HISTORY_CLEANUP_HEAD,
     build_theme,
     button_hue_css,
@@ -103,7 +104,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.5"
+APP_VERSION = "9.6"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -2306,7 +2307,7 @@ def main(argv=None):
         "share": share_enabled,
         "theme": modern_theme,
         "css": CUSTOM_CSS,
-        "head": RUN_HISTORY_CLEANUP_HEAD + CUSTOM_HEAD + theme_bootstrap_head,
+        "head": RUN_HISTORY_CLEANUP_HEAD + MEDIA_PLAYER_RELEASE_HEAD + CUSTOM_HEAD + theme_bootstrap_head,
         # Run history serialises every event's inputs and outputs into localStorage on each
         # call (hundreds of settings here); False also deletes this app's saved runs.
         "run_history": False,

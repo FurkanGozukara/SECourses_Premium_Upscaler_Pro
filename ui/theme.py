@@ -657,6 +657,47 @@ try {
 """
 
 
+# Chrome allows a limited number of media players per page and frees the player of a removed
+# <video>/<audio> only when that element is garbage collected. Every run replaces preview,
+# output and comparison videos, so after many runs new players were refused ("too many
+# WebMediaPlayers") and previews stayed on "Loading videos..." until a page refresh. Release the
+# player of every media element that has left the page (checked a moment later, so an element
+# that is only moved keeps playing).
+MEDIA_PLAYER_RELEASE_HEAD = """
+<script>
+(() => {
+  if (window.__secoursesMediaReleaseInstalled) return;
+  window.__secoursesMediaReleaseInstalled = true;
+  const removed = new Set();
+  let timer = null;
+  const release = (el) => {
+    try { el.pause(); } catch (e) {}
+    el.removeAttribute("src");
+    el.querySelectorAll("source").forEach((s) => s.remove());
+    try { el.load(); } catch (e) {}
+  };
+  const flush = () => {
+    timer = null;
+    removed.forEach((el) => { if (!el.isConnected) release(el); });
+    removed.clear();
+  };
+  const collect = (node) => {
+    if (node.nodeType !== 1) return;
+    if (node.matches("video, audio")) removed.add(node);
+    node.querySelectorAll("video, audio").forEach((el) => removed.add(el));
+  };
+  const start = () => {
+    new MutationObserver((records) => {
+      records.forEach((r) => r.removedNodes.forEach(collect));
+      if (removed.size && !timer) timer = setTimeout(flush, 1000);
+    }).observe(document.body, { childList: true, subtree: true });
+  };
+  if (document.body) start(); else document.addEventListener("DOMContentLoaded", start, { once: true });
+})();
+</script>
+"""
+
+
 def _logo_data_uri(favicon_path: Path) -> str:
     try:
         return "data:image/svg+xml;base64," + base64.b64encode(Path(favicon_path).read_bytes()).decode("ascii")

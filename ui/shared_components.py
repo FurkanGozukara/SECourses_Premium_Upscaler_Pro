@@ -135,7 +135,14 @@ def wire_auto_tune(
 def wire_auto_tune_on_run(*, upscale_btn, action, inputs: list, tuned: dict, shared_state, auto_tune_on_run, global_settings=None):
     """When "Auto Tune on every Upscale" is on, show the tuned values in the UI as the Upscale
     click starts (the job itself re-tunes at its real start, so queued jobs size for the VRAM
-    free when they run). Skipped while another job holds the GPU, whose VRAM would distort it."""
+    free when they run). Skipped while another job holds the GPU, whose VRAM would distort it.
+
+    Wire this before the Upscale job. Gradio runs a button's listeners one after another and
+    reads each listener's inputs only when its turn comes, so a server call registered before
+    the job would delay the moment the job reads its settings: a setting changed during that
+    call (seconds while other jobs keep the server busy) would leak into the queued job. The
+    tuned values are therefore shown from a browser-only listener's .then(), which runs in its
+    own chain while the job reads its settings at the click."""
     keys = list(tuned)
 
     def _out(values):
@@ -167,13 +174,38 @@ def wire_auto_tune_on_run(*, upscale_btn, action, inputs: list, tuned: dict, sha
         updates = result.get("updates") or {}
         return _out(gr.update(value=updates[k]) if k in updates else gr.update() for k in keys)
 
-    return upscale_btn.click(
+    start = upscale_btn.click(fn=None, js="() => []", queue=False, show_progress="hidden")
+    return start.then(
         fn=_on_click,
         inputs=[auto_tune_on_run] + inputs + [shared_state],
         outputs=[tuned[k] for k in keys],
         queue=False,
         show_progress="hidden",
     )
+
+
+def with_pre_run_output_signature(run_fn, capture_signature):
+    """Wrap an Upscale job so it also outputs the latest-output signature taken as the job starts.
+
+    Auto Transfer Output to Input compares it with the newest output after the run. The job
+    captures it itself instead of a listener before it, which would delay the moment the job
+    reads its settings (see wire_auto_tune_on_run). Register the job with the signature state
+    as its last output."""
+
+    def _run(*args, progress=gr.Progress()):
+        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
+        try:
+            signature = capture_signature(live_state)
+        except Exception:
+            signature = ""
+        updates = run_fn(*args, progress=progress)
+        try:
+            for payload in updates:
+                yield (*payload, signature) if isinstance(payload, (tuple, list)) else (payload, signature)
+        finally:
+            updates.close()
+
+    return _run
 
 
 def mode_banner(text: str):

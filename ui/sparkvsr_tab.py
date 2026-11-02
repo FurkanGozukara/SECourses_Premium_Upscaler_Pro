@@ -42,6 +42,7 @@ from ui.shared_components import (
     warn_cancel_confirmation,
     wire_auto_tune,
     wire_auto_tune_on_run,
+    with_pre_run_output_signature,
 )
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
@@ -2115,17 +2116,10 @@ def sparkvsr_tab(
         global_settings=global_settings,
     )
 
-    # Main processing
-    upscale_btn.click(
-        fn=capture_latest_output_signature,
-        inputs=[shared_state],
-        outputs=[SparkVSR_pre_run_output_signature],
-        queue=False,
-        show_progress="hidden",
-    )
-
+    # Main processing. The job captures the current output signature as it starts, so
+    # auto-transfer only triggers on newly generated outputs.
     run_evt = upscale_btn.click(
-        fn=run_upscale_with_queue,
+        fn=with_pre_run_output_signature(run_upscale_with_queue, capture_latest_output_signature),
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
             status_box,
@@ -2138,6 +2132,7 @@ def sparkvsr_tab(
             video_comparison_html,
             batch_gallery,
             shared_state,
+            SparkVSR_pre_run_output_signature,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",

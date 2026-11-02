@@ -31,6 +31,7 @@ from ui.shared_components import (
     warn_cancel_confirmation,
     wire_auto_tune,
     wire_auto_tune_on_run,
+    with_pre_run_output_signature,
 )
 from ui.universal_preset_section import universal_preset_section, wire_universal_preset_events
 
@@ -1685,21 +1686,16 @@ def rtx_super_resolution_tab(
         global_settings=global_settings,
     )
 
-    upscale_btn.click(
-        fn=capture_latest_output_signature,
-        inputs=[shared_state],
-        outputs=[rtx_pre_run_output_signature],
-        queue=False,
-        show_progress="hidden",
-    )
-
+    # The job captures the current output signature as it starts, so auto-transfer only
+    # triggers on newly generated outputs.
     run_evt = upscale_btn.click(
-        fn=run_upscale,
+        fn=with_pre_run_output_signature(run_upscale, capture_latest_output_signature),
         inputs=[input_file] + inputs_list + [shared_state],
         outputs=[
             status_box, log_box, progress_indicator, output_image, output_video,
             last_processed, image_slider, video_comparison_html, batch_gallery,
             chunk_status, chunk_gallery, chunk_preview_video, shared_state,
+            rtx_pre_run_output_signature,
         ],
         concurrency_limit=32,
         concurrency_id="app_processing_queue",

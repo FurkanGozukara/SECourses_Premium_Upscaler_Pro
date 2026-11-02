@@ -1,7 +1,9 @@
 # LTX 2.5 output timing and recovery
 
 Status: fixed and verified locally, 2026-11-02. Owner: Codex, Roland's V8.6 FPS report.
-Base commit: `6e6a59e` (V9.4). Not committed, pushed, or added to a release zip.
+Base commit: `6e6a59e` (V9.4). Released in V9.5: committed and pushed in `19b4e68` (2026-11-02, by
+Claude session `secourses-premium-upscaler-pro-v8-a2` after its 22 tests passed), release zip
+`SECourses_Premium_Upscaler_Pro_v9_5.zip`.
 
 ## Coordination
 

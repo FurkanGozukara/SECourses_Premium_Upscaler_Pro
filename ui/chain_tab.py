@@ -123,7 +123,7 @@ def input_info_md(info: Dict[str, Any], count: int, videos: int) -> str:
         parts.append(f"{info['width']}×{info['height']}")
     if info.get("kind") == "video":
         if info.get("fps"):
-            parts.append(f"{info['fps']:.3g} fps")
+            parts.append(f"{info['fps']:.2f}".rstrip("0").rstrip(".") + " fps")  # 29.97, 30, 23.98
         if info.get("frames"):
             parts.append(f"{info['frames']} frames")
         if info.get("duration"):

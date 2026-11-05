@@ -4369,9 +4369,9 @@ def build_seedvr2_callbacks(
                             accumulated_messages = accumulated_messages[-200:]
 
                         message_lc = message.lower()
-                        if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=message, settings=settings):
-                            state["operation_status"] = "error"
-                            show_vram_oom_modal(state, title="Out of VRAM (GPU) - SeedVR2", duration=None)
+                        # An OOM line mid-run is not final: SeedVR2's memory manager retries, then Auto Tune retries the
+                        # run with the whole Save VRAM budget. The banner is raised when the run fails (error branch) or
+                        # ends without an output (final pass below), never for an attempt that recovered.
 
                         oom_visible = bool(state.get("alerts", {}).get("oom", {}).get("visible"))
                         chunk_match = chunk_progress_re.search(message)
@@ -4736,8 +4736,8 @@ def build_seedvr2_callbacks(
                 )
                 return
 
-            # Final pass: if logs contain VRAM OOM signatures, raise the global banner.
-            if maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=logs, settings=settings):
+            # Final pass: if the run produced nothing and its logs contain VRAM OOM signatures, raise the global banner.
+            if not (output_video or output_image) and maybe_set_vram_oom_alert(state, model_label="SeedVR2", text=logs, settings=settings):
                 state["operation_status"] = "error"
                 status = "Out of VRAM (GPU) - see banner above"
                 show_vram_oom_modal(state, title="Out of VRAM (GPU) - SeedVR2", duration=None)

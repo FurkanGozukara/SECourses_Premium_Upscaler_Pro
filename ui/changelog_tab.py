@@ -30,6 +30,9 @@ CHANGELOG_ENTRIES = [
 - Click engines to build a pipeline: SeedVR2, FlashVSR+, SparkVSR, Image GAN, RTX Super Resolution, LTX 2.5, Open-H3, DLSS 5, Face Restoration and RIFE. Each step feeds its output to the next and uses the settings you set on its own tab (model, precision, VRAM Auto Tune, output codec); a step can set only its scale (or the RIFE frame-rate multiplier). Reorder, switch off or remove steps.
 - Save chains as presets; four example chains are included. Run a chain on one video, several uploads or a whole folder. Every run gets its own folder under `outputs/chains` with each step's result, the final video and an Original vs Chain comparison video.
 - Global post-processes (DLSS 5 after every upscale, Global RIFE, comparison videos) are switched off inside the steps, so nothing runs twice; add them as steps instead.
+
+**Fixed**
+- SeedVR2 no longer shows an "Out of VRAM" warning after an upscale that recovered by itself (its memory manager or the Auto Tune retry with the whole Save VRAM budget); the warning now appears only when the upscale really fails.
 """,
     ),
     (

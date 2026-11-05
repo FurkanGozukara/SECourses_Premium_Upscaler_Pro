@@ -43,6 +43,7 @@ from shared.services.rtx_super_resolution_service import (
     rtx_super_resolution_defaults,
 )
 from shared.services.face_service import FACE_ORDER, face_defaults
+from shared.services.dlss5_service import DLSS5_ORDER, dlss5_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
 from shared.models.rife_meta import get_rife_default_model
@@ -142,6 +143,11 @@ TAB_CONFIGS = {
     "rtx": {
         "order": RTX_ORDER,
         "defaults_fn": rtx_super_resolution_defaults,
+        "needs_model_arg": False,
+    },
+    "dlss5": {
+        "order": DLSS5_ORDER,
+        "defaults_fn": dlss5_defaults,
         "needs_model_arg": False,
     },
     "face": {
@@ -524,6 +530,9 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
 
     # RTX Super Resolution
     defaults["rtx"] = rtx_super_resolution_defaults()
+
+    # DLSS 5 neural rendering
+    defaults["dlss5"] = dlss5_defaults()
     
     # Face
     defaults["face"] = face_defaults(models_list)
@@ -662,6 +671,7 @@ def create_universal_preset(
         preset["rtx"] = values_to_dict("rtx", rtx_values)
     else:
         preset["rtx"] = defaults["rtx"]
+    preset["dlss5"] = defaults["dlss5"]
     
     if face_values is not None:
         preset["face"] = values_to_dict("face", face_values)
@@ -776,6 +786,7 @@ def update_shared_state_from_preset(
     seed_controls["ltx25_settings"] = preset.get("ltx25", {})
     seed_controls["open_h3_settings"] = preset.get("open_h3", {})
     seed_controls["rtx_settings"] = preset.get("rtx", {})
+    seed_controls["dlss5_settings"] = preset.get("dlss5", {})
     seed_controls["face_settings"] = preset.get("face", {})
     seed_controls["resolution_settings"] = preset.get("resolution", {})
     seed_controls["output_settings"] = preset.get("output", {})
@@ -881,6 +892,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "ltx25": seed_controls.get("ltx25_settings", {}),
         "open_h3": seed_controls.get("open_h3_settings", {}),
         "rtx": seed_controls.get("rtx_settings", {}),
+        "dlss5": seed_controls.get("dlss5_settings", {}),
         "face": seed_controls.get("face_settings", {}),
         "resolution": seed_controls.get("resolution_settings", {}),
         "output": seed_controls.get("output_settings", {}),

@@ -663,6 +663,127 @@ try {
 # WebMediaPlayers") and previews stayed on "Loading videos..." until a page refresh. Release the
 # player of every media element that has left the page (checked a moment later, so an element
 # that is only moved keeps playing).
+# DLSS 5 and Chains tabs (V9.7). Built on the --sec-* tokens, so light and dark follow the app theme.
+FEATURE_CSS = r"""
+.dlss5-hero, .chain-hero {
+  border-radius: 16px;
+  padding: 18px 20px;
+  margin-bottom: 12px;
+  border: 1px solid var(--sec-tabbar-border);
+  background: linear-gradient(120deg, rgba(16, 185, 129, 0.14), rgba(99, 102, 241, 0.12) 55%, rgba(14, 165, 233, 0.12));
+  box-shadow: var(--sec-shadow-sm);
+}
+.chain-hero {
+  background: linear-gradient(120deg, rgba(217, 70, 239, 0.13), rgba(99, 102, 241, 0.12) 50%, rgba(20, 184, 166, 0.13));
+}
+.dlss5-hero-title, .chain-hero-title {
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: var(--sec-text);
+}
+.dlss5-hero-sub, .chain-hero-sub {
+  margin-top: 6px;
+  color: var(--sec-hero-sub, var(--sec-muted));
+  line-height: 1.5;
+  font-size: 0.95rem;
+}
+.dlss5-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.dlss5-chip {
+  padding: 4px 11px;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--sec-text-2);
+  background: var(--sec-surface);
+  border: 1px solid var(--sec-border);
+}
+.dlss5-card-title p, .chain-card-title p, .dlss5-card-title h4, .chain-card-title h4 {
+  margin: 2px 0 6px 0 !important;
+  color: var(--sec-card-title) !important;
+}
+.dlss5-post-card {
+  border: 1px solid rgba(16, 185, 129, 0.45) !important;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.07), rgba(99, 102, 241, 0.05)) !important;
+}
+.chain-palette { flex-wrap: wrap !important; gap: 8px !important; }
+.chain-palette > button, .chain-palette .chain-add-btn {
+  flex: 0 1 auto !important;
+  border-radius: 999px !important;
+  font-weight: 650 !important;
+}
+.chain-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--sec-card-inner);
+  border: 1px dashed var(--sec-border);
+}
+.chain-node {
+  min-width: 110px;
+  max-width: 240px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--sec-surface);
+  border: 1px solid var(--sec-tab-hover-border, var(--sec-border));
+  box-shadow: 0 4px 14px -8px rgba(79, 70, 229, 0.55);
+}
+.chain-node-io {
+  min-width: 0;
+  font-weight: 700;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.16), rgba(20, 184, 166, 0.14));
+}
+.chain-node-off { opacity: 0.45; filter: grayscale(0.7); }
+.chain-node-top { font-weight: 700; color: var(--sec-text); white-space: nowrap; }
+.chain-node-sub { font-size: 0.75rem; color: var(--sec-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-node-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 50%;
+  font-size: 0.72rem; font-weight: 800; color: #fff;
+  background: linear-gradient(135deg, #4f46e5, #0891b2);
+}
+.chain-badge {
+  margin-left: 4px; padding: 1px 7px; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 800; color: #065f46;
+  background: rgba(52, 211, 153, 0.25); border: 1px solid rgba(16, 185, 129, 0.5);
+}
+.dark .chain-badge { color: #a7f3d0 !important; }
+.chain-arrow { font-size: 1.1rem; color: var(--sec-accent); font-weight: 800; }
+.chain-flow-summary { margin: 6px 4px 2px; font-size: 0.85rem; color: var(--sec-muted); }
+.chain-step {
+  align-items: center !important;
+  padding: 6px 10px !important;
+  margin: 6px 0 !important;
+  border-radius: 12px !important;
+  background: var(--sec-surface) !important;
+  border: 1px solid var(--sec-border) !important;
+}
+.chain-step-title { font-weight: 700; color: var(--sec-text); padding: 6px 2px; white-space: nowrap; }
+.chain-timeline { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
+.chain-tl-head { font-weight: 700; color: var(--sec-text); margin-bottom: 2px; }
+.chain-tl-row {
+  display: grid; grid-template-columns: 26px minmax(110px, 170px) 1fr; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 10px; border: 1px solid var(--sec-border); background: var(--sec-surface);
+}
+.chain-tl-name { font-weight: 650; color: var(--sec-text); white-space: nowrap; }
+.chain-tl-detail { font-size: 0.82rem; color: var(--sec-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-tl-running { border-color: rgba(99, 102, 241, 0.75); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.18); }
+.chain-tl-running .chain-tl-icon { animation: chain-pulse 1.2s ease-in-out infinite; }
+.chain-tl-done { border-color: rgba(16, 185, 129, 0.6); }
+.chain-tl-failed { border-color: rgba(225, 29, 72, 0.7); background: rgba(225, 29, 72, 0.06); }
+.chain-tl-skipped { opacity: 0.6; }
+@keyframes chain-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (max-width: 720px) {
+  .chain-node { max-width: 100%; }
+  .chain-tl-row { grid-template-columns: 26px 1fr; }
+  .chain-tl-detail { grid-column: 1 / -1; }
+}
+"""
+
+
 MEDIA_PLAYER_RELEASE_HEAD = """
 <script>
 (() => {
@@ -737,7 +858,7 @@ def hero_header(version: str, favicon_path: Path, patreon_url: str) -> gr.HTML:
     {logo_html}
     <div>
       <div class="sec-hero-title">SECourses Ultimate Video &amp; Image Upscaler Pro<span class="sec-hero-version">V{version}</span></div>
-      <div class="sec-hero-sub">SeedVR2 · FlashVSR · FlashVSR+ · Open-H3 Regenerate · LTX 2.5 · SparkVSR · RTX Super Resolution · GAN · RIFE · Face Restoration</div>
+      <div class="sec-hero-sub">SeedVR2 · FlashVSR · FlashVSR+ · Open-H3 Regenerate · LTX 2.5 · SparkVSR · RTX Super Resolution · DLSS 5 · Chains · GAN · RIFE · Face Restoration</div>
     </div>
   </div>
   <div class="sec-hero-actions">

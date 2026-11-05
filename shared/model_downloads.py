@@ -511,6 +511,23 @@ def ensure_open_h3_model(
     return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
 
 
+def ensure_dlss5_model(
+    base_dir: Path,
+    on_progress: ProgressCallback = None,
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """DLSS 5 neural rendering weights in DLSS5_Models (downloaded and verified on first use)."""
+    from shared.dlss5 import DLSS5_MODELS_DIRNAME, DLSS5_WEIGHTS_FILE, DLSS5_WEIGHTS_SIZE
+
+    target = Path(base_dir) / DLSS5_MODELS_DIRNAME / DLSS5_WEIGHTS_FILE
+    try:
+        if target.is_file() and target.stat().st_size == DLSS5_WEIGHTS_SIZE:
+            return True, ""
+    except OSError:
+        pass
+    return run_model_downloader(base_dir, ["--ensure-dlss5"], on_progress, cancel_event=cancel_event)
+
+
 def ensure_gan_model(
     base_dir: Path,
     model_filename: str,

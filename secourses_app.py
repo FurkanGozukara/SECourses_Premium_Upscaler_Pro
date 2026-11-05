@@ -84,6 +84,8 @@ from ui.ltx25_tab import ltx25_tab
 from ui.open_h3_tab import open_h3_tab
 from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
+from ui.dlss5_tab import dlss5_tab
+from ui.chain_tab import chain_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
 from ui.changelog_tab import changelog_tab
@@ -91,6 +93,7 @@ from ui.universal_preset_section import universal_preset_section, wire_universal
 from ui.model_tab_common import sync_signature as _sync_signature
 from ui.theme import (
     DESIGN_CSS,
+    FEATURE_CSS,
     MEDIA_PLAYER_RELEASE_HEAD,
     RUN_HISTORY_CLEANUP_HEAD,
     build_theme,
@@ -104,7 +107,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.6"
+APP_VERSION = "9.7"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1151,7 +1154,7 @@ def main(argv=None):
     """
     # Per-hue button colours and the light/dark design layer come last so they win the
     # cascade over the component rules above at equal specificity.
-    CUSTOM_CSS = CUSTOM_CSS + button_hue_css() + DESIGN_CSS
+    CUSTOM_CSS = CUSTOM_CSS + button_hue_css() + DESIGN_CSS + FEATURE_CSS
     CUSTOM_HEAD = """
     <script>
     (() => {
@@ -1495,6 +1498,7 @@ def main(argv=None):
                 "ltx25_settings": startup_preset.get("ltx25", {}),
                 "open_h3_settings": startup_preset.get("open_h3", {}),
                 "rtx_settings": startup_preset.get("rtx", {}),
+                "dlss5_settings": startup_preset.get("dlss5", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
                 "output_settings": startup_preset.get("output", {}),
@@ -1869,6 +1873,7 @@ def main(argv=None):
         tab_sync_ltx25 = gr.State(value="")
         tab_sync_open_h3 = gr.State(value="")
         tab_sync_rtx = gr.State(value="")
+        tab_sync_dlss5 = gr.State(value="")
         tab_sync_global = gr.State(value="")
         seedvr2_auto_res_sync = gr.State(value="")
 
@@ -2019,6 +2024,23 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
+            with gr.Tab("💎 DLSS 5", render_children=True) as tab_dlss5:
+                dlss5_ui = dlss5_tab(
+                    preset_manager=preset_manager,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    output_dir=active_output_dir,
+                )
+            tab_dlss5.select(
+                fn=_make_tab_sync("dlss5"),
+                inputs=[shared_state, tab_sync_dlss5],
+                outputs=dlss5_ui["inputs_list"] + [dlss5_ui["preset_dropdown"], dlss5_ui["preset_status"], tab_sync_dlss5],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
             with gr.Tab("📐 Resolution & Scene Split", render_children=True) as tab_resolution:
                 resolution_ui = resolution_tab(
                     preset_manager=preset_manager,
@@ -2105,6 +2127,31 @@ def main(argv=None):
                 show_progress="hidden",
                 trigger_mode="always_last",
             )
+
+            with gr.Tab("🔗 Chains", render_children=True) as tab_chains:
+                chain_ui = chain_tab(
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    output_dir=active_output_dir,
+                )
+            from ui.chain_tab import flow_html as _chain_flow_html
+            # Step cards show each tab's current settings: refresh them when the tab opens.
+            tab_chains.select(
+                fn=_chain_flow_html,
+                inputs=[chain_ui["steps_state"], shared_state],
+                outputs=[chain_ui["flow"]],
+                queue=False,
+                show_progress="hidden",
+            )
+            from shared.chain_runner import register_chain_engine as _register_chain_engine
+
+            for _key, _ui in (("seedvr2", seedvr2_ui), ("flashvsr", flashvsr_ui), ("sparkvsr", sparkvsr_ui),
+                              ("gan", gan_ui), ("rtx", rtx_ui), ("ltx25", ltx25_ui), ("open_h3", open_h3_ui)):
+                _register_chain_engine(_key, _ui["run_action"], preview_only=False)
+            _register_chain_engine("dlss5", dlss5_ui["service"]["run_action"], snapshot=False)
+            _register_chain_engine("face", face_ui["run_action"])
+            _register_chain_engine("rife", rife_ui["run_action"], style="values", progress=False, preview_only=False)
 
             with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
                 queue_ui = queue_tab(tab_queue)

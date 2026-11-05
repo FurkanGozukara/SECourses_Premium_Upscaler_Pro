@@ -50,6 +50,7 @@ Nvidia_RTX_Nodes_ComfyUI/
 nvidia-vfx-python-samples/
 gfpgan/
 OpenH3_Models
+DLSS5_Models
 
 # Local test artifacts (browser automation, test clips)
 output/

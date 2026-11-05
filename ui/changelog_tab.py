@@ -11,6 +11,28 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.7 — 5 November 2026 — DLSS 5 Neural Rendering for Your Videos and Images, New Chains Tab",
+        """
+**NVIDIA's DLSS 5 neural renderer now runs on your own videos and images, on every RTX 30 / 40 / 50 GPU, and a new Chains tab runs several upscalers and effects one after another, for example SeedVR2 2x, then FlashVSR+ 2x, then DLSS 5.**
+
+**New 💎 DLSS 5 tab**
+- DLSS 5 re-renders each frame with photoreal lighting, skin, hair and material detail. It keeps the frame size; pair it with any upscaler (or a Chain) to also upscale.
+- Videos keep their timing, frame count and audio, and stay stable over time: each frame reuses the previous rendered frame, moved along with the picture by optical flow, and the history resets by itself at scene cuts. On a test clip this cut the extra flicker DLSS 5 adds from 3.7 % to 0.7 %.
+- Style profiles (Standard, Natural, Cinematic, Neutral), Intensity, Detail and Colour & lighting strength, Local tone / structure, Processing scale (render at up to 2x internally for finer detail), motion quality, batch folders and a Preview button that renders the first 48 frames.
+- The model (292 MB) downloads automatically on the first run, also from `Models_Downloader.py` ("DLSS 5 Neural Rendering" or `--ensure-dlss5`).
+- Runs as a PyTorch network on the GPU, so it needs no special driver, no extra program and no particular RTX generation. Checked on an RTX 3090 and an RTX 5090.
+- Speed on an RTX 5090 (network only): about 20 frames/s at 960x540, 5.3 frames/s at 1080p and 1.1 frames/s at 4K, using up to 5.4 GB of VRAM at 4K. An RTX 3090 renders 1080p at about 1.6 frames/s.
+
+**DLSS 5 after every upscale**
+- Tick "Apply DLSS 5 automatically after every upscale" on the DLSS 5 tab and every finished video from SeedVR2, FlashVSR, SparkVSR, GAN, RTX Super Resolution, LTX 2.5 and Open-H3 also gets a `*_DLSS5.mp4`, rendered with the DLSS 5 tab settings. The upscaled file is kept. Global RIFE then interpolates the DLSS 5 frames.
+
+**New 🔗 Chains tab**
+- Click engines to build a pipeline: SeedVR2, FlashVSR+, SparkVSR, Image GAN, RTX Super Resolution, LTX 2.5, Open-H3, DLSS 5, Face Restoration and RIFE. Each step feeds its output to the next and uses the settings you set on its own tab (model, precision, VRAM Auto Tune, output codec); a step can set only its scale (or the RIFE frame-rate multiplier). Reorder, switch off or remove steps.
+- Save chains as presets; four example chains are included. Run a chain on one video, several uploads or a whole folder. Every run gets its own folder under `outputs/chains` with each step's result, the final video and an Original vs Chain comparison video.
+- Global post-processes (DLSS 5 after every upscale, Global RIFE, comparison videos) are switched off inside the steps, so nothing runs twice; add them as steps instead.
+""",
+    ),
+    (
         "V9.6 — 2 November 2026 — Queued Jobs Keep the Settings of Their Click, Video Previews Keep Loading in Long Sessions",
         """
 **Two fixes found by a full test of a fresh installation, which also confirmed that it installs every library the app needs.**

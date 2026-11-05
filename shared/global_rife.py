@@ -356,11 +356,41 @@ def maybe_apply_global_rife(
     chunking_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], str]:
     """
-    Apply global RIFE post-process to an already-produced video.
+    Apply the global post-processes to an already-produced video: DLSS 5 neural rendering
+    (when enabled in the DLSS 5 tab), then RIFE frame interpolation on its result.
 
     Returns:
-        (rife_output_path_or_none, message)
+        (final_output_path_or_none, message)
     """
+    if not output_video_path:
+        return None, "Global RIFE skipped: no output video path."
+    dlss5_out = None
+    try:
+        from shared.services.dlss5_service import maybe_apply_global_dlss5
+
+        dlss5_out, _dlss5_msg = maybe_apply_global_dlss5(output_video_path, seed_controls, on_log=on_log)
+    except Exception as exc:
+        if on_log:
+            on_log(f"DLSS 5 post-process skipped: {exc}" + chr(10))
+    if dlss5_out:
+        rife_out, rife_msg = _maybe_apply_global_rife_only(
+            runner, dlss5_out, seed_controls, on_log=on_log, chunking_context=chunking_context
+        )
+        if rife_out:
+            return rife_out, rife_msg
+        return dlss5_out, f"DLSS 5 output: {dlss5_out}"
+    return _maybe_apply_global_rife_only(
+        runner, output_video_path, seed_controls, on_log=on_log, chunking_context=chunking_context
+    )
+
+
+def _maybe_apply_global_rife_only(
+    runner,
+    output_video_path: Optional[str],
+    seed_controls: Dict[str, Any],
+    on_log: Optional[Callable[[str], None]] = None,
+    chunking_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], str]:
     if not output_video_path:
         return None, "Global RIFE skipped: no output video path."
     outp = Path(output_video_path)

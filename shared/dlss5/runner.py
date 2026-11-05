@@ -182,9 +182,11 @@ def _plan_engine(settings: Dict[str, Any], base_dir: Path, device, width: int, h
     scale = max(1.0, min(2.0, _float(settings.get("processing_scale"), 1.0)))
     geometry = ops.NetworkGeometry.vendor_aligned(int(round(width * scale)), int(round(height * scale)))
     chunk = engine.plan_chunk(geometry.tokens)
+    engine.on_notice = log
     props = torch.cuda.get_device_properties(device)
     log(f"[DLSS 5] GPU {props.name} (sm{props.major}{props.minor}), {precision.upper()}, {engine.speed_label}, "
-        f"network {geometry.network_width}x{geometry.network_height}, chunk {chunk} tokens")
+        f"network {geometry.network_width}x{geometry.network_height}, chunk {chunk} tokens, "
+        f"planned VRAM about {(engine.planned_peak_bytes + 0.3 * 2**30) / 2**30:.1f} GB")
     return engine
 
 

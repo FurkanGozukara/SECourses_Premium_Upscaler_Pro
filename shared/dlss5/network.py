@@ -37,6 +37,8 @@ def recovered_window_origin(
 # into rare one-quantum flips (max 2e-4 on the output in the tests).
 # ``MLXDLSS_TORCH_CHUNK_TOKENS=0`` disables it.
 CHUNK_TOKENS = int(os.environ.get("SECOURSES_DLSS5_CHUNK_TOKENS", str(1 << 18)))
+# Score elements per slice of the global attention (0 = derived from CHUNK_TOKENS).
+GLOBAL_SLICE_ELEMENTS = int(os.environ.get("SECOURSES_DLSS5_GLOBAL_SLICE", "0"))
 
 
 def set_chunk_tokens(tokens: int) -> int:
@@ -387,21 +389,51 @@ def cosine_attention(
     query = vendor_cosine_publish(query, attention_scale)
     key = vendor_cosine_publish(key)
     projected_value = e4m3_round_trip(projected_value)
-    scores = query @ key.transpose(-2, -1) + attention_bias.reshape(
-        1, head_count, token_count, token_count
-    )
-    if logit_cap is not None:
-        # The global ``vit_1d`` attention kernels clamp their logits to
-        # ``[-cap, cap]``: on DLL captures the symmetric clamp puts every
-        # global block at 0.017-0.024 where the one-sided cap leaves
-        # 0.019-0.087 (window blocks must not be clamped at all).
-        scores = (
-            scores.clamp(-logit_cap, logit_cap)
-            if symmetric_logit_cap
-            else scores.clamp(max=logit_cap)
-        )
-    probabilities = vendor_approximate_softmax(scores)
-    attended = (probabilities @ projected_value).permute(0, 2, 1, 3)
+
+    def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        scores = q @ k.transpose(-2, -1)
+        if bias is not None:
+            scores = scores + bias
+        if logit_cap is not None:
+            # The global ``vit_1d`` attention kernels clamp their logits to
+            # ``[-cap, cap]``: on DLL captures the symmetric clamp puts every
+            # global block at 0.017-0.024 where the one-sided cap leaves
+            # 0.019-0.087 (window blocks must not be clamped at all).
+            scores = (
+                scores.clamp(-logit_cap, logit_cap)
+                if symmetric_logit_cap
+                else scores.clamp(max=logit_cap)
+            )
+        return vendor_approximate_softmax(scores) @ v
+
+    if attention_bias is not None:
+        attended = attend(query, key, projected_value,
+                          attention_bias.reshape(1, head_count, token_count, token_count))
+    else:
+        # Global attention (no bias): every head and every query row is independent, so the
+        # scores are built a slice at a time. The whole-frame score tensor grows with the square of
+        # the frame area (32 heads x 2040^2 at 4K: about 0.27 GB per fp16 copy, several copies inside
+        # the vendor softmax), which was the 4K VRAM floor; the slices keep it under the chunk.
+        # Slices hold at least 4 heads: cuBLAS then runs the same batched kernel as for all 32 and
+        # the result is bit-identical (1-2 head slices rounded differently: MAE 9e-4 at 4K, RTX 5090).
+        budget = GLOBAL_SLICE_ELEMENTS or (max(1 << 24, 64 * CHUNK_TOKENS) if CHUNK_TOKENS > 0 else 0)
+        per_head = batch_count * token_count * token_count
+        if budget <= 0 or head_count * per_head <= budget:
+            attended = attend(query, key, projected_value, None)
+        else:
+            attended = torch.empty_like(projected_value)
+            group = min(head_count, 4)
+            heads_per_slice = min(head_count, max(group, (budget // per_head) // group * group))
+            rows = token_count
+            if heads_per_slice * per_head > budget:
+                rows = max(2, budget // (batch_count * heads_per_slice * token_count))
+            for h0 in range(0, head_count, heads_per_slice):
+                h1 = min(head_count, h0 + heads_per_slice)
+                k_slice, v_slice = key[:, h0:h1], projected_value[:, h0:h1]
+                for r0 in range(0, token_count, rows):
+                    r1 = min(token_count, r0 + rows)
+                    attended[:, h0:h1, r0:r1] = attend(query[:, h0:h1, r0:r1], k_slice, v_slice, None)
+    attended = attended.permute(0, 2, 1, 3)
     attended = e4m3_round_trip(attended.reshape(batch_count, token_count, channels))
     return attended @ projection_weight
 
@@ -759,13 +791,7 @@ def global_block(
         qkv_weight=qkv_weight,
         attention_scale=attention_scale
         * math.sqrt(feed_forward_output.shape[-1] // head_count),
-        attention_bias=torch.zeros(
-            head_count,
-            tokens.shape[1],
-            tokens.shape[1],
-            dtype=value.dtype,
-            device=value.device,
-        ),
+        attention_bias=None,  # the global blocks have no position bias (was an all-zero tensor)
         projection_weight=attention_projection_weight,
         head_count=head_count,
         logit_cap=logit_cap,

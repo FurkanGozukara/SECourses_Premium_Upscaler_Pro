@@ -11,6 +11,27 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V9.8 — 5 November 2026 — DLSS 5 Needs Less Than Half the VRAM and Runs Faster, Chains Get Input Preview, Quick Test, Resume and a Step Viewer",
+        """
+**DLSS 5 now renders 4K in about 3 GB of VRAM instead of 5-6 GB and is up to 40 % faster, with exactly the same picture. The Chains tab shows what you upload, tries a chain on a few seconds first, resumes a stopped run and lets you look at every step's result.**
+
+**DLSS 5: less VRAM, faster, same result**
+- The network's whole-frame attention stage built a table that grows with the square of the frame area, which set the memory floor at 4K. It is now computed a few heads at a time. The picture is bit-identical (checked on 1080p and 4K frames).
+- DLSS 5 now picks the fastest work size for its execution mode instead of the largest one that fits in VRAM, and only goes smaller when VRAM is short.
+- Measured on an RTX 5090 (network only): 1080p went from 2.7 GB to 0.8 GB and from 266 to 154 ms per frame; 4K from 5.0 GB to 2.6 GB and from about 1.1 to 0.7 s per frame.
+- If a frame runs out of VRAM because another program took memory, DLSS 5 renders the same frame again with a smaller work size and then without CUDA Graphs, instead of stopping the run.
+
+**Chains**
+- **Preview:** the uploaded video or image appears next to the upload box with its size, frame rate, frame count and length. With several inputs, choose which one to preview. The pipeline shows the approximate size after every step for that input, and warns when the result would be larger than 8K.
+- **Quick test:** run the chain on only the first 1-30 seconds of each video to try the settings before the full run.
+- **Resume:** after a failed or cancelled run, "Resume unfinished run" continues from the step that stopped and reuses the finished steps. Each run folder's `chain.json` now records every step's result.
+- **Step viewer:** after a run, view any step's result next to the step before it, not only the final video. "Open run folder" opens the run's folder.
+- **Cancel** now also stops the step that is running, with that tab's own cancel, instead of waiting for it to finish.
+- **Duplicate** a step with ⧉. On image inputs, video-only steps (LTX 2.5, RIFE) are skipped and the chain goes on.
+- **Chain presets** store only the chain (its steps, order, On / Off and scale) in `presets/chains` and never change a tab's settings. App presets (Global Settings) now remember which chain preset you use and load it with the app preset; app presets saved before V9.8 load your newest saved chain.
+""",
+    ),
+    (
         "V9.7 — 5 November 2026 — DLSS 5 Neural Rendering for Your Videos and Images, New Chains Tab",
         """
 **NVIDIA's DLSS 5 neural renderer now runs on your own videos and images, on every RTX 30 / 40 / 50 GPU, and a new Chains tab runs several upscalers and effects one after another, for example SeedVR2 2x, then FlashVSR+ 2x, then DLSS 5.**

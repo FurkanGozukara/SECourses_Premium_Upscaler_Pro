@@ -739,6 +739,9 @@ FEATURE_CSS = r"""
 .chain-node-off { opacity: 0.45; filter: grayscale(0.7); }
 .chain-node-top { font-weight: 700; color: var(--sec-text); white-space: nowrap; }
 .chain-node-sub { font-size: 0.75rem; color: var(--sec-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-node-size { font-size: 0.74rem; font-weight: 700; color: var(--sec-accent); margin-top: 2px; white-space: nowrap; }
+.chain-input-info p { margin: 4px 2px 2px !important; color: var(--sec-text-2); }
+.chain-preview { margin-top: 4px; }
 .chain-node-num {
   display: inline-flex; align-items: center; justify-content: center;
   width: 20px; height: 20px; border-radius: 50%;

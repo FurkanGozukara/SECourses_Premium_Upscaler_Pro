@@ -2232,6 +2232,7 @@ def flashvsr_tab(
     return {
         "inputs_list": inputs_list,
         "run_action": service["run_action"],
+        "cancel_action": service["cancel_action"],
         "preset_dropdown": preset_dropdown,
         "preset_status": preset_status,
     }

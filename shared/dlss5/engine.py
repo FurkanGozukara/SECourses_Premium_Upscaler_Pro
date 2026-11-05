@@ -23,10 +23,16 @@ from .motion import MotionEstimate
 WEIGHT_FORMATS = tuple(f"dlssnr-logical-v{v}" for v in range(8, 19))
 _SPEC_PATH = Path(__file__).with_name("weight_spec.json")
 PRECISIONS = ("fp16", "fp32")
-# Activation bytes per network token at the chunk ceiling, measured on the HT network (see
-# tools/test_dlss5_engine.py --vram); the planner keeps the peak inside the free VRAM.
-_FIXED_BYTES_PER_TOKEN = {"fp16": 1100, "fp32": 2200}
-_CHUNK_BYTES_PER_TOKEN = {"fp16": 9000, "fp32": 18000}
+# Peak activation bytes per network token (fixed part) and per chunk token, measured on the HT
+# network with the sliced global attention (RTX 5090, fp16, 2026-11-05: 1080p 0.78 GiB at 32k,
+# 4K 2.83 GiB at 32k, about 1.8 kB more per chunk token), with a 1.6x margin; the planner keeps
+# the peak inside the free VRAM.
+_FIXED_BYTES_PER_TOKEN = {"fp16": 600, "fp32": 1200}
+_CHUNK_BYTES_PER_TOKEN = {"fp16": 3000, "fp32": 6000}
+# Fastest chunk per execution mode (same measurement): CUDA Graphs is fastest at 64k tokens and
+# slower above (1080p: 154 ms at 64k vs 266 ms at 1M), eager gains from larger chunks (fewer launches).
+_PREFERRED_CHUNK = {"graphs": 1 << 16, "eager": 1 << 18}
+_MIN_CHUNK = 1 << 14
 
 
 def _load_spec() -> dict:
@@ -110,7 +116,8 @@ class DLSS5Engine:
                     torch.cuda.empty_cache()
 
     def plan_chunk(self, network_tokens: int, budget_bytes: Optional[int] = None) -> int:
-        """Pick the token chunk that keeps one frame's activations inside ``budget_bytes``."""
+        """Pick the token chunk: the fastest one for the execution mode, smaller when one frame's
+        activations would not fit in ``budget_bytes`` (85 % of the free VRAM by default)."""
         if budget_bytes is None and self.device.type == "cuda":
             free, _total = torch.cuda.mem_get_info(self.device)
             budget_bytes = int(free * 0.85)
@@ -119,20 +126,53 @@ class DLSS5Engine:
         fixed = _FIXED_BYTES_PER_TOKEN[self.precision] * network_tokens
         per_chunk_token = _CHUNK_BYTES_PER_TOKEN[self.precision]
         room = max(0, budget_bytes - fixed)
-        chunk = int(room // per_chunk_token)
-        chunk = max(1 << 14, min(1 << 20, chunk))
+        preferred = _PREFERRED_CHUNK["graphs" if self.use_graphs else "eager"]
+        chunk = max(_MIN_CHUNK, min(preferred, int(room // per_chunk_token)))
         chunk = 1 << int(np.floor(np.log2(chunk)))
         self.chunk_tokens = chunk
+        self.planned_peak_bytes = fixed + per_chunk_token * chunk
         _network.set_chunk_tokens(chunk)
         return chunk
 
+    planned_peak_bytes: int = 0
+    oom_retries: int = 0
+    on_notice = None  # optional callable(str) for VRAM fallback notes
+
     @torch.inference_mode()
     def head(self, features: torch.Tensor) -> torch.Tensor:
-        """(1, H, W, 16) network input -> (1, H, W, 4) float32 head."""
+        """(1, H, W, 16) network input -> (1, H, W, 4) float32 head.
+
+        Out of memory on a frame (another app took VRAM, a larger frame): the graph pool is freed,
+        the chunk halves down to 16k tokens, then CUDA Graphs is switched off (eager frees each
+        temporary at once), and the same frame is rendered again; the result does not change."""
         features = features.to(self.device, self.dtype)
-        if self.use_graphs and self.device.type == "cuda":
-            return self._graph_head(features)
-        return self._runner(features).to(torch.float32)
+        while True:
+            try:
+                if self.use_graphs and self.device.type == "cuda":
+                    return self._graph_head(features)
+                return self._runner(features).to(torch.float32)
+            except torch.cuda.OutOfMemoryError:
+                if self.device.type != "cuda":
+                    raise
+                self._graphs.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
+                if self.chunk_tokens > _MIN_CHUNK:
+                    self.chunk_tokens = max(_MIN_CHUNK, self.chunk_tokens // 2)
+                    _network.set_chunk_tokens(self.chunk_tokens)
+                    note = f"[DLSS 5] Out of VRAM on a frame: retrying with a {self.chunk_tokens}-token chunk."
+                elif self.use_graphs:
+                    self.use_graphs = False
+                    self.speed_label = "eager"
+                    note = "[DLSS 5] Out of VRAM on a frame: retrying without CUDA Graphs (eager)."
+                else:
+                    raise
+                self.oom_retries += 1
+                if callable(self.on_notice):
+                    try:
+                        self.on_notice(note)
+                    except Exception:
+                        pass
 
     use_graphs: bool = True
     speed_label: str = "CUDA Graphs"

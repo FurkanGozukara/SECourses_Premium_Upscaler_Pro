@@ -107,7 +107,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.7"
+APP_VERSION = "9.8"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1499,6 +1499,7 @@ def main(argv=None):
                 "open_h3_settings": startup_preset.get("open_h3", {}),
                 "rtx_settings": startup_preset.get("rtx", {}),
                 "dlss5_settings": startup_preset.get("dlss5", {}),
+                "chains_settings": startup_preset.get("chains", {}),
                 "face_settings": startup_preset.get("face", {}),
                 "resolution_settings": startup_preset.get("resolution", {}),
                 "output_settings": startup_preset.get("output", {}),
@@ -2135,23 +2136,25 @@ def main(argv=None):
                     base_dir=BASE_DIR,
                     output_dir=active_output_dir,
                 )
-            from ui.chain_tab import flow_html as _chain_flow_html
-            # Step cards show each tab's current settings: refresh them when the tab opens.
+            # Opening the tab refreshes the step cards to each tab's current settings and, after an app
+            # preset load or reset, loads the chain preset that app preset remembers (queued: the step
+            # editor re-renders only from queued state writes).
             tab_chains.select(
-                fn=_chain_flow_html,
-                inputs=[chain_ui["steps_state"], shared_state],
-                outputs=[chain_ui["flow"]],
-                queue=False,
+                fn=chain_ui["on_select"],
+                inputs=chain_ui["select_inputs"],
+                outputs=chain_ui["select_outputs"],
                 show_progress="hidden",
             )
             from shared.chain_runner import register_chain_engine as _register_chain_engine
 
             for _key, _ui in (("seedvr2", seedvr2_ui), ("flashvsr", flashvsr_ui), ("sparkvsr", sparkvsr_ui),
                               ("gan", gan_ui), ("rtx", rtx_ui), ("ltx25", ltx25_ui), ("open_h3", open_h3_ui)):
-                _register_chain_engine(_key, _ui["run_action"], preview_only=False)
-            _register_chain_engine("dlss5", dlss5_ui["service"]["run_action"], snapshot=False)
+                _register_chain_engine(_key, _ui["run_action"], cancel=_ui.get("cancel_action"), preview_only=False)
+            _register_chain_engine("dlss5", dlss5_ui["service"]["run_action"], snapshot=False,
+                                   cancel=dlss5_ui["service"].get("cancel_action"))
             _register_chain_engine("face", face_ui["run_action"])
-            _register_chain_engine("rife", rife_ui["run_action"], style="values", progress=False, preview_only=False)
+            _register_chain_engine("rife", rife_ui["run_action"], style="values", progress=False, preview_only=False,
+                                   cancel=rife_ui.get("cancel_action"))
 
             with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
                 queue_ui = queue_tab(tab_queue)

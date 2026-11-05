@@ -44,6 +44,7 @@ from shared.services.rtx_super_resolution_service import (
 )
 from shared.services.face_service import FACE_ORDER, face_defaults
 from shared.services.dlss5_service import DLSS5_ORDER, dlss5_defaults
+from shared.chain_runner import CHAINS_ORDER, chains_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
 from shared.services.output_service import OUTPUT_ORDER, output_defaults
 from shared.models.rife_meta import get_rife_default_model
@@ -148,6 +149,13 @@ TAB_CONFIGS = {
     "dlss5": {
         "order": DLSS5_ORDER,
         "defaults_fn": dlss5_defaults,
+        "needs_model_arg": False,
+    },
+    # Chains tab: only the NAME of the selected chain preset (presets/chains/<name>.json); the chain
+    # itself stays in its own file, so app presets never store or change chain steps.
+    "chains": {
+        "order": CHAINS_ORDER,
+        "defaults_fn": chains_defaults,
         "needs_model_arg": False,
     },
     "face": {
@@ -533,6 +541,7 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
 
     # DLSS 5 neural rendering
     defaults["dlss5"] = dlss5_defaults()
+    defaults["chains"] = chains_defaults()
     
     # Face
     defaults["face"] = face_defaults(models_list)
@@ -672,6 +681,7 @@ def create_universal_preset(
     else:
         preset["rtx"] = defaults["rtx"]
     preset["dlss5"] = defaults["dlss5"]
+    preset["chains"] = defaults["chains"]
     
     if face_values is not None:
         preset["face"] = values_to_dict("face", face_values)
@@ -787,6 +797,7 @@ def update_shared_state_from_preset(
     seed_controls["open_h3_settings"] = preset.get("open_h3", {})
     seed_controls["rtx_settings"] = preset.get("rtx", {})
     seed_controls["dlss5_settings"] = preset.get("dlss5", {})
+    seed_controls["chains_settings"] = preset.get("chains", {})
     seed_controls["face_settings"] = preset.get("face", {})
     seed_controls["resolution_settings"] = preset.get("resolution", {})
     seed_controls["output_settings"] = preset.get("output", {})
@@ -893,6 +904,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "open_h3": seed_controls.get("open_h3_settings", {}),
         "rtx": seed_controls.get("rtx_settings", {}),
         "dlss5": seed_controls.get("dlss5_settings", {}),
+        "chains": seed_controls.get("chains_settings", {}),
         "face": seed_controls.get("face_settings", {}),
         "resolution": seed_controls.get("resolution_settings", {}),
         "output": seed_controls.get("output_settings", {}),

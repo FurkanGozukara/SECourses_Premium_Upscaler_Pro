@@ -194,10 +194,27 @@ def interpolate_2d(video: torch.Tensor, size: Tuple[int, int], mode: str) -> tor
     return torch.nn.functional.interpolate(video, size=size, mode=mode, align_corners=False)
 
 
+def frames_to_uint8(video: torch.Tensor, chunk: int = 8):
+    """(1, C, T, H, W) float in [0, 1] -> (T, H, W, C) uint8 numpy, converted a few frames at a time.
+
+    The one-shot ``(video * 255)`` made a float temporary as large as the whole clip (30.5 GB for 306
+    frames at 4K) next to the clip itself, and long 4K runs failed with "not enough memory" after every
+    tile was done. Same operations per element, so the frames are bit-identical."""
+    import numpy as np
+
+    src = video[0]
+    count = int(src.shape[1])
+    out = np.empty((count, int(src.shape[2]), int(src.shape[3]), int(src.shape[0])), dtype=np.uint8)
+    for start in range(0, count, chunk):
+        part = src[:, start:start + chunk].permute(1, 2, 3, 0)
+        out[start:start + part.shape[0]] = (part * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    return out
+
+
 def save_frames_as_png(video: torch.Tensor, output_dir: str | os.PathLike) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    frames = (video[0].permute(1, 2, 3, 0) * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    frames = frames_to_uint8(video)
     for idx, frame in enumerate(frames):
         Image.fromarray(frame).save(output / f"{idx:05d}.png")
 
@@ -205,7 +222,7 @@ def save_frames_as_png(video: torch.Tensor, output_dir: str | os.PathLike) -> No
 def save_video_with_imageio(video: torch.Tensor, output_path: str | os.PathLike, fps: float, pixel_format: str) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    frames = (video[0].permute(1, 2, 3, 0) * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    frames = frames_to_uint8(video)
     pix_fmt = "yuv444p" if str(pixel_format).lower() == "yuv444p" else "yuv420p"
     crf = "0" if pix_fmt == "yuv444p" else "10"
     iio.imwrite(
@@ -2074,8 +2091,16 @@ def main() -> int:
             )
 
         video_lr = video_source
-        video = (video_up / 255.0 * 2.0) - 1.0
+        if video_up.is_floating_point() and (
+            video_up.untyped_storage().data_ptr() != video_source.untyped_storage().data_ptr()
+        ):  # never in place on the source frames (video_lr), which the reference frames still use
+            # In place (same operations, same order): the out-of-place form made two more full-size float copies
+            # of the upsampled clip (about 30 GB each for 306 frames at 4K).
+            video = video_up.div_(255.0).mul_(2.0).sub_(1.0)
+        else:
+            video = (video_up / 255.0 * 2.0) - 1.0
         video = video.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+        del video_up
 
         _, _, frame_count, height, width = video.shape
         overlap_t = int(args.overlap_t if args.chunk_len > 0 else 0)
@@ -2275,6 +2300,9 @@ def main() -> int:
                     started_at=run_started_at,
                 )
 
+        # The upsampled input is not needed any more; release it before the output is converted and saved.
+        del video, video_lr
+        release_torch_memory()
         emit_progress(video_pct(0.88), "postprocess", "removing padding and extra frames", step=index, total=len(video_files), started_at=run_started_at)
         video_generate = remove_padding_and_extra_frames(
             output_video,

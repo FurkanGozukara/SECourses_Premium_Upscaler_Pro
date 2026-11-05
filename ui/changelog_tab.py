@@ -29,6 +29,9 @@ CHANGELOG_ENTRIES = [
 - **Cancel** now also stops the step that is running, with that tab's own cancel, instead of waiting for it to finish.
 - **Duplicate** a step with ⧉. On image inputs, video-only steps (LTX 2.5, RIFE) are skipped and the chain goes on.
 - **Chain presets** store only the chain (its steps, order, On / Off and scale) in `presets/chains` and never change a tab's settings. App presets (Global Settings) now remember which chain preset you use and load it with the app preset; app presets saved before V9.8 load your newest saved chain.
+
+**Fixed**
+- SparkVSR: long 4K upscales no longer fail with "not enough memory" after every tile is done. Saving the video made a full-size copy of the whole clip in system RAM (30 GB for a 10-second 4K clip, next to two other full-size copies) and a 10-second 4x upscale to 4K ran out of memory on a 96 GB PC. The video is now converted a few frames at a time and the upscaled input is released before saving; the output is bit-identical.
 """,
     ),
     (

@@ -4,6 +4,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 import hashlib
 import math
 import re
@@ -471,11 +472,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                             file_types=["video"]
                         )
 
-                    direct_video_a_path = gr.Textbox(
+                    direct_video_a_path = path_textbox("video", 
                         label="Video A Path",
                         placeholder="C:/path/to/video_a.mp4",
                     )
-                    direct_video_b_path = gr.Textbox(
+                    direct_video_b_path = path_textbox("video", 
                         label="Video B Path",
                         placeholder="C:/path/to/video_b.mp4",
                     )

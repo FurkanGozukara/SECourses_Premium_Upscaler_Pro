@@ -4,6 +4,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -187,7 +188,7 @@ def gan_tab(
                             type="filepath",
                             file_types=["image", "video"]
                         )
-                        input_path = gr.Textbox(
+                        input_path = path_textbox("media+folder", 
                             label="Image/Video Path",
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/image.jpg or C:/path/to/video.mp4",
@@ -237,13 +238,13 @@ def gan_tab(
                         scale=2,
                     )
                 with gr.Row():
-                    batch_input = gr.Textbox(
+                    batch_input = path_textbox("folder", 
                         label="Batch Input Folder",
                         value=_value("batch_input_path", ""),
                         placeholder="Folder containing images/videos",
                         info="Directory with images, videos, or frame-sequence subfolders"
                     )
-                    batch_output = gr.Textbox(
+                    batch_output = path_textbox("folder", 
                         label="Batch Output Folder",
                         value=_value("batch_output_path", ""),
                         placeholder="Output directory for batch results"
@@ -453,14 +454,14 @@ def gan_tab(
                         elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
-            output_override = gr.Textbox(
+            output_override = path_textbox("folder", 
                 label="Output Override (single run)",
                 value=_value("output_override", ""),
                 placeholder="Leave empty for auto naming",
                 info="Optional output folder override for this run. Ignored when resume mode is active.",
             )
 
-            resume_run_dir = gr.Textbox(
+            resume_run_dir = path_textbox("folder", 
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
                     _value("resume_run_dir", "")

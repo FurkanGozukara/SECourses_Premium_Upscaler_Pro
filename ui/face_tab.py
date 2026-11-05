@@ -4,6 +4,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from typing import Dict, Any
 
 from shared.services.face_service import (
@@ -166,14 +167,14 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                                 visible=False,
                             )
 
-                    standalone_input_path = gr.Textbox(
+                    standalone_input_path = path_textbox("media", 
                         label="Input Path (alternative to upload)",
                         value=values[17] if len(values) > 17 else "",
                         placeholder="C:/path/to/image.png or C:/path/to/video.mp4",
                         info="Upload wins if both are set. For batch, enable Batch Processing below.",
                     )
 
-                    standalone_output_override = gr.Textbox(
+                    standalone_output_override = path_textbox("folder", 
                         label="Output Override (optional)",
                         value=values[18] if len(values) > 18 else "",
                         placeholder="Leave empty for auto output in Outputs folder",
@@ -188,12 +189,12 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                             value=values[19] if len(values) > 19 else False,
                             info="Process all supported media in a directory (recursive).",
                         )
-                        standalone_batch_input = gr.Textbox(
+                        standalone_batch_input = path_textbox("folder", 
                             label="Batch Input Path",
                             value=values[20] if len(values) > 20 else "",
                             placeholder="Folder containing images/videos (or a single media file)",
                         )
-                        standalone_batch_output = gr.Textbox(
+                        standalone_batch_output = path_textbox("folder", 
                             label="Batch Output Folder Override (optional)",
                             value=values[21] if len(values) > 21 else "",
                             placeholder="Leave empty for default outputs folder",

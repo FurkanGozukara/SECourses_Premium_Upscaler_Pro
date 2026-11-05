@@ -11,6 +11,7 @@ import gradio as gr
 from shared import chain_runner as cr
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
+from ui.path_picker import path_textbox
 
 DEFAULT_CHAIN = cr.DEFAULT_CHAIN
 
@@ -27,6 +28,13 @@ PRESET_NOTE = ("Chain presets store only the chain: its steps, their order, On /
                "Loading or saving one never changes a tab's settings. An app preset (Global Settings) remembers "
                "which chain preset you use and loads it with the app preset; it never stores the steps themselves.")
 
+BATCH_NOTE = ("Enter a **batch input folder** and **Run Chain** processes every video and image in it through this "
+              "chain, one file after another. Each result is saved in the batch output folder as `<name>_chain` "
+              "(subfolders are kept). With *Skip* on, files that already have a result there are skipped, so pressing "
+              "Run Chain again continues an interrupted batch. While a batch folder is set, the uploads and the path "
+              "above are not used; the preview shows the batch files. A report of every file is written to "
+              "`chain_batch_report.json` in the output folder.")
+
 ICONS = {"pending": "⏸️", "running": "⏳", "done": "✅", "failed": "❌", "skipped": "⏭️", "skipped-image": "⏭️"}
 
 
@@ -40,6 +48,13 @@ def _step_summary(engine: str, state: Dict[str, Any]) -> str:
         if value not in (None, ""):
             text = str(value)
             parts.append(text if len(text) <= 38 else text[:35] + "...")
+    if engine == "dlss5":
+        try:
+            passes = int(float(settings.get("passes") or 1))
+        except (TypeError, ValueError):
+            passes = 1
+        if passes > 1:
+            parts.append(f"{passes} passes")
     return " · ".join(parts) if parts else "tab defaults"
 
 
@@ -56,9 +71,16 @@ def flow_html(steps: List[Dict[str, Any]], state: Dict[str, Any], dims: Optional
     nodes = [f'<div class="chain-node chain-node-io">{input_label}</div>']
     total_scale = 1.0
     fps = 1
+    dlss_total = sum(1 for s in steps if s["engine"] == "dlss5" and s.get("enabled", True))
+    dlss_seen = 0
     for i, step in enumerate(steps, 1):
         engine = step["engine"]
         meta = cr.ENGINE_META.get(engine, (engine, "🔧", "", ()))
+        pass_badge = ""
+        if engine == "dlss5" and dlss_total > 1 and step.get("enabled", True):
+            dlss_seen += 1
+            pass_badge = f'<span class="chain-badge">pass {dlss_seen}/{dlss_total}</span>'
+
         factor = step.get("factor")
         if step.get("enabled", True):
             if factor and meta[2] == "scale":
@@ -79,7 +101,7 @@ def flow_html(steps: List[Dict[str, Any]], state: Dict[str, Any], dims: Optional
                 size_line = f'<div class="chain-node-size">≈ {_size(sizes[i - 1])}</div>'
         nodes.append(
             f'<div class="{cls}"><div class="chain-node-top"><span class="chain-node-num">{i}</span> {meta[1]} '
-            f'{html.escape(meta[0])} {badge}</div><div class="chain-node-sub">{html.escape(_step_summary(engine, state))}</div>'
+            f'{html.escape(meta[0])} {badge}{pass_badge}</div><div class="chain-node-sub">{html.escape(_step_summary(engine, state))}</div>'
             f'{size_line}</div>'
         )
     final = next((s for s in reversed(sizes) if s), None) if sizes and sizes[-1] else None
@@ -91,6 +113,8 @@ def flow_html(steps: List[Dict[str, Any]], state: Dict[str, Any], dims: Optional
         summary += f" · total scale ×{total_scale:g}"
     if fps != 1:
         summary += f" · {fps}× frame rate"
+    if dlss_total > 1:
+        summary += f" · DLSS 5 ×{dlss_total} (each pass strengthens the look)"
     if final and max(final) > 7680:
         summary += " · ⚠️ the result is larger than 8K: lower a scale"
     if not steps:
@@ -110,7 +134,7 @@ def timeline_html(event: "cr.ChainEvent | None") -> str:
             f'<span class="chain-tl-name">{row.index}. {meta[1]} {html.escape(meta[0])}</span>'
             f'<span class="chain-tl-detail">{html.escape(row.detail or row.status)}</span></div>'
         )
-    head = f"Video {event.video_index} of {event.video_count}: {html.escape(Path(event.source).name)}" if event.source else ""
+    head = f"File {event.video_index} of {event.video_count}: {html.escape(Path(event.source).name)}" if event.source else ""
     return f'<div class="chain-timeline"><div class="chain-tl-head">{head}</div>{"".join(rows)}</div>'
 
 
@@ -160,7 +184,8 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                     files = gr.File(label="Videos or images (several allowed)", file_count="multiple", type="filepath",
                                     file_types=["video", "image"], scale=3)
                     with gr.Column(scale=2):
-                        path_box = gr.Textbox(label="...or a file / folder path", placeholder="D:/videos  or  D:/videos/clip.mp4")
+                        path_box = path_textbox("media+folder", label="...or a file / folder path",
+                                                placeholder="D:/videos  or  D:/videos/clip.mp4")
                         preview_pick = gr.Dropdown(label="Preview input", choices=[], value=None, visible=False,
                                                    allow_custom_value=False)
                 input_info = gr.Markdown("", elem_classes=["chain-input-info"])
@@ -273,12 +298,24 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
 
         with gr.Column(scale=2):
             gr.Markdown("### Run")
-            status = gr.Markdown("Ready. Pick videos, build or load a chain, then press **Run Chain**.",
+            status = gr.Markdown("Ready. Pick videos or images (or a batch folder below), build or load a chain, "
+                                 "then press **Run Chain**.",
                                  elem_classes=["runtime-status-box"])
             with gr.Row():
                 run_btn = gr.Button("▶️ Run Chain", variant="primary", elem_classes=["action-btn", "sec-btn-emerald"], scale=3)
                 cancel_btn = gr.Button("⏹️ Cancel", variant="stop", elem_classes=["action-btn", "sec-btn-red"], scale=1)
             resume_btn = gr.Button("↻ Resume unfinished run", elem_classes=["sec-btn-amber"], visible=False)
+            with gr.Group(elem_classes=["chain-card", "chain-batch-card"]):
+                gr.Markdown("#### 📁 Batch processing (folder)", elem_classes=["chain-card-title"])
+                gr.Markdown(BATCH_NOTE, elem_classes=["resolution-info"])
+                batch_in = path_textbox("folder", label="Batch input folder (videos and images)",
+                                        placeholder="D:/to_process  (empty = no batch)")
+                batch_out = path_textbox("folder", label="Batch output folder (empty = <outputs>/<folder>_chain)",
+                                         placeholder="D:/processed")
+                with gr.Row():
+                    batch_skip = gr.Checkbox(label="Skip files that already have a result", value=True)
+                    batch_sub = gr.Checkbox(label="Include subfolders", value=False)
+                batch_info = gr.Markdown("", elem_classes=["chain-batch-info"])
             timeline = gr.HTML("")
             step_pick = gr.Dropdown(label="🔍 View a step's result (compared with the step before it)", choices=[],
                                     value=None, visible=False, allow_custom_value=False)
@@ -300,20 +337,61 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
         dims = {"width": info.get("width", 0), "height": info.get("height", 0), "kind": info.get("kind", "video")} if info else {}
         return vid_upd, img_upd, input_info_md(info, len(sources), videos), dims, flow_html(steps, state, dims)
 
-    def _inputs_changed(uploads, path_text, steps, state):
-        sources = cr.collect_videos(uploads, path_text)
+    def _out_root(state) -> Path:
+        seed = state.get("seed_controls", {}) if isinstance(state, dict) else {}
+        glob = seed.get("global_settings", {}) if isinstance(seed, dict) else {}
+        return Path(str((glob or {}).get("output_dir") or global_settings.get("output_dir") or output_dir))
+
+    def _batch_spec(batch_folder, batch_folder_out, skip, state) -> Optional[Dict[str, Any]]:
+        folder = str(batch_folder or "").strip().strip('"')
+        if not folder:
+            return None
+        out = str(batch_folder_out or "").strip().strip('"') or str(cr.default_batch_output(_out_root(state), folder))
+        return {"input": folder, "output": out, "skip_done": bool(skip)}
+
+    def _sources(uploads, path_text, batch_folder, batch_folder_out, sub, state) -> List[str]:
+        spec = _batch_spec(batch_folder, batch_folder_out, True, state)
+        if spec:
+            return cr.list_batch_sources(spec["input"], bool(sub), exclude=spec["output"])
+        return cr.collect_videos(uploads, path_text)
+
+    def _batch_info(batch_folder, batch_folder_out, skip, sub, state):
+        spec = _batch_spec(batch_folder, batch_folder_out, skip, state)
+        if not spec:
+            return ""
+        if not Path(spec["input"]).is_dir():
+            return f"⚠️ Batch input folder not found: `{spec['input']}`"
+        files = cr.list_batch_sources(spec["input"], bool(sub), exclude=spec["output"])
+        videos = sum(1 for f in files if Path(f).suffix.lower() in cr.VIDEO_EXTS)
+        if not files:
+            return f"⚠️ No videos or images in `{spec['input']}`" + (" (subfolders off)" if not sub else "")
+        done = sum(1 for f in files if cr.batch_done(f, spec)) if skip else 0
+        text = f"📚 **{len(files)} file(s)**: {videos} video(s), {len(files) - videos} image(s)"
+        if done:
+            text += f" · {done} already done (skipped)"
+        return text + f"  \n📦 Results → `{spec['output']}`"
+
+    def _inputs_changed(uploads, path_text, batch_folder, batch_folder_out, sub, steps, state):
+        sources = _sources(uploads, path_text, batch_folder, batch_folder_out, sub, state)
         first = sources[0] if sources else None
         names = [(f"{i + 1}. {Path(s).name}", s) for i, s in enumerate(sources)]
         pick = gr.update(choices=names, value=first, visible=len(sources) > 1)
         return (pick, *_preview(first, sources, steps, state))
 
     preview_outputs = [in_video, in_image, input_info, dims_state, flow]
-    for event in (files.change, path_box.submit, path_box.blur):
-        event(_inputs_changed, inputs=[files, path_box, steps_state, shared_state],
-              outputs=[preview_pick] + preview_outputs, show_progress="hidden")
-    preview_pick.input(lambda p, u, t, s, st: _preview(p, cr.collect_videos(u, t), s, st),
-                       inputs=[preview_pick, files, path_box, steps_state, shared_state], outputs=preview_outputs,
+    source_inputs = [files, path_box, batch_in, batch_out, batch_sub]
+    # One serialized group, newest wins: a fast edit (type, then click away) never leaves stale info behind.
+    for event in (files.change, path_box.submit, path_box.blur, batch_in.submit, batch_in.blur, batch_sub.change):
+        event(_inputs_changed, inputs=source_inputs + [steps_state, shared_state],
+              outputs=[preview_pick] + preview_outputs, show_progress="hidden",
+              concurrency_id="chain_input_preview", concurrency_limit=1, trigger_mode="always_last")
+    preview_pick.input(lambda p, u, t, bi, bo, sb, s, st: _preview(p, _sources(u, t, bi, bo, sb, st), s, st),
+                       inputs=[preview_pick] + source_inputs + [steps_state, shared_state], outputs=preview_outputs,
                        show_progress="hidden")
+    batch_info_inputs = [batch_in, batch_out, batch_skip, batch_sub, shared_state]
+    for event in (batch_in.submit, batch_in.blur, batch_out.submit, batch_out.blur, batch_skip.change, batch_sub.change):
+        event(_batch_info, inputs=batch_info_inputs, outputs=[batch_info], show_progress="hidden",
+              concurrency_id="chain_batch_info", concurrency_limit=1, trigger_mode="always_last")
 
     # --- editing -----------------------------------------------------------------------------
     for key, button in palette.items():
@@ -411,20 +489,25 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
 
     NO = gr.update()
 
-    def _run(sources, steps, preset_label, state, progress, test_seconds=0.0, resume_dirs=None):
+    def _run(sources, steps, preset_label, state, progress, test_seconds=0.0, resume_dirs=None, batch=None):
         live_state = state if isinstance(state, dict) else {}
 
         def idle(text):
             return (text, NO, NO, NO, NO, NO, NO, live_state, NO, NO, NO, NO, NO)
 
+        if batch and not Path(batch["input"]).is_dir():
+            yield idle(f"⚠️ Batch input folder not found: {batch['input']}")
+            return
         if not sources:
-            yield idle("⚠️ Pick at least one video or image (upload or path).")
+            yield idle("⚠️ No videos or images in the batch input folder." if batch
+                       else "⚠️ Pick at least one video or image (upload or path), or set a batch input folder.")
             return
         missing = [s["engine"] for s in cr.normalize_steps(steps) if s["engine"] not in cr.ENGINES]
         if missing:
             yield idle(f"❌ Unknown chain step(s): {', '.join(missing)}")
             return
         cancel.clear()
+        preset_label = cr.chain_label(steps, str(preset_label or ""), base_dir)
         queued_state = snapshot_queue_state(live_state)
         queued_globals = snapshot_global_settings(global_settings)
         manager = get_processing_queue_manager()
@@ -436,15 +519,13 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                     yield idle("⏹️ Chain cancelled while waiting in the queue.")
                     return
                 yield idle(f"⏳ Waiting in the processing queue ({ticket.job_id})...")
-            seed = queued_state.get("seed_controls", {})
-            glob = seed.get("global_settings", {}) if isinstance(seed, dict) else {}
-            out_root = Path(str((glob or {}).get("output_dir") or global_settings.get("output_dir") or output_dir))
+            out_root = _out_root(queued_state)
             last_final, last_source = None, sources[-1]
             for event in cr.run_chain(sources, steps, queued_state, base_dir=base_dir, output_root=out_root,
                                       chain_name=str(preset_label or ""), progress=progress,
                                       cancel_flag=lambda: cancel.is_set() or ticket.cancel_event.is_set(),
                                       global_settings_snapshot=queued_globals, test_seconds=test_seconds,
-                                      resume_dirs=resume_dirs):
+                                      resume_dirs=resume_dirs, batch=batch):
                 if event.final_output:
                     last_final, last_source = event.final_output, event.source
                 if not event.finished:
@@ -469,21 +550,25 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
         finally:
             manager.complete(ticket.job_id)
 
-    def run_chain_ui(uploads, path_text, steps, preset_label, test_on, test_secs, state, progress=gr.Progress()):
-        sources = cr.collect_videos(uploads, path_text)
-        yield from _run(sources, steps, preset_label, state, progress, float(test_secs) if test_on else 0.0)
+    def run_chain_ui(uploads, path_text, steps, preset_label, test_on, test_secs, b_in, b_out, b_skip, b_sub, state,
+                     progress=gr.Progress()):
+        batch = _batch_spec(b_in, b_out, b_skip, state)
+        sources = _sources(uploads, path_text, b_in, b_out, b_sub, state)
+        yield from _run(sources, steps, preset_label, state, progress, float(test_secs) if test_on else 0.0, batch=batch)
 
-    def resume_chain_ui(runs, steps, preset_label, state, progress=gr.Progress()):
-        unfinished = [r for r in (runs or []) if not r.get("ok") and Path(str(r.get("run_dir") or "")).is_dir()]
+    def resume_chain_ui(runs, steps, preset_label, b_in, b_out, b_skip, state, progress=gr.Progress()):
+        unfinished = [r for r in (runs or []) if not r.get("ok") and r.get("source")]
         sources = [r["source"] for r in unfinished]
-        yield from _run(sources, steps, preset_label, state, progress, 0.0, {r["source"]: r["run_dir"] for r in unfinished})
+        dirs = {r["source"]: r["run_dir"] for r in unfinished if r.get("run_dir") and Path(str(r["run_dir"])).is_dir()}
+        yield from _run(sources, steps, preset_label, state, progress, 0.0, dirs, batch=_batch_spec(b_in, b_out, b_skip, state))
 
     run_outputs = [status, log_box, timeline, out_video, out_image, slider, comparison, shared_state, runs_state, resume_btn,
                    step_pick, step_outputs, open_btn]
-    run_btn.click(run_chain_ui, inputs=[files, path_box, steps_state, preset_dd, quick_test, quick_seconds, shared_state],
+    run_btn.click(run_chain_ui, inputs=[files, path_box, steps_state, preset_dd, quick_test, quick_seconds,
+                                        batch_in, batch_out, batch_skip, batch_sub, shared_state],
                   outputs=run_outputs, concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
-    resume_btn.click(resume_chain_ui, inputs=[runs_state, steps_state, preset_dd, shared_state], outputs=run_outputs,
-                     concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
+    resume_btn.click(resume_chain_ui, inputs=[runs_state, steps_state, preset_dd, batch_in, batch_out, batch_skip, shared_state],
+                     outputs=run_outputs, concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
 
     def _view_step(label, choices):
         for name, pair in choices or []:
@@ -497,7 +582,7 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
     def _open_folder(runs):
         from shared.services.global_service import open_outputs_folder
 
-        folder = (runs or [{}])[-1].get("run_dir") if runs else ""
+        folder = next((r.get("run_dir") for r in reversed(runs or []) if r.get("run_dir")), "")
         return open_outputs_folder(folder) if folder else gr.update(value="⚠️ No run folder yet.")
 
     open_btn.click(_open_folder, inputs=[runs_state], outputs=[status], queue=False)

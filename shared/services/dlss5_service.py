@@ -37,6 +37,7 @@ DLSS5_ORDER: List[str] = [
     "max_frames",
     "keep_model_loaded",
     "global_postprocess",
+    "passes",
 ]
 
 # Output-tab encoding keys a DLSS 5 render inherits (same codec, quality and audio as the upscalers).

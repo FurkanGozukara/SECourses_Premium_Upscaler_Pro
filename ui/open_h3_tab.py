@@ -7,6 +7,7 @@ settings, right: output/status).
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -201,7 +202,7 @@ def open_h3_tab(
                             type="filepath",
                             file_types=["video", "image"],
                         )
-                        input_path = gr.Textbox(
+                        input_path = path_textbox("media+folder", 
                             label="Input Path",
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/video.mp4",
@@ -237,7 +238,7 @@ def open_h3_tab(
                 input_detection_result = gr.Markdown("", visible=False)
                 sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
 
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (folder or file)",
                     value=_value("output_override", ""),
                     placeholder="Leave empty for auto naming",
@@ -246,7 +247,7 @@ def open_h3_tab(
                         "A file path renames the final output (.mp4 for videos, .png for images)."
                     ),
                 )
-                resume_run_dir = gr.Textbox(
+                resume_run_dir = path_textbox("folder", 
                     label="Resume Run Folder (chunk/scene resume)",
                     value=str(_value("resume_run_dir", "") or ""),
                     placeholder="Optional: G:/.../outputs/0019",
@@ -262,12 +263,12 @@ def open_h3_tab(
                         value=bool(_value("batch_enable", False)),
                         info="Process every video and image in a folder.",
                     )
-                    batch_input = gr.Textbox(
+                    batch_input = path_textbox("folder", 
                         label="Batch Input Folder",
                         value=_value("batch_input_path", ""),
                         placeholder="Folder with videos / images",
                     )
-                    batch_output = gr.Textbox(
+                    batch_output = path_textbox("folder", 
                         label="Batch Output Folder",
                         value=_value("batch_output_path", ""),
                         placeholder="Output directory (empty = <input>/upscaled_files)",

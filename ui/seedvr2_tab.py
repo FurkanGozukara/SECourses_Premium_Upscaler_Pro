@@ -6,6 +6,7 @@ UPDATED: Now uses Universal Preset System for all preset operations.
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from pathlib import Path
 from typing import Dict, Any, List
 import copy
@@ -637,7 +638,7 @@ def seedvr2_tab(
             # Input path textbox (direct path alternative to upload)
             gr.Markdown("---")
             gr.Markdown("####  Direct Input Path (Alternative to Upload)")
-            input_path = gr.Textbox(
+            input_path = path_textbox("media+folder", 
                 label="Input Video or Frames Folder Path",
                 value=values[0],
                 placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
@@ -645,7 +646,7 @@ def seedvr2_tab(
             )
 
             # Model directory override (optional). SeedVR2 Model selection is above Batch Size.
-            model_dir = gr.Textbox(
+            model_dir = path_textbox("folder", 
                 label="Model Directory (optional)",
                 value=values[3],
                 info="Override default model directory. Leave empty to use default ./SeedVR2/models location."
@@ -752,7 +753,7 @@ def seedvr2_tab(
                         elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
-                resume_run_dir = gr.Textbox(
+                resume_run_dir = path_textbox("folder", 
                     label="Resume Run Folder (chunk/scene resume)",
                     value=(
                         values[SEEDVR2_ORDER.index("resume_run_dir")]
@@ -850,7 +851,7 @@ def seedvr2_tab(
                 output_format_value = "auto"
 
             with gr.Row():
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (single run)",
                     value=values[1],
                     placeholder="Leave empty for auto naming",
@@ -899,13 +900,13 @@ def seedvr2_tab(
                         info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
                         scale=2,
                     )
-                batch_input = gr.Textbox(
+                batch_input = path_textbox("folder", 
                     label="Batch Input Folder",
                     value=values[6],
                     placeholder="Folder containing videos or frames",
                     info="Per-file folder batch mode. Each supported file is processed separately, unlike the direct input path frame-sequence mode."
                 )
-                batch_output = gr.Textbox(
+                batch_output = path_textbox("folder", 
                     label="Batch Output Folder Override",
                     value=values[7],
                     placeholder="Optional override for batch outputs"

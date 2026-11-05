@@ -6,6 +6,7 @@ SeedVR2-like layout (left: input + model settings, right: output/status).
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -212,7 +213,7 @@ def ltx25_tab(
                             type="filepath",
                             file_types=["video"],
                         )
-                        input_path = gr.Textbox(
+                        input_path = path_textbox("video+folder", 
                             label="Input Path",
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/video.mp4",
@@ -252,7 +253,7 @@ def ltx25_tab(
                     "This tab does not use the Resolution tab's upscale factor."
                 )
 
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (folder or .mp4 file)",
                     value=_value("output_override", ""),
                     placeholder="Leave empty for auto naming",
@@ -261,7 +262,7 @@ def ltx25_tab(
                         "A .mp4 file path renames the final output to that exact file."
                     ),
                 )
-                resume_run_dir = gr.Textbox(
+                resume_run_dir = path_textbox("folder", 
                     label="Resume Run Folder (chunk/scene resume)",
                     value=str(_value("resume_run_dir", "") or ""),
                     placeholder="Optional: G:/.../outputs/0019",
@@ -277,12 +278,12 @@ def ltx25_tab(
                         value=bool(_value("batch_enable", False)),
                         info="Process every video in a folder (LTX 2.5 skips images).",
                     )
-                    batch_input = gr.Textbox(
+                    batch_input = path_textbox("folder", 
                         label="Batch Input Folder",
                         value=_value("batch_input_path", ""),
                         placeholder="Folder with videos",
                     )
-                    batch_output = gr.Textbox(
+                    batch_output = path_textbox("folder", 
                         label="Batch Output Folder",
                         value=_value("batch_output_path", ""),
                         placeholder="Output directory (empty = <input>/upscaled_files)",

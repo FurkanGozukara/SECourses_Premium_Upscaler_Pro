@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import gradio as gr
+from ui.path_picker import path_textbox
 
 from shared.path_utils import (
     detect_input_type,
@@ -854,7 +855,7 @@ def rtx_super_resolution_tab(
                 with gr.Row():
                     with gr.Column(scale=3):
                         input_file = gr.File(label="Upload video or image (optional)", type="filepath", file_types=["video", "image"])
-                        input_path = gr.Textbox(label="Input Path", value=_value("input_path", ""), placeholder="C:/path/to/video.mp4 or C:/path/to/frames/")
+                        input_path = path_textbox("media+folder", label="Input Path", value=_value("input_path", ""), placeholder="C:/path/to/video.mp4 or C:/path/to/frames/")
                         copy_output_into_input_btn = gr.Button("Copy Output Into Input", elem_classes=["action-btn", "action-btn-source-seed", "sec-btn-teal"])
                         auto_transfer_output_to_input = gr.Checkbox(label="Auto Transfer Output to Input", value=bool(_value("auto_transfer_output_to_input", False)))
                     with gr.Column(scale=3):
@@ -929,7 +930,7 @@ def rtx_super_resolution_tab(
                 )
 
             with gr.Row():
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (single run)",
                     value=_value("output_override", ""),
                     placeholder="Leave empty for auto naming",
@@ -1057,7 +1058,7 @@ def rtx_super_resolution_tab(
                         scale=3,
                     )
                     cancel_btn = gr.Button("Cancel (subprocess only)", variant="stop", elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"], scale=1)
-                resume_run_dir = gr.Textbox(
+                resume_run_dir = path_textbox("folder", 
                     label="Resume Run Folder (chunk/scene resume)",
                     value=str(_value("resume_run_dir", "") or ""),
                     placeholder="Optional: G:/.../outputs/0019",
@@ -1093,8 +1094,8 @@ def rtx_super_resolution_tab(
                         info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
                         scale=2,
                     )
-                batch_input = gr.Textbox(label="Batch Input Folder", value=_value("batch_input_path", ""))
-                batch_output = gr.Textbox(label="Batch Output Folder", value=_value("batch_output_path", ""))
+                batch_input = path_textbox("folder", label="Batch Input Folder", value=_value("batch_input_path", ""))
+                batch_output = path_textbox("folder", label="Batch Output Folder", value=_value("batch_output_path", ""))
 
             log_box = gr.Textbox(label="Run Log", value="", lines=14, buttons=["copy"])
 

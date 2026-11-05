@@ -46,11 +46,11 @@ ENGINE_ORDER = ["seedvr2", "flashvsr", "sparkvsr", "gan", "rtx", "ltx25", "open_
 ENGINE_META = {
     "seedvr2": ("SeedVR2", "🎬", "scale", ("dit_model", "resolution")),
     "flashvsr": ("FlashVSR+", "⚡", "scale", ("version", "mode")),
-    "sparkvsr": ("SparkVSR", "✨", "scale", ("model", "upscale_mode")),
+    "sparkvsr": ("SparkVSR", "✨", "scale", ("model_name", "upscale_mode")),
     "gan": ("Image GAN", "🖼️", "scale", ("model",)),
     "rtx": ("RTX Super Res", "🚀", "scale", ("quality_preset",)),
-    "ltx25": ("LTX 2.5", "🎞️", "", ("model",)),
-    "open_h3": ("Open-H3", "🌀", "scale", ("model",)),
+    "ltx25": ("LTX 2.5", "🎞️", "", ("model_name",)),
+    "open_h3": ("Open-H3", "🌀", "scale", ("model_name", "resolution_preset")),
     "dlss5": ("DLSS 5", "💎", "", ("profile", "intensity")),
     "face": ("Face Restore", "👤", "", ("restoration_model", "face_strength")),
     "rife": ("RIFE FPS", "⏱️", "fps", ("model",)),
@@ -110,6 +110,63 @@ def _tab_factor(engine: str, state: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+_CAP_KEYS = ("max_resolution", "max_target_resolution")
+
+
+def _tab_settings(engine: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+    value = seed.get(f"{engine}_settings") if isinstance(seed, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _cap(size: tuple, settings: Dict[str, Any]) -> tuple:
+    """Apply the tab's max-edge cap (0 = no cap) to a projected size."""
+    cap = 0
+    for key in _CAP_KEYS:
+        try:
+            cap = int(float(settings.get(key) or 0))
+        except (TypeError, ValueError):
+            cap = 0
+        if cap:
+            break
+    if cap and max(size) > cap:
+        ratio = cap / float(max(size))
+        return int(round(size[0] * ratio)), int(round(size[1] * ratio))
+    return size
+
+
+def _open_h3_size(size: tuple, settings: Dict[str, Any], factor: Optional[float]) -> Optional[tuple]:
+    preset = str(settings.get("resolution_preset") or "")
+    if factor or preset.startswith("Custom"):
+        f = factor or float(settings.get("upscale_factor") or 2.0)
+        return int(round(size[0] * f)), int(round(size[1] * f))
+    match = re.search(r"(\d{3,4})p", preset)
+    if not match:
+        return None
+    short = int(match.group(1))
+    ratio = short / float(min(size))
+    return int(round(size[0] * ratio)), int(round(size[1] * ratio))
+
+
+def chain_label(steps: List[Dict[str, Any]], preset_name: str = "", base_dir: Optional[Path] = None) -> str:
+    """The preset name when the steps are that preset's, otherwise the steps themselves (queue / chain.json)."""
+    active = [s for s in normalize_steps(steps) if s.get("enabled", True)]
+    name = str(preset_name or "").strip()
+    if name and base_dir is not None and normalize_steps(load_chain_preset(base_dir, name)) == normalize_steps(steps):
+        return name
+    parts: List[str] = []
+    for step in active:
+        meta = ENGINE_META.get(step["engine"], (step["engine"], "", "", ()))
+        factor = step.get("factor")
+        text = meta[0] + (f" {factor:g}x" if factor and meta[2] == "scale" else f" {int(factor)}x FPS" if factor else "")
+        if parts and parts[-1].split(" ×")[0] == text:
+            head, _, count = parts[-1].partition(" ×")
+            parts[-1] = f"{head} ×{int(count or 1) + 1}"
+        else:
+            parts.append(text)
+    return ("Custom chain: " + " → ".join(parts)) if parts else (name or "Chain")
+
+
 def project_sizes(steps: List[Dict[str, Any]], state: Dict[str, Any], width: int, height: int,
                   kind: str = "video") -> List[Optional[tuple]]:
     """Approximate frame size after each step for an input of ``width`` x ``height`` (None = unknown).
@@ -122,9 +179,14 @@ def project_sizes(steps: List[Dict[str, Any]], state: Dict[str, Any], width: int
     for step in normalize_steps(steps):
         meta = ENGINE_META.get(step["engine"], (step["engine"], "", "", ()))
         if current is not None and step.get("enabled", True) and not (kind == "image" and step["engine"] in VIDEO_ONLY):
-            if meta[2] == "scale":
+            settings = _tab_settings(step["engine"], state)
+            if step["engine"] == "open_h3":
+                current = _open_h3_size(current, settings, step.get("factor"))
+                current = _cap(current, settings) if current else None
+            elif meta[2] == "scale":
                 factor = step.get("factor") or _tab_factor(step["engine"], state)
                 current = (int(round(current[0] * factor)), int(round(current[1] * factor))) if factor else None
+                current = _cap(current, settings) if current else None
             elif step["engine"] == "ltx25":  # LTX 2.5 always upscales 2x ("Upscale 2x")
                 current = (current[0] * 2, current[1] * 2)
         sizes.append(current)
@@ -149,6 +211,10 @@ BUILTIN_CHAINS: Dict[str, List[Dict[str, Any]]] = {
     "⭐ RTX Super Res 2x → DLSS 5 → RIFE 2x FPS": [
         {"engine": "rtx", "factor": 2.0}, {"engine": "dlss5"}, {"engine": "rife", "factor": 2}],
     "⭐ DLSS 5 → RTX Super Res 2x": [{"engine": "dlss5"}, {"engine": "rtx", "factor": 2.0}],
+    # Multi-pass DLSS 5: every pass renders the previous pass again, so the photoreal look gets stronger.
+    "⭐ DLSS 5 ×3 (multi-pass, strongest look)": [{"engine": "dlss5"}, {"engine": "dlss5"}, {"engine": "dlss5"}],
+    "⭐ SeedVR2 2x → DLSS 5 ×3": [{"engine": "seedvr2", "factor": 2.0}, {"engine": "dlss5"}, {"engine": "dlss5"},
+                                 {"engine": "dlss5"}],
 }
 
 
@@ -296,6 +362,8 @@ def _step_overrides(engine: ChainEngine, step: Dict[str, Any], source: str, step
     if factor and engine.factor_kind == "scale":
         overrides["upscale_factor"] = float(factor)
         overrides["use_resolution_tab"] = False
+        if engine.key == "open_h3":  # Open-H3 reads the factor only in its custom mode
+            overrides["resolution_preset"] = "Custom upscale factor"
     elif factor and engine.factor_kind == "fps":
         overrides["fps_multiplier"] = f"x{int(float(factor))}"
     return overrides
@@ -366,6 +434,89 @@ def collect_videos(uploads: Any, path_text: str) -> List[str]:
     return unique
 
 
+# --- batch folders ------------------------------------------------------------------------------
+
+BATCH_SUFFIX = "_chain"
+BATCH_REPORT = "chain_batch_report.json"
+
+
+def default_batch_output(output_root: Path, folder: str) -> Path:
+    """Where a batch writes when its output folder is empty: <outputs>/<input folder name>_chain."""
+    name = Path(str(folder or "batch").strip().strip('"').rstrip("/\\")).name or "batch"
+    return Path(output_root) / f"{name}{BATCH_SUFFIX}"
+
+
+def list_batch_sources(folder: str, subfolders: bool = False, exclude: Optional[str] = None) -> List[str]:
+    """Every video and image in ``folder`` (and its subfolders when asked), in natural order; files inside
+    ``exclude`` (the batch output folder, when it lies inside the input folder) are left out."""
+    root = Path(str(folder or "").strip().strip('"'))
+    if not root.is_dir():
+        return []
+    from shared.path_utils import list_directory_entries_sorted
+
+    skip = None
+    if exclude:
+        try:
+            skip = Path(str(exclude).strip().strip('"')).resolve()
+        except OSError:
+            skip = None
+    found: List[str] = []
+
+    def walk(directory: Path) -> None:
+        try:
+            if skip is not None and directory.resolve() == skip:
+                return
+        except OSError:
+            return
+        entries = [Path(p) for p in list_directory_entries_sorted(directory, include_dirs=subfolders)]
+        for entry in entries:
+            if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS | IMAGE_EXTS:
+                found.append(str(entry))
+        if subfolders:
+            for entry in entries:
+                if entry.is_dir() and not entry.is_symlink():
+                    walk(entry)
+
+    walk(root)
+    return found
+
+
+def batch_target(source: str, batch: Dict[str, Any], test_seconds: float = 0.0) -> Path:
+    """The result path (without suffix) of ``source`` in the batch output folder, keeping subfolders."""
+    out = Path(batch["output"])
+    try:
+        rel = Path(source).resolve().parent.relative_to(Path(batch["input"]).resolve())
+    except (ValueError, OSError):
+        rel = Path()
+    tag = f"_first{test_seconds:g}s" if test_seconds else ""
+    return out / rel / f"{Path(source).stem}{BATCH_SUFFIX}{tag}"
+
+
+def batch_done(source: str, batch: Dict[str, Any]) -> Optional[str]:
+    """The existing full result of ``source`` in the batch output folder (quick-test results do not count)."""
+    target = batch_target(source, batch)
+    if not target.parent.is_dir():
+        return None
+    want = VIDEO_EXTS if Path(source).suffix.lower() in VIDEO_EXTS else IMAGE_EXTS | VIDEO_EXTS
+    for candidate in sorted(target.parent.glob(target.name + ".*")):
+        if candidate.suffix.lower() in want and candidate.stem == target.name and candidate.stat().st_size > 0:
+            return str(candidate)
+    return None
+
+
+def _write_batch_report(batch: Dict[str, Any], chain_name: str, started: str, entries: List[Dict[str, Any]]) -> None:
+    payload = {"chain": chain_name, "input_folder": str(batch["input"]), "output_folder": str(batch["output"]),
+               "started": started, "updated": datetime.now().isoformat(timespec="seconds"), "files": entries}
+    try:
+        Path(batch["output"]).mkdir(parents=True, exist_ok=True)
+        target = Path(batch["output"]) / BATCH_REPORT
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        pass
+
+
 def _write_chain_json(run_dir: Path, chain_name: str, source: str, original: str, active: List[Dict[str, Any]],
                       table: List[StepState], started: str, test_seconds: float) -> None:
     payload = {
@@ -427,12 +578,16 @@ def run_chain(
     global_settings_snapshot: Optional[Dict[str, Any]] = None,
     test_seconds: float = 0.0,
     resume_dirs: Optional[Dict[str, str]] = None,
+    batch: Optional[Dict[str, Any]] = None,
 ) -> Iterator[ChainEvent]:
     """Run ``steps`` over every source; yields ChainEvents for the UI.
 
     ``test_seconds`` > 0 runs the chain on the first seconds of each video (quick test).
     ``resume_dirs`` maps a source to the run folder of an earlier, unfinished run of it: the
     leading steps that match and whose outputs still exist are reused, the chain goes on from there.
+    ``batch`` = {"input": folder, "output": folder, "skip_done": bool}: each final result is also saved as
+    ``<output>/<subfolders>/<name>_chain.<ext>``, files that already have one are skipped (skip_done) and
+    ``chain_batch_report.json`` in the output folder lists every file. Cancel stops the whole run.
     """
     from shared.output_run_manager import allocate_sequential_run_dir
     from shared.universal_preset import get_all_defaults
@@ -449,12 +604,33 @@ def run_chain(
     runs: List[Dict[str, Any]] = []
     table: List[StepState] = []
     resume_dirs = dict(resume_dirs or {})
+    batch_started = datetime.now().isoformat(timespec="seconds")
+    report: List[Dict[str, Any]] = []
+    skipped_done = 0
+    if batch:
+        log.append(f"=== Batch: {len(sources)} file(s) from {batch['input']} -> {batch['output']}")
     for video_index, source in enumerate(sources, 1):
+        if cancel_flag and cancel_flag():
+            log.append(f"=== Cancelled: {len(sources) - video_index + 1} file(s) not started")
+            for rest in sources[video_index - 1:]:
+                runs.append({"source": rest, "run_dir": "", "ok": False})
+            break
+        if batch and batch.get("skip_done") and not test_seconds and not resume_dirs.get(source):
+            existing = batch_done(source, batch)
+            if existing:
+                skipped_done += 1
+                log.append(f"=== Skipped {Path(source).name}: already done ({existing})")
+                runs.append({"source": source, "run_dir": "", "ok": True, "skipped": True})
+                report.append({"source": source, "status": "skipped (already done)", "output": existing})
+                _write_batch_report(batch, chain_name, batch_started, report)
+                yield ChainEvent([], video_index, len(sources), source, f"⏭️ {Path(source).name}: already done",
+                                 log, runs=runs)
+                continue
         table = [StepState(i + 1, s["engine"]) for i, s in enumerate(active)]
         reused: List[Optional[str]] = []
         chain_input = source
         old_dir = resume_dirs.get(source)
-        if old_dir and Path(old_dir).is_dir():
+        if old_dir and (Path(old_dir) / "chain.json").is_file():
             run_dir = Path(old_dir)
             chain_input, reused = _resume_plan(run_dir, active)
             chain_input = chain_input if chain_input and Path(chain_input).is_file() else source
@@ -570,6 +746,17 @@ def run_chain(
                 shutil.copy2(current, final)
             except OSError:
                 final = Path(current)
+            if batch:
+                target = batch_target(source, batch, test_seconds)
+                target = target.with_name(target.name + Path(current).suffix)
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = target.with_name(target.name + ".part")
+                    shutil.copy2(final, tmp)
+                    tmp.replace(target)
+                    final = target
+                except OSError as exc:
+                    log.append(f"    batch copy failed ({exc}); the result stays in {run_dir}")
             finals.append(str(final))
             runs[-1]["ok"] = True
             log.append(f"=== Final: {final}")
@@ -577,13 +764,27 @@ def run_chain(
         elif not failed:
             failed = True
             log.append("    no step changed the file (every step was skipped)")
+        if batch:
+            failed_row = next((r for r in table if r.status == "failed"), None)
+            report.append({"source": source, "status": "failed" if failed else "done",
+                           "output": finals[-1] if finals and not failed else None, "run_dir": str(run_dir),
+                           "detail": (f"step {failed_row.index} {failed_row.engine}: {failed_row.detail}"
+                                      if failed_row else ("every step was skipped" if failed else ""))})
+            _write_batch_report(batch, chain_name, batch_started, report)
         _write_chain_json(run_dir, chain_name, chain_input, source, active, table, started, test_seconds)
         yield ChainEvent(table, video_index, len(sources), chain_input,
                          ("❌ Chain stopped" if failed else f"✅ Chain finished for {Path(source).name}"), log,
                          final_output=finals[-1] if finals and not failed else None, run_dir=str(run_dir), runs=runs)
     ok = len(finals)
-    status = (f"✅ Chain complete: {ok} of {len(sources)} video(s)" if ok == len(sources)
-              else f"⚠️ Chain finished: {ok} of {len(sources)} video(s) succeeded")
+    if batch:
+        done_all = ok + skipped_done
+        extra = f" ({skipped_done} already done, skipped)" if skipped_done else ""
+        status = (f"✅ Batch complete: {done_all} of {len(sources)} file(s){extra} → {batch['output']}"
+                  if done_all == len(sources)
+                  else f"⚠️ Batch finished: {done_all} of {len(sources)} file(s) done{extra} → {batch['output']}")
+    else:
+        status = (f"✅ Chain complete: {ok} of {len(sources)} video(s)" if ok == len(sources)
+                  else f"⚠️ Chain finished: {ok} of {len(sources)} video(s) succeeded")
     last_source = runs[-1]["source"] if runs else (sources[-1] if sources else "")
     yield ChainEvent(table, len(sources), len(sources), last_source, status, log,
                      final_output=finals[-1] if finals else None, finished=True,

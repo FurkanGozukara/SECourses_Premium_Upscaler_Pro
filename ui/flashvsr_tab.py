@@ -5,6 +5,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 import math
 from pathlib import Path
 from typing import Dict, Any
@@ -300,7 +301,7 @@ def flashvsr_tab(
                             type="filepath",
                             file_types=["video", "image"]
                         )
-                        input_path = gr.Textbox(
+                        input_path = path_textbox("media+folder", 
                             label="Input Path",
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
@@ -667,7 +668,7 @@ def flashvsr_tab(
                 codec = gr.State(str(_value("codec", "libx264") or "libx264"))
                 crf = gr.State(int(_value("crf", _value("quality", 18)) or 18))
 
-                models_dir = gr.Textbox(
+                models_dir = path_textbox("folder", 
                     label="FlashVSR Models Directory",
                     value=str(_value("models_dir", str(base_dir / "ComfyUI-FlashVSR_Stable" / "models")) or ""),
                     placeholder="G:/.../ComfyUI-FlashVSR_Stable/models",
@@ -677,7 +678,7 @@ def flashvsr_tab(
                     ),
                 )
 
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (folder or .mp4 file)",
                     value=_value("output_override", ""),
                     placeholder="Leave empty for auto naming",
@@ -834,7 +835,7 @@ def flashvsr_tab(
                         elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
-            resume_run_dir = gr.Textbox(
+            resume_run_dir = path_textbox("folder", 
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
                     _value("resume_run_dir", "")
@@ -931,12 +932,12 @@ def flashvsr_tab(
                         info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
                         scale=2,
                     )
-                batch_input = gr.Textbox(
+                batch_input = path_textbox("folder", 
                     label="Batch Input Folder",
                     value=_value("batch_input_path", ""),
                     placeholder="Folder with videos"
                 )
-                batch_output = gr.Textbox(
+                batch_output = path_textbox("folder", 
                     label="Batch Output Folder",
                     value=_value("batch_output_path", ""),
                     placeholder="Output directory"

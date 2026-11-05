@@ -11,6 +11,33 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.0 — 5 November 2026 — Multi-Pass DLSS 5, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
+        """
+**Run DLSS 5 two or three times for a much stronger photoreal look, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+
+**Multi-pass DLSS 5**
+- New **Passes** setting (1-4) on the DLSS 5 tab: pass 2 renders DLSS 5 again on the result of pass 1, and so on. Every pass adds more real skin, hair, light and material detail, so 2-3 passes give the strongest look on game graphics, CGI and plastic-looking AI footage. Footage that already looks real can look overdone with several passes; start with 1-2 there.
+- All passes run in one go: no re-encode between passes, and each pass keeps its own temporal history, so videos stay stable.
+- In Chains you can also add DLSS 5 two or three times; the pipeline labels the steps pass 1/3, 2/3 and 3/3. Two new example chains: "⭐ DLSS 5 ×3 (multi-pass, strongest look)" and "⭐ SeedVR2 2x → DLSS 5 ×3".
+
+**Chains: batch folders**
+- New **📁 Batch processing** block right below Run Chain: enter a batch input folder and Run Chain processes every video and image in it, one after another. Results are saved in the batch output folder (empty = `<outputs>/<folder>_chain`) as `<name>_chain`, keeping the subfolders when "Include subfolders" is on.
+- "Skip files that already have a result" (on by default) lets you press Run Chain again to continue an interrupted batch. A failing file never stops the batch, Cancel stops the whole batch, and Resume continues the files that were not finished. `chain_batch_report.json` in the output folder lists every file with its result.
+- The block shows how many videos and images it found and how many are already done, and the input preview shows the batch files.
+
+**📂 / 📄 picker buttons on every path field**
+- Every folder and file path in the app (inputs, batch folders, output overrides, resume folders, model folders and files, the Global Settings folders) now has a picker button: 📂 opens a folder dialog, 📄 a file dialog filtered to videos, images or model files. It opens at the current path (or the last folder you picked), and a picked file refreshes the tab's preview exactly like a typed path.
+- The dialog runs in its own small process, so it never freezes or crashes the app. On a server without a screen (RunPod) the buttons are hidden and typing paths works as before. The Windows installer now checks that Python's tkinter is present (part of the standard Python installer); the Massed Compute installer adds python3.12-tk.
+
+**Chains fixes**
+- The size shown after every step now follows each tab's Max Resolution and Open-H3's Target Resolution.
+- An Open-H3 step with its own Scale now uses that scale (it switches Open-H3 to "Custom upscale factor"); before, the step's scale was ignored.
+- The queue and the run's `chain.json` name an edited chain by its steps (for example "Custom chain: SeedVR2 → DLSS 5 ×3") instead of the preset it was loaded from.
+- Step cards show the SparkVSR, LTX 2.5 and Open-H3 model instead of "tab defaults", and a DLSS 5 step shows its passes.
+- Typing a batch folder and clicking away at once never leaves a stale file count behind.
+""",
+    ),
+    (
         "V9.8 — 5 November 2026 — DLSS 5 Needs Less Than Half the VRAM and Runs Faster, Chains Get Input Preview, Quick Test, Resume and a Step Viewer",
         """
 **DLSS 5 now renders 4K in about 3 GB of VRAM instead of 5-6 GB and is up to 40 % faster, with exactly the same picture. The Chains tab shows what you upload, tries a chain on a few seconds first, resumes a stopped run and lets you look at every step's result.**

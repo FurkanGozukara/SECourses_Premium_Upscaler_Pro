@@ -51,6 +51,7 @@ if sys.platform == 'win32':
             pass  # Silently ignore if we can't change encoding
 
 import gradio as gr
+from ui.path_picker import path_textbox
 
 from shared.models import scan_gan_models
 from shared.health import collect_health_report
@@ -107,7 +108,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "9.8"
+APP_VERSION = "10.0"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1639,13 +1640,13 @@ def main(argv=None):
                 gr.Markdown("### Global Settings")
                 gr.Markdown("Configure absolute output/temp directories and choose light or dark theme.")
                 with gr.Row():
-                    output_dir_box = gr.Textbox(
+                    output_dir_box = path_textbox("folder", 
                         label="Default Outputs Folder",
                         value=global_settings["output_dir"],
                         placeholder=str(BASE_DIR / "outputs"),
                         info="Absolute path required. Supports /, //, and \\ separators."
                     )
-                    temp_dir_box = gr.Textbox(
+                    temp_dir_box = path_textbox("folder", 
                         label="Default Temp Folder",
                         value=global_settings["temp_dir"],
                         placeholder=str(BASE_DIR / "temp"),
@@ -1719,7 +1720,7 @@ def main(argv=None):
                     visible=False,
                     interactive=True
                 )
-                models_dir_box = gr.Textbox(
+                models_dir_box = path_textbox("folder", 
                     label="Models Directory (MODELS_DIR)",
                     value=global_settings.get("models_dir", ""),
                     visible=False,

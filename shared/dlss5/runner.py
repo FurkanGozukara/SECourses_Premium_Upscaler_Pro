@@ -49,7 +49,9 @@ DLSS5_DEFAULTS: Dict[str, Any] = {
     "speed_mode": SPEED_CHOICES[0],
     "max_frames": 0,
     "keep_model_loaded": False,
+    "passes": 1,
 }
+MAX_PASSES = 4
 
 
 @dataclass
@@ -109,6 +111,11 @@ def build_options(settings: Dict[str, Any]):
         tone_strength=None if abs(tone - base[0]) < 1e-6 else max(0.0, min(2.0, tone)),
         structure_strength=None if abs(structure - base[1]) < 1e-6 else max(0.0, min(2.0, structure)),
     )
+
+
+def passes_of(settings: Dict[str, Any]) -> int:
+    """How many times each frame is rendered (pass 2 renders pass 1's result again, and so on)."""
+    return max(1, min(MAX_PASSES, _int(settings.get("passes"), 1)))
 
 
 def _resolve_device(settings: Dict[str, Any]):
@@ -291,8 +298,9 @@ def _render_still(engine, settings, frame: np.ndarray, deep: bool):
 
     options = build_options(settings)
     options.temporal = False
-    session = DLSS5Session(engine, options)
-    out = session.render(to_tensor(frame, engine.device))
+    out = to_tensor(frame, engine.device)
+    for _ in range(passes_of(settings)):  # each pass renders the previous pass again (float, no rounding between)
+        out = DLSS5Session(engine, options).render(out)
     return to_array(out, deep=deep)
 
 
@@ -475,9 +483,12 @@ def _run_video(settings, base_dir, device, source: Path, log, result, cancel_eve
 
     engine = _plan_engine(settings, base_dir, device, width, height, log)
     options = build_options(settings)
-    session = DLSS5Session(engine, options)
+    passes = passes_of(settings)
+    # One session per pass: each keeps its own temporal history; pass k renders pass k-1's frame.
+    sessions = [DLSS5Session(engine, options) for _ in range(passes)]
+    session = sessions[0]
     log(f"[DLSS 5] {source.name}: {width}x{height} @ {_rate_value(rate):.3f} fps, {total or '?'} frames, "
-        f"profile {options.profile}, intensity {options.intensity:g}, "
+        f"profile {options.profile}, intensity {options.intensity:g}, {passes} pass{'es' if passes > 1 else ''}, "
         f"{'temporal ' + str(settings.get('motion_quality') or DEFAULT_MOTION_QUALITY) if options.temporal else 'independent frames'}")
 
     reader = _FrameReader(str(source), width, height, deep=want_deep, prefetch=0)
@@ -523,7 +534,9 @@ def _run_video(settings, base_dir, device, source: Path, log, result, cancel_eve
             if item is None:
                 break
             frame, estimate = item
-            out = session.render(to_tensor(frame, device), estimate)
+            out = to_tensor(frame, device)
+            for pass_session in sessions:
+                out = pass_session.render(out, estimate)
             write_q.put(to_array(out, deep=want_deep))
             done += 1
             if write_error:

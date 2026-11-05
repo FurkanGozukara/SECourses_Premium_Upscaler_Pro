@@ -4,6 +4,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 from pathlib import Path
 from typing import Dict, Any
 import html
@@ -143,7 +144,7 @@ def rife_tab(
                             height=220,
                             visible=False,
                         )
-                input_path = gr.Textbox(
+                input_path = path_textbox("video+folder", 
                     label="Input Path",
                     value=_value("input_path", ""),
                     placeholder="C:/path/to/video.mp4 or C:/path/to/images/",
@@ -157,13 +158,13 @@ def rife_tab(
                     value=bool(_value("batch_enable", False)),
                     info="Process multiple files from directory"
                 )
-                batch_input = gr.Textbox(
+                batch_input = path_textbox("folder", 
                     label="Batch Input Folder",
                     value=_value("batch_input_path", ""),
                     placeholder="Folder containing videos",
                     info="Directory with files to process in batch mode"
                 )
-                batch_output = gr.Textbox(
+                batch_output = path_textbox("folder", 
                     label="Batch Output Folder Override",
                     value=_value("batch_output_path", ""),
                     placeholder="Optional override for batch outputs",
@@ -180,7 +181,7 @@ def rife_tab(
                     with gr.Group():
                         gr.Markdown("#### Output Configuration")
                         
-                        output_override = gr.Textbox(
+                        output_override = path_textbox("folder", 
                             label="Output Override (custom path)",
                             value=_value("output_override", ""),
                             placeholder="Leave empty for auto naming",
@@ -230,7 +231,7 @@ def rife_tab(
                             # Only list locally installed models from supported layouts.
                             return get_rife_model_names(base_dir)
                         
-                        model_dir = gr.Textbox(
+                        model_dir = path_textbox("folder", 
                             label="Model Directory Override",
                             value=_value("model_dir", ""),
                             placeholder="Leave empty for default (RIFE/train_log)",
@@ -473,7 +474,7 @@ def rife_tab(
                 buttons=["copy"]
             )
 
-            resume_run_dir = gr.Textbox(
+            resume_run_dir = path_textbox("folder", 
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
                     values[RIFE_ORDER.index("resume_run_dir")]

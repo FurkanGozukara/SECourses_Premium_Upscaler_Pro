@@ -742,6 +742,36 @@ FEATURE_CSS = r"""
 .chain-node-size { font-size: 0.74rem; font-weight: 700; color: var(--sec-accent); margin-top: 2px; white-space: nowrap; }
 .chain-input-info p { margin: 4px 2px 2px !important; color: var(--sec-text-2); }
 .chain-preview { margin-top: 4px; }
+/* Path fields with native folder / file picker buttons (ui/path_picker.py, V10) */
+.path-row { gap: 6px !important; align-items: flex-end !important; flex-wrap: nowrap !important; }
+.path-row > .form { flex: 1 1 auto !important; min-width: 0 !important; }
+.path-row:not(:has(.block)) { display: none !important; }
+button.path-pick-btn {
+  flex: 0 0 auto !important;
+  min-width: 46px !important;
+  width: 46px !important;
+  height: 41px !important;
+  margin-bottom: 11px !important;
+  padding: 0 !important;
+  font-size: 1.25rem !important;
+  line-height: 1 !important;
+  border-radius: 10px !important;
+  border: none !important;
+  color: #fff !important;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+button.path-pick-folder {
+  background: linear-gradient(135deg, #1e40af 0%, #2563eb 60%, #60a5fa 100%) !important;
+  box-shadow: 0 6px 14px -4px rgba(37, 99, 235, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+button.path-pick-file {
+  background: linear-gradient(135deg, #115e59 0%, #0d9488 60%, #2dd4bf 100%) !important;
+  box-shadow: 0 6px 14px -4px rgba(13, 148, 136, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+button.path-pick-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08) saturate(1.05); }
+button.path-pick-btn:active:not(:disabled) { transform: scale(0.97); filter: brightness(0.95); }
+.chain-batch-card .chain-batch-info p { margin: 2px 2px 0 !important; color: var(--sec-text-2); }
 .chain-node-num {
   display: inline-flex; align-items: center; justify-content: center;
   width: 20px; height: 20px; border-radius: 50%;

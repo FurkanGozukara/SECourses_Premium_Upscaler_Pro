@@ -6,7 +6,7 @@ UPDATED: Uses Universal Preset System
 import gradio as gr
 from pathlib import Path
 
-from shared.path_dialogs import get_any_file_path
+from ui.path_picker import path_textbox
 from shared.services.global_service import open_outputs_folder
 from shared.services.resolution_service import (
     build_resolution_callbacks, RESOLUTION_ORDER
@@ -171,20 +171,12 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
             gr.Markdown("#### Estimate & Preview")
             
             # Input path for estimation
-            with gr.Row(equal_height=True):
-                calc_input_path = gr.Textbox(
-                    label="Input Path (for estimation)",
-                    placeholder="Paste input video/image path or use a Quick Action button below",
-                    info="Path to estimate scene/chunk splitting for",
-                    scale=20,
-                )
-                calc_input_browse_btn = gr.Button(
-                    "Pick File",
-                    size="lg",
-                    elem_id="resolution_pick_file_btn",
-                    elem_classes=["action-btn", "resolution-btn-browse", "sec-btn-blue"],
-                    scale=3,
-                )
+            calc_input_path = path_textbox(
+                "media",
+                label="Input Path (for estimation)",
+                placeholder="Paste input video/image path, pick it with 📄 or use a Quick Action button below",
+                info="Path to estimate scene/chunk splitting for",
+            )
             
             with gr.Row():
                 calc_chunks_btn = gr.Button(
@@ -390,12 +382,6 @@ def resolution_tab(preset_manager, shared_state: gr.State, base_dir: Path):
         fn=open_standalone_split_folder,
         inputs=standalone_split_output_dir,
         outputs=standalone_split_result,
-    )
-
-    calc_input_browse_btn.click(
-        fn=get_any_file_path,
-        inputs=[calc_input_path],
-        outputs=[calc_input_path],
     )
 
     # Quick Action input buttons (pull from per-tab cached settings)

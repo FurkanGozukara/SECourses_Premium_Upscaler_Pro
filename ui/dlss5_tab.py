@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 import gradio as gr
+from ui.path_picker import path_textbox
 
 from shared.dlss5.motion import MOTION_QUALITY
-from shared.dlss5.runner import MOTION_CHOICES, PRECISION_CHOICES, PROFILE_CHOICES, SPEED_CHOICES
+from shared.dlss5.runner import MAX_PASSES, MOTION_CHOICES, PRECISION_CHOICES, PROFILE_CHOICES, SPEED_CHOICES
 from shared.services.dlss5_service import DLSS5_ORDER, build_dlss5_callbacks
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
@@ -29,6 +30,7 @@ HERO_HTML = """
   <div class="dlss5-chips">
     <span class="dlss5-chip">🎞️ Temporal video</span><span class="dlss5-chip">🖼️ Images &amp; folders</span>
     <span class="dlss5-chip">🔗 Post-process after any upscaler</span><span class="dlss5-chip">⛓️ Usable in Chains</span>
+    <span class="dlss5-chip">🔁 Multi-pass: 2-3 passes for a stronger look</span>
   </div>
 </div>
 """
@@ -52,7 +54,7 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
                 with gr.Row():
                     with gr.Column(scale=3):
                         input_file = gr.File(label="Upload video or image", type="filepath", file_types=["video", "image"])
-                        input_path = gr.Textbox(label="Input Path (video, image or image folder)", value=v("input_path") or "",
+                        input_path = path_textbox("media+folder", label="Input Path (video, image or image folder)", value=v("input_path") or "",
                                                 placeholder="C:/videos/clip.mp4")
                     with gr.Column(scale=3):
                         input_image_preview = gr.Image(label="Input", type="filepath", interactive=False, height=230, visible=False)
@@ -70,6 +72,12 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
                                                 value=float(v("detail_strength")), info="Fine texture the render adds (high frequencies).")
                     colour_strength = gr.Slider(label="Colour & lighting strength", minimum=0.0, maximum=3.0, step=0.05,
                                                 value=float(v("colour_strength")), info="Broad lighting / colour change (low frequencies).")
+                passes = gr.Slider(label="Passes (multi-pass DLSS 5)", minimum=1, maximum=MAX_PASSES, step=1,
+                                   value=int(v("passes") or 1),
+                                   info="Each pass renders DLSS 5 again on the previous pass: 2-3 passes give a much stronger "
+                                        "photoreal look on game graphics and CGI; already realistic footage can look overdone. "
+                                        "Same as chaining DLSS 5 several times, but in one go (no re-encode between passes). "
+                                        "A DLSS 5 step in Chains also uses this setting.")
 
             with gr.Accordion("🎞️ Temporal stability (video)", open=False, elem_classes=["dlss5-card"]):
                 with gr.Row():
@@ -118,10 +126,10 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
             with gr.Accordion("📁 Batch & output", open=False, elem_classes=["dlss5-card"]):
                 batch_enable = gr.Checkbox(label="Batch: render every video and image in a folder", value=bool(v("batch_enable")))
                 with gr.Row():
-                    batch_input_path = gr.Textbox(label="Batch input folder", value=v("batch_input_path") or "")
-                    batch_output_path = gr.Textbox(label="Batch output folder (empty = <outputs>/<folder>_DLSS5)",
+                    batch_input_path = path_textbox("folder", label="Batch input folder", value=v("batch_input_path") or "")
+                    batch_output_path = path_textbox("folder", label="Batch output folder (empty = <outputs>/<folder>_DLSS5)",
                                                    value=v("batch_output_path") or "")
-                output_override = gr.Textbox(label="Output Override (single run)", value=v("output_override") or "",
+                output_override = path_textbox("folder", label="Output Override (single run)", value=v("output_override") or "",
                                              placeholder="Empty = a numbered run folder in the outputs folder")
 
             (preset_dropdown, preset_name_input, save_preset_btn, load_preset_btn, preset_status, reset_defaults_btn,
@@ -150,6 +158,7 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
         input_path, output_override, batch_enable, batch_input_path, batch_output_path, profile, intensity,
         detail_strength, colour_strength, detail_radius, processing_scale, temporal, motion_quality, scene_cut_threshold,
         tone_strength, structure_strength, precision, speed_mode, max_frames, keep_model_loaded, global_postprocess,
+        passes,
     ]
     assert len(inputs_list) == len(DLSS5_ORDER)
 

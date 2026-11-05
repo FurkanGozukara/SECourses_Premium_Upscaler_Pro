@@ -5,6 +5,7 @@ UPDATED: Now uses Universal Preset System
 """
 
 import gradio as gr
+from ui.path_picker import path_textbox
 import math
 from pathlib import Path
 from typing import Dict, Any
@@ -357,7 +358,7 @@ def sparkvsr_tab(
                             type="filepath",
                             file_types=["video", "image"]
                         )
-                        input_path = gr.Textbox(
+                        input_path = path_textbox("media+folder", 
                             label="Input Path",
                             value=_value("input_path", ""),
                             placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
@@ -383,13 +384,13 @@ def sparkvsr_tab(
                             value=model_name_value,
                             info="Stage-2 is the official final SparkVSR checkpoint. Stage-1 is exposed for compatibility.",
                         )
-                        model_path = gr.Textbox(
+                        model_path = path_textbox("model", 
                             label="Model Path Override",
                             value=str(_value("model_path", "") or ""),
                             placeholder="Leave empty to use SparkVSR/models/<selected model>",
                             info="Optional local Diffusers model folder. Overrides the selected model when set.",
                         )
-                        lora_path = gr.Textbox(
+                        lora_path = path_textbox("model", 
                             label="LoRA Path",
                             value=str(_value("lora_path", "") or ""),
                             placeholder="Optional .safetensors LoRA file",
@@ -646,7 +647,7 @@ def sparkvsr_tab(
                     placeholder="Example: 0",
                     info="Comma-separated source frame indices. For short clips, SparkVSR recommends using only frame 0.",
                 )
-                ref_source_path = gr.Textbox(
+                ref_source_path = path_textbox("media+folder", 
                     label="Local SR Reference Path",
                     value=str(_value("ref_source_path", "") or ""),
                     placeholder="Leave blank for input video fallback, or provide image/video/folder",
@@ -677,23 +678,23 @@ def sparkvsr_tab(
                     gr.Markdown(
                         "`sr_image`: local default; blank path uses the input video. `pisasr`: strongest fully local reference path when PiSA-SR is installed. `no_ref`: baseline without reference guidance."
                     )
-                    ref_pisa_cache_dir = gr.Textbox(
+                    ref_pisa_cache_dir = path_textbox("folder", 
                         label="PiSA-SR Reference Cache Directory",
                         value=str(_value("ref_pisa_cache_dir", "") or ""),
                     )
-                    pisa_python_executable = gr.Textbox(
+                    pisa_python_executable = path_textbox("file", 
                         label="PiSA Python Executable",
                         value=str(_value("pisa_python_executable", "") or ""),
                     )
-                    pisa_script_path = gr.Textbox(
+                    pisa_script_path = path_textbox("script", 
                         label="PiSA Script Path",
                         value=str(_value("pisa_script_path", "") or ""),
                     )
-                    pisa_sd_model_path = gr.Textbox(
+                    pisa_sd_model_path = path_textbox("folder", 
                         label="PiSA SD Model Path",
                         value=str(_value("pisa_sd_model_path", "") or ""),
                     )
-                    pisa_chkpt_path = gr.Textbox(
+                    pisa_chkpt_path = path_textbox("model", 
                         label="PiSA Checkpoint Path",
                         value=str(_value("pisa_chkpt_path", "") or ""),
                     )
@@ -744,7 +745,7 @@ def sparkvsr_tab(
                 codec = gr.State(str(_value("codec", "libx264") or "libx264"))
                 crf = gr.State(int(_value("crf", _value("quality", 18)) or 18))
 
-                models_dir = gr.Textbox(
+                models_dir = path_textbox("folder", 
                     label="SparkVSR Models Directory",
                     value=str(_value("models_dir", str(base_dir / "SparkVSR" / "models")) or ""),
                     placeholder="G:/.../SparkVSR/models",
@@ -753,7 +754,7 @@ def sparkvsr_tab(
                     ),
                 )
 
-                output_override = gr.Textbox(
+                output_override = path_textbox("folder", 
                     label="Output Override (folder or .mp4 file)",
                     value=_value("output_override", ""),
                     placeholder="Leave empty for auto naming",
@@ -910,7 +911,7 @@ def sparkvsr_tab(
                         elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
                     )
 
-            resume_run_dir = gr.Textbox(
+            resume_run_dir = path_textbox("folder", 
                 label="Resume Run Folder (chunk/scene resume)",
                 value=(
                     _value("resume_run_dir", "")
@@ -1007,12 +1008,12 @@ def sparkvsr_tab(
                         info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
                         scale=2,
                     )
-                batch_input = gr.Textbox(
+                batch_input = path_textbox("folder", 
                     label="Batch Input Folder",
                     value=_value("batch_input_path", ""),
                     placeholder="Folder with videos"
                 )
-                batch_output = gr.Textbox(
+                batch_output = path_textbox("folder", 
                     label="Batch Output Folder",
                     value=_value("batch_output_path", ""),
                     placeholder="Output directory"

@@ -503,9 +503,17 @@ class H3TextEncoder:
         place_blocks(transformer.model, layers, self.device, budget_bytes, emit=emit, label="text encoder layers")
         del keep
 
+    def place_vision(self, emit: Emit = None) -> None:
+        """Pictures in the prompt (JonXL first frame): keep the vision tower on the GPU (about 1 GB)."""
+        visual = getattr(self.model.qwen3vl_32b.transformer, "visual", None)
+        if visual is not None:
+            visual.to(self.device)
+            _emit(emit, f"Text encoder vision tower on {self.device} ({module_bytes(visual) / GIB:.2f} GB)")
+
     @torch.no_grad()
-    def encode(self, text: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        tokens = self.tokenizer.tokenize_with_weights(text, return_word_ids=False)
+    def encode(self, text: str, images=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """images: [1, H, W, 3] float pictures in [0, 1], tokenized as '<Picture n>: ' before the text."""
+        tokens = self.tokenizer.tokenize_with_weights(text, return_word_ids=False, images=list(images or []))
         self.model.set_clip_options({"execution_device": self.device})
         out = self.model.encode_token_weights(tokens)
         self.model.reset_clip_options()

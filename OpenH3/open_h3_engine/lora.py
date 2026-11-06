@@ -17,6 +17,7 @@ import copy
 import hashlib
 import logging
 import os
+import re
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -72,6 +73,46 @@ class _LoraWeightPatch:
         return weight
 
 
+_KOHYA_MODULE = re.compile(r"^lora_unet_blocks_(\d+)_(attn_qkv_proj|attn_out_proj|mlp_fc1|mlp_fc2)$")
+_KOHYA_LEAF = {"attn_qkv_proj": "attn.qkv_proj", "attn_out_proj": "attn.out_proj", "mlp_fc1": "mlp.fc1", "mlp_fc2": "mlp.fc2"}
+
+
+def load_kohya_pairs(path: str, dtype: torch.dtype) -> Dict[str, Tuple[torch.Tensor, torch.Tensor, str, object]]:
+    """A kohya-format LoRA trained on the ComfyUI H3 layout ('lora_unet_blocks_<n>_<layer>' with lora_down / lora_up /
+    alpha, such as JonXL's h3_upscale_1920): the names map one to one onto 'diffusion_model.blocks.<n>.<layer>.weight'
+    (fused qkv and SwiGLU rows as the checkpoint stores them). A carries the alpha / rank scale.
+    Returns {module: (A, B, weight key, None)}."""
+    from safetensors import safe_open
+
+    pairs = {}
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+        modules = sorted({k.rsplit(".lora_down.weight", 1)[0] for k in keys if k.endswith(".lora_down.weight")})
+        if not modules:
+            raise ValueError(f"{os.path.basename(str(path))} holds no kohya lora_down / lora_up pairs")
+        for module in modules:
+            match = _KOHYA_MODULE.match(module)
+            if match is None or f"{module}.lora_up.weight" not in keys:
+                raise ValueError(f"unexpected LoRA module {module} (expected lora_unet_blocks_<n>_<layer> pairs)")
+            down = f.get_tensor(module + ".lora_down.weight").to(torch.float32)
+            up = f.get_tensor(module + ".lora_up.weight").to(torch.float32)
+            rank = down.shape[0]
+            alpha = float(f.get_tensor(module + ".alpha")) if f"{module}.alpha" in keys else float(rank)
+            target = f"diffusion_model.blocks.{int(match.group(1))}.{_KOHYA_LEAF[match.group(2)]}.weight"
+            pairs[module] = ((down * (alpha / rank)).to(dtype), up.to(dtype), target, None)
+    return pairs
+
+
+@torch.no_grad()
+def apply_kohya_lora(model: nn.Module, path: str, strength: float, device: torch.device,
+                     compute_dtype: torch.dtype, emit: Emit = None) -> str:
+    """Merge a kohya-format H3 LoRA (LoraLoaderModelOnly parity) into the DiT. Returns a one-line report."""
+    if float(strength) == 0.0:
+        return "LoRA: strength 0 (skipped)"
+    _emit(emit, f"Loading LoRA: {os.path.basename(str(path))}")
+    return _merge_pairs(model, load_kohya_pairs(path, compute_dtype), path, strength, device, compute_dtype, emit)
+
+
 @torch.no_grad()
 def apply_merged_lora(model: nn.Module, path: str, strength: float, device: torch.device,
                       compute_dtype: torch.dtype, emit: Emit = None) -> str:
@@ -79,7 +120,11 @@ def apply_merged_lora(model: nn.Module, path: str, strength: float, device: torc
     if float(strength) == 0.0:
         return "LoRA: strength 0 (skipped - not the reference recipe)"
     _emit(emit, f"Loading Open-H3 merged LoRA: {os.path.basename(str(path))}")
-    pairs = load_lora_pairs(path, compute_dtype)
+    return _merge_pairs(model, load_lora_pairs(path, compute_dtype), path, strength, device, compute_dtype, emit)
+
+
+def _merge_pairs(model: nn.Module, pairs, path: str, strength: float, device: torch.device,
+                 compute_dtype: torch.dtype, emit: Emit = None) -> str:
     modules = dict(model.named_modules())
 
     grouped: Dict[str, list] = {}

@@ -78,3 +78,40 @@ def openh3_download_size_gb(dit: str, text_encoder: str, vae: str) -> float:
         + OPENH3_VAE_SIZES_GB.get(vae, 3.6)
         + OPENH3_ALWAYS_SIZE_GB
     )
+
+
+# JonXL H3 Upscale: JonXL's MiniMax H3 image upscaler (LoRA + workflow), the second Open-H3 workflow. Every picture
+# (an image, or every frame of a video) becomes the last frame of a 24-frame H3 clip that cross-fades from the blurry
+# input to a sharp picture (OpenH3/open_h3_engine/jxl.py). Needs only the DiT, the text encoder, the VAE and this LoRA.
+OPENH3_WORKFLOW_REGEN = "Open-H3 Regenerate (default)"
+OPENH3_WORKFLOW_JXL = "JonXL H3 Upscale"
+OPENH3_WORKFLOWS = [OPENH3_WORKFLOW_REGEN, OPENH3_WORKFLOW_JXL]
+OPENH3_JXL_LORA_FILE = "h3_upscale_1920.safetensors"
+OPENH3_JXL_LORA_SIZE_GB = 0.6
+OPENH3_JXL_PROMPT = "A static still blurry pixelated picture crossfades into a clear sharp detailed picture, 4psc4l3,"
+OPENH3_JXL_SEED = 505817956432961   # the workflow's fixed seed (used while Seed holds the Open-H3 default)
+OPENH3_JXL_STEPS = 20
+OPENH3_JXL_MAX_SIDES = [1920, 1536, 1280]
+OPENH3_JXL_MAX_SIDE_DEFAULT = 1920
+
+
+def is_jxl_workflow(settings) -> bool:
+    value = str((settings or {}).get("workflow") or "").strip().lower()
+    return value.startswith("jonxl") or value == "jxl"
+
+
+def jxl_output_size(src_w: int, src_h: int, max_side: int = OPENH3_JXL_MAX_SIDE_DEFAULT):
+    """Output size of a JonXL upscale: the picture fitted under max_side x max_side at its exact aspect, even sides
+    (mirrors open_h3_engine.jxl.plan_geometry 'keep'; the model renders a 32-pixel padded canvas around it)."""
+    import math
+
+    src_w, src_h, max_side = max(1, int(src_w)), max(1, int(src_h)), int(max_side)
+    total = (max_side * max_side / 1e6) * 1024 * 1024
+    scale = min(math.sqrt(total / (src_w * src_h)), max_side / src_w, max_side / src_h)
+    out_w, out_h = max(2, int(round(src_w * scale / 2)) * 2), max(2, int(round(src_h * scale / 2)) * 2)
+    return min(out_w, max_side - max_side % 2), min(out_h, max_side - max_side % 2)
+
+
+def openh3_jxl_download_size_gb(dit: str, text_encoder: str, vae: str) -> float:
+    return (OPENH3_DIT_SIZES_GB.get(dit, 21.0) + OPENH3_TE_SIZES_GB.get(text_encoder, 15.7)
+            + OPENH3_VAE_SIZES_GB.get(vae, 3.6) + OPENH3_JXL_LORA_SIZE_GB)

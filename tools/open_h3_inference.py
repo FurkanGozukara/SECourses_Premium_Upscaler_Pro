@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stages", default="",
                    help="Comma list of text,encode,refine,decode to run (default: all four in this process)")
     p.add_argument("--work_dir", default="", help="Hand-over folder between stages run as separate processes")
+    p.add_argument("--workflow", default="regenerate", choices=["regenerate", "jxl"],
+                   help="regenerate: Open-H3 Regenerate (NVIDIA recipe); jxl: JonXL H3 Upscale (h3_upscale_1920 LoRA, "
+                        "fixed prompt, 20 steps er_sde / beta57, the last frame of a 24-frame clip per picture)")
+    p.add_argument("--jxl_lora", default="", help="JonXL LoRA file (h3_upscale_1920.safetensors)")
+    p.add_argument("--jxl_max_side", type=int, default=1920, help="JonXL: largest output side (the LoRA is trained at 1920)")
+    p.add_argument("--jxl_steps", type=int, default=20)
+    p.add_argument("--jxl_geometry", default="keep", choices=["keep", "workflow"],
+                   help="keep: exact aspect on a padded canvas; workflow: the ComfyUI graph's crop + stretch (parity tests)")
     p.add_argument("--batch_json", default="",
                    help="JSON list of per-input overrides (input, output, target_width, target_height, draft_size, "
                         "start_frame, end_frame); every input runs with the models loaded once")
@@ -115,6 +123,9 @@ def main() -> int:
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+
+    if args.workflow == "jxl":
+        return run_jxl_cli(args, prompt)
 
     from open_h3_engine.pipeline import OpenH3Pipeline, OpenH3Progress, OpenH3Settings
 
@@ -206,6 +217,70 @@ def main() -> int:
         return 1
     if "decode" in stages:
         emit(f"[OpenH3] OUTPUT_PATH: {output}")
+    emit(f"[OpenH3] Total time: {time.time() - started:.1f}s")
+    return 0
+
+
+def run_jxl_cli(args, prompt: str) -> int:
+    """JonXL H3 Upscale: one input, or every input of --batch_json, with the models loaded once."""
+    import dataclasses
+    import json
+
+    from open_h3_engine.jxl import JXL_PROMPT, JXLSettings, run_jxl
+
+    if args.plan_only:
+        from open_h3_engine.jxl import plan_geometry, video_io
+
+        if video_io.is_image(args.input):
+            img = video_io.read_image(args.input)
+            w, h, what = img.shape[1], img.shape[0], "image"
+        else:
+            info = video_io.probe_video(args.input)
+            w, h, what = info.width, info.height, f"{info.frames} frame(s) @ {float(info.fps):.6g} fps, one H3 clip per frame"
+        g = plan_geometry(w, h, int(args.jxl_max_side), int(args.jxl_max_side), args.jxl_geometry)
+        emit(f"[Plan] JonXL H3 Upscale: {w}x{h} -> {g.out_w}x{g.out_h} (model canvas {g.width}x{g.height}), {what}")
+        return 0
+    if not args.jxl_lora or not Path(args.jxl_lora).is_file():
+        emit(f"[OpenH3] ERROR: JonXL LoRA not found: {args.jxl_lora}")
+        return 2
+    base = JXLSettings(
+        input_path=args.input, output_path=args.output, dit_path=args.dit, text_encoder_path=args.text_encoder,
+        vae_path=args.decode_vae or args.vae, lora_path=args.jxl_lora, cache_dir=args.cache_dir,
+        prompt=(prompt or "").strip() and prompt or JXL_PROMPT, seed=args.seed, steps=max(1, int(args.jxl_steps)),
+        max_width=int(args.jxl_max_side), max_height=int(args.jxl_max_side), geometry=args.jxl_geometry,
+        start_frame=args.start_frame, end_frame=args.end_frame, reserve_vram_gb=args.reserve_vram_gb,
+        max_gpu_blocks=args.max_gpu_blocks, bytes_per_token=args.bytes_per_token, ffn_chunk_tokens=args.ffn_chunk_tokens,
+        codec=args.codec, crf=args.crf, preset=args.preset, pixel_format=args.pixel_format, keep_audio=not args.no_audio)
+    items = [base]
+    if args.batch_json:
+        allowed = {"input_path", "output_path", "start_frame", "end_frame"}
+        items = []
+        for item in json.loads(Path(args.batch_json).read_text(encoding="utf-8")):
+            overrides = {"input_path": item["input"], "output_path": item["output"]}
+            overrides.update({k: v for k, v in item.items() if k in allowed})
+            items.append(dataclasses.replace(base, **overrides))
+    emit(f"[OpenH3] Starting JonXL H3 Upscale | {len(items)} input(s) | LoRA {Path(args.jxl_lora).name} | "
+         f"seed {args.seed} | max side {args.jxl_max_side}")
+    started = time.time()
+    try:
+        results = run_jxl(items, emit)
+    except KeyboardInterrupt:
+        emit("[OpenH3] Cancelled by user")
+        return 130
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        emit(f"[OpenH3] ERROR: {exc}")
+        return 1
+    ok = sum(1 for out, _err in results if out)
+    if len(items) > 1:
+        emit(f"[OpenH3] Batch finished: {ok}/{len(results)} succeeded | total {time.time() - started:.1f}s")
+        return 0 if ok == len(results) else (3 if ok else 1)
+    if results[0][1] is not None:
+        emit(f"[OpenH3] ERROR: {results[0][1]}")
+        return 1
+    emit(f"[OpenH3] OUTPUT_PATH: {results[0][0]}")
     emit(f"[OpenH3] Total time: {time.time() - started:.1f}s")
     return 0
 

@@ -43,7 +43,11 @@ def _step_summary(engine: str, state: Dict[str, Any]) -> str:
     seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
     settings = seed.get(f"{engine}_settings") or {}
     parts = []
-    for key in (meta[3] if meta else ()):
+    keys = meta[3] if meta else ()
+    if engine == "open_h3" and str(settings.get("workflow") or "").lower().startswith("jonxl"):
+        parts.append("JonXL H3 Upscale")
+        keys = ("model_name",)
+    for key in keys:
         value = settings.get(key)
         if value not in (None, ""):
             text = str(value)

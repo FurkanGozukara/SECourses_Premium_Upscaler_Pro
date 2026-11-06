@@ -39,6 +39,15 @@ from shared.open_h3_constants import (
     OPENH3_TE_NVFP4,
     OPENH3_VAE_NAMES,
     OPENH3_VAE_SOL_FP16,
+    OPENH3_JXL_MAX_SIDE_DEFAULT,
+    OPENH3_JXL_MAX_SIDES,
+    OPENH3_JXL_PROMPT,
+    OPENH3_JXL_SEED,
+    OPENH3_WORKFLOW_JXL,
+    OPENH3_WORKFLOW_REGEN,
+    OPENH3_WORKFLOWS,
+    is_jxl_workflow,
+    openh3_jxl_download_size_gb,
     openh3_download_size_gb,
 )
 from shared.path_utils import get_media_dimensions, normalize_path
@@ -149,7 +158,17 @@ def open_h3_tab(
     if device_value not in device_valid_values:
         device_value = "auto"
 
-    def _build_model_info_md(dit: str, te: str, vae: str) -> str:
+    def _build_model_info_md(dit: str, te: str, vae: str, workflow: str = OPENH3_WORKFLOW_REGEN) -> str:
+        if is_jxl_workflow({"workflow": workflow}):
+            total = openh3_jxl_download_size_gb(dit, te, vae)
+            return (
+                f"**{dit}** &nbsp;`{OPENH3_DIT_FILES.get(dit, '')}` ({OPENH3_DIT_SIZES_GB.get(dit, 0):g} GB) - "
+                f"{_DIT_NOTES.get(dit, '')}\n\n"
+                f"- **JonXL H3 Upscale** downloads only the selected DiT, text encoder and VAE plus JonXL's "
+                f"`h3_upscale_1920` LoRA (0.6 GB) into `OpenH3_Models` (about **{total:.0f} GB** with this selection).\n"
+                "- Recipe: FL2VA + the JonXL upscale LoRA (strength 1), the picture as the first frame of a 24-frame "
+                "clip, 20 steps er_sde on the beta57 schedule, CFG 1, the fixed JonXL prompt; the last frame is kept."
+            )
         total = openh3_download_size_gb(dit, te, vae)
         return (
             f"**{dit}** &nbsp;`{OPENH3_DIT_FILES.get(dit, '')}` ({OPENH3_DIT_SIZES_GB.get(dit, 0):g} GB) - "
@@ -161,7 +180,8 @@ def open_h3_tab(
             "Sol sparse attention, fast Sol VAE decoder."
         )
 
-    def _build_sizing_md(path_val, preset_val, factor_val, max_edge_val, draft_val) -> gr.update:
+    def _build_sizing_md(path_val, preset_val, factor_val, max_edge_val, draft_val,
+                         workflow_val=OPENH3_WORKFLOW_REGEN, jxl_side_val=OPENH3_JXL_MAX_SIDE_DEFAULT) -> gr.update:
         normalized = normalize_path(path_val) if path_val else ""
         if not normalized:
             return gr.update(value="", visible=False)
@@ -172,11 +192,16 @@ def open_h3_tab(
             from shared.open_h3_runner import _draft_size, compute_target_size
 
             settings = {"resolution_preset": preset_val, "upscale_factor": factor_val,
-                        "max_target_resolution": max_edge_val, "draft_size": draft_val}
+                        "max_target_resolution": max_edge_val, "draft_size": draft_val,
+                        "workflow": workflow_val, "jxl_max_side": jxl_side_val}
             tw, th, note = compute_target_size(int(dims[0]), int(dims[1]), settings)
-            draft = _draft_size(settings, int(dims[0]), int(dims[1]))
-            text = (f"**Output size:** `{int(dims[0])}x{int(dims[1])}` -> `{tw}x{th}` ({note}) | "
-                    f"draft `{draft}` | aspect ratio kept, no cropping.")
+            if is_jxl_workflow(settings):
+                text = (f"**Output size:** `{int(dims[0])}x{int(dims[1])}` -> `{tw}x{th}` ({note}) | aspect ratio "
+                        "kept, no cropping | every frame of a video is upscaled as its own picture.")
+            else:
+                draft = _draft_size(settings, int(dims[0]), int(dims[1]))
+                text = (f"**Output size:** `{int(dims[0])}x{int(dims[1])}` -> `{tw}x{th}` ({note}) | "
+                        f"draft `{draft}` | aspect ratio kept, no cropping.")
         except Exception as exc:
             text = f"**Output size:** could not be computed ({exc})"
         return gr.update(value=text, visible=True)
@@ -213,12 +238,6 @@ def open_h3_tab(
                             elem_classes=["action-btn", "action-btn-source-seed", "OPENH3-copy-output-compact", "sec-btn-teal"],
                             size="md",
                         )
-                        auto_transfer_output_to_input = gr.Checkbox(
-                            label="Auto Transfer Output to Input",
-                            value=bool(_value("auto_transfer_output_to_input", False)),
-                            info="After a run completes, automatically copy the latest output path into Input Path.",
-                        )
-
                     with gr.Column(scale=2):
                         input_image_preview = gr.Image(
                             label="🖼️ Input Preview (Image)",
@@ -234,9 +253,51 @@ def open_h3_tab(
                             visible=False,
                         )
 
+                with gr.Row(elem_classes=["OPENH3-transfer-workflow-row"]):
+                    auto_transfer_output_to_input = gr.Checkbox(
+                        label="Auto Transfer Output to Input",
+                        value=bool(_value("auto_transfer_output_to_input", False)),
+                        info="After a run completes, automatically copy the latest output path into Input Path.",
+                        scale=1,
+                        min_width=200,
+                    )
+                    workflow = gr.Radio(
+                        label="MiniMax H3 Workflow",
+                        choices=list(OPENH3_WORKFLOWS),
+                        value=_choice("workflow", OPENH3_WORKFLOWS, OPENH3_WORKFLOW_REGEN),
+                        info=("Open-H3 Regenerate = NVIDIA's 3-step regenerate (default). JonXL H3 Upscale = "
+                              "JonXL's MiniMax H3 upscale LoRA: sharp detail out of blurry pictures, up to 1920 px."),
+                        scale=2,
+                        min_width=280,
+                        elem_id="open-h3-workflow",
+                    )
                 input_cache_msg = gr.Markdown("", visible=False)
                 input_detection_result = gr.Markdown("", visible=False)
                 sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
+                _jxl_on = is_jxl_workflow({"workflow": _choice("workflow", OPENH3_WORKFLOWS, OPENH3_WORKFLOW_REGEN)})
+                with gr.Group(visible=_jxl_on, elem_classes=["OPENH3-jxl-panel"]) as jxl_panel:
+                    gr.Markdown(
+                        "**🔍 JonXL H3 Upscale**: JonXL's MiniMax H3 upscale LoRA and workflow. Each picture (an image, "
+                        "or every frame of a video) becomes the first frame of a 24-frame H3 clip that cross-fades from "
+                        "the blurry input into a sharp picture; the last frame is kept. It pulls real detail out of "
+                        "blurry, pixelated and compressed footage (an upscaler, not a detailer).\n\n"
+                        f"Fixed prompt `{OPENH3_JXL_PROMPT}`, 20 steps, seed `{OPENH3_JXL_SEED}` while Seed holds the "
+                        "Open-H3 default; base model FL2VA INT8 ConvRot as in JonXL's workflow (picked when you switch). "
+                        "Target Resolution, Draft Size, Prompt and Refine Sampling are not used; Max Edge still caps the "
+                        "size. Every frame is a full H3 run, so try a short frame range of a video first.",
+                        elem_classes=["OPENH3-jxl-note"],
+                    )
+                    try:
+                        _jxl_side = int(float(_value("jxl_max_side", OPENH3_JXL_MAX_SIDE_DEFAULT) or 0))
+                    except (TypeError, ValueError):
+                        _jxl_side = 0
+                    jxl_max_side = gr.Dropdown(
+                        label="JonXL Max Size (longest side, px)",
+                        choices=list(OPENH3_JXL_MAX_SIDES),
+                        value=_jxl_side if _jxl_side in OPENH3_JXL_MAX_SIDES else OPENH3_JXL_MAX_SIDE_DEFAULT,
+                        info=("1920 = the size the LoRA is trained at (best detail). 1536 / 1280 = less VRAM and faster "
+                              "(JonXL suggests 1280 on smaller GPUs). The picture keeps its aspect ratio."),
+                    )
 
                 output_override = path_textbox("folder", 
                     label="Output Override (folder or file)",
@@ -348,9 +409,10 @@ def open_h3_tab(
                     _choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT),
                     _choice("text_encoder", OPENH3_TE_NAMES, OPENH3_TE_NVFP4),
                     _choice("video_vae", OPENH3_VAE_NAMES, OPENH3_VAE_SOL_FP16),
+                    _choice("workflow", OPENH3_WORKFLOWS, OPENH3_WORKFLOW_REGEN),
                 ))
 
-            with gr.Accordion("✍️ Prompt", open=True):
+            with gr.Accordion("✍️ Prompt", open=True, visible=not _jxl_on) as prompt_accordion:
                 prompt = gr.Textbox(
                     label="Prompt",
                     value=str(_value("prompt", OPENH3_DEFAULT_PROMPT) or ""),
@@ -700,7 +762,7 @@ def open_h3_tab(
                 buttons=["copy"],
             )
 
-            with gr.Accordion("⚙️ Refine Sampling", open=True):
+            with gr.Accordion("⚙️ Refine Sampling", open=True, visible=not _jxl_on) as refine_accordion:
                 with gr.Row():
                     steps = gr.Slider(
                         label="Steps",
@@ -783,6 +845,7 @@ def open_h3_tab(
         resume_run_dir, keep_only_output_files,
         auto_tune_on_run,
         sparse_dense_steps,
+        workflow, jxl_max_side,
     ]
 
     if len(inputs_list) != len(OPENH3_ORDER):
@@ -795,13 +858,46 @@ def open_h3_tab(
     # Wire up events
     # ------------------------------------------------------------------ #
 
-    def _on_model_switch(dit, te, vae):
-        return gr.update(value=_build_model_info_md(dit, te, vae))
+    def _on_model_switch(dit, te, vae, workflow_val):
+        return gr.update(value=_build_model_info_md(dit, te, vae, workflow_val))
 
     gr.on(
-        triggers=[model_name.input, text_encoder.input, video_vae.input],
+        triggers=[model_name.input, text_encoder.input, video_vae.input, workflow.change],
         fn=_on_model_switch,
-        inputs=[model_name, text_encoder, video_vae],
+        inputs=[model_name, text_encoder, video_vae, workflow],
+        outputs=[model_info_md],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    def _on_workflow_switch(workflow_val):
+        jxl = is_jxl_workflow({"workflow": workflow_val})
+        return gr.update(visible=jxl), gr.update(visible=not jxl), gr.update(visible=not jxl)
+
+    workflow.change(
+        fn=_on_workflow_switch,
+        inputs=[workflow],
+        outputs=[jxl_panel, prompt_accordion, refine_accordion],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    def _jxl_base_model(workflow_val, dit):
+        # JonXL's workflow runs on FL2VA INT8 ConvRot; with this LoRA W4A8 renders slightly darker (measured), so a
+        # switch to JonXL moves the W4A8 default to INT8 ConvRot. Any other choice is kept.
+        if is_jxl_workflow({"workflow": workflow_val}) and dit == OPENH3_DIT_DEFAULT and OPENH3_DIT_DEFAULT != OPENH3_DIT_INT8:
+            return gr.update(value=OPENH3_DIT_INT8)
+        return gr.skip()
+
+    workflow.input(
+        fn=_jxl_base_model,
+        inputs=[workflow, model_name],
+        outputs=[model_name],
+        queue=False,
+        show_progress="hidden",
+    ).then(
+        fn=_on_model_switch,
+        inputs=[model_name, text_encoder, video_vae, workflow],
         outputs=[model_info_md],
         queue=False,
         show_progress="hidden",
@@ -814,7 +910,7 @@ def open_h3_tab(
         show_progress="hidden",
     )
 
-    sizing_inputs = [resolution_preset, upscale_factor, max_target_resolution, draft_size]
+    sizing_inputs = [resolution_preset, upscale_factor, max_target_resolution, draft_size, workflow, jxl_max_side]
 
     # ---------------- Input caching / detection / sizing ---------------- #
 
@@ -1190,7 +1286,8 @@ def open_h3_tab(
         return _output_path_signature(_resolve_latest_output_path(state))
 
     def auto_transfer_latest_output_to_input(*args):
-        sizing_vals, auto_enabled, previous_signature, state = args[:4], args[4], args[5], args[6]
+        n = len(sizing_inputs)
+        sizing_vals, auto_enabled, previous_signature, state = args[:n], args[n], args[n + 1], args[n + 2]
         state = state if isinstance(state, dict) else {}
         if not bool(auto_enabled):
             return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), state)

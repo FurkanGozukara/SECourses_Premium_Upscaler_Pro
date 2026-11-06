@@ -45,10 +45,15 @@ from shared.open_h3_constants import (
     OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
     OPENH3_DIT_NAMES,
+    OPENH3_JXL_MAX_SIDE_DEFAULT,
+    OPENH3_JXL_MAX_SIDES,
     OPENH3_TE_NAMES,
     OPENH3_TE_NVFP4,
     OPENH3_VAE_NAMES,
     OPENH3_VAE_SOL_FP16,
+    OPENH3_WORKFLOW_JXL,
+    OPENH3_WORKFLOW_REGEN,
+    is_jxl_workflow,
 )
 from shared.gpu_utils import get_global_gpu_override
 from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
@@ -271,6 +276,15 @@ def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
             fps = 24.0
 
     target_w, target_h, size_note = compute_target_size(width, height, settings)
+    if is_jxl_workflow(settings):
+        what = "image" if kind == "image" else f"{total_frames} frame(s) @ {fps:.6g} fps"
+        return "\n".join([
+            f"[Plan] JonXL H3 Upscale: {width}x{height} -> {target_w}x{target_h} ({size_note})",
+            f"[Plan] {what}: every picture is the first frame of its own 24-frame H3 clip (39 frames on the H3 grid), "
+            "20 steps er_sde / beta57, CFG 1; the last frame is the result",
+            "[Plan] models: the selected DiT + text encoder + VAE and the JonXL h3_upscale_1920 LoRA "
+            "(Draft Size, Prompt, Refine Sampling and the window settings are not used)",
+        ])
     draft = _draft_size(settings, width, height)
     geometry = planner.plan_geometry(width, height, target_w, target_h, draft)
     lines.append(f"[Plan] {geometry.describe()}")
@@ -433,6 +447,8 @@ def open_h3_defaults() -> Dict[str, Any]:
         "resume_run_dir": "",
         "keep_only_output_files": False,
         "auto_tune_on_run": True,
+        "workflow": OPENH3_WORKFLOW_REGEN,
+        "jxl_max_side": OPENH3_JXL_MAX_SIDE_DEFAULT,
     }
 
 
@@ -484,6 +500,8 @@ OPENH3_ORDER: List[str] = [
     "keep_only_output_files",
     "auto_tune_on_run",
     "sparse_dense_steps",
+    "workflow",
+    "jxl_max_side",
 ]
 
 
@@ -511,6 +529,9 @@ def _enforce_open_h3_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -
         cfg[key] = _to_bool(cfg.get(key), _to_bool(defaults.get(key, False), False))
 
     cfg["model_name"] = _pick(cfg.get("model_name"), OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT)
+    cfg["workflow"] = OPENH3_WORKFLOW_JXL if is_jxl_workflow(cfg) else OPENH3_WORKFLOW_REGEN
+    side = _to_int(cfg.get("jxl_max_side"), OPENH3_JXL_MAX_SIDE_DEFAULT)
+    cfg["jxl_max_side"] = side if side in OPENH3_JXL_MAX_SIDES else OPENH3_JXL_MAX_SIDE_DEFAULT
     cfg["text_encoder"] = _pick(cfg.get("text_encoder"), OPENH3_TE_NAMES, OPENH3_TE_NVFP4)
     cfg["video_vae"] = _pick(cfg.get("video_vae"), OPENH3_VAE_NAMES, OPENH3_VAE_SOL_FP16)
     cfg["prompt"] = str(cfg.get("prompt") if cfg.get("prompt") is not None else OPENH3_DEFAULT_PROMPT)[:6000]
@@ -1046,7 +1067,9 @@ def build_open_h3_callbacks(
             return
         html_comp, img_slider = create_unified_comparison(input_path=still, output_path=result.output_path, mode="native")
         vid_upd, img_upd = _media_updates(result.output_path)
-        yield ("[OK] First-frame preview ready (5-frame still, first frame shown)", "\n".join(lines[-200:]),
+        done_text = ("[OK] First-frame preview ready (JonXL H3 Upscale of the first frame)" if is_jxl_workflow(item)
+                     else "[OK] First-frame preview ready (5-frame still, first frame shown)")
+        yield (done_text, "\n".join(lines[-200:]),
                vid_upd, img_upd, img_slider if img_slider else gr.update(visible=False),
                html_comp if html_comp else gr.update(value="", visible=False), state)
 
@@ -2313,15 +2336,16 @@ def build_open_h3_callbacks(
                     },
                 )
 
+            done_name = "JonXL H3 Upscale" if is_jxl_workflow(settings) else "Open-H3 regenerate"
             if chunk_count > 0:
                 status = (
-                    f"[OK] Open-H3 chunked regenerate complete ({chunk_count} chunks)"
+                    f"[OK] {done_name} complete ({chunk_count} chunks)"
                     if result.returncode == 0
                     else f"[WARN] Chunked upscale exited with code {result.returncode}"
                 )
             else:
                 status = (
-                    "[OK] Open-H3 regenerate complete"
+                    f"[OK] {done_name} complete"
                     if result.returncode == 0
                     else f"[WARN] Exited with code {result.returncode}"
                 )

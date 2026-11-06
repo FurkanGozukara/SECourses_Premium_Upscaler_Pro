@@ -11,9 +11,16 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
-        "V10.0 — 5 November 2026 — Multi-Pass DLSS 5, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
+        "V10.0 — 6 November 2026 — Multi-Pass DLSS 5, JonXL H3 Upscale in Open-H3, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
         """
-**Run DLSS 5 two or three times for a much stronger photoreal look, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+**Run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry footage with JonXL's MiniMax H3 upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+
+**JonXL H3 Upscale: a second MiniMax H3 workflow in the Open-H3 tab**
+- New **MiniMax H3 Workflow** switch next to "Auto Transfer Output to Input": Open-H3 Regenerate (the default, unchanged) or **JonXL H3 Upscale**, JonXL's MiniMax H3 image upscaler LoRA and workflow, built into the app's own Open-H3 engine.
+- Every picture (an image, or every frame of a video) becomes the first frame of a 24-frame H3 clip that cross-fades from the blurry input into a sharp picture, and the last frame is the result: real detail pulled out of blurry, pixelated and compressed footage, up to 1920 px on the longest side (JonXL Max Size 1920 / 1536 / 1280). The picture keeps its exact aspect ratio (nothing stretched or cut off).
+- Same recipe as JonXL's workflow: FL2VA + the `h3_upscale_1920` LoRA at strength 1, the fixed prompt "A static still blurry pixelated picture crossfades into a clear sharp detailed picture, 4psc4l3,", 20 steps er_sde on the beta57 schedule, CFG 1, Comfy Kitchen INT8 attention. Checked against JonXL's workflow run in ComfyUI: the same picture (45.7 dB).
+- The LoRA (0.6 GB) downloads from our Hugging Face mirror only the first time you use the workflow; it needs only the selected DiT, text encoder and VAE besides. Switching to JonXL picks FL2VA INT8 ConvRot, the model of JonXL's workflow (W4A8 renders slightly darker with this LoRA).
+- Works for images, videos, batch folders, Preview First Frame and Chains (the step card shows "JonXL H3 Upscale"). Every frame is a full 20-step H3 run, so try a short frame range of a video first.
 
 **Multi-pass DLSS 5**
 - New **Passes** setting (1-4) on the DLSS 5 tab: pass 2 renders DLSS 5 again on the result of pass 1, and so on. Every pass adds more real skin, hair, light and material detail, so 2-3 passes give the strongest look on game graphics, CGI and plastic-looking AI footage. Footage that already looks real can look overdone with several passes; start with 1-2 there.

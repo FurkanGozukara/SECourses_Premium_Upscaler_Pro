@@ -136,6 +136,12 @@ def _cap(size: tuple, settings: Dict[str, Any]) -> tuple:
 
 
 def _open_h3_size(size: tuple, settings: Dict[str, Any], factor: Optional[float]) -> Optional[tuple]:
+    from .open_h3_constants import is_jxl_workflow, jxl_output_size
+
+    if is_jxl_workflow(settings):  # JonXL H3 Upscale: fitted under its max size, no factor
+        from .open_h3_runner import jxl_max_side
+
+        return jxl_output_size(size[0], size[1], jxl_max_side(settings))
     preset = str(settings.get("resolution_preset") or "")
     if factor or preset.startswith("Custom"):
         f = factor or float(settings.get("upscale_factor") or 2.0)

@@ -477,12 +477,15 @@ def ensure_open_h3_model(
     video_vae: str,
     on_progress: ProgressCallback = None,
     cancel_event=None,
+    jxl: bool = False,
 ) -> tuple[bool, str]:
-    """Ensure every file the selected Open-H3 Regenerate variants need exists in OpenH3_Models."""
+    """Ensure every file the selected Open-H3 variants need exists in OpenH3_Models (jxl: the JonXL H3 Upscale
+    workflow, which needs the DiT, text encoder and VAE plus the JonXL LoRA, nothing else)."""
     from shared.open_h3_constants import (
         OPENH3_ALWAYS_FILES,
         OPENH3_DIT_FILES,
         OPENH3_DIT_INT8,
+        OPENH3_JXL_LORA_FILE,
         OPENH3_MODELS_DIRNAME,
         OPENH3_TABLE_FILE,
         OPENH3_TE_FILES,
@@ -502,12 +505,16 @@ def ensure_open_h3_model(
         models_dir / dit_file,
         models_dir / OPENH3_TE_FILES[text_encoder],
         models_dir / OPENH3_VAE_FILES[video_vae],
-        models_dir / OPENH3_TABLE_FILE,
-        *(models_dir / name for name in OPENH3_ALWAYS_FILES),
     ]
+    if jxl:
+        required.append(models_dir / OPENH3_JXL_LORA_FILE)
+    else:
+        required += [models_dir / OPENH3_TABLE_FILE, *(models_dir / name for name in OPENH3_ALWAYS_FILES)]
     if _all_files_exist(required):
         return True, ""
     args = ["--ensure-openh3", model_name, "--openh3-te", text_encoder, "--openh3-vae", video_vae]
+    if jxl:
+        args.append("--openh3-jxl")
     return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
 
 

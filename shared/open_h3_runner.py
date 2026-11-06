@@ -32,6 +32,14 @@ from .ltx25_runner import (
 from .open_h3_constants import (
     OPENH3_AUDIO_VAE_FILE,
     OPENH3_CURVES_FILE,
+    OPENH3_DEFAULT_SEED,
+    OPENH3_JXL_LORA_FILE,
+    OPENH3_JXL_MAX_SIDE_DEFAULT,
+    OPENH3_JXL_PROMPT,
+    OPENH3_JXL_SEED,
+    OPENH3_JXL_STEPS,
+    is_jxl_workflow,
+    jxl_output_size,
     OPENH3_DIT_FILES,
     OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
@@ -110,8 +118,20 @@ def _even(value: float) -> int:
     return max(2, int(round(float(value) / 2.0)) * 2)
 
 
+def jxl_max_side(settings: Dict[str, Any]) -> int:
+    """JonXL largest output side: the JonXL Max Size setting, lowered by Max Edge when that is set."""
+    side = max(256, min(2560, _parse_int(settings.get("jxl_max_side"), OPENH3_JXL_MAX_SIDE_DEFAULT)))
+    max_edge = max(0, _parse_int(settings.get("max_target_resolution"), 0))
+    return min(side, max_edge) if max_edge >= 256 else side
+
+
 def compute_target_size(src_w: int, src_h: int, settings: Dict[str, Any]) -> Tuple[int, int, str]:
-    """Output size for a src_w x src_h input: resolution preset (short side) or upscale factor, then max-edge cap."""
+    """Output size for a src_w x src_h input: resolution preset (short side) or upscale factor, then max-edge cap.
+    The JonXL H3 Upscale workflow fits the picture under its max size instead."""
+    if is_jxl_workflow(settings):
+        side = jxl_max_side(settings)
+        width, height = jxl_output_size(src_w, src_h, side)
+        return width, height, f"JonXL H3 Upscale, fitted under {side}x{side}"
     preset = str(settings.get("resolution_preset") or "").strip().lower()
     src_w, src_h = max(1, int(src_w)), max(1, int(src_h))
     short_side = None
@@ -185,7 +205,18 @@ def resolve_model_files(base_dir: Path, settings: Dict[str, Any]) -> Tuple[Optio
         "lora": models_dir / OPENH3_LORA_FILE,
         "curves": models_dir / OPENH3_CURVES_FILE,
         "table": models_dir / OPENH3_TABLE_FILE,
+        "jxl_lora": models_dir / OPENH3_JXL_LORA_FILE,
     }, notes, None
+
+
+def _needed_paths(paths: Dict[str, Path], settings: Dict[str, Any]) -> Dict[str, Path]:
+    """Model files the selected workflow reads."""
+    if is_jxl_workflow(settings):
+        return {k: paths[k] for k in ("dit", "text_encoder", "vae", "jxl_lora")}
+    out = {k: v for k, v in paths.items() if k != "jxl_lora"}
+    if _parse_float(settings.get("curve_strength"), 1.0) == 0:
+        out.pop("curves", None)
+    return out
 
 
 def _expected_frames(source_frames: int, source_fps: float, settings: Dict[str, Any]) -> int:
@@ -241,7 +272,8 @@ def _write_prompt_file(base_dir: Path, settings: Dict[str, Any]) -> Path:
     folder = Path(base_dir) / "temp" / "open_h3_prompt"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"prompt_{os.getpid()}_{int(time.time() * 1000)}.txt"
-    path.write_text(str(settings.get("prompt") or ""), encoding="utf-8")
+    text = OPENH3_JXL_PROMPT if is_jxl_workflow(settings) else str(settings.get("prompt") or "")
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -306,7 +338,20 @@ def build_command(python_exe: str, script_path: Path, settings: Dict[str, Any], 
         cmd.append("--no_audio")
     if _bool(settings.get("keep_latents"), False):
         cmd.append("--keep_latents")
+    if is_jxl_workflow(settings):
+        cmd += ["--workflow", "jxl", "--jxl_lora", str(paths["jxl_lora"]),
+                "--jxl_max_side", str(jxl_max_side(settings)), "--jxl_steps", str(OPENH3_JXL_STEPS)]
     return cmd
+
+
+def _prepare_workflow(settings: Dict[str, Any], log: Callable[[str], None]) -> None:
+    """JonXL H3 Upscale runs every frame 1:1 in one process (no 24 fps resample, no separate stage processes)."""
+    if not is_jxl_workflow(settings):
+        return
+    settings["fps_mode"] = "source"
+    if _bool(settings.get("isolated_stages"), False):
+        settings["isolated_stages"] = False
+        log(f"[{TAG}] JonXL H3 Upscale runs in one process; 'Run each stage as a separate process' is not used.")
 
 
 def _resolve_seed(settings: Dict[str, Any], log: Callable[[str], None]) -> int:
@@ -314,7 +359,10 @@ def _resolve_seed(settings: Dict[str, Any], log: Callable[[str], None]) -> int:
         seed_value = random.randint(0, 2**31 - 1)
         log(f"[{TAG}] Randomized seed: {seed_value}")
         return seed_value
-    return _parse_int(settings.get("seed"), 1766580932)
+    seed_value = _parse_int(settings.get("seed"), OPENH3_DEFAULT_SEED)
+    if is_jxl_workflow(settings) and seed_value == OPENH3_DEFAULT_SEED:
+        return OPENH3_JXL_SEED  # JonXL's fixed workflow seed while Seed holds the Open-H3 default
+    return seed_value
 
 
 def _popen(cmd: List[str], base_dir: Path, env: Dict[str, str]) -> subprocess.Popen:
@@ -455,6 +503,7 @@ def run_open_h3(
                 return OpenH3Result(1, None, fps_note or "Open-H3 FPS preprocess failed")
             input_path = normalize_path(settings.get("_effective_input_path") or settings.get("input_path") or "")
 
+        _prepare_workflow(settings, log)
         seed_value = _resolve_seed(settings, log)
         low_bit_int8 = OPENH3_LOW_BIT_INT8_FALLBACK.get(str(settings.get("model_name") or OPENH3_DIT_DEFAULT).strip())
         if low_bit_int8 and not normalize_path(settings.get("model_path") or ""):
@@ -475,6 +524,7 @@ def run_open_h3(
                 str(settings.get("video_vae") or OPENH3_VAE_SOL_FP16),
                 on_progress,
                 cancel_event=cancel_event,
+                jxl=is_jxl_workflow(settings),
             )
             if not ok:
                 if cancel_event is not None and cancel_event.is_set():
@@ -486,8 +536,7 @@ def run_open_h3(
             log(note)
         if error or paths is None:
             return OpenH3Result(1, None, error or "Failed to resolve Open-H3 model files.")
-        missing = [str(p) for key, p in paths.items()
-                   if not Path(p).is_file() and not (key == "curves" and _parse_float(settings.get("curve_strength"), 1.0) == 0)]
+        missing = [str(p) for p in _needed_paths(paths, settings).values() if not Path(p).is_file()]
         if missing:
             return OpenH3Result(1, None, "Open-H3 model files missing after download step:\n" + "\n".join(missing))
 
@@ -510,8 +559,12 @@ def run_open_h3(
         cache_dir = Path(base_dir) / OPENH3_MODELS_DIRNAME / ".cache"
         cmd = build_command(python_exe, script_path, settings, paths, input_path, output_file, seed_value,
                             (target_w, target_h), draft, prompt_file, cache_dir)
-        log(f"Running Open-H3 Regenerate: {src_w}x{src_h} -> {target_w}x{target_h} ({size_note}), draft {draft}, "
-            f"model={settings.get('model_name')}, steps={settings.get('steps')}, seed={seed_value}")
+        if is_jxl_workflow(settings):
+            log(f"Running JonXL H3 Upscale: {src_w}x{src_h} -> {target_w}x{target_h} ({size_note}), "
+                f"model={settings.get('model_name')}, {OPENH3_JXL_STEPS} steps, seed={seed_value}")
+        else:
+            log(f"Running Open-H3 Regenerate: {src_w}x{src_h} -> {target_w}x{target_h} ({size_note}), draft {draft}, "
+                f"model={settings.get('model_name')}, steps={settings.get('steps')}, seed={seed_value}")
         log(f"Command: {_format_command_for_log(cmd)}")
 
         env = _build_env(Path(base_dir), visible_gpu, log, tag=TAG)
@@ -614,6 +667,10 @@ def run_open_h3_batch(
     prompt_file: Optional[Path] = None
     batch_file: Optional[Path] = None
     try:
+        _prepare_workflow(base, log)
+        for settings in items:
+            if is_jxl_workflow(settings):
+                settings["fps_mode"] = "source"
         seed_value = _resolve_seed(base, log)
         if not normalize_path(base.get("model_path") or ""):
             from .model_downloads import ensure_open_h3_model
@@ -621,7 +678,7 @@ def run_open_h3_batch(
             ok, error = ensure_open_h3_model(base_dir, str(base.get("model_name") or OPENH3_DIT_DEFAULT),
                                              str(base.get("text_encoder") or OPENH3_TE_NVFP4),
                                              str(base.get("video_vae") or OPENH3_VAE_SOL_FP16),
-                                             on_progress, cancel_event=cancel_event)
+                                             on_progress, cancel_event=cancel_event, jxl=is_jxl_workflow(base))
             if not ok:
                 message = "[Cancelled by user] Model download stopped." if (cancel_event and cancel_event.is_set()) \
                     else f"Open-H3 model download failed:\n{error}"
@@ -631,6 +688,10 @@ def run_open_h3_batch(
             log(note)
         if error or paths is None:
             return [OpenH3Result(1, None, error or "Failed to resolve Open-H3 model files.") for _ in items]
+        missing = [str(p) for p in _needed_paths(paths, base).values() if not Path(p).is_file()]
+        if missing:
+            return [OpenH3Result(1, None, "Open-H3 model files missing after download step:\n" + "\n".join(missing))
+                    for _ in items]
 
         plans = []
         for index, settings in enumerate(items):
@@ -667,7 +728,8 @@ def run_open_h3_batch(
         cmd = build_command(python_exe, script_path, base, paths, first_input, first_item[6], seed_value,
                             first_item[1], first_item[3], prompt_file, Path(base_dir) / OPENH3_MODELS_DIRNAME / ".cache")
         cmd += ["--batch_json", str(batch_file)]
-        log(f"Running Open-H3 Regenerate on {len(plans)} input(s) in one engine process (models load once), seed={seed_value}")
+        log(f"Running {'JonXL H3 Upscale' if is_jxl_workflow(base) else 'Open-H3 Regenerate'} on {len(plans)} input(s) "
+            f"in one engine process (models load once), seed={seed_value}")
         log(f"Command: {_format_command_for_log(cmd)}")
         visible_gpu, gpu_note = _resolve_device(base.get("device", "auto"))
         if gpu_note:

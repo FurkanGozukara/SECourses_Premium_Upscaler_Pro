@@ -795,6 +795,7 @@ button.path-pick-btn:active:not(:disabled) { transform: scale(0.97); filter: bri
   border: 1px solid var(--sec-border) !important;
 }
 .chain-step-title { font-weight: 700; color: var(--sec-text); padding: 6px 2px; white-space: nowrap; }
+.chain-step-sub { font-weight: 400; font-size: 0.75rem; color: var(--sec-muted); margin-top: 2px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chain-timeline { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
 .chain-tl-head { font-weight: 700; color: var(--sec-text); margin-bottom: 2px; }
 .chain-tl-row {

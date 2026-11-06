@@ -101,10 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--work_dir", default="", help="Hand-over folder between stages run as separate processes")
     p.add_argument("--workflow", default="regenerate", choices=["regenerate", "jxl"],
                    help="regenerate: Open-H3 Regenerate (NVIDIA recipe); jxl: JonXL H3 Upscale (h3_upscale_1920 LoRA, "
-                        "fixed prompt, 20 steps er_sde / beta57, the last frame of a 24-frame clip per picture)")
+                        "fixed prompt, --jxl_steps er_sde / beta57 steps, the last frame of a 24-frame clip per picture)")
     p.add_argument("--jxl_lora", default="", help="JonXL LoRA file (h3_upscale_1920.safetensors)")
     p.add_argument("--jxl_max_side", type=int, default=1920, help="JonXL: largest output side (the LoRA is trained at 1920)")
-    p.add_argument("--jxl_steps", type=int, default=20)
+    p.add_argument("--jxl_steps", type=int, default=20, help="JonXL: er_sde steps per picture (the workflow runs 20)")
     p.add_argument("--jxl_geometry", default="keep", choices=["keep", "workflow"],
                    help="keep: exact aspect on a padded canvas; workflow: the ComfyUI graph's crop + stretch (parity tests)")
     p.add_argument("--batch_json", default="",
@@ -262,7 +262,7 @@ def run_jxl_cli(args, prompt: str) -> int:
             overrides.update({k: v for k, v in item.items() if k in allowed})
             items.append(dataclasses.replace(base, **overrides))
     emit(f"[OpenH3] Starting JonXL H3 Upscale | {len(items)} input(s) | LoRA {Path(args.jxl_lora).name} | "
-         f"seed {args.seed} | max side {args.jxl_max_side}")
+         f"seed {args.seed} | steps {base.steps} | max side {args.jxl_max_side}")
     started = time.time()
     try:
         results = run_jxl(items, emit)

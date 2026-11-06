@@ -9,7 +9,8 @@ CPU (default):
 3. LoRA: a kohya 'lora_unet_blocks_<n>_<layer>' file maps to 'diffusion_model.blocks.<n>.<layer>.weight' with the
    alpha / rank scale.
 4. Runner / service / Chains: JonXL sizes, seed, fixed prompt, command flags, needed model files, settings
-   guardrails, the Chains step size and label; the root downloader lists only the JonXL files.
+   guardrails, the Chains step size and label; the root downloader lists only the JonXL files. JonXL Steps (default
+   20): UI value -> service -> command, clamping, app and tab presets (old presets load 20), Chains, Past Generations.
 --gpu [image]: a real 1-picture run through tools/open_h3_inference.py; with the ComfyUI reference of
    dlss5_work/v10_jxl (JonXL's graph in ComfyUI V92) it must match it (PSNR above 40 dB, workflow geometry).
 Run: venv/Scripts/python.exe tools/test_open_h3_jxl.py [--gpu]
@@ -139,6 +140,17 @@ def cpu_checks() -> None:
         cmd = R.build_command("py", Path("x.py"), jxl_set, paths, "in.mp4", Path("out.mp4"), 1, (1920, 1080), "768p", pf, Path(tmp))
         check("command selects the JonXL workflow", cmd[cmd.index("--workflow") + 1] == "jxl" and "--jxl_lora" in cmd
               and cmd[cmd.index("--jxl_steps") + 1] == "20")
+
+        def steps_flag(settings):
+            c = R.build_command("py", Path("x.py"), settings, paths, "in.png", Path("out.png"), 1, (1920, 1080), "768p",
+                                pf, Path(tmp))
+            return c[c.index("--jxl_steps") + 1]
+
+        check("JonXL Steps reaches the command", steps_flag({**jxl_set, "jxl_steps": 30}) == "30"
+              and steps_flag({**jxl_set, "jxl_steps": 12.0}) == "12" and steps_flag({**jxl_set, "jxl_steps": "8"}) == "8")
+        check("JonXL Steps clamped / unreadable = 20", steps_flag({**jxl_set, "jxl_steps": 0}) == "1"
+              and steps_flag({**jxl_set, "jxl_steps": 999}) == str(C.OPENH3_JXL_STEPS_MAX)
+              and steps_flag({**jxl_set, "jxl_steps": None}) == "20" and steps_flag({**jxl_set, "jxl_steps": "x"}) == "20")
         check("Regenerate command has no workflow flag", "--workflow" not in R.build_command(
             "py", Path("x.py"), {}, paths, "in.mp4", Path("out.mp4"), 1, (1920, 1080), "768p", pf, Path(tmp)))
     st = {"isolated_stages": True, **jxl_set, "fps_mode": "24 fps (reference resample)"}
@@ -147,7 +159,49 @@ def cpu_checks() -> None:
     defaults = S.open_h3_defaults() if hasattr(S, "open_h3_defaults") else None
     cfg = S._enforce_open_h3_guardrails({"workflow": "jonxl h3 upscale", "jxl_max_side": 777}, defaults or {})
     check("service keeps the workflow, resets a bad max size", cfg["workflow"] == C.OPENH3_WORKFLOW_JXL and cfg["jxl_max_side"] == 1920)
-    check("settings order has the new keys last", S.OPENH3_ORDER[-2:] == ["workflow", "jxl_max_side"])
+    check("settings order has the new keys last", S.OPENH3_ORDER[-3:] == ["workflow", "jxl_max_side", "jxl_steps"])
+    check("JonXL Steps default 20", S.open_h3_defaults()["jxl_steps"] == C.OPENH3_JXL_STEPS == 20)
+    check("service clamps JonXL Steps", S._enforce_open_h3_guardrails({"jxl_steps": 35}, defaults)["jxl_steps"] == 35
+          and S._enforce_open_h3_guardrails({"jxl_steps": "0"}, defaults)["jxl_steps"] == 1
+          and S._enforce_open_h3_guardrails({"jxl_steps": 80}, defaults)["jxl_steps"] == C.OPENH3_JXL_STEPS_MAX
+          and S._enforce_open_h3_guardrails({}, defaults)["jxl_steps"] == 20)
+    # UI values (inputs_list order) -> service settings -> runner command: the exact value of the slider
+    ui_values = [{**defaults, "workflow": C.OPENH3_WORKFLOW_JXL, "jxl_steps": 27}[k] for k in S.OPENH3_ORDER]
+    run_cfg = S._runner_settings(S._enforce_open_h3_guardrails(S._open_h3_dict_from_args(ui_values), defaults))
+    with tempfile.TemporaryDirectory() as tmp:
+        paths, _notes, _err = R.resolve_model_files(Path(tmp), run_cfg)
+        cmd = R.build_command("py", Path("x.py"), run_cfg, paths, "in.png", Path("out.png"), 1, (1920, 1080), "768p",
+                              None, Path(tmp))
+    check("UI value -> service -> command", cmd[cmd.index("--jxl_steps") + 1] == "27")
+    # presets: save (values -> dict), load (dict -> values), old presets without the key, the per-tab preset path
+    from shared import universal_preset as U
+
+    saved = U.values_to_dict("open_h3", ui_values)
+    check("app preset saves JonXL Steps", saved["jxl_steps"] == 27)
+    loaded = dict(zip(S.OPENH3_ORDER, U.dict_to_values("open_h3", saved, defaults)))
+    check("app preset loads JonXL Steps", loaded["jxl_steps"] == 27 and loaded["workflow"] == C.OPENH3_WORKFLOW_JXL)
+    old = {k: v for k, v in saved.items() if k != "jxl_steps"}
+    merged = U.merge_preset_with_defaults({"open_h3": old})["open_h3"]
+    check("old app preset (no JonXL Steps) loads 20", merged["jxl_steps"] == 20
+          and dict(zip(S.OPENH3_ORDER, U.dict_to_values("open_h3", old, defaults)))["jxl_steps"] == 20)
+    check("app preset JSON round trip", U.merge_preset_with_defaults(
+        __import__("json").loads(__import__("json").dumps({"open_h3": saved})))["open_h3"]["jxl_steps"] == 27)
+    from shared.preset_manager import PresetManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tab_vals = S._apply_open_h3_preset({"jxl_steps": 9}, defaults, PresetManager(Path(tmp)),
+                                           current=dict(zip(S.OPENH3_ORDER, ui_values)))
+        check("tab preset load keeps JonXL Steps", dict(zip(S.OPENH3_ORDER, tab_vals))["jxl_steps"] == 9)
+    from shared.generation_history import param_group, settings_for_reload
+
+    rec_old = {"args": {k: v for k, v in saved.items() if k != "jxl_steps"}}
+    reloaded, _n = settings_for_reload({"args": saved}, {}, list(S.OPENH3_ORDER))
+    legacy, _n = settings_for_reload(rec_old, {"jxl_steps": 33}, list(S.OPENH3_ORDER))
+    check("Past Generations reload restores JonXL Steps (20 for runs saved before the setting)",
+          reloaded["jxl_steps"] == 27 and legacy["jxl_steps"] == 20, f"{reloaded['jxl_steps']}, {legacy['jxl_steps']}")
+    other, _n = settings_for_reload({"args": {"seed": 1}}, {"seed": 2}, ["seed", "steps"])
+    check("reload of other tabs unchanged", other == {"seed": 1})
+    check("Past Generations groups JonXL Steps under Quality", param_group("jxl_steps") == "Quality")
     from shared import chain_runner as CR
 
     check("Chains size of a JonXL step", CR._open_h3_size((960, 540), jxl_set, 4.0) == (1920, 1080))
@@ -155,7 +209,13 @@ def cpu_checks() -> None:
     from ui import chain_tab
 
     label = chain_tab._step_summary("open_h3", {"seed_controls": {"open_h3_settings": {**jxl_set, "model_name": "FL2VA Pruned W4A8"}}})
-    check("Chains label names JonXL", label.startswith("JonXL H3 Upscale"), label)
+    check("Chains label names JonXL", label.startswith("JonXL H3 Upscale") and "steps" not in label, label)
+    label = chain_tab._step_summary("open_h3", {"seed_controls": {"open_h3_settings": {**jxl_set, "jxl_steps": 30}}})
+    check("Chains label shows changed JonXL Steps", label.endswith("30 steps"), label)
+    chain_cfg = dict(zip(S.OPENH3_ORDER, CR._tab_values(
+        type("E", (), {"key": "open_h3"})(), {"seed_controls": {"open_h3_settings": {**jxl_set, "jxl_steps": 30}}},
+        {"open_h3": defaults}, {})))
+    check("Chains step runs the tab's JonXL Steps", chain_cfg["jxl_steps"] == 30)
     clip = ROOT.parent / "test_media" / "test_640x360_24fps_3s.mp4"
     if clip.is_file():  # images only: a video is refused before any model loads (single, queue, Chains and batch)
         single = R.run_open_h3({**jxl_set, "input_path": str(clip)}, ROOT)

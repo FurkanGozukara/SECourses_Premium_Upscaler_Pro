@@ -1150,6 +1150,10 @@ def _fmt_value(value: Any) -> str:
     return str(value)
 
 
+# Settings added after a fixed value had been in use: a run saved before the setting existed ran with this value.
+_VALUE_BEFORE_SETTING = {"jxl_steps": 20}  # Open-H3 JonXL Steps (JonXL H3 Upscale always ran 20 steps before)
+
+
 def settings_for_reload(rec: Dict[str, Any], current: Dict[str, Any], order: List[str]) -> Tuple[Dict[str, Any], int]:
     """The tab's settings with every saved value of the run applied; run-internal paths are reset."""
     args = rec.get("args") or {}
@@ -1159,6 +1163,8 @@ def settings_for_reload(rec: Dict[str, Any], current: Dict[str, Any], order: Lis
         if key in args:
             merged[key] = args[key]
             applied += 1
+        elif key in _VALUE_BEFORE_SETTING:
+            merged[key] = _VALUE_BEFORE_SETTING[key]
     if "output_override" in order:
         merged["output_override"] = str(args.get("_user_output_override_raw") or "") \
             if "_user_output_override_raw" in args else ("" if _inside(args.get("output_override"), rec.get("dir"))

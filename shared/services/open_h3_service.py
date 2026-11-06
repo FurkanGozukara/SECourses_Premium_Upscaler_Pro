@@ -47,6 +47,7 @@ from shared.open_h3_constants import (
     OPENH3_DIT_NAMES,
     OPENH3_JXL_MAX_SIDE_DEFAULT,
     OPENH3_JXL_MAX_SIDES,
+    OPENH3_JXL_STEPS,
     OPENH3_JXL_VIDEO_MESSAGE,
     OPENH3_TE_NAMES,
     OPENH3_TE_NVFP4,
@@ -55,6 +56,7 @@ from shared.open_h3_constants import (
     OPENH3_WORKFLOW_JXL,
     OPENH3_WORKFLOW_REGEN,
     is_jxl_workflow,
+    jxl_steps,
 )
 from shared.gpu_utils import get_global_gpu_override
 from shared.vram_autotune.common import DEFAULT_SAVE_VRAM_GB, clamp_save_vram_gb
@@ -282,7 +284,7 @@ def build_live_plan_text(settings: Dict[str, Any], base_dir: Path) -> str:
         return "\n".join([
             f"[Plan] JonXL H3 Upscale: {width}x{height} -> {target_w}x{target_h} ({size_note})",
             f"[Plan] {what}: every picture is the first frame of its own 24-frame H3 clip (39 frames on the H3 grid), "
-            "20 steps er_sde / beta57, CFG 1; the last frame is the result",
+            f"{jxl_steps(settings)} steps er_sde / beta57, CFG 1; the last frame is the result",
             "[Plan] models: the selected DiT + text encoder + VAE and the JonXL h3_upscale_1920 LoRA "
             "(Draft Size, Prompt, Refine Sampling and the window settings are not used)",
         ])
@@ -450,6 +452,7 @@ def open_h3_defaults() -> Dict[str, Any]:
         "auto_tune_on_run": True,
         "workflow": OPENH3_WORKFLOW_REGEN,
         "jxl_max_side": OPENH3_JXL_MAX_SIDE_DEFAULT,
+        "jxl_steps": OPENH3_JXL_STEPS,
     }
 
 
@@ -503,6 +506,7 @@ OPENH3_ORDER: List[str] = [
     "sparse_dense_steps",
     "workflow",
     "jxl_max_side",
+    "jxl_steps",
 ]
 
 
@@ -533,6 +537,7 @@ def _enforce_open_h3_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) -
     cfg["workflow"] = OPENH3_WORKFLOW_JXL if is_jxl_workflow(cfg) else OPENH3_WORKFLOW_REGEN
     side = _to_int(cfg.get("jxl_max_side"), OPENH3_JXL_MAX_SIDE_DEFAULT)
     cfg["jxl_max_side"] = side if side in OPENH3_JXL_MAX_SIDES else OPENH3_JXL_MAX_SIDE_DEFAULT
+    cfg["jxl_steps"] = jxl_steps(cfg)
     cfg["text_encoder"] = _pick(cfg.get("text_encoder"), OPENH3_TE_NAMES, OPENH3_TE_NVFP4)
     cfg["video_vae"] = _pick(cfg.get("video_vae"), OPENH3_VAE_NAMES, OPENH3_VAE_SOL_FP16)
     cfg["prompt"] = str(cfg.get("prompt") if cfg.get("prompt") is not None else OPENH3_DEFAULT_PROMPT)[:6000]

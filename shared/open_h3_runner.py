@@ -37,10 +37,10 @@ from .open_h3_constants import (
     OPENH3_JXL_MAX_SIDE_DEFAULT,
     OPENH3_JXL_PROMPT,
     OPENH3_JXL_SEED,
-    OPENH3_JXL_STEPS,
     OPENH3_JXL_VIDEO_MESSAGE,
     is_jxl_workflow,
     jxl_output_size,
+    jxl_steps,
     OPENH3_DIT_FILES,
     OPENH3_DIT_DEFAULT,
     OPENH3_DIT_INT8,
@@ -341,7 +341,7 @@ def build_command(python_exe: str, script_path: Path, settings: Dict[str, Any], 
         cmd.append("--keep_latents")
     if is_jxl_workflow(settings):
         cmd += ["--workflow", "jxl", "--jxl_lora", str(paths["jxl_lora"]),
-                "--jxl_max_side", str(jxl_max_side(settings)), "--jxl_steps", str(OPENH3_JXL_STEPS)]
+                "--jxl_max_side", str(jxl_max_side(settings)), "--jxl_steps", str(jxl_steps(settings))]
     return cmd
 
 
@@ -564,7 +564,7 @@ def run_open_h3(
                             (target_w, target_h), draft, prompt_file, cache_dir)
         if is_jxl_workflow(settings):
             log(f"Running JonXL H3 Upscale: {src_w}x{src_h} -> {target_w}x{target_h} ({size_note}), "
-                f"model={settings.get('model_name')}, {OPENH3_JXL_STEPS} steps, seed={seed_value}")
+                f"model={settings.get('model_name')}, {jxl_steps(settings)} steps, seed={seed_value}")
         else:
             log(f"Running Open-H3 Regenerate: {src_w}x{src_h} -> {target_w}x{target_h} ({size_note}), draft {draft}, "
                 f"model={settings.get('model_name')}, steps={settings.get('steps')}, seed={seed_value}")
@@ -628,6 +628,7 @@ def run_open_h3(
                         "video_vae": settings.get("video_vae"),
                         "resolution_preset": settings.get("resolution_preset"),
                         "steps": settings.get("steps"),
+                        "jxl_steps": jxl_steps(settings) if is_jxl_workflow(settings) else None,
                         "start_sigma": settings.get("start_sigma"),
                         "draft_size": settings.get("draft_size"),
                         "sparse_attention": settings.get("sparse_attention"),

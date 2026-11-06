@@ -45,11 +45,15 @@ from shared.open_h3_constants import (
     OPENH3_JXL_MAX_SIDES,
     OPENH3_JXL_PROMPT,
     OPENH3_JXL_SEED,
+    OPENH3_JXL_STEPS,
+    OPENH3_JXL_STEPS_MAX,
+    OPENH3_JXL_STEPS_MIN,
     OPENH3_JXL_VIDEO_MESSAGE,
     OPENH3_WORKFLOW_JXL,
     OPENH3_WORKFLOW_REGEN,
     OPENH3_WORKFLOWS,
     is_jxl_workflow,
+    jxl_steps as jxl_steps_of,
     openh3_jxl_download_size_gb,
     openh3_download_size_gb,
 )
@@ -170,7 +174,8 @@ def open_h3_tab(
                 f"- **JonXL H3 Upscale** downloads only the selected DiT, text encoder and VAE plus JonXL's "
                 f"`h3_upscale_1920` LoRA (0.6 GB) into `OpenH3_Models` (about **{total:.0f} GB** with this selection).\n"
                 "- Recipe: FL2VA + the JonXL upscale LoRA (strength 1), the picture as the first frame of a 24-frame "
-                "clip, 20 steps er_sde on the beta57 schedule, CFG 1, the fixed JonXL prompt; the last frame is kept."
+                f"clip, er_sde on the beta57 schedule (JonXL Steps, {OPENH3_JXL_STEPS} by default), CFG 1, the fixed "
+                "JonXL prompt; the last frame is kept."
             )
         total = openh3_download_size_gb(dit, te, vae)
         return (
@@ -290,7 +295,8 @@ def open_h3_tab(
                         "**⚠️ For images and folders of images. A video input is refused with a warning (videos in a "
                         "batch folder are skipped); for videos use Open-H3 Regenerate or RelayVSR, FlashVSR+ or SeedVR2. "
                         "Preview First Frame still upscales the first frame of a video as one picture.**\n\n"
-                        f"Fixed prompt `{OPENH3_JXL_PROMPT}`, 20 steps, seed `{OPENH3_JXL_SEED}` while Seed holds the "
+                        f"Fixed prompt `{OPENH3_JXL_PROMPT}`, {OPENH3_JXL_STEPS} steps by default (JonXL Steps below), "
+                        f"seed `{OPENH3_JXL_SEED}` while Seed holds the "
                         "Open-H3 default; base model FL2VA INT8 ConvRot and the Released H3 VAE as in JonXL's workflow (both "
                         "picked when you switch; the Sol fast VAE gives less fine detail with this LoRA). "
                         "Target Resolution, Draft Size, Prompt and Refine Sampling are not used; Max Edge still caps the "
@@ -301,13 +307,23 @@ def open_h3_tab(
                         _jxl_side = int(float(_value("jxl_max_side", OPENH3_JXL_MAX_SIDE_DEFAULT) or 0))
                     except (TypeError, ValueError):
                         _jxl_side = 0
-                    jxl_max_side = gr.Dropdown(
-                        label="JonXL Max Size (longest side, px)",
-                        choices=list(OPENH3_JXL_MAX_SIDES),
-                        value=_jxl_side if _jxl_side in OPENH3_JXL_MAX_SIDES else OPENH3_JXL_MAX_SIDE_DEFAULT,
-                        info=("1920 = the size the LoRA is trained at (best detail). 1536 / 1280 = less VRAM and faster "
-                              "(JonXL suggests 1280 on smaller GPUs). The picture keeps its aspect ratio."),
-                    )
+                    with gr.Row():
+                        jxl_max_side = gr.Dropdown(
+                            label="JonXL Max Size (longest side, px)",
+                            choices=list(OPENH3_JXL_MAX_SIDES),
+                            value=_jxl_side if _jxl_side in OPENH3_JXL_MAX_SIDES else OPENH3_JXL_MAX_SIDE_DEFAULT,
+                            info=("1920 = the size the LoRA is trained at (best detail). 1536 / 1280 = less VRAM and "
+                                  "faster (JonXL suggests 1280 on smaller GPUs). The picture keeps its aspect ratio."),
+                        )
+                        jxl_steps = gr.Slider(
+                            label="JonXL Steps",
+                            minimum=OPENH3_JXL_STEPS_MIN,
+                            maximum=OPENH3_JXL_STEPS_MAX,
+                            step=1,
+                            value=jxl_steps_of({"jxl_steps": _value("jxl_steps", OPENH3_JXL_STEPS)}),
+                            info=(f"er_sde steps per picture. {OPENH3_JXL_STEPS} = JonXL's workflow (default). Every "
+                                  "step takes the same time, so fewer steps are faster."),
+                        )
 
                 output_override = path_textbox("folder", 
                     label="Output Override (folder or file)",
@@ -855,7 +871,7 @@ def open_h3_tab(
         resume_run_dir, keep_only_output_files,
         auto_tune_on_run,
         sparse_dense_steps,
-        workflow, jxl_max_side,
+        workflow, jxl_max_side, jxl_steps,
     ]
 
     if len(inputs_list) != len(OPENH3_ORDER):
@@ -1750,6 +1766,9 @@ def open_h3_tab(
         upscale_factor.change,
         max_target_resolution.change,
         draft_size.change,
+        workflow.change,
+        jxl_max_side.change,
+        jxl_steps.change,
         fps_mode.change,
         start_frame.change,
         end_frame.change,

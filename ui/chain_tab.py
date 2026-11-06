@@ -1,7 +1,10 @@
 """Chains tab: build a pipeline of tabs (e.g. SeedVR2 2x -> FlashVSR+ 2x -> DLSS 5), save it, run it on videos."""
 from __future__ import annotations
 
+import copy
+import hashlib
 import html
+import json
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,14 +22,17 @@ HERO_HTML = """
 <div class="chain-hero">
   <div class="chain-hero-title">🔗 Chains</div>
   <div class="chain-hero-sub">Stack upscalers and effects into one pipeline: the output of each step feeds the next.
-  Every step runs with the settings you set on its own tab (model, quality, VRAM Auto Tune, output codec); a step can
-  override only its scale. Save chains as presets and run them on one video or a whole folder.</div>
+  Every step runs with the settings its tab had when you added the step (model, quality, VRAM Auto Tune), so one
+  engine can appear twice with different settings; a step can also override its scale. Save chains as presets and
+  run them on one video or a whole folder.</div>
 </div>
 """
 
-PRESET_NOTE = ("Chain presets store only the chain: its steps, their order, On / Off and scale (`presets/chains`). "
-               "Loading or saving one never changes a tab's settings. An app preset (Global Settings) remembers "
-               "which chain preset you use and loads it with the app preset; it never stores the steps themselves.")
+PRESET_NOTE = ("Chain presets store the chain: its steps, their order, On / Off, scale and each step's own settings "
+               "(`presets/chains`); Load brings every step back with the settings it was saved with. Loading or "
+               "saving one never changes a tab's settings. Steps of the built-in examples follow their tabs until "
+               "you save the chain under your own name. An app preset (Global Settings) remembers which chain preset "
+               "you use and loads it with the app preset; it never stores the steps themselves.")
 
 BATCH_NOTE = ("Enter a **batch input folder** and **Run Chain** processes every video and image in it through this "
               "chain, one file after another. Each result is saved in the batch output folder as `<name>_chain` "
@@ -38,28 +44,13 @@ BATCH_NOTE = ("Enter a **batch input folder** and **Run Chain** processes every 
 ICONS = {"pending": "⏸️", "running": "⏳", "done": "✅", "failed": "❌", "skipped": "⏭️", "skipped-image": "⏭️"}
 
 
-def _step_summary(engine: str, state: Dict[str, Any]) -> str:
-    meta = cr.ENGINE_META.get(engine)
-    seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-    settings = seed.get(f"{engine}_settings") or {}
-    parts = []
-    keys = meta[3] if meta else ()
-    if engine == "open_h3" and str(settings.get("workflow") or "").lower().startswith("jonxl"):
-        parts.append("JonXL H3 Upscale")
-        keys = ("model_name",)
-    for key in keys:
-        value = settings.get(key)
-        if value not in (None, ""):
-            text = str(value)
-            parts.append(text if len(text) <= 38 else text[:35] + "...")
-    if engine == "dlss5":
-        try:
-            passes = int(float(settings.get("passes") or 1))
-        except (TypeError, ValueError):
-            passes = 1
-        if passes > 1:
-            parts.append(f"{passes} passes")
-    return " · ".join(parts) if parts else "tab defaults"
+def _step_summary(engine: str, state: Dict[str, Any], step: Optional[Dict[str, Any]] = None) -> str:
+    """The card text of a step: its own settings, or (no step / an older step without them) its tab's settings."""
+    settings = cr.step_settings(step if step is not None else {"engine": engine}, state)
+    text = cr.settings_summary(engine, settings)
+    if step is not None and not cr.has_own_settings(step):
+        text += " · follows the tab"
+    return text
 
 
 def _size(size: Optional[tuple]) -> str:
@@ -105,7 +96,7 @@ def flow_html(steps: List[Dict[str, Any]], state: Dict[str, Any], dims: Optional
                 size_line = f'<div class="chain-node-size">≈ {_size(sizes[i - 1])}</div>'
         nodes.append(
             f'<div class="{cls}"><div class="chain-node-top"><span class="chain-node-num">{i}</span> {meta[1]} '
-            f'{html.escape(meta[0])} {badge}{pass_badge}</div><div class="chain-node-sub">{html.escape(_step_summary(engine, state))}</div>'
+            f'{html.escape(meta[0])} {badge}{pass_badge}</div><div class="chain-node-sub">{html.escape(_step_summary(engine, state, step))}</div>'
             f'{size_line}</div>'
         )
     final = next((s for s in reversed(sizes) if s), None) if sizes and sizes[-1] else None
@@ -204,8 +195,10 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
 
             with gr.Group(elem_classes=["chain-card"]):
                 gr.Markdown("#### ② Build the chain", elem_classes=["chain-card-title"])
-                gr.Markdown("Click an engine to append it. Each step uses the current settings of its tab; "
-                            "the ≈ sizes follow the previewed input.", elem_classes=["resolution-info"])
+                gr.Markdown("Click an engine to append it: the step keeps that tab's settings of this moment, so "
+                            "you can change the tab and add the same engine again with other settings. "
+                            "**⟳** on a step takes its tab's current settings again. "
+                            "The ≈ sizes follow the previewed input.", elem_classes=["resolution-info"])
                 palette = {}
                 with gr.Row(elem_classes=["chain-palette"]):
                     for key in cr.ENGINE_ORDER:
@@ -221,21 +214,32 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                         return
                     for i, step in enumerate(steps):
                         meta = cr.ENGINE_META.get(step["engine"], (step["engine"], "🔧", "", ()))
+                        own = cr.has_own_settings(step)
+                        about = (cr.settings_summary(step["engine"], step["settings"]) if own
+                                 else "follows the tab's current settings")
+                        # The title's key follows its text, so a step whose settings were taken again re-renders.
+                        sig = hashlib.sha1(json.dumps(step.get("settings") or {}, sort_keys=True, default=str)
+                                           .encode("utf-8")).hexdigest()[:10]
+                        default_label = "Step setting" if own else "Tab setting"
                         with gr.Row(elem_classes=["chain-step"], equal_height=True, key=f"row-{i}-{step['engine']}"):
                             gr.HTML(f'<div class="chain-step-title"><span class="chain-node-num">{i + 1}</span> '
-                                    f'{meta[1]} {html.escape(meta[0])}</div>', key=f"title-{i}-{step['engine']}")
+                                    f'{meta[1]} {html.escape(meta[0])}'
+                                    f'<div class="chain-step-sub" title="{html.escape(about)}">{html.escape(about)}</div></div>',
+                                    key=f"title-{i}-{step['engine']}-{sig}")
                             enabled = gr.Checkbox(value=step.get("enabled", True), label="On", scale=0, min_width=70,
                                                   key=f"on-{i}-{step['engine']}")
                             factor = None
                             if meta[2] == "scale":
-                                factor = gr.Dropdown(choices=[("Tab setting", 0.0), ("1x", 1.0), ("1.5x", 1.5), ("2x", 2.0),
+                                factor = gr.Dropdown(choices=[(default_label, 0.0), ("1x", 1.0), ("1.5x", 1.5), ("2x", 2.0),
                                                               ("3x", 3.0), ("4x", 4.0)],
                                                      value=float(step.get("factor") or 0.0), label="Scale", scale=1,
                                                      min_width=120, key=f"f-{i}-{step['engine']}")
                             elif meta[2] == "fps":
-                                factor = gr.Dropdown(choices=[("Tab setting", 0.0), ("2x FPS", 2.0), ("4x FPS", 4.0), ("8x FPS", 8.0)],
+                                factor = gr.Dropdown(choices=[(default_label, 0.0), ("2x FPS", 2.0), ("4x FPS", 4.0), ("8x FPS", 8.0)],
                                                      value=float(step.get("factor") or 0.0), label="Frame rate", scale=1,
                                                      min_width=120, key=f"f-{i}-{step['engine']}")
+                            retake = gr.Button("⟳", size="sm", scale=0, min_width=44, key=f"snap-{i}-{step['engine']}",
+                                               elem_classes=["chain-retake-btn"])
                             up = gr.Button("▲", size="sm", scale=0, min_width=44, key=f"up-{i}-{step['engine']}")
                             down = gr.Button("▼", size="sm", scale=0, min_width=44, key=f"dn-{i}-{step['engine']}")
                             dup = gr.Button("⧉", size="sm", scale=0, min_width=44, key=f"dup-{i}-{step['engine']}")
@@ -258,7 +262,16 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                         def _duplicate(cur, idx=i):
                             cur = cr.normalize_steps(cur)
                             if 0 <= idx < len(cur):
-                                cur.insert(idx + 1, dict(cur[idx]))
+                                cur.insert(idx + 1, copy.deepcopy(cur[idx]))
+                            return cur
+
+                        def _retake(cur, state, idx=i):
+                            """The step takes its tab's current settings again (factor and On stay)."""
+                            cur = cr.normalize_steps(cur)
+                            if 0 <= idx < len(cur):
+                                snapshot = cr.snapshot_settings(cur[idx]["engine"], state)
+                                if snapshot:
+                                    cur[idx]["settings"] = snapshot
                             return cur
 
                         def _toggle(value, cur, idx=i):
@@ -279,6 +292,8 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                         up.click(lambda cur, idx=i: _move(cur, idx, -1), inputs=[steps_state], outputs=[steps_state], show_progress="hidden")
                         down.click(lambda cur, idx=i: _move(cur, idx, 1), inputs=[steps_state], outputs=[steps_state], show_progress="hidden")
                         dup.click(_duplicate, inputs=[steps_state], outputs=[steps_state], show_progress="hidden")
+                        retake.click(_retake, inputs=[steps_state, shared_state], outputs=[steps_state],
+                                     show_progress="hidden")
                         remove.click(_remove, inputs=[steps_state], outputs=[steps_state], show_progress="hidden")
                         enabled.input(_toggle, inputs=[enabled, steps_state], outputs=[steps_state], show_progress="hidden")
                         if factor is not None:
@@ -398,9 +413,11 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
               concurrency_id="chain_batch_info", concurrency_limit=1, trigger_mode="always_last")
 
     # --- editing -----------------------------------------------------------------------------
+    # A new step keeps its tab's settings of this moment: change the tab and add the engine again for a second,
+    # differently set step (e.g. Open-H3 Regenerate, then JonXL H3 Upscale).
     for key, button in palette.items():
-        button.click(lambda cur, k=key: cr.normalize_steps(cur) + [{"engine": k, "enabled": True}],
-                     inputs=[steps_state], outputs=[steps_state], show_progress="hidden")
+        button.click(lambda cur, state, k=key: cr.normalize_steps(cur) + [cr.new_step(k, state)],
+                     inputs=[steps_state, shared_state], outputs=[steps_state], show_progress="hidden")
     clear_btn.click(lambda: [], outputs=[steps_state], show_progress="hidden")
     # A state written by a non-queued event does not fire .change in this app, so every editing event
     # above is queued; the flow view follows the state through .change.
@@ -417,19 +434,26 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
         steps = cr.load_chain_preset(base_dir, name)
         if not steps:
             return gr.update(), f"⚠️ Chain '{name}' not found.", state
-        return steps, f"✅ Loaded chain **{name}** ({len(steps)} steps). Tab settings are unchanged.", _remember(state, name)
+        own = sum(1 for s in steps if cr.has_own_settings(s))
+        note = ("every step with its saved settings" if own == len(steps) else
+                "its steps follow their tabs' current settings" if not own else
+                f"{own} step(s) with saved settings, the others follow their tabs")
+        return steps, f"✅ Loaded chain **{name}** ({len(steps)} steps, {note}). Tab settings are unchanged.", \
+            _remember(state, name)
 
     def _save(name, selected, steps, state):
         target = str(name or "").strip() or (selected if selected and selected not in cr.BUILTIN_CHAINS else "")
         if not target:
-            return gr.update(), "⚠️ Type a name for the chain first.", state
+            return gr.update(), "⚠️ Type a name for the chain first.", state, gr.update()
         if not cr.normalize_steps(steps):
-            return gr.update(), "⚠️ The chain is empty.", state
+            return gr.update(), "⚠️ The chain is empty.", state, gr.update()
         existed = target in cr.list_chain_presets(base_dir)
-        saved = cr.save_chain_preset(base_dir, target, steps)
+        frozen = cr.freeze_steps(steps, state)  # steps that followed their tab keep that tab's settings of now
+        saved = cr.save_chain_preset(base_dir, target, frozen)
         verb = "Updated" if existed else "Saved"
         return (gr.update(choices=cr.list_chain_presets(base_dir), value=saved),
-                f"💾 {verb} chain **{saved}** ({len(cr.normalize_steps(steps))} steps, chain only).", _remember(state, saved))
+                f"💾 {verb} chain **{saved}** ({len(frozen)} steps, each with its settings).", _remember(state, saved),
+                frozen)
 
     def _delete(name, state):
         if name in cr.BUILTIN_CHAINS:
@@ -445,12 +469,12 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
     preset_dd.input(_load, inputs=[preset_dd, shared_state], outputs=[steps_state, preset_status, shared_state],
                     show_progress="hidden")
     save_btn.click(_save, inputs=[preset_name, preset_dd, steps_state, shared_state],
-                   outputs=[preset_dd, preset_status, shared_state], queue=False)
+                   outputs=[preset_dd, preset_status, shared_state, steps_state])
     delete_btn.click(_delete, inputs=[preset_dd, shared_state], outputs=[preset_dd, preset_status, shared_state], queue=False)
 
     def on_tab_select(state, sig, steps, dims):
         """Opening the tab after an app preset was loaded or reset (from any tab) loads that preset's
-        chain; otherwise the chain being edited stays. The step cards always follow the tabs' settings."""
+        chain; otherwise the chain being edited stays. Cards of steps without their own settings follow the tabs."""
         seed = state.get("seed_controls", {}) if isinstance(state, dict) else {}
         seed = seed if isinstance(seed, dict) else {}
         wanted = (seed.get("chains_settings") or {}).get("chain_preset") or ""

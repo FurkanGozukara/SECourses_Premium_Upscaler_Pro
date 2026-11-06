@@ -91,7 +91,9 @@ OPENH3_JXL_LORA_FILE = "h3_upscale_1920.safetensors"
 OPENH3_JXL_LORA_SIZE_GB = 0.6
 OPENH3_JXL_PROMPT = "A static still blurry pixelated picture crossfades into a clear sharp detailed picture, 4psc4l3,"
 OPENH3_JXL_SEED = 505817956432961   # the workflow's fixed seed (used while Seed holds the Open-H3 default)
-OPENH3_JXL_STEPS = 20
+OPENH3_JXL_STEPS = 20              # the workflow's step count: the default of the JonXL Steps setting
+OPENH3_JXL_STEPS_MIN = 1
+OPENH3_JXL_STEPS_MAX = 50
 OPENH3_JXL_MAX_SIDES = [1920, 1536, 1280]
 OPENH3_JXL_MAX_SIDE_DEFAULT = 1920
 OPENH3_JXL_VIDEO_MESSAGE = ("JonXL H3 Upscale is an image upscaler: use it on images or a folder of images, not on "
@@ -102,6 +104,17 @@ OPENH3_JXL_VIDEO_MESSAGE = ("JonXL H3 Upscale is an image upscaler: use it on im
 def is_jxl_workflow(settings) -> bool:
     value = str((settings or {}).get("workflow") or "").strip().lower()
     return value.startswith("jonxl") or value == "jxl"
+
+
+def jxl_steps(settings) -> int:
+    """JonXL er_sde step count of a settings dict: the JonXL Steps setting within its range; a missing or unreadable
+    value (presets, queue items and history runs from before the setting) is the workflow's 20 steps."""
+    value = (settings or {}).get("jxl_steps")
+    try:
+        steps = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return OPENH3_JXL_STEPS
+    return max(OPENH3_JXL_STEPS_MIN, min(OPENH3_JXL_STEPS_MAX, steps))
 
 
 def jxl_output_size(src_w: int, src_h: int, max_side: int = OPENH3_JXL_MAX_SIDE_DEFAULT):

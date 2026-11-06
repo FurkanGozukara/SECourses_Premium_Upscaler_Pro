@@ -34,6 +34,10 @@ CHANGELOG_ENTRIES = [
 - **Send output to…** makes a result the input of any other tab or of Chains.
 - Favorites (★), Download (several files download as one zip), Show in folder, Copy path, and Delete, which moves runs to the Recycle Bin so you can restore them.
 - Keyboard: / search, Enter open, Space select, F favorite, Delete, ← → next, W slider, S side by side, 0 fit, 1 100 %, R reload parameters, Esc close.
+
+**Also new in V10.1**
+- **Chains: every step keeps its own settings.** A step keeps the settings its tab had when you added it, so you can add the same engine twice with different settings: for example Open-H3 Regenerate, then switch the Open-H3 tab to JonXL H3 Upscale and add Open-H3 again. Each step card shows its own settings, saved chains bring every step back with them, and **⟳** on a step takes its tab's current settings again. Built-in example chains follow their tabs until you save them under your own name.
+- **JonXL Steps:** JonXL H3 Upscale in the Open-H3 tab has its own Steps setting, 20 by default as in JonXL's workflow; fewer steps run faster. It is saved in presets and brought back by Reload parameters.
 """,
     ),
     (

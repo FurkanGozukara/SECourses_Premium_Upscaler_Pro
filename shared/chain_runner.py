@@ -1,7 +1,10 @@
 """Chains: run several tabs one after another on the same video (step N's output is step N+1's input).
 
-Every step runs the tab's own ``run_action`` with the settings currently set in that tab (from the
-shared state), so a chain reuses every engine, option, VRAM Auto Tune and output rule as they are.
+Every step runs the tab's own ``run_action``, so a chain reuses every engine, option, VRAM Auto Tune and output
+rule as they are. A step keeps a copy of its tab's settings from the moment it was added (``step["settings"]``),
+so the same engine can appear twice with different settings (Open-H3 Regenerate, then JonXL H3 Upscale); chain
+presets, chain.json and Resume carry that copy. A step without one (built-in examples, chains saved before steps
+kept settings) uses the settings currently set in its tab, as before.
 A step overrides only the input, its output folder, batch / resume / auto-transfer and, when given,
 its scale (upscalers) or FPS multiplier (RIFE). Global post-processes (DLSS 5, RIFE, comparison
 videos) are switched off inside steps; a chain adds them as explicit steps instead.
@@ -102,13 +105,16 @@ def media_info(path: str) -> Dict[str, Any]:
     return info
 
 
-def _tab_factor(engine: str, state: Dict[str, Any]) -> Optional[float]:
-    seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-    value = (seed.get(f"{engine}_settings") or {}).get("upscale_factor")
+def _settings_factor(settings: Dict[str, Any]) -> Optional[float]:
+    value = (settings or {}).get("upscale_factor")
     try:
         return float(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _tab_factor(engine: str, state: Dict[str, Any]) -> Optional[float]:
+    return _settings_factor(_tab_settings(engine, state))
 
 
 _CAP_KEYS = ("max_resolution", "max_target_resolution")
@@ -118,6 +124,81 @@ def _tab_settings(engine: str, state: Dict[str, Any]) -> Dict[str, Any]:
     seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
     value = seed.get(f"{engine}_settings") if isinstance(seed, dict) else None
     return value if isinstance(value, dict) else {}
+
+
+# Per-run fields of a tab that every chain step sets itself (input, step folder, batch / resume / auto-transfer off):
+# never part of a step's settings, so a saved chain carries no input or output paths.
+_RUN_FIELDS = frozenset({"input_path", "output_override", "batch_enable", "batch_input_path", "batch_output_path",
+                         "resume_run_dir", "resume_chunking", "auto_transfer_output_to_input"})
+
+
+def snapshot_settings(engine: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of the engine tab's settings as they are now (JSON-safe, per-run fields left out); {} if unknown."""
+    live = {k: v for k, v in _tab_settings(engine, state).items()
+            if k not in _RUN_FIELDS and not str(k).startswith("_")}
+    try:
+        return json.loads(json.dumps(live, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return {}
+
+
+def new_step(engine: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    """A chain step for ``engine`` that keeps its tab's settings of this moment."""
+    step: Dict[str, Any] = {"engine": str(engine), "enabled": True}
+    snapshot = snapshot_settings(engine, state)
+    if snapshot:
+        step["settings"] = snapshot
+    return step
+
+
+def has_own_settings(step: Dict[str, Any]) -> bool:
+    return isinstance(step, dict) and isinstance(step.get("settings"), dict) and bool(step["settings"])
+
+
+def step_settings(step: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    """The settings a step runs with: its own copy, else (older chains) its tab's current settings."""
+    return step["settings"] if has_own_settings(step) else _tab_settings(str((step or {}).get("engine") or ""), state)
+
+
+def settings_summary(engine: str, settings: Dict[str, Any]) -> str:
+    """Short text of a step's main settings (step cards and the chain log)."""
+    meta = ENGINE_META.get(engine)
+    settings = settings if isinstance(settings, dict) else {}
+    parts: List[str] = []
+    keys = meta[3] if meta else ()
+    jxl = engine == "open_h3" and str(settings.get("workflow") or "").lower().startswith("jonxl")
+    if jxl:
+        parts.append("JonXL H3 Upscale")
+        keys = ("model_name",)
+    for key in keys:
+        value = settings.get(key)
+        if value not in (None, ""):
+            text = str(value)
+            parts.append(text if len(text) <= 38 else text[:35] + "...")
+    if engine == "dlss5":
+        try:
+            passes = int(float(settings.get("passes") or 1))
+        except (TypeError, ValueError):
+            passes = 1
+        if passes > 1:
+            parts.append(f"{passes} passes")
+    if jxl:
+        from .open_h3_constants import OPENH3_JXL_STEPS, jxl_steps
+
+        if jxl_steps(settings) != OPENH3_JXL_STEPS:
+            parts.append(f"{jxl_steps(settings)} steps")
+    return " · ".join(parts) if parts else "tab defaults"
+
+
+def freeze_steps(steps: Any, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Steps where every step without its own settings takes its tab's current settings (Save chain)."""
+    result = normalize_steps(steps)
+    for step in result:
+        if not has_own_settings(step):
+            snapshot = snapshot_settings(step["engine"], state)
+            if snapshot:
+                step["settings"] = snapshot
+    return result
 
 
 def _cap(size: tuple, settings: Dict[str, Any]) -> tuple:
@@ -186,12 +267,12 @@ def project_sizes(steps: List[Dict[str, Any]], state: Dict[str, Any], width: int
     for step in normalize_steps(steps):
         meta = ENGINE_META.get(step["engine"], (step["engine"], "", "", ()))
         if current is not None and step.get("enabled", True) and not (kind == "image" and step["engine"] in VIDEO_ONLY):
-            settings = _tab_settings(step["engine"], state)
+            settings = step_settings(step, state)
             if step["engine"] == "open_h3":
                 current = _open_h3_size(current, settings, step.get("factor"))
                 current = _cap(current, settings) if current else None
             elif meta[2] == "scale":
-                factor = step.get("factor") or _tab_factor(step["engine"], state)
+                factor = step.get("factor") or _settings_factor(settings)
                 current = (int(round(current[0] * factor)), int(round(current[1] * factor))) if factor else None
                 current = _cap(current, settings) if current else None
             elif step["engine"] == "ltx25":  # LTX 2.5 always upscales 2x ("Upscale 2x")
@@ -273,6 +354,8 @@ def normalize_steps(steps: Any) -> List[Dict[str, Any]]:
                 item["factor"] = float(factor)
             except (TypeError, ValueError):
                 pass
+        if has_own_settings(step):
+            item["settings"] = copy.deepcopy(step["settings"])
         result.append(item)
     return result
 
@@ -339,11 +422,16 @@ class ChainEvent:
 
 
 def _tab_values(engine: ChainEngine, state: Dict[str, Any], defaults: Dict[str, Dict[str, Any]],
-                overrides: Dict[str, Any]) -> List[Any]:
+                overrides: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> List[Any]:
+    """The tab's run values: the step's own settings over the tab defaults (a setting newer than the step keeps
+    its default), or without them the tab's current settings; then the step's overrides."""
     from shared.universal_preset import TAB_CONFIGS, dict_to_values
 
     seed = state.get("seed_controls", {}) if isinstance(state, dict) else {}
-    settings = dict(seed.get(f"{engine.key}_settings") or {})
+    if snapshot:
+        settings = {**copy.deepcopy(defaults.get(engine.key, {})), **copy.deepcopy(snapshot)}
+    else:
+        settings = dict(seed.get(f"{engine.key}_settings") or {})
     order = TAB_CONFIGS[engine.key]["order"]
     for key, value in overrides.items():
         if key in order:
@@ -546,7 +634,8 @@ def _resume_plan(run_dir: Path, active: List[Dict[str, Any]]) -> tuple:
         return None, []
     done: List[Optional[str]] = []
     for step, old_step, result in zip(active, data.get("steps") or [], data.get("results") or []):
-        same = step["engine"] == old_step.get("engine") and step.get("factor") == old_step.get("factor")
+        same = (step["engine"] == old_step.get("engine") and step.get("factor") == old_step.get("factor")
+                and (step.get("settings") or None) == (old_step.get("settings") or None))
         out = result.get("output")
         if not same or result.get("status") not in ("done", "skipped-image") or (out and not Path(out).is_file()):
             break
@@ -686,7 +775,15 @@ def run_chain(
                 # SeedVR2 sizes from the shared Resolution-tab factor whenever it is set; the step's own
                 # copy of the state carries the step's scale so every engine reads the same factor.
                 step_state["seed_controls"]["upscale_factor_val"] = float(factor)
-            values = _tab_values(engine, step_state, defaults, _step_overrides(engine, step, current, step_dir))
+            snapshot = step["settings"] if has_own_settings(step) else None
+            values = _tab_values(engine, step_state, defaults, _step_overrides(engine, step, current, step_dir), snapshot)
+            if snapshot:
+                # The step's copy of the state carries the step's settings, for any code that reads its tab from it.
+                from shared.universal_preset import TAB_CONFIGS
+
+                step_state["seed_controls"][f"{engine.key}_settings"] = dict(zip(TAB_CONFIGS[engine.key]["order"], values))
+            log.append(f"    settings: {settings_summary(engine.key, step_settings(step, state))}"
+                       + ("" if snapshot else " (current tab settings)"))
             kwargs = dict(engine.kwargs)
             kwargs["state"] = step_state
             if engine.accepts_progress:

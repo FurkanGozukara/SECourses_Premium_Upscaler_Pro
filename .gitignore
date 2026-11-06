@@ -57,3 +57,6 @@ RelayVSR_Models
 output/
 test_media/
 .playwright-cli/
+
+# Past Generations tab cache, favorites and journal
+history_data/

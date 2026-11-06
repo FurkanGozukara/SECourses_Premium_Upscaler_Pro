@@ -40,7 +40,16 @@ class RunLogger:
         # Write back all entries
         with summary_path.open("w", encoding="utf-8") as f:
             json.dump(existing_entries, f, indent=2)
-        
+
+        # Past Generations journal: finds results written outside the outputs folder (custom batch / override folders)
+        try:
+            from shared.generation_history import journal_append
+
+            journal_append({"output": str(payload.get("output") or ""), "input": str(payload.get("input") or ""),
+                            "pipeline": str(payload.get("pipeline") or ""), "summary": str(summary_path)})
+        except Exception:
+            pass
+
         return summary_path
 
 

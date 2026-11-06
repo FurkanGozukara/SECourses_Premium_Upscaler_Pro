@@ -679,6 +679,7 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
     )
 
     return {
+        "input_file": input_file,
         "inputs_list": inputs_list,
         "run_action": service["run_action"],
         "preset_dropdown": preset_dropdown,

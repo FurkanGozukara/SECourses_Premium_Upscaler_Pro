@@ -11,6 +11,32 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.1 — 6 November 2026 — New Past Generations Tab: Every Upscale in One Place, with Filters, a Zoomable Viewer, Input vs Output, Compare Any Two and Reload Parameters",
+        """
+**Every video and image you made with any tab is now one click away in the new 🗂️ Past Generations tab: find it with search and filters, inspect it zoomed in next to its input, compare any two results with a synced slider and a list of what differs, and bring back the exact settings of any run with Reload parameters.**
+
+**Browse everything**
+- One gallery of every result: SeedVR2, FlashVSR+, RelayVSR, Open-H3, LTX 2.5, SparkVSR, RTX Super Resolution, DLSS 5, Image GAN, RIFE, Face Restoration and Chains, including batch folders and results saved outside the outputs folder.
+- Thumbnails load as you scroll, and videos play as you hover over them. Results are grouped by day (Today, Yesterday, weekdays, months), with the engine, size, upscale factor and length on every card.
+- Search by file name, engine, model, prompt or size ("3840", "4x"). Filter by engine (click one, Ctrl+click several), videos or images, today / 7 days / 30 days, finished or failed / cancelled runs, and favorites. Sort by date, resolution, file size, length, name or engine. Grid or list view, adjustable card size. Your filters are remembered.
+- New results appear by themselves while the tab is open.
+
+**A full viewer**
+- Click a card for a full-screen viewer: scroll to zoom at the cursor (up to 6400 %), drag to pan, double-click for 100 % (actual pixels), arrow keys for the next result.
+- **Input vs output:** a slider between the run's input and its result, or both side by side, zoomed and panned together, so the added detail is easy to see. Videos play in sync, with frame-by-frame steps, speed and loop.
+- Details of every run: engine, model, input and output size, upscale factor, length, frame rate, codec, file size, run time and date, all its parameters (grouped and searchable, Copy as JSON), the run's comparison video and its other files. Chains show every step: click a step to compare it with the step before it.
+
+**Compare any two generations**
+- Select two cards (or "Compare with…" in the viewer) to compare them with a synced slider or side by side, zoom and video playback linked, swap with one key, and a table of every setting that differs between the two runs.
+
+**Reload parameters and reuse results**
+- **Reload parameters** opens the engine tab with every setting of that run and its input file, ready to run again or to tweak. On a Chains run it loads the chain's steps and input.
+- **Send output to…** makes a result the input of any other tab or of Chains.
+- Favorites (★), Download (several files download as one zip), Show in folder, Copy path, and Delete, which moves runs to the Recycle Bin so you can restore them.
+- Keyboard: / search, Enter open, Space select, F favorite, Delete, ← → next, W slider, S side by side, 0 fit, 1 100 %, R reload parameters, Esc close.
+""",
+    ),
+    (
         "V10.0 — 6 November 2026 — RelayVSR Fast 4x Video Upscaler, Multi-Pass DLSS 5, JonXL H3 Upscale in Open-H3, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
         """
 **Upscale videos 4x with the new, very fast RelayVSR tab and our own Wan INT8 ConvRot model (only in this app), run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry images with JonXL's MiniMax H3 image upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**

@@ -88,6 +88,7 @@ from ui.sparkvsr_tab import sparkvsr_tab
 from ui.rtx_super_resolution_tab import rtx_super_resolution_tab
 from ui.dlss5_tab import dlss5_tab
 from ui.chain_tab import chain_tab
+from ui.history_tab import history_tab
 from ui.health_tab import health_tab
 from ui.queue_tab import queue_tab
 from ui.changelog_tab import changelog_tab
@@ -109,7 +110,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "10.0"
+APP_VERSION = "10.1"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1887,7 +1888,7 @@ def main(argv=None):
 
         # Self-contained tabs following SECourses pattern
         with gr.Tabs(elem_id="secourses-main-tabs", elem_classes=["secourses-main-tabs"], overflow_behavior="wrap"):
-            with gr.Tab("🎬 SeedVR2", render_children=True) as tab_seedvr2:
+            with gr.Tab("🎬 SeedVR2", render_children=True, elem_id="sec-tab-seedvr2") as tab_seedvr2:
                 seedvr2_ui = seedvr2_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -1932,7 +1933,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("⚡ FlashVSR", render_children=True) as tab_flashvsr:
+            with gr.Tab("⚡ FlashVSR", render_children=True, elem_id="sec-tab-flashvsr") as tab_flashvsr:
                 flashvsr_ui = flashvsr_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -1952,7 +1953,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🔁 RelayVSR", render_children=True) as tab_relayvsr:
+            with gr.Tab("🔁 RelayVSR", render_children=True, elem_id="sec-tab-relayvsr") as tab_relayvsr:
                 relayvsr_ui = relayvsr_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -1972,7 +1973,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🌀 Open-H3 Regenerate", render_children=True) as tab_open_h3:
+            with gr.Tab("🌀 Open-H3 Regenerate", render_children=True, elem_id="sec-tab-open_h3") as tab_open_h3:
                 open_h3_ui = open_h3_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -1992,7 +1993,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🎞️ LTX 2.5", render_children=True) as tab_ltx25:
+            with gr.Tab("🎞️ LTX 2.5", render_children=True, elem_id="sec-tab-ltx25") as tab_ltx25:
                 ltx25_ui = ltx25_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -2012,7 +2013,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("✨ SparkVSR", render_children=True) as tab_sparkvsr:
+            with gr.Tab("✨ SparkVSR", render_children=True, elem_id="sec-tab-sparkvsr") as tab_sparkvsr:
                 sparkvsr_ui = sparkvsr_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -2032,7 +2033,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🚀 RTX Super Resolution", render_children=True) as tab_rtx:
+            with gr.Tab("🚀 RTX Super Resolution", render_children=True, elem_id="sec-tab-rtx") as tab_rtx:
                 rtx_ui = rtx_super_resolution_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -2052,7 +2053,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("💎 DLSS 5", render_children=True) as tab_dlss5:
+            with gr.Tab("💎 DLSS 5", render_children=True, elem_id="sec-tab-dlss5") as tab_dlss5:
                 dlss5_ui = dlss5_tab(
                     preset_manager=preset_manager,
                     global_settings=global_settings,
@@ -2084,7 +2085,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🖼️ Image-Based (GAN)", render_children=True) as tab_gan:
+            with gr.Tab("🖼️ Image-Based (GAN)", render_children=True, elem_id="sec-tab-gan") as tab_gan:
                 gan_ui = gan_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -2120,7 +2121,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("⏱️ RIFE / FPS / Edit Videos", render_children=True) as tab_rife:
+            with gr.Tab("⏱️ RIFE / FPS / Edit Videos", render_children=True, elem_id="sec-tab-rife") as tab_rife:
                 rife_ui = rife_tab(
                     preset_manager=preset_manager,
                     runner=runner,
@@ -2140,7 +2141,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("👤 Face Restoration", render_children=True) as tab_face:
+            with gr.Tab("👤 Face Restoration", render_children=True, elem_id="sec-tab-face") as tab_face:
                 face_ui = face_tab(
                     preset_manager=preset_manager,
                     global_settings=global_settings,
@@ -2156,7 +2157,7 @@ def main(argv=None):
                 trigger_mode="always_last",
             )
 
-            with gr.Tab("🔗 Chains", render_children=True) as tab_chains:
+            with gr.Tab("🔗 Chains", render_children=True, elem_id="sec-tab-chains") as tab_chains:
                 chain_ui = chain_tab(
                     global_settings=global_settings,
                     shared_state=shared_state,
@@ -2183,6 +2184,27 @@ def main(argv=None):
             _register_chain_engine("face", face_ui["run_action"])
             _register_chain_engine("rife", rife_ui["run_action"], style="values", progress=False, preview_only=False,
                                    cancel=rife_ui.get("cancel_action"))
+
+            # Past Generations: every result of every tab, with filters, viewer, compare and Reload parameters.
+            HISTORY_TAB_TARGETS = {key: (f"sec-tab-{key}", label) for key, label in (
+                ("seedvr2", "🎬 SeedVR2"), ("flashvsr", "⚡ FlashVSR"), ("relayvsr", "🔁 RelayVSR"),
+                ("open_h3", "🌀 Open-H3 Regenerate"), ("ltx25", "🎞️ LTX 2.5"), ("sparkvsr", "✨ SparkVSR"),
+                ("rtx", "🚀 RTX Super Resolution"), ("dlss5", "💎 DLSS 5"), ("gan", "🖼️ Image-Based (GAN)"),
+                ("rife", "⏱️ RIFE / FPS / Edit Videos"), ("face", "👤 Face Restoration"), ("chains", "🔗 Chains"))}
+            with gr.Tab("🗂️ Past Generations", render_children=True, elem_id="sec-tab-history") as tab_history:
+                history_tab(
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    output_dir=active_output_dir,
+                    temp_dir=active_temp_dir,
+                    tab_uis={"seedvr2": seedvr2_ui, "flashvsr": flashvsr_ui, "relayvsr": relayvsr_ui,
+                             "open_h3": open_h3_ui, "ltx25": ltx25_ui, "sparkvsr": sparkvsr_ui, "rtx": rtx_ui,
+                             "dlss5": dlss5_ui, "gan": gan_ui, "rife": rife_ui, "face": face_ui},
+                    tab_targets=HISTORY_TAB_TARGETS,
+                    chain_ui=chain_ui,
+                )
+            tab_history.select(fn=None, js="() => { if (window.__ghOnShow) window.__ghOnShow(); }",
+                               queue=False, show_progress="hidden")
 
             with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
                 queue_ui = queue_tab(tab_queue)

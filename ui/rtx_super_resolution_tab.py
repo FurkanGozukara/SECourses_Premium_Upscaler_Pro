@@ -1839,6 +1839,7 @@ def rtx_super_resolution_tab(
     )
 
     return {
+        "input_file": input_file,
         "inputs_list": inputs_list,
         "run_action": service["run_action"],
         "cancel_action": service["cancel_action"],

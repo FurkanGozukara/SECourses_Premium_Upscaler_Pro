@@ -599,6 +599,6 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
         return "⏹️ Cancelling: the chain stops after the current step (finished steps are kept for Resume)."
 
     cancel_btn.click(_cancel, outputs=[status], queue=False)
-    return {"steps_state": steps_state, "flow": flow, "dims_state": dims_state, "on_select": on_tab_select,
+    return {"steps_state": steps_state, "path_box": path_box, "flow": flow, "dims_state": dims_state, "on_select": on_tab_select,
             "select_inputs": [shared_state, sync_sig, steps_state, dims_state],
             "select_outputs": [steps_state, preset_dd, flow, sync_sig, preset_status]}

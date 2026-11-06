@@ -292,6 +292,12 @@ def build_dlss5_callbacks(
                     break
                 continue
             last_output = result.output_path
+            try:
+                from shared.generation_history import record_generation
+
+                record_generation(last_output, source, "dlss5", {**tab, "input_path": source})
+            except Exception:
+                pass
             seed_controls["dlss5_last_output_path"] = last_output
             seed_controls["last_output_dir"] = str(Path(last_output).parent)
             seed_controls["last_output_path"] = last_output if Path(last_output).is_file() else None

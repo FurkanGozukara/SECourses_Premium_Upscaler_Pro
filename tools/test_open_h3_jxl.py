@@ -2,8 +2,8 @@
 
 CPU (default):
 1. Geometry: the app-side size (shared.open_h3_constants.jxl_output_size) equals the engine's plan_geometry; the
-   canvas is a multiple of 32 around the exact-aspect picture; the workflow geometry of a 960x540 picture is
-   JonXL's 1920x1056 canvas; first frames are exact uint8 pictures of the canvas size.
+   model always renders on JonXL's own canvas (sides floored to 32: 1920x1056 for 16:9, never the softer 1920x1088)
+   and the result is resampled to the exact-aspect output; first frames are exact uint8 pictures of the canvas size.
 2. Schedule: beta57 (20 steps, shift 12) gives ComfyUI's values (cross-checked against ComfyUI's beta_scheduler and
    sample_er_sde: identical); er_sde is deterministic per seed.
 3. LoRA: a kohya 'lora_unet_blocks_<n>_<layer>' file maps to 'diffusion_model.blocks.<n>.<layer>.weight' with the
@@ -56,8 +56,18 @@ def cpu_checks() -> None:
                 for w, h in sizes for s in C.OPENH3_JXL_MAX_SIDES)
     check("app size == engine geometry", agree)
     g = jxl.plan_geometry(960, 540)
-    check("960x540 -> 1920x1080 on a 1920x1088 canvas", (g.out_w, g.out_h, g.width, g.height, g.y0) == (1920, 1080, 1920, 1088, 4),
+    check("960x540 -> 1920x1080 rendered on JonXL's 1920x1056 canvas", (g.out_w, g.out_h, g.width, g.height) == (1920, 1080, 1920, 1056),
           f"{g}")
+    check("9:16 renders on 1056x1920", (jxl.plan_geometry(540, 960).width, jxl.plan_geometry(540, 960).height) == (1056, 1920))
+    same = all((jxl.plan_geometry(w, h, s, s).width, jxl.plan_geometry(w, h, s, s).height)
+               == (jxl.plan_geometry(w, h, s, s, mode="workflow").width, jxl.plan_geometry(w, h, s, s, mode="workflow").height)
+               for w, h in sizes for s in C.OPENH3_JXL_MAX_SIDES)
+    check("keep canvas == JonXL's workflow canvas (every size)", same)
+    small = all(abs((jxl.plan_geometry(w, h).width / jxl.plan_geometry(w, h).out_w)
+                    / (jxl.plan_geometry(w, h).height / jxl.plan_geometry(w, h).out_h) - 1) < 0.05 for w, h in sizes)
+    check("canvas aspect within 5% of the picture", small)
+    ge = jxl.plan_geometry(4000, 60)
+    check("extreme aspect still plans", ge.width % 32 == 0 and ge.height >= 32, f"{ge}")
     ok = all(jxl.plan_geometry(w, h).width % 32 == 0 and jxl.plan_geometry(w, h).height % 32 == 0
              and jxl.plan_geometry(w, h).out_w % 2 == 0 and max(jxl.plan_geometry(w, h).out_w, jxl.plan_geometry(w, h).out_h) <= 1920
              for w, h in sizes)
@@ -67,8 +77,7 @@ def cpu_checks() -> None:
     rng = np.random.default_rng(0)
     frame = rng.integers(0, 256, (540, 960, 3), dtype=np.uint8)
     first = jxl.prepare_first_frame(frame, g)
-    check("keep first frame fills the canvas", first.shape == (1088, 1920, 3) and first.dtype == np.uint8)
-    check("keep padding is the edge row", bool((first[0] == first[4]).all() and (first[-1] == first[-5]).all()))
+    check("keep first frame fills the canvas", first.shape == (1056, 1920, 3) and first.dtype == np.uint8)
     check("workflow first frame on the canvas", jxl.prepare_first_frame(frame, gw).shape == (1056, 1920, 3))
 
     # 2) schedule + sampler

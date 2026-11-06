@@ -65,7 +65,7 @@ class JXLSettings:
     max_width: int = JXL_MAX_SIDE
     max_height: int = JXL_MAX_SIDE
     lora_strength: float = 1.0
-    geometry: str = "keep"           # keep (exact aspect, padded canvas) | workflow (parity tests)
+    geometry: str = "keep"           # keep (exact-aspect output from JonXL's canvas) | workflow (parity tests)
     start_frame: int = 0
     end_frame: int = -1
     reserve_vram_gb: float = 2.0
@@ -113,21 +113,28 @@ class Geometry:
 
 def plan_geometry(src_w: int, src_h: int, max_w: int = JXL_MAX_SIDE, max_h: int = JXL_MAX_SIDE,
                   mode: str = "keep") -> Geometry:
-    """'keep' (the app): the picture fitted under max_w x max_h at its exact aspect (even sides), edge-padded onto
-    the 32-pixel canvas the model needs and cropped back after decoding: no stretch, nothing cut off.
-    'workflow': the workflow's own canvas (jxl_canvas), whose first frame is cropped to sides floored to 32 and then
-    stretched onto the canvas (a 960x540 picture becomes 1856x1056 stretched to 1920x1056); kept for parity tests."""
+    """'keep' (the app): the output is the picture fitted under max_w x max_h at its exact aspect (even sides). The
+    model renders on JonXL's own canvas (jxl_canvas: sides floored to 32, 1920x1056 for 16:9), the whole picture
+    stretched onto it (2.3% for 16:9, no crop), and the decoded canvas is resampled back to the exact-aspect output.
+    The canvas matters: the model + LoRA is far sharper on JonXL's canvas than on the next 32-step size (a 16:9 picture
+    on 1920x1088 or 9:16 on 1088x1920 came out about as soft as the input; ComfyUI gives the same), so the canvas is
+    never rounded up around the picture.
+    'workflow': the workflow's own geometry, whose first frame is cropped to sides floored to 32 and then stretched
+    onto the canvas (a 960x540 picture becomes 1856x1056 stretched to 1920x1056); kept for parity tests."""
     if mode == "workflow":
-        w, h = jxl_canvas(src_w, src_h, max_w, max_h)
-        return Geometry(w, h, w, h, 0, 0, mode)
+        width, height = jxl_canvas(src_w, src_h, max_w, max_h)
+        return Geometry(width, height, width, height, 0, 0, mode)
     total = (max_w * max_h / 1e6) * 1024 * 1024  # same area rule as the workflow, then fit under the max sides
     scale = math.sqrt(total / (src_w * src_h))
     scale = min(scale, max_w / src_w, max_h / src_h)
     out_w, out_h = max(2, int(round(src_w * scale / 2)) * 2), max(2, int(round(src_h * scale / 2)) * 2)
     out_w, out_h = min(out_w, max_w - max_w % 2), min(out_h, max_h - max_h % 2)
-    width = -(-out_w // CANVAS_MULTIPLE) * CANVAS_MULTIPLE
-    height = -(-out_h // CANVAS_MULTIPLE) * CANVAS_MULTIPLE
-    return Geometry(width, height, out_w, out_h, (width - out_w) // 2, (height - out_h) // 2, mode)
+    try:
+        width, height = jxl_canvas(src_w, src_h, max_w, max_h)
+    except ValueError:  # a side under 32 px on JonXL's canvas (extreme aspect): smallest 32-step canvas around it
+        width = max(CANVAS_MULTIPLE, out_w - out_w % CANVAS_MULTIPLE)
+        height = max(CANVAS_MULTIPLE, out_h - out_h % CANVAS_MULTIPLE)
+    return Geometry(width, height, out_w, out_h, 0, 0, mode)
 
 
 def prepare_first_frame(frame_u8: np.ndarray, geo: Geometry) -> np.ndarray:
@@ -136,10 +143,9 @@ def prepare_first_frame(frame_u8: np.ndarray, geo: Geometry) -> np.ndarray:
     img = torch.from_numpy(np.ascontiguousarray(frame_u8)).to(torch.float32).div(255.0).unsqueeze(0)
     src_h, src_w = img.shape[1], img.shape[2]
     if geo.mode != "workflow":
-        img = _lanczos(img, geo.out_w, geo.out_h)
-        pic = np.ascontiguousarray(np.clip(np.rint(img[0].numpy() * 255.0), 0, 255).astype(np.uint8))
-        pad = ((geo.y0, geo.height - geo.out_h - geo.y0), (geo.x0, geo.width - geo.out_w - geo.x0), (0, 0))
-        return np.pad(pic, pad, mode="edge") if any(sum(p) for p in pad[:2]) else pic
+        # the whole picture onto JonXL's canvas in one Lanczos pass (no crop, no padding)
+        img = _lanczos(img, geo.width, geo.height)
+        return np.ascontiguousarray(np.clip(np.rint(img[0].numpy() * 255.0), 0, 255).astype(np.uint8))
     # ImageResizeKJv2 'resize' to the canvas (divisible by 2) ...
     ratio = min(geo.width / src_w, geo.height / src_h)
     w1, h1 = round(src_w * ratio), round(src_h * ratio)
@@ -499,8 +505,11 @@ def run_jxl(items: List[JXLSettings], emit: Callable[[str], None]) -> List[Tuple
                     latent = load_file(str(unit_file(u, "latent")))["video"].to(torch.float32)
                     pixels = vae.decode(latent)                      # [1, 3, frames, H, W] in [0, 1]
                     g = it.geo
-                    last = pixels[0, :, -1].movedim(0, -1)[g.y0:g.y0 + g.out_h, g.x0:g.x0 + g.out_w]
-                    frame = video_io.to_uint8(last.float())
+                    last = pixels[0, :, -1].movedim(0, -1).float().clamp(0.0, 1.0)
+                    if (g.width, g.height) != (g.out_w, g.out_h):
+                        # JonXL's canvas back to the exact-aspect output
+                        last = _lanczos(last.unsqueeze(0).cpu(), g.out_w, g.out_h)[0].clamp(0.0, 1.0)
+                    frame = video_io.to_uint8(last)
                     if writer is None:
                         video_io.write_image(s.output_path, frame.numpy())
                     else:

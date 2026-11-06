@@ -38,7 +38,9 @@ from shared.open_h3_constants import (
     OPENH3_TE_NAMES,
     OPENH3_TE_NVFP4,
     OPENH3_VAE_NAMES,
+    OPENH3_VAE_RELEASED,
     OPENH3_VAE_SOL_FP16,
+    OPENH3_VAE_SOL_INT8,
     OPENH3_JXL_MAX_SIDE_DEFAULT,
     OPENH3_JXL_MAX_SIDES,
     OPENH3_JXL_PROMPT,
@@ -282,7 +284,8 @@ def open_h3_tab(
                         "the blurry input into a sharp picture; the last frame is kept. It pulls real detail out of "
                         "blurry, pixelated and compressed footage (an upscaler, not a detailer).\n\n"
                         f"Fixed prompt `{OPENH3_JXL_PROMPT}`, 20 steps, seed `{OPENH3_JXL_SEED}` while Seed holds the "
-                        "Open-H3 default; base model FL2VA INT8 ConvRot as in JonXL's workflow (picked when you switch). "
+                        "Open-H3 default; base model FL2VA INT8 ConvRot and the Released H3 VAE as in JonXL's workflow (both "
+                        "picked when you switch; the Sol fast VAE gives less fine detail with this LoRA). "
                         "Target Resolution, Draft Size, Prompt and Refine Sampling are not used; Max Edge still caps the "
                         "size. Every frame is a full H3 run, so try a short frame range of a video first.",
                         elem_classes=["OPENH3-jxl-note"],
@@ -882,17 +885,21 @@ def open_h3_tab(
         show_progress="hidden",
     )
 
-    def _jxl_base_model(workflow_val, dit):
-        # JonXL's workflow runs on FL2VA INT8 ConvRot; with this LoRA W4A8 renders slightly darker (measured), so a
-        # switch to JonXL moves the W4A8 default to INT8 ConvRot. Any other choice is kept.
-        if is_jxl_workflow({"workflow": workflow_val}) and dit == OPENH3_DIT_DEFAULT and OPENH3_DIT_DEFAULT != OPENH3_DIT_INT8:
-            return gr.update(value=OPENH3_DIT_INT8)
-        return gr.skip()
+    def _jxl_base_model(workflow_val, dit, vae):
+        # JonXL's workflow runs on FL2VA INT8 ConvRot and the released H3 VAE. With this LoRA W4A8 renders slightly
+        # darker and the Sol fast VAEs decode visibly less fine detail (face detail 15.7 vs 19.0, measured), so a
+        # switch to JonXL moves the W4A8 default to INT8 ConvRot and a Sol VAE to the Released H3 VAE. Other choices stay.
+        if not is_jxl_workflow({"workflow": workflow_val}):
+            return gr.skip(), gr.skip()
+        dit_up = (gr.update(value=OPENH3_DIT_INT8) if dit == OPENH3_DIT_DEFAULT and OPENH3_DIT_DEFAULT != OPENH3_DIT_INT8
+                  else gr.skip())
+        vae_up = gr.update(value=OPENH3_VAE_RELEASED) if vae in (OPENH3_VAE_SOL_FP16, OPENH3_VAE_SOL_INT8) else gr.skip()
+        return dit_up, vae_up
 
     workflow.input(
         fn=_jxl_base_model,
-        inputs=[workflow, model_name],
-        outputs=[model_name],
+        inputs=[workflow, model_name, video_vae],
+        outputs=[model_name, video_vae],
         queue=False,
         show_progress="hidden",
     ).then(

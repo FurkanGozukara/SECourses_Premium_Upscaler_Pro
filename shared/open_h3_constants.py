@@ -102,7 +102,7 @@ def is_jxl_workflow(settings) -> bool:
 
 def jxl_output_size(src_w: int, src_h: int, max_side: int = OPENH3_JXL_MAX_SIDE_DEFAULT):
     """Output size of a JonXL upscale: the picture fitted under max_side x max_side at its exact aspect, even sides
-    (mirrors open_h3_engine.jxl.plan_geometry 'keep'; the model renders a 32-pixel padded canvas around it)."""
+    (mirrors open_h3_engine.jxl.plan_geometry 'keep'; the model renders on JonXL's own canvas, resampled to this size)."""
     import math
 
     src_w, src_h, max_side = max(1, int(src_w)), max(1, int(src_h)), int(max_side)

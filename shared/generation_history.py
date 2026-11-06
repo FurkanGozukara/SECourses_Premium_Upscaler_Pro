@@ -1134,6 +1134,8 @@ _GROUP_RULES = [
 
 def param_group(key: str) -> str:
     low = key.lower()
+    if "face" in low:  # face_restore_after_upscale is about quality, not size
+        return "Quality"
     for name, needles in _GROUP_RULES:
         if any(n in low for n in needles):
             return name

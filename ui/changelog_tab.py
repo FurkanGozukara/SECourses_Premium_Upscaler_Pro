@@ -22,7 +22,7 @@ CHANGELOG_ENTRIES = [
 - New results appear by themselves while the tab is open.
 
 **A full viewer**
-- Click a card for a full-screen viewer: scroll to zoom at the cursor (up to 6400 %), drag to pan, double-click for 100 % (actual pixels), arrow keys for the next result.
+- Click a card for a full-screen viewer: scroll to zoom at the cursor (well past actual pixels), drag to pan, double-click for 100 % (actual pixels), arrow keys for the next result.
 - **Input vs output:** a slider between the run's input and its result, or both side by side, zoomed and panned together, so the added detail is easy to see. Videos play in sync, with frame-by-frame steps, speed and loop.
 - Details of every run: engine, model, input and output size, upscale factor, length, frame rate, codec, file size, run time and date, all its parameters (grouped and searchable, Copy as JSON), the run's comparison video and its other files. Chains show every step: click a step to compare it with the step before it.
 

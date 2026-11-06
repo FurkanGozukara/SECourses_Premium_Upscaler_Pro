@@ -1,0 +1,3 @@
+Vendored from https://github.com/kopperx/RelayVSR (commit e856773350f53036d825404c9ea9228e6dffadca, 2026-10-05), refvsr_inference/ only.
+Weights: https://huggingface.co/kopper/RelayVSR (wan.safetensors, flash.safetensors), mirrored to MonsterMMORPG/Wan_GGUF RelayVSR/.
+Local changes are marked with "SECourses:" comments.

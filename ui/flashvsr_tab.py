@@ -1,60 +1,29 @@
 """
-FlashVSR Tab - Self-contained modular implementation
-Real-time diffusion-based streaming video super-resolution
-UPDATED: Now uses Universal Preset System
+FlashVSR tab: the shared video SR tab (ui/video_sr_tab.py) with FlashVSR's own controls - model / pipeline mode /
+VAE, precision, attention, chunking, sparse / KV ratios, offloading, DiT / VAE tiling with the live tile count,
+diffusion controls, color correction and the models folder.
 """
 
-import gradio as gr
-from ui.path_picker import path_textbox
 import math
 from pathlib import Path
-from typing import Dict, Any
-import html
-import threading
-import time
+from typing import Any, Dict
 
-from shared.services.flashvsr_service import (
-    build_flashvsr_callbacks,
-    FLASHVSR_ORDER,
-    FLASHVSR_VAE_OPTIONS,
-    FLASHVSR_PRECISION_OPTIONS,
-    FLASHVSR_ATTENTION_OPTIONS,
-    canonical_flashvsr_scale,
-)
-from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
+import gradio as gr
+
 from shared.models.flashvsr_meta import FLASHVSR_VERSION_CHOICES, flashvsr_version_to_ui
 from shared.path_utils import get_media_dimensions, normalize_path
 from shared.resolution_calculator import estimate_fixed_scale_upscale_plan_from_dims
-from ui.universal_preset_section import (
-    universal_preset_section,
-    wire_universal_preset_events,
+from shared.services.flashvsr_service import (
+    FLASHVSR_ATTENTION_OPTIONS,
+    FLASHVSR_ORDER,
+    FLASHVSR_PRECISION_OPTIONS,
+    FLASHVSR_VAE_OPTIONS,
+    build_flashvsr_callbacks,
+    canonical_flashvsr_scale,
 )
-from shared.universal_preset import dict_to_values
-from ui.media_preview import preview_updates
-from ui.shared_components import (
-    autotune_modal_dismiss_js,
-    autotune_vram_controls,
-    warn_cancel_confirmation,
-    wire_auto_tune,
-    wire_auto_tune_on_run,
-    with_pre_run_output_signature,
-)
-from shared.video_comparison_slider import get_video_comparison_js_on_load
-from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
-from shared.queue_state import (
-    snapshot_queue_state,
-    snapshot_global_settings,
-    merge_payload_state,
-)
-from ui.model_tab_common import (
-    TERMINAL_STATUS_TOKENS,
-    sync_signature as _sync_signature,
-    resolve_shared_upscale_factor,
-    build_input_detection_md as _build_input_detection_md,
-    compact_single_line as _compact_single_line,
-    log_tail_line as _log_tail_line,
-    extract_update_value as _extract_update_value,
-)
+from ui.model_tab_common import resolve_shared_upscale_factor
+from ui.path_picker import path_textbox
+from ui.video_sr_tab import TabContext, VideoSRTabSpec, video_sr_tab
 
 
 def resolve_flashvsr_effective_scale(
@@ -75,6 +44,520 @@ def resolve_flashvsr_effective_scale(
         default=default_scale,
     )
 
+def _vae_mode_note(mode_value: str) -> str:
+    mode_norm = str(mode_value or "full").strip().lower()
+    if mode_norm == "full":
+        return "**Decoder:** `full` mode decodes with the selected **VAE Model**."
+    return (
+        "**Decoder:** `tiny` / `tiny-long` decode with FlashVSR's TC decoder, so **VAE Model** "
+        "applies only to `full` mode."
+    )
+
+def _compute_dit_tile_count_text(
+    path_val,
+    tile_size_val,
+    overlap_val,
+    scale_state_val,
+    use_global,
+    local_upscale_factor,
+    max_edge_val,
+    pre_downscale_val,
+    state,
+    tiled_dit_val,
+    mode_val,
+    stream_decode_val,
+) -> tuple[str, bool]:
+    if not bool(tiled_dit_val):
+        return "DiT tile count: disabled (`Enable DiT Tiling` is OFF).", True
+
+    mode_norm = str(mode_val or "full").strip().lower()
+    if bool(stream_decode_val) and mode_norm in {"tiny", "tiny-long"}:
+        return "DiT tile count: disabled at runtime (`Stream Decode` is ON in tiny modes).", True
+
+    try:
+        tile_size = int(float(tile_size_val))
+    except Exception:
+        tile_size = 256
+    tile_size = max(32, min(1024, tile_size))
+
+    try:
+        overlap = int(float(overlap_val))
+    except Exception:
+        overlap = 24
+    overlap = max(8, min(512, overlap))
+
+    notes = []
+    if tile_size < 128:
+        tile_size = 128
+        notes.append("tile_size auto-raised to 128")
+    if overlap >= tile_size:
+        overlap = max(8, tile_size - 8)
+        notes.append("overlap auto-corrected")
+    stride = max(1, int(tile_size - overlap))
+
+    normalized_path = normalize_path(path_val) if path_val else None
+    if not normalized_path:
+        return "**DiT tiles:** set an input path to estimate tile count.", True
+
+    dims = get_media_dimensions(normalized_path)
+    if not dims:
+        return "**DiT tiles:** unable to read input dimensions yet.", True
+
+    src_w, src_h = int(dims[0]), int(dims[1])
+    tiling_w, tiling_h = src_w, src_h
+
+    try:
+        resolved_scale = resolve_flashvsr_effective_scale(
+            scale_state_val=scale_state_val,
+            use_global=bool(use_global),
+            local_upscale_factor=local_upscale_factor,
+            state=state if isinstance(state, dict) else None,
+        )
+        model_scale = int(resolved_scale or 4)
+        max_edge = int(max_edge_val or 0)
+
+        plan = estimate_fixed_scale_upscale_plan_from_dims(
+            src_w,
+            src_h,
+            requested_scale=float(model_scale),
+            model_scale=int(model_scale),
+            max_edge=max_edge,
+            force_pre_downscale=bool(pre_downscale_val),
+        )
+        tiling_w = int(plan.preprocess_width or src_w)
+        tiling_h = int(plan.preprocess_height or src_h)
+    except Exception:
+        tiling_w, tiling_h = src_w, src_h
+
+    rows = max(1, int(math.ceil((tiling_h - overlap) / float(stride))))
+    cols = max(1, int(math.ceil((tiling_w - overlap) / float(stride))))
+    total = int(rows * cols)
+
+    preprocess_note = ""
+    if tiling_w != src_w or tiling_h != src_h:
+        preprocess_note = f"; preprocessed from `{src_w}x{src_h}`"
+
+    guardrail_note = ""
+    if notes:
+        guardrail_note = f" ({'; '.join(notes)})"
+
+    text = (
+        f"**DiT tiles:** `{total}` (`{cols} x {rows}`)  \n"
+        f"Input for tiling: `{tiling_w}x{tiling_h}`; stride: `{stride}`{preprocess_note}{guardrail_note}."
+    )
+    return text, True
+
+def _tile_count_info_update(
+    path_val,
+    tile_size_val,
+    overlap_val,
+    scale_state_val,
+    use_global,
+    local_upscale_factor,
+    max_edge_val,
+    pre_downscale_val,
+    state,
+    tiled_dit_val,
+    mode_val,
+    stream_decode_val,
+):
+    text, visible = _compute_dit_tile_count_text(
+        path_val,
+        tile_size_val,
+        overlap_val,
+        scale_state_val,
+        use_global,
+        local_upscale_factor,
+        max_edge_val,
+        pre_downscale_val,
+        state,
+        tiled_dit_val,
+        mode_val,
+        stream_decode_val,
+    )
+    return gr.update(value=text, visible=visible)
+
+
+def _build_model_column(ctx: TabContext) -> None:
+    _value = ctx.value
+    version = gr.Dropdown(
+        label="Model",
+        choices=list(FLASHVSR_VERSION_CHOICES),
+        value=flashvsr_version_to_ui(_value("version", "1.1")),
+        info=(
+            "FlashVSR v1.1 (`FlashVSR-v1.1`, v1.0 = legacy). FlashVSR+ Turbo / Base = the official "
+            "FlashVSR+ release: one stream over the whole clip (no chunk restarts), reward-tuned "
+            "detail; Turbo uses hybrid local attention (less VRAM at high resolution, the better "
+            "default); Base needs more VRAM. FlashVSR+ ignores Pipeline Mode / VAE Model, decodes with "
+            "the TC decoder and follows the Precision setting (INT8 ConvRot: slightly faster and "
+            "0.5-1 GB less VRAM than BF16 at the same quality; its 1.7 GB INT8 cache downloads on first use)."
+        ),
+    )
+    mode = gr.Dropdown(
+        label="Pipeline Mode",
+        choices=["tiny", "tiny-long", "full"],
+        value=(
+            str(_value("mode", "full"))
+            if str(_value("mode", "full")) in {"tiny", "tiny-long", "full"}
+            else "full"
+        ),
+        info=(
+            "`tiny` = best speed/quality balance. `tiny-long` = lowest VRAM for long clips. "
+            "`full` = maximum quality (default), but highest VRAM usage."
+        )
+    )
+    vae_model = gr.Dropdown(
+        label="VAE Model",
+        choices=list(FLASHVSR_VAE_OPTIONS),
+        value=(
+            str(_value("vae_model", "LightVAE_W2.1"))
+            if str(_value("vae_model", "LightVAE_W2.1")) in set(FLASHVSR_VAE_OPTIONS)
+            else "LightVAE_W2.1"
+        ),
+        info=(
+            "Full mode decoder. LightVAE_W2.1 (default) = closest to the original, least flicker, "
+            "fastest. Wan2.1 = full Wan VAE: crisper but invents more detail, more VRAM."
+        ),
+        interactive=str(_value("mode", "full")).strip().lower() == "full",
+    )
+    vae_mode_note = gr.Markdown(
+        _vae_mode_note(str(_value("mode", "full"))),
+        elem_classes=["resolution-info"],
+    )
+    with gr.Row():
+        temporal_compression = gr.Dropdown(
+            label="FlashVSR+ Temporal Compression",
+            choices=[4, 2, 1],
+            value=int(_value("temporal_compression", 4) or 4) if int(_value("temporal_compression", 4) or 4) in (1, 2, 4) else 4,
+            info="FlashVSR+ only. Input frames per latent frame: 4 = default; 2 or 1 keep more detail in large motion (about 2x / 4x the work).",
+        )
+        decode_every = gr.Slider(
+            label="FlashVSR+ Decode Every (latent frames)",
+            minimum=4,
+            maximum=64,
+            step=4,
+            value=int(_value("decode_every", 16) or 16),
+            info="FlashVSR+ only. The clip streams through the model once; every N latent frames (4N video frames) are decoded and written, so RAM stays bounded on long clips.",
+        )
+    ctx.c.update(version=version, mode=mode, vae_model=vae_model, vae_mode_note=vae_mode_note,
+                 temporal_compression=temporal_compression, decode_every=decode_every)
+
+
+def _build_runtime_row(ctx: TabContext) -> None:
+    _value = ctx.value
+    precision = gr.Dropdown(
+        label="Precision",
+        choices=list(FLASHVSR_PRECISION_OPTIONS),
+        value=(
+            str(_value("precision", _value("dtype", "int8_convrot")))
+            if str(_value("precision", _value("dtype", "int8_convrot"))) in set(FLASHVSR_PRECISION_OPTIONS)
+            else "int8_convrot"
+        ),
+        info="`int8_convrot` is the default on every platform: same quality as BF16, about 1 GB less VRAM and 3-6% faster (FlashVSR spends most of its time in attention and decoding, not in the layers INT8 speeds up). It downloads a prebuilt Hadamard-rotated DiT cache on first use (1.7 GB); local generation remains the fallback."
+    )
+
+    attention_mode = gr.Dropdown(
+        label="Attention Backend",
+        choices=list(FLASHVSR_ATTENTION_OPTIONS),
+        value=(
+            str(_value("attention_mode", _value("attention", "flash_attention_2")))
+            if str(_value("attention_mode", _value("attention", "flash_attention_2"))) in set(FLASHVSR_ATTENTION_OPTIONS)
+            else "flash_attention_2"
+        ),
+        info=(
+            "Default `flash_attention_2` (dense, fast on modern NVIDIA). "
+            "`Local Range` / `Sparse Ratio` / `KV Ratio` mainly affect sparse backends "
+            "(`sparse_sage_attention`, `block_sparse_attention`)."
+        )
+    )
+    ctx.c.update(precision=precision, attention_mode=attention_mode)
+
+
+def _build_runtime_extra(ctx: TabContext) -> None:
+    _value = ctx.value
+    with gr.Row():
+        frame_chunk_size = gr.Slider(
+            label="Frame Chunk Size",
+            minimum=0,
+            maximum=10000,
+            step=1,
+            value=int(_value("frame_chunk_size", 0) or 0),
+            info=(
+                "0 = process all frames at once. Larger chunks are usually faster and improve temporal quality, "
+                "but require more VRAM. Smaller chunks use less VRAM on long clips, but may be slower."
+            ),
+        )
+        local_range = gr.Dropdown(
+            label="Local Range",
+            choices=[9, 11],
+            value=9 if str(_value("local_range", 11)).strip() == "9" else 11,
+            info=(
+                "Backend-supported values: `9` or `11` only. Sparse local window size: "
+                "`9` = tighter/sharper and slightly lighter, `11` = wider/stabler motion and slightly heavier. "
+                "Limited impact on dense backends."
+            ),
+        )
+
+    with gr.Row():
+        sparse_ratio = gr.Slider(
+            label="Sparse Ratio",
+            minimum=1.5,
+            maximum=2.0,
+            step=0.1,
+            value=float(_value("sparse_ratio", 2.0) or 2.0),
+            info=(
+                "True range in this build: `1.5-2.0` (not `1-3`). Controls sparse top-k density: "
+                "lower = less compute/VRAM and faster, higher = more detail/stability and slower. "
+                "Primarily affects sparse backends."
+            ),
+        )
+        kv_ratio = gr.Slider(
+            label="KV Ratio",
+            minimum=1.0,
+            maximum=3.0,
+            step=0.1,
+            value=float(_value("kv_ratio", 3.0) or 3.0),
+            info=(
+                "True range in this build: `1.0-3.0` (not `1-5`). Controls temporal KV cache length. "
+                "Higher keeps more history (better consistency, more VRAM/time). Internally cast to int "
+                "(effective levels are roughly `1`, `2`, `3`)."
+            ),
+        )
+
+    with gr.Row():
+        keep_models_on_cpu = gr.Checkbox(
+            label="Keep Models on CPU",
+            value=bool(_value("keep_models_on_cpu", True)),
+            info=(
+                "Keeps idle model parts in system RAM and moves them to GPU only when needed. "
+                "Reduces peak VRAM but adds transfer overhead (can lower FPS). Usually good for low-VRAM "
+                "or multi-job stability."
+            ),
+        )
+        force_offload = gr.Checkbox(
+            label="Force Offload After Run",
+            value=bool(_value("force_offload", True)),
+            info=(
+                "After processing, explicitly offloads models from VRAM to CPU RAM. "
+                "Effective only when `Keep Models on CPU` is ON. Useful for long-lived app sessions; "
+                "in one-job-per-subprocess usage, benefit is usually smaller."
+            ),
+        )
+        enable_debug = gr.Checkbox(
+            label="Enable Debug Logging",
+            value=bool(_value("enable_debug", False)),
+            info="Verbose backend logging (timings, memory behavior, diagnostics).",
+        )
+    ctx.c.update(frame_chunk_size=frame_chunk_size, local_range=local_range, sparse_ratio=sparse_ratio,
+                 kv_ratio=kv_ratio, keep_models_on_cpu=keep_models_on_cpu, force_offload=force_offload,
+                 enable_debug=enable_debug)
+
+
+def _build_sections(ctx: TabContext) -> None:
+    _value = ctx.value
+    shared_state = ctx.shared_state
+    gr.Markdown("#### Memory Optimization (Tiling)")
+
+    with gr.Group():
+        with gr.Row():
+            tiled_vae = gr.Checkbox(
+                label="Enable VAE Tiling",
+                value=bool(_value("tiled_vae", False)),
+                info="Decodes in tiles: in full mode the VAE (lower VRAM), in tiny modes the TC decoder."
+            )
+
+            tiled_dit = gr.Checkbox(
+                label="Enable DiT Tiling",
+                value=bool(_value("tiled_dit", True)),
+                info="Splits diffusion transformer inference into tiles. Default ON."
+            )
+
+            unload_dit = gr.Checkbox(
+                label="Unload DiT Before Decoding",
+                value=bool(_value("unload_dit", True)),
+                info="Releases DiT from VRAM before decoder step (TCDecoder in tiny modes, VAE in full mode). Default ON."
+            )
+
+        with gr.Row():
+            stream_decode = gr.Checkbox(
+                label="Enable Stream Decode (Tiny/Tiny-Long)",
+                value=bool(_value("stream_decode", False)),
+                info=(
+                    "Forces streaming decode path in tiny modes by disabling DiT tiling at runtime. "
+                    "Can improve responsiveness and lower host RAM, but typically increases peak VRAM."
+                ),
+            )
+
+        _initial_tile_count_text, _initial_tile_count_visible = _compute_dit_tile_count_text(
+            _value("input_path", ""),
+            _value("tile_size", 256),
+            _value("overlap", 24),
+            _value("scale", "4"),
+            _value("use_resolution_tab", True),
+            _value("upscale_factor", _value("scale", 4)),
+            _value("max_target_resolution", 1920),
+            _value("pre_downscale_then_upscale", True),
+            shared_state.value if isinstance(shared_state.value, dict) else {},
+            _value("tiled_dit", True),
+            _value("mode", "full"),
+            _value("stream_decode", False),
+        )
+
+        with gr.Row():
+            with gr.Column():
+                tile_size = gr.Slider(
+                    label="Tile Size",
+                    minimum=32, maximum=1024, step=32,
+                    value=int(_value("tile_size", 256) or 256),
+                    info="Larger tiles are faster but use more VRAM. 256 is a balanced default."
+                )
+                dit_tile_count = gr.Markdown(
+                    value=_initial_tile_count_text,
+                    visible=bool(_initial_tile_count_visible),
+                    elem_classes=["resolution-info"],
+                )
+
+            with gr.Column():
+                overlap = gr.Slider(
+                    label="Tile Overlap",
+                    minimum=8, maximum=512, step=8,
+                    value=int(_value("overlap", 24) or 24),
+                    info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
+                )
+
+    gr.Markdown("#### Diffusion Controls (Experimental)")
+    with gr.Group():
+        with gr.Row():
+            cfg_scale = gr.Slider(
+                label="CFG Scale",
+                minimum=0.5,
+                maximum=2.0,
+                step=0.05,
+                value=float(_value("cfg_scale", 1.0) or 1.0),
+                info=(
+                    "Experimental latent update gain. `1.0` = default behavior. "
+                    "Higher values push stronger hallucination/detail; lower values are more conservative."
+                ),
+            )
+            denoise_amount = gr.Slider(
+                label="Denoise Amount",
+                minimum=0.5,
+                maximum=2.0,
+                step=0.05,
+                value=float(_value("denoise_amount", 1.0) or 1.0),
+                info=(
+                    "Experimental one-step denoise strength. `1.0` = default. "
+                    "Higher can increase diffusion impact but may introduce artifacts/flicker."
+                ),
+            )
+    ctx.c.update(tiled_vae=tiled_vae, tiled_dit=tiled_dit, unload_dit=unload_dit, stream_decode=stream_decode,
+                 tile_size=tile_size, dit_tile_count=dit_tile_count, overlap=overlap, cfg_scale=cfg_scale,
+                 denoise_amount=denoise_amount)
+
+
+def _build_output_leading(ctx: TabContext) -> None:
+    _value = ctx.value
+    color_fix = gr.Checkbox(
+        label="Color Correction",
+        value=bool(_value("color_fix", True)),
+        info="Wavelet color transfer. Recommended ON unless you intentionally want different colors."
+    )
+    ctx.c["color_fix"] = color_fix
+
+
+def _build_models_dir(ctx: TabContext) -> None:
+    _value = ctx.value
+    base_dir = ctx.base_dir
+    models_dir = path_textbox("folder", 
+        label="FlashVSR Models Directory",
+        value=str(_value("models_dir", str(base_dir / "ComfyUI-FlashVSR_Stable" / "models")) or ""),
+        placeholder="G:/.../ComfyUI-FlashVSR_Stable/models",
+        info=(
+            "Folder containing `FlashVSR` and/or `FlashVSR-v1.1` subfolders. "
+            "VAE files can auto-download if missing."
+        ),
+    )
+    ctx.c["models_dir"] = models_dir
+
+
+def _tile_count_inputs(c: Dict[str, Any]):
+    return [c["input_path"], c["tile_size"], c["overlap"], c["scale"], c["use_resolution_tab"], c["upscale_factor"],
+            c["max_target_resolution"], c["pre_downscale_then_upscale"], c["shared_state"], c["tiled_dit"], c["mode"],
+            c["stream_decode"]]
+
+
+def _after_sizing(ctx: TabContext):
+    ctx.c["shared_state"] = ctx.shared_state
+    return _tile_count_info_update, _tile_count_inputs(ctx.c), [ctx.c["dit_tile_count"]]
+
+
+def _wire_extra(ctx: TabContext) -> None:
+    c = ctx.c
+    c["shared_state"] = ctx.shared_state
+    c["mode"].change(
+        fn=lambda m: (gr.update(value=_vae_mode_note(m)),
+                      gr.update(interactive=str(m or "").strip().lower() == "full")),
+        inputs=[c["mode"]],
+        outputs=[c["vae_mode_note"], c["vae_model"]],
+        queue=False,
+        show_progress="hidden",
+    )
+    for key in ("mode", "tile_size", "overlap", "tiled_dit", "stream_decode"):
+        c[key].change(fn=_tile_count_info_update, inputs=_tile_count_inputs(c), outputs=[c["dit_tile_count"]],
+                      queue=False, show_progress="hidden", trigger_mode="always_last")
+
+
+FLASHVSR_TAB = VideoSRTabSpec(
+    key="flashvsr",
+    label="FlashVSR",
+    build_service=build_flashvsr_callbacks,
+    order=FLASHVSR_ORDER,
+    canonical_scale=canonical_flashvsr_scale,
+    model_label="FlashVSR Stable",
+    runtime_label=lambda ms: f"FlashVSR Stable pipeline (fixed {ms}x pass)",
+    upscale_slider=dict(label="FlashVSR Upscale Factor", minimum=2.0, maximum=4.0, step=2.0,
+                        info="FlashVSR backend supports only 2x or 4x."),
+    input_path_info="Video file or image sequence folder",
+    input_placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
+    gpu_note="FlashVSR uses single GPU only (multi-GPU not supported)",
+    autotune_help=(
+    "**Auto Tune (instant, no test runs):** reads your GPU's total and in-use VRAM, the input's size and "
+    "length, the output size, version and mode, then sets the longest **Frame Chunk Size** that fits "
+    "(the whole clip in one pass when possible: every chunk restarts FlashVSR's temporal memory), "
+    "**DiT tiling OFF** when the full frame fits (otherwise the fewest tiles, with a wider overlap), "
+    "**KV Ratio 3** and no CPU offloading for speed. It keeps `Save VRAM (GB)` free. Every run is "
+    "capped at GPU total - in use - Save VRAM, so it never uses shared GPU memory."
+),
+    guide_md="""
+    #### FlashVSR Stable Guide
+
+    **Decoder**
+    - `full` mode decodes with the selected VAE: `Wan2.1` (full Wan VAE) or `LightVAE_W2.1` (quarter width, less VRAM).
+    - `tiny` / `tiny-long` decode with FlashVSR's TC decoder; the VAE choice does not apply there.
+
+    **Important backend limits**
+    - FlashVSR supports only **2x** or **4x** upscale factors.
+    - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
+    - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
+    - `Local Range` is truly `9` or `11` only. `Sparse Ratio` is `1.5-2.0`. `KV Ratio` is `1.0-3.0`.
+    - `Sparse Ratio`/`Local Range` matter most on sparse attention backends; on `flash_attention_2`/`sdpa` their effect is limited.
+    - `CFG Scale` and `Denoise Amount` are experimental one-step multipliers; keep both near `1.0` for baseline behavior.
+    - `Force Offload After Run` is most useful in long-lived processes; in subprocess-per-job flows it usually has smaller impact.
+    - `Enable Stream Decode` works only in tiny modes and automatically disables DiT tiling for that run.
+    """,
+    tuned_keys=["frame_chunk_size", "tiled_dit", "tile_size", "overlap", "kv_ratio", "keep_models_on_cpu",
+                "force_offload", "unload_dit"],
+    build_model_column=_build_model_column,
+    build_runtime_row=_build_runtime_row,
+    build_runtime_extra=_build_runtime_extra,
+    build_sections=_build_sections,
+    build_output_leading=_build_output_leading,
+    build_models_dir=_build_models_dir,
+    output_format_info="FlashVSR Stable CLI outputs MP4.",
+    after_sizing=_after_sizing,
+    wire_extra=_wire_extra,
+)
+
 
 def flashvsr_tab(
     preset_manager,
@@ -84,2157 +567,8 @@ def flashvsr_tab(
     shared_state: gr.State,
     base_dir: Path,
     temp_dir: Path,
-    output_dir: Path
+    output_dir: Path,
 ):
-    """
-    Self-contained FlashVSR tab following SECourses modular pattern.
-    """
-
-    # Build service callbacks
-    service = build_flashvsr_callbacks(
-        preset_manager, runner, run_logger, global_settings, shared_state,
-        base_dir, temp_dir, output_dir
-    )
-    queue_manager = get_processing_queue_manager()
-
-    # Get defaults
-    defaults = service["defaults"]
-    
-    # UNIVERSAL PRESET: Load from shared_state
-    seed_controls = shared_state.value.get("seed_controls", {})
-    flashvsr_settings = seed_controls.get("flashvsr_settings", {})
-    models_list = seed_controls.get("available_models", ["default"])
-    
-    # Merge with defaults
-    merged_defaults = defaults.copy()
-    for key, value in flashvsr_settings.items():
-        if value is not None:
-            merged_defaults[key] = value
-    
-    values = [merged_defaults[k] for k in FLASHVSR_ORDER]
-
-    def _value(key: str, default=None):
-        try:
-            idx = FLASHVSR_ORDER.index(key)
-            if 0 <= idx < len(values):
-                raw = values[idx]
-                if raw is None and default is not None:
-                    return default
-                return raw
-        except Exception:
-            pass
-        return default
-
-    def _vae_mode_note(mode_value: str) -> str:
-        mode_norm = str(mode_value or "full").strip().lower()
-        if mode_norm == "full":
-            return "**Decoder:** `full` mode decodes with the selected **VAE Model**."
-        return (
-            "**Decoder:** `tiny` / `tiny-long` decode with FlashVSR's TC decoder, so **VAE Model** "
-            "applies only to `full` mode."
-        )
-
-    def _compute_dit_tile_count_text(
-        path_val,
-        tile_size_val,
-        overlap_val,
-        scale_state_val,
-        use_global,
-        local_upscale_factor,
-        max_edge_val,
-        pre_downscale_val,
-        state,
-        tiled_dit_val,
-        mode_val,
-        stream_decode_val,
-    ) -> tuple[str, bool]:
-        if not bool(tiled_dit_val):
-            return "DiT tile count: disabled (`Enable DiT Tiling` is OFF).", True
-
-        mode_norm = str(mode_val or "full").strip().lower()
-        if bool(stream_decode_val) and mode_norm in {"tiny", "tiny-long"}:
-            return "DiT tile count: disabled at runtime (`Stream Decode` is ON in tiny modes).", True
-
-        try:
-            tile_size = int(float(tile_size_val))
-        except Exception:
-            tile_size = 256
-        tile_size = max(32, min(1024, tile_size))
-
-        try:
-            overlap = int(float(overlap_val))
-        except Exception:
-            overlap = 24
-        overlap = max(8, min(512, overlap))
-
-        notes = []
-        if tile_size < 128:
-            tile_size = 128
-            notes.append("tile_size auto-raised to 128")
-        if overlap >= tile_size:
-            overlap = max(8, tile_size - 8)
-            notes.append("overlap auto-corrected")
-        stride = max(1, int(tile_size - overlap))
-
-        normalized_path = normalize_path(path_val) if path_val else None
-        if not normalized_path:
-            return "**DiT tiles:** set an input path to estimate tile count.", True
-
-        dims = get_media_dimensions(normalized_path)
-        if not dims:
-            return "**DiT tiles:** unable to read input dimensions yet.", True
-
-        src_w, src_h = int(dims[0]), int(dims[1])
-        tiling_w, tiling_h = src_w, src_h
-
-        try:
-            resolved_scale = resolve_flashvsr_effective_scale(
-                scale_state_val=scale_state_val,
-                use_global=bool(use_global),
-                local_upscale_factor=local_upscale_factor,
-                state=state if isinstance(state, dict) else None,
-            )
-            model_scale = int(resolved_scale or 4)
-            max_edge = int(max_edge_val or 0)
-
-            plan = estimate_fixed_scale_upscale_plan_from_dims(
-                src_w,
-                src_h,
-                requested_scale=float(model_scale),
-                model_scale=int(model_scale),
-                max_edge=max_edge,
-                force_pre_downscale=bool(pre_downscale_val),
-            )
-            tiling_w = int(plan.preprocess_width or src_w)
-            tiling_h = int(plan.preprocess_height or src_h)
-        except Exception:
-            tiling_w, tiling_h = src_w, src_h
-
-        rows = max(1, int(math.ceil((tiling_h - overlap) / float(stride))))
-        cols = max(1, int(math.ceil((tiling_w - overlap) / float(stride))))
-        total = int(rows * cols)
-
-        preprocess_note = ""
-        if tiling_w != src_w or tiling_h != src_h:
-            preprocess_note = f"; preprocessed from `{src_w}x{src_h}`"
-
-        guardrail_note = ""
-        if notes:
-            guardrail_note = f" ({'; '.join(notes)})"
-
-        text = (
-            f"**DiT tiles:** `{total}` (`{cols} x {rows}`)  \n"
-            f"Input for tiling: `{tiling_w}x{tiling_h}`; stride: `{stride}`{preprocess_note}{guardrail_note}."
-        )
-        return text, True
-
-    def _tile_count_info_update(
-        path_val,
-        tile_size_val,
-        overlap_val,
-        scale_state_val,
-        use_global,
-        local_upscale_factor,
-        max_edge_val,
-        pre_downscale_val,
-        state,
-        tiled_dit_val,
-        mode_val,
-        stream_decode_val,
-    ):
-        text, visible = _compute_dit_tile_count_text(
-            path_val,
-            tile_size_val,
-            overlap_val,
-            scale_state_val,
-            use_global,
-            local_upscale_factor,
-            max_edge_val,
-            pre_downscale_val,
-            state,
-            tiled_dit_val,
-            mode_val,
-            stream_decode_val,
-        )
-        return gr.update(value=text, visible=visible)
-    # GPU detection and warnings (parent-process safe: NO torch import)
-    cuda_available = False
-    cuda_count = 0
-    gpu_hint = "CUDA detection in progress..."
-    
-    try:
-        from shared.gpu_utils import get_gpu_info
-
-        gpus = get_gpu_info()
-        cuda_count = len(gpus)
-        cuda_available = cuda_count > 0
-        
-        if cuda_available:
-            gpu_hint = f" Detected {cuda_count} CUDA GPU(s) - GPU acceleration available\n FlashVSR uses single GPU only (multi-GPU not supported)"
-        else:
-            gpu_hint = " CUDA not detected (nvidia-smi unavailable or no NVIDIA GPU) - Processing will use CPU (significantly slower)"
-    except Exception as e:
-        gpu_hint = f" CUDA detection failed: {str(e)}"
-        cuda_available = False
-
-    # Show GPU warning if not available
-    if not cuda_available:
-        gr.Markdown(
-            f'<div style="background: #fff3cd; padding: 12px; border-radius: 8px; border: 1px solid #ffc107;">'
-            f'<strong> GPU Acceleration Unavailable</strong><br>'
-            f'{gpu_hint}<br><br>'
-            f'FlashVSR is designed for CUDA GPUs. CPU mode is possible but very slow.'
-            f'</div>',
-            elem_classes="warning-text"
-        )
-
-    with gr.Row():
-        # Left Column: Input & Settings
-        with gr.Column(scale=3):
-            gr.Markdown("####  Input")
-
-            with gr.Group():
-                with gr.Row():
-                    with gr.Column(scale=2, elem_classes=["flashvsr-input-source-col"]):
-                        input_file = gr.File(
-                            label="Upload video or image (optional)",
-                            type="filepath",
-                            file_types=["video", "image"]
-                        )
-                        input_path = path_textbox("media+folder", 
-                            label="Input Path",
-                            value=_value("input_path", ""),
-                            placeholder="C:/path/to/video.mp4 or C:/path/to/frames/",
-                            info="Video file or image sequence folder"
-                        )
-                        copy_output_into_input_btn = gr.Button(
-                            "Copy Output Into Input",
-                            elem_classes=["action-btn", "action-btn-source-seed", "flashvsr-copy-output-compact", "sec-btn-teal"],
-                            size="md",
-                        )
-
-                    with gr.Column(scale=2):
-                        # Backend-only state (kept for preset/schema compatibility).
-                        _initial_scale_state = canonical_flashvsr_scale(
-                            scale_value=_value("scale", "4"),
-                            upscale_factor_value=_value("upscale_factor", None),
-                            default=4,
-                        )
-                        scale = gr.State(
-                            value=str(int(_initial_scale_state))
-                        )
-                        version = gr.Dropdown(
-                            label="Model",
-                            choices=list(FLASHVSR_VERSION_CHOICES),
-                            value=flashvsr_version_to_ui(_value("version", "1.1")),
-                            info=(
-                                "FlashVSR v1.1 (`FlashVSR-v1.1`, v1.0 = legacy). FlashVSR+ Turbo / Base = the official "
-                                "FlashVSR+ release: one stream over the whole clip (no chunk restarts), reward-tuned "
-                                "detail; Turbo uses hybrid local attention (less VRAM at high resolution, the better "
-                                "default); Base needs more VRAM. FlashVSR+ ignores Pipeline Mode / VAE Model, decodes with "
-                                "the TC decoder and follows the Precision setting (INT8 ConvRot: slightly faster and "
-                                "0.5-1 GB less VRAM than BF16 at the same quality; its 1.7 GB INT8 cache downloads on first use)."
-                            ),
-                        )
-                        mode = gr.Dropdown(
-                            label="Pipeline Mode",
-                            choices=["tiny", "tiny-long", "full"],
-                            value=(
-                                str(_value("mode", "full"))
-                                if str(_value("mode", "full")) in {"tiny", "tiny-long", "full"}
-                                else "full"
-                            ),
-                            info=(
-                                "`tiny` = best speed/quality balance. `tiny-long` = lowest VRAM for long clips. "
-                                "`full` = maximum quality (default), but highest VRAM usage."
-                            )
-                        )
-                        vae_model = gr.Dropdown(
-                            label="VAE Model",
-                            choices=list(FLASHVSR_VAE_OPTIONS),
-                            value=(
-                                str(_value("vae_model", "LightVAE_W2.1"))
-                                if str(_value("vae_model", "LightVAE_W2.1")) in set(FLASHVSR_VAE_OPTIONS)
-                                else "LightVAE_W2.1"
-                            ),
-                            info=(
-                                "Full mode decoder. LightVAE_W2.1 (default) = closest to the original, least flicker, "
-                                "fastest. Wan2.1 = full Wan VAE: crisper but invents more detail, more VRAM."
-                            ),
-                            interactive=str(_value("mode", "full")).strip().lower() == "full",
-                        )
-                        vae_mode_note = gr.Markdown(
-                            _vae_mode_note(str(_value("mode", "full"))),
-                            elem_classes=["resolution-info"],
-                        )
-                        with gr.Row():
-                            temporal_compression = gr.Dropdown(
-                                label="FlashVSR+ Temporal Compression",
-                                choices=[4, 2, 1],
-                                value=int(_value("temporal_compression", 4) or 4) if int(_value("temporal_compression", 4) or 4) in (1, 2, 4) else 4,
-                                info="FlashVSR+ only. Input frames per latent frame: 4 = default; 2 or 1 keep more detail in large motion (about 2x / 4x the work).",
-                            )
-                            decode_every = gr.Slider(
-                                label="FlashVSR+ Decode Every (latent frames)",
-                                minimum=4,
-                                maximum=64,
-                                step=4,
-                                value=int(_value("decode_every", 16) or 16),
-                                info="FlashVSR+ only. The clip streams through the model once; every N latent frames (4N video frames) are decoded and written, so RAM stays bounded on long clips.",
-                            )
-
-                    with gr.Column(scale=2):
-                        input_image_preview = gr.Image(
-                            label=" Input Preview (Image)",
-                            type="filepath",
-                            interactive=False,
-                            height=250,
-                            visible=False
-                        )
-                        input_video_preview = gr.Video(
-                            label=" Input Preview (Video)",
-                            interactive=False,
-                            height=250,
-                            visible=False
-                        )
-
-                input_cache_msg = gr.Markdown("", visible=False)
-                sizing_info = gr.Markdown("", visible=False, elem_classes=["resolution-info"])
-                input_detection_result = gr.Markdown("", visible=False)
-
-            # vNext sizing controls are placed in the right column to mirror SeedVR2 layout.
-
-            # Processing Settings
-            gr.Markdown("#### Core Runtime Settings")
-            
-            with gr.Group():
-                with gr.Row():
-                    precision = gr.Dropdown(
-                        label="Precision",
-                        choices=list(FLASHVSR_PRECISION_OPTIONS),
-                        value=(
-                            str(_value("precision", _value("dtype", "int8_convrot")))
-                            if str(_value("precision", _value("dtype", "int8_convrot"))) in set(FLASHVSR_PRECISION_OPTIONS)
-                            else "int8_convrot"
-                        ),
-                        info="`int8_convrot` is the default on every platform: same quality as BF16, about 1 GB less VRAM and 3-6% faster (FlashVSR spends most of its time in attention and decoding, not in the layers INT8 speeds up). It downloads a prebuilt Hadamard-rotated DiT cache on first use (1.7 GB); local generation remains the fallback."
-                    )
-                    
-                    attention_mode = gr.Dropdown(
-                        label="Attention Backend",
-                        choices=list(FLASHVSR_ATTENTION_OPTIONS),
-                        value=(
-                            str(_value("attention_mode", _value("attention", "flash_attention_2")))
-                            if str(_value("attention_mode", _value("attention", "flash_attention_2"))) in set(FLASHVSR_ATTENTION_OPTIONS)
-                            else "flash_attention_2"
-                        ),
-                        info=(
-                            "Default `flash_attention_2` (dense, fast on modern NVIDIA). "
-                            "`Local Range` / `Sparse Ratio` / `KV Ratio` mainly affect sparse backends "
-                            "(`sparse_sage_attention`, `block_sparse_attention`)."
-                        )
-                    )
-                    with gr.Column(scale=1):
-                        seed = gr.Number(
-                            label="Random Seed",
-                            value=_value("seed", 0),
-                            precision=0,
-                            info="Seed for reproducibility."
-                        )
-                        auto_transfer_output_to_input = gr.Checkbox(
-                            label="Auto Transfer Output to Input",
-                            value=bool(_value("auto_transfer_output_to_input", False)),
-                            info="After upscale completes, automatically copy the latest output path into Input Path.",
-                        )
-                    with gr.Column(scale=2):
-                        auto_tune_btn, save_vram_gb, auto_tune_on_run = autotune_vram_controls(
-                            _value("save_vram_gb", None),
-                            _value("auto_tune_on_run", True),
-                        )
-                optimize_summary = gr.Markdown(value="", visible=False, elem_classes=["resolution-info"])
-                gr.Markdown(
-                    "**Auto Tune (instant, no test runs):** reads your GPU's total and in-use VRAM, the input's size and "
-                    "length, the output size, version and mode, then sets the longest **Frame Chunk Size** that fits "
-                    "(the whole clip in one pass when possible: every chunk restarts FlashVSR's temporal memory), "
-                    "**DiT tiling OFF** when the full frame fits (otherwise the fewest tiles, with a wider overlap), "
-                    "**KV Ratio 3** and no CPU offloading for speed. It keeps `Save VRAM (GB)` free. Every run is "
-                    "capped at GPU total - in use - Save VRAM, so it never uses shared GPU memory."
-                )
-
-                with gr.Row():
-                    frame_chunk_size = gr.Slider(
-                        label="Frame Chunk Size",
-                        minimum=0,
-                        maximum=10000,
-                        step=1,
-                        value=int(_value("frame_chunk_size", 0) or 0),
-                        info=(
-                            "0 = process all frames at once. Larger chunks are usually faster and improve temporal quality, "
-                            "but require more VRAM. Smaller chunks use less VRAM on long clips, but may be slower."
-                        ),
-                    )
-                    local_range = gr.Dropdown(
-                        label="Local Range",
-                        choices=[9, 11],
-                        value=9 if str(_value("local_range", 11)).strip() == "9" else 11,
-                        info=(
-                            "Backend-supported values: `9` or `11` only. Sparse local window size: "
-                            "`9` = tighter/sharper and slightly lighter, `11` = wider/stabler motion and slightly heavier. "
-                            "Limited impact on dense backends."
-                        ),
-                    )
-
-                with gr.Row():
-                    sparse_ratio = gr.Slider(
-                        label="Sparse Ratio",
-                        minimum=1.5,
-                        maximum=2.0,
-                        step=0.1,
-                        value=float(_value("sparse_ratio", 2.0) or 2.0),
-                        info=(
-                            "True range in this build: `1.5-2.0` (not `1-3`). Controls sparse top-k density: "
-                            "lower = less compute/VRAM and faster, higher = more detail/stability and slower. "
-                            "Primarily affects sparse backends."
-                        ),
-                    )
-                    kv_ratio = gr.Slider(
-                        label="KV Ratio",
-                        minimum=1.0,
-                        maximum=3.0,
-                        step=0.1,
-                        value=float(_value("kv_ratio", 3.0) or 3.0),
-                        info=(
-                            "True range in this build: `1.0-3.0` (not `1-5`). Controls temporal KV cache length. "
-                            "Higher keeps more history (better consistency, more VRAM/time). Internally cast to int "
-                            "(effective levels are roughly `1`, `2`, `3`)."
-                        ),
-                    )
-
-                with gr.Row():
-                    keep_models_on_cpu = gr.Checkbox(
-                        label="Keep Models on CPU",
-                        value=bool(_value("keep_models_on_cpu", True)),
-                        info=(
-                            "Keeps idle model parts in system RAM and moves them to GPU only when needed. "
-                            "Reduces peak VRAM but adds transfer overhead (can lower FPS). Usually good for low-VRAM "
-                            "or multi-job stability."
-                        ),
-                    )
-                    force_offload = gr.Checkbox(
-                        label="Force Offload After Run",
-                        value=bool(_value("force_offload", True)),
-                        info=(
-                            "After processing, explicitly offloads models from VRAM to CPU RAM. "
-                            "Effective only when `Keep Models on CPU` is ON. Useful for long-lived app sessions; "
-                            "in one-job-per-subprocess usage, benefit is usually smaller."
-                        ),
-                    )
-                    enable_debug = gr.Checkbox(
-                        label="Enable Debug Logging",
-                        value=bool(_value("enable_debug", False)),
-                        info="Verbose backend logging (timings, memory behavior, diagnostics).",
-                    )
-                gr.Markdown(
-                    "**GPU Device:** Controlled globally from the top app header selector. "
-                    "This tab no longer has a per-tab GPU override."
-                )
-                device = gr.State(str(_value("device", "auto") or "auto"))
-            
-            # Memory Optimization
-            gr.Markdown("#### Memory Optimization (Tiling)")
-            
-            with gr.Group():
-                with gr.Row():
-                    tiled_vae = gr.Checkbox(
-                        label="Enable VAE Tiling",
-                        value=bool(_value("tiled_vae", False)),
-                        info="Decodes in tiles: in full mode the VAE (lower VRAM), in tiny modes the TC decoder."
-                    )
-                    
-                    tiled_dit = gr.Checkbox(
-                        label="Enable DiT Tiling",
-                        value=bool(_value("tiled_dit", True)),
-                        info="Splits diffusion transformer inference into tiles. Default ON."
-                    )
-                    
-                    unload_dit = gr.Checkbox(
-                        label="Unload DiT Before Decoding",
-                        value=bool(_value("unload_dit", True)),
-                        info="Releases DiT from VRAM before decoder step (TCDecoder in tiny modes, VAE in full mode). Default ON."
-                    )
-
-                with gr.Row():
-                    stream_decode = gr.Checkbox(
-                        label="Enable Stream Decode (Tiny/Tiny-Long)",
-                        value=bool(_value("stream_decode", False)),
-                        info=(
-                            "Forces streaming decode path in tiny modes by disabling DiT tiling at runtime. "
-                            "Can improve responsiveness and lower host RAM, but typically increases peak VRAM."
-                        ),
-                    )
-
-                _initial_tile_count_text, _initial_tile_count_visible = _compute_dit_tile_count_text(
-                    _value("input_path", ""),
-                    _value("tile_size", 256),
-                    _value("overlap", 24),
-                    _value("scale", "4"),
-                    _value("use_resolution_tab", True),
-                    _value("upscale_factor", _value("scale", 4)),
-                    _value("max_target_resolution", 1920),
-                    _value("pre_downscale_then_upscale", True),
-                    shared_state.value if isinstance(shared_state.value, dict) else {},
-                    _value("tiled_dit", True),
-                    _value("mode", "full"),
-                    _value("stream_decode", False),
-                )
-
-                with gr.Row():
-                    with gr.Column():
-                        tile_size = gr.Slider(
-                            label="Tile Size",
-                            minimum=32, maximum=1024, step=32,
-                            value=int(_value("tile_size", 256) or 256),
-                            info="Larger tiles are faster but use more VRAM. 256 is a balanced default."
-                        )
-                        dit_tile_count = gr.Markdown(
-                            value=_initial_tile_count_text,
-                            visible=bool(_initial_tile_count_visible),
-                            elem_classes=["resolution-info"],
-                        )
-
-                    with gr.Column():
-                        overlap = gr.Slider(
-                            label="Tile Overlap",
-                            minimum=8, maximum=512, step=8,
-                            value=int(_value("overlap", 24) or 24),
-                            info="Overlap between tiles to hide seams. Higher overlap is smoother but slower."
-                        )
-
-            gr.Markdown("#### Diffusion Controls (Experimental)")
-            with gr.Group():
-                with gr.Row():
-                    cfg_scale = gr.Slider(
-                        label="CFG Scale",
-                        minimum=0.5,
-                        maximum=2.0,
-                        step=0.05,
-                        value=float(_value("cfg_scale", 1.0) or 1.0),
-                        info=(
-                            "Experimental latent update gain. `1.0` = default behavior. "
-                            "Higher values push stronger hallucination/detail; lower values are more conservative."
-                        ),
-                    )
-                    denoise_amount = gr.Slider(
-                        label="Denoise Amount",
-                        minimum=0.5,
-                        maximum=2.0,
-                        step=0.05,
-                        value=float(_value("denoise_amount", 1.0) or 1.0),
-                        info=(
-                            "Experimental one-step denoise strength. `1.0` = default. "
-                            "Higher can increase diffusion impact but may introduce artifacts/flicker."
-                        ),
-                    )
-            
-            # Quality / I/O Settings
-            gr.Markdown("#### Output / I/O Settings")
-            
-            with gr.Group():
-                with gr.Row():
-                    color_fix = gr.Checkbox(
-                        label="Color Correction",
-                        value=bool(_value("color_fix", True)),
-                        info="Wavelet color transfer. Recommended ON unless you intentionally want different colors."
-                    )
-                    start_frame = gr.Number(
-                        label="Start Frame",
-                        value=int(_value("start_frame", 0) or 0),
-                        precision=0,
-                        info="0-indexed start frame for partial processing."
-                    )
-                    end_frame = gr.Number(
-                        label="End Frame",
-                        value=int(_value("end_frame", -1) or -1),
-                        precision=0,
-                        info="-1 = process until the end of input."
-                    )
-
-                gr.Markdown(
-                    "**Video Codec / CRF / FPS Override:** Controlled from `Output > Video Output` "
-                    "and automatically applied here."
-                )
-                # Keep schema compatibility fields without exposing duplicate controls.
-                fps_flashvsr = gr.State(float(_value("fps", 0.0) or 0.0))
-                codec = gr.State(str(_value("codec", "libx264") or "libx264"))
-                crf = gr.State(int(_value("crf", _value("quality", 18)) or 18))
-
-                models_dir = path_textbox("folder", 
-                    label="FlashVSR Models Directory",
-                    value=str(_value("models_dir", str(base_dir / "ComfyUI-FlashVSR_Stable" / "models")) or ""),
-                    placeholder="G:/.../ComfyUI-FlashVSR_Stable/models",
-                    info=(
-                        "Folder containing `FlashVSR` and/or `FlashVSR-v1.1` subfolders. "
-                        "VAE files can auto-download if missing."
-                    ),
-                )
-
-                output_override = path_textbox("folder", 
-                    label="Output Override (folder or .mp4 file)",
-                    value=_value("output_override", ""),
-                    placeholder="Leave empty for auto naming",
-                    info="Optional custom output location. A folder saves into that folder. A .mp4 file path renames the final output to that exact file.",
-                )
-
-                with gr.Row():
-                    output_format = gr.Dropdown(
-                        label="Output Format",
-                        choices=["mp4"],
-                        value=str(_value("output_format", "mp4") or "mp4"),
-                        info="FlashVSR Stable CLI outputs MP4.",
-                        interactive=False,
-                    )
-                    save_metadata = gr.Checkbox(
-                        label="Save Processing Metadata",
-                        value=bool(_value("save_metadata", True)),
-                        info="Save run metadata to output folder."
-                    )
-                    face_restore_after_upscale = gr.Checkbox(
-                        label="Apply Face Restoration after upscale",
-                        value=bool(_value("face_restore_after_upscale", False)),
-                        info="Per-run face restore toggle. Also respects Global Settings face toggle."
-                    )
-
-            # UNIVERSAL PRESET MANAGEMENT
-            (
-                preset_dropdown,
-                preset_name_input,
-                save_preset_btn,
-                load_preset_btn,
-                preset_status,
-                reset_defaults_btn,
-                delete_preset_btn,
-                preset_callbacks,
-            ) = universal_preset_section(
-                preset_manager=preset_manager,
-                shared_state=shared_state,
-                tab_name="flashvsr",
-                inputs_list=[],
-                base_dir=base_dir,
-                models_list=models_list,
-                open_accordion=True,
-            )
-        
-        # Right Column: Output & Controls
-        with gr.Column(scale=2):
-            gr.Markdown("####  Output & Actions")
-            status_box = gr.Markdown(value="Ready.", visible=False, elem_classes=["runtime-status-box"])
-            progress_indicator = gr.Markdown(value="", visible=False, elem_classes=["runtime-progress-box"])
-            with gr.Group(
-                visible=False,
-                elem_id="flash-autotune-notice-modal",
-                elem_classes=["autotune-modal-overlay"],
-            ) as flash_autotune_notice_modal:
-                with gr.Group(elem_classes=["autotune-modal-card"]):
-                    with gr.Row(elem_classes=["autotune-modal-header"]):
-                        gr.Markdown("Auto Tune Update", elem_classes=["autotune-modal-title"])
-                        flash_autotune_notice_close_btn = gr.Button("X", size="sm", elem_classes=["autotune-modal-close", "sec-btn-slate"])
-                    flash_autotune_notice_text = gr.Markdown("", elem_classes=["autotune-modal-body"])
-                    with gr.Row(elem_classes=["autotune-modal-actions"]):
-                        flash_autotune_notice_ok_btn = gr.Button("OK", variant="primary", elem_classes=["autotune-modal-ok", "sec-btn-pink"])
-
-            with gr.Group():
-                _upscale_factor_default = _value("upscale_factor", _value("scale", 4))
-                try:
-                    _upscale_factor_default = float(_upscale_factor_default)
-                except Exception:
-                    _upscale_factor_default = 4.0
-                _upscale_factor_default = 2.0 if _upscale_factor_default <= 3.0 else 4.0
-
-                _initial_use_global_scale = bool(_value("use_resolution_tab", True))
-                _initial_shared_scale = resolve_shared_upscale_factor(
-                    shared_state.value if _initial_use_global_scale else None
-                )
-                if _initial_use_global_scale and _initial_shared_scale is not None:
-                    _upscale_factor_default = float(
-                        canonical_flashvsr_scale(
-                            scale_value=None,
-                            upscale_factor_value=_initial_shared_scale,
-                            default=_upscale_factor_default,
-                        )
-                    )
-
-                _max_resolution_default = _value("max_target_resolution", 1920)
-                try:
-                    _max_resolution_default = int(_max_resolution_default)
-                except Exception:
-                    _max_resolution_default = 1920
-                _max_resolution_default = min(8192, max(0, _max_resolution_default))
-
-                with gr.Row():
-                    upscale_factor = gr.Slider(
-                        label="FlashVSR Upscale Factor",
-                        minimum=2.0,
-                        maximum=4.0,
-                        step=2.0,
-                        value=_upscale_factor_default,
-                        info="FlashVSR backend supports only 2x or 4x.",
-                        interactive=True,
-                        scale=2,
-                    )
-                    max_target_resolution = gr.Slider(
-                        label="Max Resolution (max edge, 0 = no cap)",
-                        minimum=0,
-                        maximum=8192,
-                        step=16,
-                        value=_max_resolution_default,
-                        info="Caps the LONG side (max(width,height)) of the target. 0 = unlimited.",
-                        scale=2,
-                    )
-                    pre_downscale_then_upscale = gr.Checkbox(
-                        label="Pre-downscale then upscale (when capped)",
-                        value=bool(_value("pre_downscale_then_upscale", True)),
-                        info="If max edge would reduce effective scale, downscale input first so the model still runs at the full Upscale x.",
-                        scale=1,
-                    )
-
-                use_resolution_tab = gr.Checkbox(
-                    label="Use Resolution & Scene Split Tab Settings",
-                    value=bool(_value("use_resolution_tab", True)),
-                    info=(
-                        "When enabled, Upscale x follows shared app scale cache (e.g., SeedVR2/Resolution workflow). "
-                        "Moving this local slider will switch this toggle OFF and use local sizing."
-                    ),
-                )
-
-                with gr.Row():
-                    upscale_btn = gr.Button(
-                        " Start Upscaling",
-                        variant="primary",
-                        size="lg",
-                        elem_classes=["action-btn", "action-btn-upscale", "sec-btn-emerald"],
-                    )
-                    preview_btn = gr.Button(
-                        "Preview First Frame",
-                        size="lg",
-                        elem_classes=["action-btn", "action-btn-preview", "sec-btn-cyan"],
-                    )
-
-                with gr.Row():
-                    cancel_confirm = gr.Checkbox(
-                        label=" Confirm cancel (required for safety)",
-                        value=False,
-                        info="Enable this checkbox to confirm cancellation of processing",
-                        scale=3,
-                    )
-                    cancel_btn = gr.Button(
-                        " Cancel",
-                        variant="stop",
-                        size="md",
-                        min_width=170,
-                        scale=1,
-                        elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"],
-                    )
-
-            resume_run_dir = path_textbox("folder", 
-                label="Resume Run Folder (chunk/scene resume)",
-                value=(
-                    _value("resume_run_dir", "")
-                    if "resume_run_dir" in FLASHVSR_ORDER and len(values) > FLASHVSR_ORDER.index("resume_run_dir")
-                    else ""
-                ),
-                placeholder="Optional: G:/.../outputs/0019",
-                info=(
-                    "Optional. When set, chunk/scene processing resumes from the last completed chunk in that folder. "
-                    "Use the same settings as the original run to continue remaining chunks. "
-                    "Fresh output path overrides are ignored while resume is active."
-                ),
-            )
-            
-            with gr.Accordion(" Upscaled Output", open=True):
-                output_video = gr.Video(
-                    label=" Upscaled Video",
-                    interactive=False,
-                    visible=False,
-                    buttons=["download"],
-                )
-                output_image = gr.Image(
-                    label=" Upscaled Image",
-                    interactive=False,
-                    visible=False,
-                    buttons=["download"],
-                )
-            
-            # Comparison
-            image_slider = gr.ImageSlider(
-                label=" Comparison",
-                interactive=False,
-                slider_position=50,
-                max_height=1000,
-                buttons=["download", "fullscreen"],
-                elem_classes=["native-image-comparison-slider"],
-            )
-            
-            video_comparison_html = gr.HTML(
-                label=" Video Comparison",
-                value="",
-                js_on_load=get_video_comparison_js_on_load(),
-                visible=False
-            )
-            
-            chunk_status = gr.Markdown("", visible=False)
-            chunk_gallery = gr.Gallery(
-                label=" Chunk Preview",
-                visible=False,
-                columns=4,
-                rows=2,
-                height=220,
-                object_fit="contain",
-            )
-            chunk_preview_video = gr.Video(
-                label=" Selected Chunk",
-                interactive=False,
-                visible=False,
-                buttons=["download"],
-            )
-            batch_gallery = gr.Gallery(
-                label=" Batch Results",
-                visible=False,
-                columns=4,
-                rows=2,
-                height="auto",
-                object_fit="contain",
-                buttons=["download"],
-            )
-            last_processed = gr.Markdown("Batch processing results will appear here.")
-            
-            # Utility buttons
-            with gr.Row():
-                open_outputs_btn = gr.Button(
-                    " Open Outputs",
-                    elem_classes=["action-btn", "action-btn-open", "sec-btn-blue"],
-                )
-                clear_temp_btn = gr.Button(
-                    " Clear Temp",
-                    elem_classes=["action-btn", "action-btn-clear", "sec-btn-orange"],
-                )
-
-            with gr.Accordion(" Batch Processing", open=True):
-                with gr.Row():
-                    batch_enable = gr.Checkbox(
-                        label="Enable Batch",
-                        value=bool(_value("batch_enable", False)),
-                        info="Process multiple files",
-                        scale=2,
-                    )
-                    keep_only_output_files = gr.Checkbox(
-                        label="Keep only output files",
-                        value=bool(_value("keep_only_output_files", False)),
-                        info="After batch completion, remove metadata/chunks/temp artifacts and keep only final outputs.",
-                        scale=2,
-                    )
-                batch_input = path_textbox("folder", 
-                    label="Batch Input Folder",
-                    value=_value("batch_input_path", ""),
-                    placeholder="Folder with videos"
-                )
-                batch_output = path_textbox("folder", 
-                    label="Batch Output Folder",
-                    value=_value("batch_output_path", ""),
-                    placeholder="Output directory"
-                )
-            
-            log_box = gr.Textbox(
-                label=" Processing Log",
-                value="",
-                lines=12,
-                buttons=["copy"]
-            )
-            
-            # Info
-            gr.Markdown("""
-            #### FlashVSR Stable Guide
-
-            **Decoder**
-            - `full` mode decodes with the selected VAE: `Wan2.1` (full Wan VAE) or `LightVAE_W2.1` (quarter width, less VRAM).
-            - `tiny` / `tiny-long` decode with FlashVSR's TC decoder; the VAE choice does not apply there.
-
-            **Important backend limits**
-            - FlashVSR supports only **2x** or **4x** upscale factors.
-            - Use `Max Resolution` + `Pre-downscale then upscale` to keep output size safe on limited VRAM.
-            - For long videos, combine this tab with Resolution tab chunking (scene split or fixed chunk seconds).
-            - `Local Range` is truly `9` or `11` only. `Sparse Ratio` is `1.5-2.0`. `KV Ratio` is `1.0-3.0`.
-            - `Sparse Ratio`/`Local Range` matter most on sparse attention backends; on `flash_attention_2`/`sdpa` their effect is limited.
-            - `CFG Scale` and `Denoise Amount` are experimental one-step multipliers; keep both near `1.0` for baseline behavior.
-            - `Force Offload After Run` is most useful in long-lived processes; in subprocess-per-job flows it usually has smaller impact.
-            - `Enable Stream Decode` works only in tiny modes and automatically disables DiT tiling for that run.
-            """)
-    
-    # Collect inputs
-    inputs_list = [
-        input_path, output_override, output_format, scale, version, mode,
-        vae_model, precision, attention_mode,
-        tiled_vae, tiled_dit, tile_size, overlap, unload_dit, stream_decode,
-        cfg_scale, denoise_amount,
-        sparse_ratio, kv_ratio, local_range, frame_chunk_size,
-        keep_models_on_cpu, force_offload, enable_debug,
-        color_fix, seed, auto_transfer_output_to_input, device, fps_flashvsr, codec, crf, start_frame, end_frame, models_dir,
-        save_metadata, face_restore_after_upscale, batch_enable, batch_input, batch_output,
-        use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale,
-        resume_run_dir,
-        save_vram_gb,
-        keep_only_output_files,
-        auto_tune_on_run,
-        temporal_compression,
-        decode_every,
-    ]
-
-    # Development validation: inputs_list must stay aligned with FLASHVSR_ORDER
-    if len(inputs_list) != len(FLASHVSR_ORDER):
-        import logging
-        logging.getLogger("FlashVSRTab").error(
-            f"ERROR: inputs_list ({len(inputs_list)}) != FLASHVSR_ORDER ({len(FLASHVSR_ORDER)})"
-        )
-    
-    # Wire up events
-    def _analysis_progress_note(state: Dict[str, Any], pct: int) -> str:
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
-        if pct < 15:
-            return "Reading media metadata..."
-        if pct < 35:
-            return "Computing resize target..."
-        if pct < 70:
-            return "Scanning scenes for chunk stats..." if scene_mode else "Building runtime summary..."
-        if pct < 95:
-            return "Preparing analysis panel..."
-        return "Finalizing analysis..."
-
-    def _analysis_banner_html(state: Dict[str, Any], progress_pct: int, progress_note: str = "") -> str:
-        safe_pct = max(0, min(100, int(progress_pct)))
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        scene_mode = bool(seed_controls.get("auto_chunk", True)) and bool(seed_controls.get("auto_detect_scenes", True))
-        title = "Analyzing input (resolution + scene detection)" if scene_mode else "Analyzing input"
-        sub = f"{safe_pct}%"
-        if progress_note:
-            sub = f"{sub}<br>{html.escape(str(progress_note))}"
-        return (
-            '<div class="processing-banner">'
-            '<div class="processing-spinner"></div>'
-            '<div class="processing-col">'
-            f'<div class="processing-text">{html.escape(title)}</div>'
-            f'<div class="processing-sub">{sub}</div>'
-            "</div></div>"
-        )
-
-    def _build_sizing_info(path_val, model_scale_val, use_global, local_scale_x, local_max_edge, local_pre_down, state):
-        resolved_scale = resolve_flashvsr_effective_scale(
-            scale_state_val=model_scale_val,
-            use_global=bool(use_global),
-            local_upscale_factor=local_scale_x,
-            state=state if isinstance(state, dict) else None,
-        )
-        ms = int(resolved_scale or 4)
-        return build_fixed_scale_analysis_update(
-            input_path_val=path_val,
-            model_scale=ms,
-            # Scale is resolved locally (with Resolution-tab fallback + 2x/4x clamp)
-            # so the preview cannot desync from hidden backend state.
-            use_global=False,
-            local_scale_x=float(ms),
-            local_max_edge=int(local_max_edge or 0),
-            local_pre_down=bool(local_pre_down),
-            state=state,
-            model_label="FlashVSR Stable",
-            runtime_label=f"FlashVSR Stable pipeline (fixed {ms}x pass)",
-            auto_scene_scan=True,
-        )
-
-    def _run_analysis_payload(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        det = _build_input_detection_md(path_val or "")
-        info = _build_sizing_info(path_val or "", int(scale_val), bool(use_global), scale_x, max_edge, pre_down, state)
-        img_prev, vid_prev = preview_updates(path_val)
-        return img_prev, vid_prev, det, info, state
-
-    def _iter_analysis_with_progress(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        result: Dict[str, Any] = {}
-
-        def _worker():
-            try:
-                result["payload"] = _run_analysis_payload(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state)
-            except Exception as exc:
-                result["error"] = exc
-
-        worker = threading.Thread(target=_worker, daemon=True)
-        worker.start()
-
-        fallback_steps = [4, 10, 18, 26, 35, 46, 58, 70, 80, 88, 94]
-        step_idx = 0
-        last_emit = 0.0
-
-        while worker.is_alive():
-            now = time.monotonic()
-            if now - last_emit >= 0.2:
-                pct = fallback_steps[min(step_idx, len(fallback_steps) - 1)]
-                if step_idx < len(fallback_steps) - 1:
-                    step_idx += 1
-                yield "progress", pct, _analysis_progress_note(state, pct)
-                last_emit = now
-            time.sleep(0.05)
-
-        worker.join()
-        if "error" in result:
-            raise result["error"]
-        yield "progress", 100, _analysis_progress_note(state, 100)
-        yield "result", result.get("payload"), ""
-
-    def cache_input_upload(val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        try:
-            state = state or {}
-            state.setdefault("seed_controls", {})
-            state["seed_controls"]["last_input_path"] = val if val else ""
-        except Exception:
-            pass
-
-        if not val:
-            img_prev, vid_prev = preview_updates(None)
-            yield (
-                "",
-                gr.update(value="", visible=False),
-                img_prev,
-                vid_prev,
-                gr.update(value="", visible=False),
-                gr.update(value="", visible=False),
-                state,
-            )
-            return
-
-        yield (
-            val or "",
-            gr.update(value="", visible=False),
-            gr.skip(),
-            gr.skip(),
-            gr.skip(),
-            gr.update(value=_analysis_banner_html(state, 0, _analysis_progress_note(state, 0)), visible=True),
-            state,
-        )
-
-        try:
-            for event_type, payload_a, _ in _iter_analysis_with_progress(
-                val, scale_val, use_global, scale_x, max_edge, pre_down, state
-            ):
-                if event_type == "progress":
-                    pct = int(payload_a)
-                    yield (
-                        val or "",
-                        gr.update(value="", visible=False),
-                        gr.skip(),
-                        gr.skip(),
-                        gr.skip(),
-                        gr.update(value=_analysis_banner_html(state, pct, _analysis_progress_note(state, pct)), visible=True),
-                        state,
-                    )
-                    continue
-
-                img_prev, vid_prev, det, info, state_out = payload_a
-                yield (
-                    val or "",
-                    gr.update(value="OK: Input cached for processing.", visible=True),
-                    img_prev,
-                    vid_prev,
-                    det,
-                    info,
-                    state_out,
-                )
-                return
-        except Exception as e:
-            img_prev, vid_prev = preview_updates(val)
-            yield (
-                val or "",
-                gr.update(value=f"Input cached (analysis error: {str(e)[:120]})", visible=True),
-                img_prev,
-                vid_prev,
-                _build_input_detection_md(val or ""),
-                gr.update(value="", visible=False),
-                state,
-            )
-
-    def refresh_tile_count(path_val, tile_size_val, overlap_val, scale_val, use_global, local_scale_x, max_edge, pre_down, state, tiled_dit_val, mode_val, stream_decode_val):
-        return _tile_count_info_update(
-            path_val,
-            tile_size_val,
-            overlap_val,
-            scale_val,
-            use_global,
-            local_scale_x,
-            max_edge,
-            pre_down,
-            state,
-            tiled_dit_val,
-            mode_val,
-            stream_decode_val,
-        )
-
-    tile_count_inputs = [
-        input_path,
-        tile_size,
-        overlap,
-        scale,
-        use_resolution_tab,
-        upscale_factor,
-        max_target_resolution,
-        pre_downscale_then_upscale,
-        shared_state,
-        tiled_dit,
-        mode,
-        stream_decode,
-    ]
-
-    upload_evt = input_file.upload(
-        fn=cache_input_upload,
-        inputs=[input_file, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state]
-    )
-    upload_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    # When upload is cleared, also clear the textbox path and hide dependent panels.
-    def clear_input_path_on_upload_clear(file_path, state):
-        if file_path:
-            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), state
-        try:
-            state = state or {}
-            state.setdefault("seed_controls", {})
-            state["seed_controls"]["last_input_path"] = ""
-        except Exception:
-            pass
-        img_prev, vid_prev = preview_updates(None)
-        return (
-            "",
-            gr.update(value="", visible=False),
-            img_prev,
-            vid_prev,
-            gr.update(value="", visible=False),
-            gr.update(value="", visible=False),
-            state,
-        )
-
-    upload_clear_evt = input_file.change(
-        fn=clear_input_path_on_upload_clear,
-        inputs=[input_file, shared_state],
-        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
-    )
-    upload_clear_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def cache_input_path(path_val, scale_val, use_global, scale_x, max_edge, pre_down, state):
-        try:
-            state = state or {}
-            state.setdefault("seed_controls", {})
-            state["seed_controls"]["last_input_path"] = path_val if path_val else ""
-        except Exception:
-            pass
-
-        if not path_val or not str(path_val).strip():
-            img_prev, vid_prev = preview_updates(None)
-            yield (
-                gr.update(value="", visible=False),
-                img_prev,
-                vid_prev,
-                gr.update(value="", visible=False),
-                gr.update(value="", visible=False),
-                state,
-            )
-            return
-
-        yield (
-            gr.update(value="", visible=False),
-            gr.skip(),
-            gr.skip(),
-            gr.skip(),
-            gr.update(value=_analysis_banner_html(state, 0, _analysis_progress_note(state, 0)), visible=True),
-            state,
-        )
-
-        try:
-            for event_type, payload_a, _ in _iter_analysis_with_progress(
-                path_val, scale_val, use_global, scale_x, max_edge, pre_down, state
-            ):
-                if event_type == "progress":
-                    pct = int(payload_a)
-                    yield (
-                        gr.update(value="", visible=False),
-                        gr.skip(),
-                        gr.skip(),
-                        gr.skip(),
-                        gr.update(value=_analysis_banner_html(state, pct, _analysis_progress_note(state, pct)), visible=True),
-                        state,
-                    )
-                    continue
-
-                img_prev, vid_prev, det, info, state_out = payload_a
-                yield (
-                    gr.update(value="OK: Input path updated.", visible=True),
-                    img_prev,
-                    vid_prev,
-                    det,
-                    info,
-                    state_out,
-                )
-                return
-        except Exception as e:
-            img_prev, vid_prev = preview_updates(path_val)
-            yield (
-                gr.update(value=f"Input path updated (analysis error: {str(e)[:120]})", visible=True),
-                img_prev,
-                vid_prev,
-                _build_input_detection_md(path_val or ""),
-                gr.update(value="", visible=False),
-                state,
-            )
-
-    def _output_path_signature(path_val):
-        normalized = normalize_path(path_val) if path_val else ""
-        if not normalized:
-            return ""
-        try:
-            cand = Path(normalized)
-            if not cand.exists() or not cand.is_file():
-                return ""
-            stat = cand.stat()
-            return f"{normalized}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
-        except Exception:
-            return ""
-
-    def _resolve_latest_output_path(state):
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        candidates = []
-
-        last_output = normalize_path(seed_controls.get("last_output_path")) if seed_controls.get("last_output_path") else ""
-        if last_output:
-            candidates.append(last_output)
-
-        batch_outputs = seed_controls.get("flashvsr_batch_outputs", [])
-        if isinstance(batch_outputs, list):
-            for item in reversed(batch_outputs):
-                normalized = normalize_path(item) if item else ""
-                if normalized:
-                    candidates.append(normalized)
-
-        seen = set()
-        for cand in candidates:
-            if cand in seen:
-                continue
-            seen.add(cand)
-            try:
-                if Path(cand).exists():
-                    return cand
-            except Exception:
-                continue
-        return ""
-
-    def _apply_output_path_to_input(
-        output_path_val,
-        scale_val,
-        use_global,
-        scale_x,
-        max_edge,
-        pre_down,
-        state,
-        source_label="Output transferred to input.",
-    ):
-        state = state or {}
-        state.setdefault("seed_controls", {})
-        state["seed_controls"]["last_input_path"] = output_path_val or ""
-
-        try:
-            img_prev, vid_prev, det, info, state_out = _run_analysis_payload(
-                output_path_val or "",
-                scale_val,
-                use_global,
-                scale_x,
-                max_edge,
-                pre_down,
-                state,
-            )
-            return (
-                output_path_val or "",
-                gr.update(value=f"OK: {source_label}", visible=True),
-                img_prev,
-                vid_prev,
-                det,
-                info,
-                state_out,
-            )
-        except Exception as exc:
-            img_prev, vid_prev = preview_updates(output_path_val)
-            return (
-                output_path_val or "",
-                gr.update(
-                    value=f"OK: {source_label} Analysis warning: {str(exc)[:120]}",
-                    visible=True,
-                ),
-                img_prev,
-                vid_prev,
-                _build_input_detection_md(output_path_val or ""),
-                gr.update(value="", visible=False),
-                state,
-            )
-
-    def copy_latest_output_to_input(scale_val, use_global, scale_x, max_edge, pre_down, state):
-        state = state if isinstance(state, dict) else {}
-        output_path_val = _resolve_latest_output_path(state)
-        if not output_path_val:
-            return (
-                gr.skip(),
-                gr.update(value="⚠️ No generated output found to transfer.", visible=True),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                state,
-            )
-        return _apply_output_path_to_input(
-            output_path_val,
-            scale_val,
-            use_global,
-            scale_x,
-            max_edge,
-            pre_down,
-            state,
-            source_label="Output path copied into input.",
-        )
-
-    def capture_latest_output_signature(state):
-        return _output_path_signature(_resolve_latest_output_path(state))
-
-    def auto_transfer_latest_output_to_input(
-        scale_val,
-        use_global,
-        scale_x,
-        max_edge,
-        pre_down,
-        auto_enabled,
-        previous_signature,
-        state,
-    ):
-        state = state if isinstance(state, dict) else {}
-        if not bool(auto_enabled):
-            return (
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                state,
-            )
-
-        output_path_val = _resolve_latest_output_path(state)
-        if not output_path_val:
-            return (
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                state,
-            )
-
-        latest_signature = _output_path_signature(output_path_val)
-        if previous_signature and latest_signature and str(previous_signature) == str(latest_signature):
-            return (
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                state,
-            )
-
-        return _apply_output_path_to_input(
-            output_path_val,
-            scale_val,
-            use_global,
-            scale_x,
-            max_edge,
-            pre_down,
-            state,
-            source_label="Auto-transferred latest output into input.",
-        )
-
-    # Keep heavy media/path analysis user-triggered only.
-    # `.change()` also fires on function updates (e.g. tab sync), which can fan out
-    # into expensive cascades on large UIs.
-    input_submit_evt = input_path.submit(
-        fn=cache_input_path,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
-    )
-    input_submit_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    copy_output_evt = copy_output_into_input_btn.click(
-        fn=copy_latest_output_to_input,
-        inputs=[scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
-    )
-    copy_output_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    input_path.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def refresh_sizing(path_val, scale_val, use_global, local_scale_x, max_edge, pre_down, state):
-        return _build_sizing_info(path_val, int(scale_val), bool(use_global), local_scale_x, max_edge, pre_down, state)
-
-    scale_evt = scale.change(
-        fn=refresh_sizing,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[sizing_info],
-        trigger_mode="always_last",
-    )
-    scale_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    pre_down_evt = pre_downscale_then_upscale.change(
-        fn=refresh_sizing,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[sizing_info],
-        trigger_mode="always_last",
-    )
-    pre_down_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    max_res_evt = max_target_resolution.release(
-        fn=refresh_sizing,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[sizing_info],
-        preprocess=False,
-        trigger_mode="always_last",
-    )
-    max_res_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def _sync_upscale_ui(use_global, local_x, state):
-        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
-        if bool(use_global) and shared_scale is not None:
-            effective = canonical_flashvsr_scale(
-                scale_value=None,
-                upscale_factor_value=shared_scale,
-                default=local_x if local_x is not None else 4,
-            )
-            return (
-                gr.update(value=float(effective), interactive=True),
-                gr.update(value=str(int(effective))),
-            )
-
-        effective_local = canonical_flashvsr_scale(
-            scale_value=None,
-            upscale_factor_value=local_x,
-            default=4,
-        )
-        return (
-            gr.update(value=float(effective_local), interactive=True),
-            gr.update(value=str(int(effective_local))),
-        )
-
-    def _sync_upscale_ui_and_sizing(use_global, local_x, path_val, max_edge, pre_down, state):
-        slider_upd, scale_upd = _sync_upscale_ui(use_global, local_x, state)
-        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
-        effective_scale = shared_scale if (bool(use_global) and shared_scale is not None) else local_x
-        resolved = canonical_flashvsr_scale(
-            scale_value=None,
-            upscale_factor_value=effective_scale,
-            default=4,
-        )
-        info = _build_sizing_info(
-            path_val or "",
-            int(resolved),
-            bool(use_global),
-            float(resolved),
-            max_edge,
-            pre_down,
-            state,
-        )
-        return slider_upd, scale_upd, info
-
-    def _on_local_upscale_changed(local_x, use_global, state):
-        resolved = canonical_flashvsr_scale(
-            scale_value=None,
-            upscale_factor_value=local_x,
-            default=4,
-        )
-        # If a shared/global scale is currently active, local slider interaction
-        # switches to local mode instead of staying locked behind global mode.
-        shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
-        next_use_global = bool(use_global)
-        if bool(use_global) and shared_scale is not None:
-            next_use_global = False
-        return gr.update(value=next_use_global), gr.update(value=str(int(resolved)))
-
-    local_scale_evt = upscale_factor.release(
-        fn=_on_local_upscale_changed,
-        inputs=[upscale_factor, use_resolution_tab, shared_state],
-        outputs=[use_resolution_tab, scale],
-        preprocess=False,
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-    local_scale_evt.then(
-        fn=refresh_sizing,
-        inputs=[input_path, scale, use_resolution_tab, upscale_factor, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[sizing_info],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-    local_scale_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    use_resolution_evt = use_resolution_tab.change(
-        fn=_sync_upscale_ui_and_sizing,
-        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
-        outputs=[upscale_factor, scale, sizing_info],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-    use_resolution_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def refresh_chunk_preview_ui(state):
-        preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})
-        if not isinstance(preview, dict):
-            return gr.update(value="", visible=False), gr.update(value=[], visible=False), gr.update(value=None, visible=False)
-
-        gallery = preview.get("gallery") or []
-        videos = preview.get("videos") or []
-        message = str(preview.get("message") or "")
-
-        first_video = None
-        for v in videos:
-            if v and Path(v).exists():
-                first_video = v
-                break
-
-        return (
-            gr.update(value=message, visible=bool(message or gallery)),
-            gr.update(value=gallery, visible=bool(gallery)),
-            gr.update(value=first_video, visible=bool(first_video)),
-        )
-
-    def on_chunk_gallery_select(evt: gr.SelectData, state):
-        try:
-            idx = int(evt.index)
-            videos = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {}).get("videos", [])
-            if 0 <= idx < len(videos):
-                cand = videos[idx]
-                if cand and Path(cand).exists():
-                    return gr.update(value=cand, visible=True)
-        except Exception:
-            pass
-        return gr.update(value=None, visible=False)
-
-    chunk_gallery.select(
-        fn=on_chunk_gallery_select,
-        inputs=[shared_state],
-        outputs=[chunk_preview_video],
-    )
-    
-    def _queue_status_indicator(title: str, subtitle: str, spinning: bool = True):
-        safe_title = html.escape(str(title or ""))
-        safe_subtitle = html.escape(str(subtitle or ""))
-        spinner_style = "" if spinning else ' style="opacity:0.45; animation:none;"'
-        indicator_html = (
-            '<div class="processing-banner">'
-            f'<div class="processing-spinner"{spinner_style}></div>'
-            '<div class="processing-col">'
-            f'<div class="processing-text">{safe_title}</div>'
-            f'<div class="processing-sub">{safe_subtitle}</div>'
-            "</div></div>"
-        )
-        return gr.update(value=indicator_html, visible=True)
-
-    def _batch_gallery_update_from_state(state):
-        outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
-        if not isinstance(outputs, list):
-            outputs = []
-        outputs = [str(p) for p in outputs if p and Path(str(p)).exists()]
-        return gr.update(value=outputs, visible=bool(outputs))
-
-    def _last_processed_text(state, vid_upd, img_upd) -> str:
-        outputs = (state or {}).get("seed_controls", {}).get("flashvsr_batch_outputs", [])
-        if isinstance(outputs, list) and outputs:
-            last_out = str(outputs[-1])
-            return f"Batch results: {len(outputs)} item(s). Last output: {Path(last_out).name}"
-
-        single = _extract_update_value(img_upd) or _extract_update_value(vid_upd)
-        if single:
-            return f"Output: {single}"
-        return "Batch processing results will appear here."
-
-    def _expand_service_payload(payload, live_state):
-        merged = merge_payload_state(payload, live_state)
-        if not isinstance(merged, tuple) or len(merged) < 7:
-            safe_state = live_state if isinstance(live_state, dict) else {}
-            return (
-                gr.update(value="ERROR: Invalid FlashVSR payload"),
-                "",
-                gr.update(value="", visible=False),
-                gr.update(value=None, visible=False),
-                gr.update(value=None, visible=False),
-                "Error",
-                gr.update(value=None),
-                gr.update(value="", visible=False),
-                gr.update(value=[], visible=False),
-                safe_state,
-            )
-
-        status, logs, vid_upd, img_upd, slider_upd, html_upd, state_out = merged
-        status_text = _extract_update_value(status) if isinstance(status, dict) else status
-        status_text = str(status_text or "").strip()
-        log_tail = _log_tail_line(logs)
-        status_lc = status_text.lower()
-        log_lc = log_tail.lower()
-
-        terminal_tokens = TERMINAL_STATUS_TOKENS + (
-            "max resolution preprocess failed",
-        )
-        is_terminal = any(tok in status_lc for tok in terminal_tokens) or any(
-            tok in log_lc for tok in ("critical error", "processing failed", "cancelled", "out of vram")
-        )
-
-        if (status_text or log_tail) and not is_terminal:
-            title = _compact_single_line(status_text or "FlashVSR processing...", max_len=96)
-            subtitle = log_tail or "Processing..."
-            progress_update = _queue_status_indicator(title, subtitle, spinning=True)
-        else:
-            progress_update = gr.update(value="", visible=False)
-
-        return (
-            status,
-            logs,
-            progress_update,
-            img_upd if img_upd is not None else gr.update(value=None, visible=False),
-            vid_upd if vid_upd is not None else gr.update(value=None, visible=False),
-            _last_processed_text(state_out, vid_upd, img_upd),
-            slider_upd if slider_upd is not None else gr.update(value=None),
-            html_upd if html_upd is not None else gr.update(value="", visible=False),
-            _batch_gallery_update_from_state(state_out),
-            state_out,
-        )
-
-    def _starting_runtime_output(state, action_label: str):
-        safe_state = state or {}
-        title = f"{action_label} started"
-        subtitle = "Initializing runtime and preparing input..."
-        return (
-            gr.update(value=title),
-            gr.update(value=f"{action_label} requested. Preparing backend..."),
-            _queue_status_indicator(title, subtitle, spinning=True),
-            gr.update(value=None, visible=False),
-            gr.update(value=None, visible=False),
-            "Initializing...",
-            gr.update(value=None),
-            gr.update(value="", visible=False),
-            _batch_gallery_update_from_state(safe_state),
-            safe_state,
-        )
-
-    def _queued_waiting_output(state, ticket_id: str, position: int):
-        safe_state = state or {}
-        pos = max(1, int(position)) if position else "?"
-        title = f"Queue waiting: {ticket_id} (position {pos})"
-        subtitle = (
-            f"Queued and waiting for active processing slot. Queue position: {pos}. "
-            "Run logs and chunk previews will update once processing starts."
-        )
-        return (
-            gr.update(value=title),
-            gr.update(value=f"Queued and waiting for active processing slot. Queue position: {pos}."),
-            _queue_status_indicator(title, subtitle, spinning=True),
-            gr.update(value=None, visible=False),
-            gr.update(value=None, visible=False),
-            "Waiting in queue",
-            gr.update(value=None),
-            gr.update(value="", visible=False),
-            _batch_gallery_update_from_state(safe_state),
-            safe_state,
-        )
-
-    def _queued_cancelled_output(state, ticket_id: str):
-        safe_state = state or {}
-        title = f"Queue item removed: {ticket_id}"
-        subtitle = "This queued request was removed before processing started."
-        return (
-            gr.update(value=title),
-            gr.update(value=subtitle),
-            _queue_status_indicator(title, subtitle, spinning=False),
-            gr.update(value=None, visible=False),
-            gr.update(value=None, visible=False),
-            "Removed from queue",
-            gr.update(value=None),
-            gr.update(value="", visible=False),
-            _batch_gallery_update_from_state(safe_state),
-            safe_state,
-        )
-
-    def _queue_disabled_busy_output(state):
-        safe_state = state or {}
-        title = "Processing already in progress (queue disabled)."
-        subtitle = "Enable 'Enable Queue' in Global Settings to stack additional requests."
-        return (
-            gr.update(value=title),
-            gr.update(value=subtitle),
-            _queue_status_indicator(title, subtitle, spinning=False),
-            gr.update(value=None, visible=False),
-            gr.update(value=None, visible=False),
-            "Queue disabled: request ignored",
-            gr.update(value=None),
-            gr.update(value="", visible=False),
-            _batch_gallery_update_from_state(safe_state),
-            safe_state,
-        )
-
-    def run_upscale_with_queue(*args, progress=gr.Progress()):
-        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
-        queued_state = snapshot_queue_state(live_state)
-        queued_global_settings = snapshot_global_settings(global_settings)
-        queue_enabled = bool(queued_global_settings.get("queue_enabled", True))
-        queue_resource_keys, queue_resource_label = resolve_queue_gpu_resources(queued_state, queued_global_settings)
-        ticket = queue_manager.submit(
-            "FlashVSR",
-            "Upscale",
-            resource_keys=queue_resource_keys,
-            resource_label=queue_resource_label,
-        )
-        acquired_slot = queue_manager.is_active(ticket.job_id)
-
-        try:
-            yield _starting_runtime_output(live_state, "Upscale")
-
-            if not queue_enabled:
-                if not acquired_slot:
-                    queue_manager.cancel_waiting([ticket.job_id])
-                    yield _queue_disabled_busy_output(live_state)
-                    return
-                for payload in service["run_action"](
-                    args[0],
-                    *args[1:-1],
-                    preview_only=False,
-                    state=queued_state,
-                    progress=progress,
-                    global_settings_snapshot=queued_global_settings,
-                ):
-                    yield _expand_service_payload(payload, live_state)
-                return
-
-            wait_notice_sent = False
-            while not ticket.start_event.wait(timeout=0.5):
-                if ticket.cancel_event.is_set():
-                    yield _queued_cancelled_output(live_state, ticket.job_id)
-                    return
-                if not wait_notice_sent:
-                    try:
-                        pos = queue_manager.waiting_position(ticket.job_id)
-                        pos_text = max(1, int(pos)) if pos else "?"
-                        gr.Info(f"Queued: {ticket.job_id} (position {pos_text})")
-                    except Exception:
-                        pass
-                    wait_notice_sent = True
-
-            if ticket.cancel_event.is_set() and not queue_manager.is_active(ticket.job_id):
-                yield _queued_cancelled_output(live_state, ticket.job_id)
-                return
-
-            acquired_slot = True
-            for payload in service["run_action"](
-                args[0],
-                *args[1:-1],
-                preview_only=False,
-                state=queued_state,
-                progress=progress,
-                global_settings_snapshot=queued_global_settings,
-            ):
-                yield _expand_service_payload(payload, live_state)
-        finally:
-            if acquired_slot:
-                queue_manager.complete(ticket.job_id)
-            else:
-                queue_manager.cancel_waiting([ticket.job_id])
-
-    def run_preview_with_snapshot(*args, progress=gr.Progress()):
-        live_state = args[-1] if (args and isinstance(args[-1], dict)) else {}
-        queued_state = snapshot_queue_state(live_state)
-        queued_global_settings = snapshot_global_settings(global_settings)
-        yield _starting_runtime_output(live_state, "Preview")
-        for payload in service["run_action"](
-            args[0],
-            *args[1:-1],
-            preview_only=True,
-            state=queued_state,
-            progress=progress,
-            global_settings_snapshot=queued_global_settings,
-        ):
-            yield _expand_service_payload(payload, live_state)
-
-    flashvsr_upscale_sync_signature = gr.State(value="")
-    flashvsr_chunk_sync_signature = gr.State(value="")
-    flashvsr_pre_run_output_signature = gr.State(value="")
-
-    def _sync_upscale_ui_and_sizing_if_needed(
-        use_global,
-        local_x,
-        path_val,
-        max_edge,
-        pre_down,
-        state,
-        previous_signature: str = "",
-    ):
-        seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
-        signature = _sync_signature(
-            {
-                "use_global": bool(use_global),
-                "local_x": local_x,
-                "path_val": path_val,
-                "max_edge": max_edge,
-                "pre_down": bool(pre_down),
-                "shared_scale": resolve_shared_upscale_factor(state if bool(use_global) else None),
-                "resolution_settings": seed_controls.get("resolution_settings", {}),
-            }
-        )
-        if signature == str(previous_signature or ""):
-            return gr.skip(), gr.skip(), gr.skip(), previous_signature
-        slider_upd, scale_upd, sizing_upd = _sync_upscale_ui_and_sizing(
-            use_global, local_x, path_val, max_edge, pre_down, state
-        )
-        return slider_upd, scale_upd, sizing_upd, signature
-
-    def _refresh_chunk_preview_ui_if_needed(state, previous_signature: str = ""):
-        preview = (state or {}).get("seed_controls", {}).get("flashvsr_chunk_preview", {})
-        signature = _sync_signature(preview if isinstance(preview, dict) else {"preview": None})
-        if signature == str(previous_signature or ""):
-            return gr.skip(), gr.skip(), gr.skip(), previous_signature
-        chunk_status_upd, chunk_gallery_upd, chunk_video_upd = refresh_chunk_preview_ui(state)
-        return chunk_status_upd, chunk_gallery_upd, chunk_video_upd, signature
-
-    # Registered before the Upscale job: Gradio runs a button's listeners in order and waits for a
-    # queued job to finish before the next one, so a later listener would update the UI only after the run.
-    flash_tuned = {
-        "frame_chunk_size": frame_chunk_size,
-        "tiled_dit": tiled_dit,
-        "tile_size": tile_size,
-        "overlap": overlap,
-        "kv_ratio": kv_ratio,
-        "keep_models_on_cpu": keep_models_on_cpu,
-        "force_offload": force_offload,
-        "unload_dit": unload_dit,
-    }
-    wire_auto_tune_on_run(
-        upscale_btn=upscale_btn,
-        action=service["auto_tune_action"],
-        inputs=[input_file] + inputs_list,
-        tuned=flash_tuned,
-        shared_state=shared_state,
-        auto_tune_on_run=auto_tune_on_run,
-        global_settings=global_settings,
-    )
-
-    # Main processing
-    run_evt = upscale_btn.click(
-        fn=with_pre_run_output_signature(run_upscale_with_queue, capture_latest_output_signature),
-        inputs=[input_file] + inputs_list + [shared_state],
-        outputs=[
-            status_box,
-            log_box,
-            progress_indicator,
-            output_image,
-            output_video,
-            last_processed,
-            image_slider,
-            video_comparison_html,
-            batch_gallery,
-            shared_state,
-            flashvsr_pre_run_output_signature,
-        ],
-        concurrency_limit=32,
-        concurrency_id="app_processing_queue",
-        trigger_mode="multiple",
-    )
-    run_evt.then(
-        fn=_refresh_chunk_preview_ui_if_needed,
-        inputs=[shared_state, flashvsr_chunk_sync_signature],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
-    )
-    auto_transfer_evt = run_evt.then(
-        fn=auto_transfer_latest_output_to_input,
-        inputs=[
-            scale,
-            use_resolution_tab,
-            upscale_factor,
-            max_target_resolution,
-            pre_downscale_then_upscale,
-            auto_transfer_output_to_input,
-            flashvsr_pre_run_output_signature,
-            shared_state,
-        ],
-        outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],
-    )
-    auto_transfer_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    preview_evt = preview_btn.click(
-        fn=run_preview_with_snapshot,
-        inputs=[input_file] + inputs_list + [shared_state],
-        outputs=[
-            status_box,
-            log_box,
-            progress_indicator,
-            output_image,
-            output_video,
-            last_processed,
-            image_slider,
-            video_comparison_html,
-            batch_gallery,
-            shared_state,
-        ],
-    )
-    preview_evt.then(
-        fn=_refresh_chunk_preview_ui_if_needed,
-        inputs=[shared_state, flashvsr_chunk_sync_signature],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
-    )
-
-    autotune_evt = wire_auto_tune(
-        auto_tune_btn=auto_tune_btn,
-        action=service["auto_tune_action"],
-        inputs=[input_file] + inputs_list,
-        tuned=flash_tuned,
-        status_box=status_box,
-        shared_state=shared_state,
-        notice_text=flash_autotune_notice_text,
-        notice_modal=flash_autotune_notice_modal,
-        modal_id="flash-autotune-notice-modal",
-        global_settings=global_settings,
-    )
-    autotune_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def _dismiss_flash_autotune_notice():
-        return gr.update(value=""), gr.update(visible=False)
-
-    flash_autotune_notice_ok_btn.click(
-        fn=_dismiss_flash_autotune_notice,
-        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
-        queue=False,
-        show_progress="hidden",
-        js=autotune_modal_dismiss_js("flash-autotune-notice-modal"),
-    )
-    flash_autotune_notice_close_btn.click(
-        fn=_dismiss_flash_autotune_notice,
-        outputs=[flash_autotune_notice_text, flash_autotune_notice_modal],
-        queue=False,
-        show_progress="hidden",
-        js=autotune_modal_dismiss_js("flash-autotune-notice-modal"),
-    )
-
-    shared_scale_sync_evt = shared_state.change(
-        fn=_sync_upscale_ui_and_sizing_if_needed,
-        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, flashvsr_upscale_sync_signature],
-        outputs=[upscale_factor, scale, sizing_info, flashvsr_upscale_sync_signature],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-    shared_scale_sync_evt.then(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    shared_state.change(
-        fn=_refresh_chunk_preview_ui_if_needed,
-        inputs=[shared_state, flashvsr_chunk_sync_signature],
-        outputs=[chunk_status, chunk_gallery, chunk_preview_video, flashvsr_chunk_sync_signature],
-        queue=False,
-        show_progress="hidden",
-    )
-
-    mode.change(
-        fn=lambda m: (gr.update(value=_vae_mode_note(m)),
-                      gr.update(interactive=str(m or "").strip().lower() == "full")),
-        inputs=[mode],
-        outputs=[vae_mode_note, vae_model],
-        queue=False,
-        show_progress="hidden",
-    )
-
-    mode.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    tile_size.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    overlap.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    tiled_dit.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    stream_decode.change(
-        fn=refresh_tile_count,
-        inputs=tile_count_inputs,
-        outputs=[dit_tile_count],
-        queue=False,
-        show_progress="hidden",
-        trigger_mode="always_last",
-    )
-
-    def _cancel_with_confirmation_reset(ok):
-        if ok:
-            status_upd, log_msg = service["cancel_action"]()
-            return status_upd, log_msg, gr.update(value=False)
-        message = warn_cancel_confirmation()
-        return gr.update(value=f"WARNING: {message}", visible=True), message, gr.update(value=False)
-
-    cancel_btn.click(
-        fn=_cancel_with_confirmation_reset,
-        inputs=[cancel_confirm],
-        outputs=[status_box, log_box, cancel_confirm]
-    )
-    
-    open_outputs_btn.click(
-        fn=service["open_outputs_folder"],
-        outputs=status_box
-    )
-
-    clear_temp_btn.click(
-        fn=lambda: service["clear_temp_folder"](False),
-        outputs=status_box
-    )
-    
-    # UNIVERSAL PRESET EVENT WIRING
-    wire_universal_preset_events(
-        preset_dropdown=preset_dropdown,
-        preset_name_input=preset_name_input,
-        save_btn=save_preset_btn,
-        load_btn=load_preset_btn,
-        preset_status=preset_status,
-        reset_btn=reset_defaults_btn,
-        delete_btn=delete_preset_btn,
-        callbacks=preset_callbacks,
-        inputs_list=inputs_list,
-        shared_state=shared_state,
-        tab_name="flashvsr",
-    )
-
-    return {
-        "inputs_list": inputs_list,
-        "run_action": service["run_action"],
-        "cancel_action": service["cancel_action"],
-        "preset_dropdown": preset_dropdown,
-        "preset_status": preset_status,
-    }
-
+    """FlashVSR tab (the shared video SR tab with the FlashVSR spec)."""
+    return video_sr_tab(FLASHVSR_TAB, preset_manager, runner, run_logger, global_settings, shared_state, base_dir,
+                        temp_dir, output_dir)

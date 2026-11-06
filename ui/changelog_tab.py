@@ -11,9 +11,17 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
-        "V10.0 — 6 November 2026 — Multi-Pass DLSS 5, JonXL H3 Upscale in Open-H3, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
+        "V10.0 — 6 November 2026 — RelayVSR Fast 4x Video Upscaler, Multi-Pass DLSS 5, JonXL H3 Upscale in Open-H3, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
         """
-**Run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry footage with JonXL's MiniMax H3 upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+**Upscale videos 4x with the new, very fast RelayVSR tab, run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry footage with JonXL's MiniMax H3 upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+
+**RelayVSR: a new, very fast 4x video upscaler tab**
+- New **🔁 RelayVSR** tab next to FlashVSR. RelayVSR upscales videos and images 4x: a large Wan model writes a sharp reference keyframe every 15 frames, and a small Flash decoder relays that detail to every frame in between, one frame at a time.
+- Very fast: our 306-frame 960 x 540 test clip took 72 seconds to 4K (3840 x 2160) on an RTX 5090, about 4x faster than FlashVSR+ Turbo (5 min 02 s) and 17x faster than SeedVR2 7B (20 min 26 s) on the same clip.
+- The models download automatically the first time from our Hugging Face mirror: **Wan INT8 ConvRot** (5.1 GB, the default, made for this app: half the size of BF16 with the same look) or **Wan BF16** (10 GB), plus the 0.13 GB Flash decoder. Models_Downloader.py has both as presets.
+- Settings: Wan Model, Precision (auto / BF16 / FP16), Keyframe Window (16 = the trained default; smaller = more keyframes, larger = faster), Wan Blocks on GPU, Seed.
+- VRAM: a 4K output needs about 19 GB with all of Wan on the GPU. On smaller GPUs, **Auto Tune** keeps as many Wan blocks (each with its memory of the last 4 keyframes) on the GPU as fit and copies the rest from RAM when Wan runs: the same result, just slower (a 10 GB limit made the identical 4K video). Memory depends on the output size, not on the clip length. Every run is capped at GPU total - in use - Save VRAM, so it never spills into shared GPU memory.
+- Everything the other tabs have: Upscale x 1-4 and Max Resolution from the Resolution tab (the model always runs at 4x; smaller factors downscale the input first), batch folders, Preview First Frame, scene / fixed-length chunks with Resume, Cancel, face restoration, presets, the queue, Chains steps, image and video comparison sliders, codec settings and metadata.
 
 **JonXL H3 Upscale: a second MiniMax H3 workflow in the Open-H3 tab**
 - New **MiniMax H3 Workflow** switch next to "Auto Transfer Output to Input": Open-H3 Regenerate (the default, unchanged) or **JonXL H3 Upscale**, JonXL's MiniMax H3 image upscaler LoRA and workflow, built into the app's own Open-H3 engine.
@@ -35,6 +43,10 @@ CHANGELOG_ENTRIES = [
 **📂 / 📄 picker buttons on every path field**
 - Every folder and file path in the app (inputs, batch folders, output overrides, resume folders, model folders and files, the Global Settings folders) now has a picker button: 📂 opens a folder dialog, 📄 a file dialog filtered to videos, images or model files. It opens at the current path (or the last folder you picked), and a picked file refreshes the tab's preview exactly like a typed path.
 - The dialog runs in its own small process, so it never freezes or crashes the app. On a server without a screen (RunPod) the buttons are hidden and typing paths works as before. The Windows installer now checks that Python's tkinter is present (part of the standard Python installer); the Massed Compute installer adds python3.12-tk.
+
+**Launch options and fixes**
+- New optional launch arguments `--server <IP>` and `--port <number>`, for example `Windows_Run_SECourses_Upscaler_Pro.bat --server 0.0.0.0 --port 7870`. Without them the app starts exactly as before.
+- Video comparison slider: the two labels no longer cover each other on narrow videos; long names are shortened and show in full on hover.
 
 **Chains fixes**
 - The size shown after every step now follows each tab's Max Resolution and Open-H3's Target Resolution.

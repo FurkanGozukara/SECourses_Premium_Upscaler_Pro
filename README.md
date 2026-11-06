@@ -46,15 +46,17 @@ selection, model caching toggles.
 static-frame skip, recursion depth.
 - FlashVSR+ diffusion upscaling pipeline with version/mode/scale selection and VRAM-aware modes.
 - FlashVSR memory controls: VAE/DiT tiling, tile size/overlap, unload DiT before decode.
+- RelayVSR (V10.0): fast 4x video and image upscaler. A large Wan model writes a reference keyframe every 15 frames and a small Flash decoder relays its detail to every frame, streaming one frame at a time (the 306-frame 960x540 test clip to 4K in 72 seconds on an RTX 5090, about 4x faster than FlashVSR+ Turbo). Wan INT8 ConvRot (5.1 GB, default, made for the app) or BF16 (10 GB); models download automatically from the SECourses Hugging Face mirror. Auto Tune keeps as many Wan blocks and their keyframe memory on the GPU as fit and streams the rest from RAM, so smaller GPUs give the same result. Batch, preview, chunking with resume, presets, queue and Chains.
 - Open-H3 Regenerate (MiniMax H3 + Open-H3-Regenerate-2K adapters): generative 2K/1080p/4K regeneration with a standalone engine, first-click model download, batch and chunked runs in one engine session.
 - DLSS 5 Neural Rendering (V9.7): NVIDIA's DLSS 5 renderer for existing videos, images and image folders, with photoreal lighting, skin, hair and material detail, temporal history with optical-flow reprojection and scene-cut resets, style profiles and strength controls. Runs as a PyTorch network on any RTX 30 / 40 / 50 GPU (about 3 GB of VRAM at 4K since V9.8); the model downloads automatically. It can also run automatically after every upscaler as a post-process.
 - Chains (V9.7): pipelines of several tabs (for example SeedVR2 2x, then FlashVSR+ 2x, then DLSS 5), each step using its own tab's settings, saved as chain presets and run on one video, several uploads or a folder. Since V9.8: input preview with the size after every step, a quick test on the first seconds, Resume of a stopped run, a viewer for every step's result, and app presets that remember the chain preset. Since V10.0: batch folders (input and output folder, skip finished files, subfolders, a report of every file) and multi-pass DLSS 5 (DLSS 5 two or three times in a row for a stronger look, also as the DLSS 5 tab's Passes setting).
 - JonXL H3 Upscale (V10.0): a second Open-H3 workflow, JonXL's MiniMax H3 upscale LoRA (h3_upscale_1920, fixed prompt, 20 steps er_sde / beta57): each picture or video frame upscaled up to 1920 px with real detail from blurry footage; the LoRA downloads on first use.
+- Optional launch arguments (V10.0): `--server <IP>` and `--port <number>` (for example `Windows_Run_SECourses_Upscaler_Pro.bat --server 0.0.0.0 --port 7870`); without them the app starts as before.
 - Folder and file pickers (V10.0): every path field has a 📂 / 📄 button that opens a native dialog at the current path (hidden on servers without a screen).
 - Face Restoration as both standalone processor and integrated post-processing across pipelines.
 - Global face restoration enable + global strength control from Global Settings.
 - Unified cross-model resolution strategy: Upscale-x, max-edge cap, and pre-downscale-then-upscale behavior.
-- Instant Auto Tune for Max Quality on SeedVR2, FlashVSR+, Open-H3, LTX 2.5, SparkVSR and RTX Super Resolution: sets the largest batch / chunk / window and the least offloading and tiling that fit GPU total - in use - Save VRAM, from measured memory formulas (no test runs); optionally applied automatically on every Upscale.
+- Instant Auto Tune for Max Quality on SeedVR2, FlashVSR+, RelayVSR, Open-H3, LTX 2.5, SparkVSR and RTX Super Resolution: sets the largest batch / chunk / window and the least offloading and tiling that fit GPU total - in use - Save VRAM, from measured memory formulas (no test runs); optionally applied automatically on every Upscale.
 
 ##  Tier 2: Output, Encoding, and Comparison
 
@@ -81,7 +83,7 @@ static-frame skip, recursion depth.
 - Per-chunk cleanup option to save disk.
 - SeedVR2 native streaming chunk mode (frame-count chunks) in addition to universal chunking.
 - Resume interrupted chunk runs from partial outputs.
-- Batch processing in SeedVR2, GAN, RIFE, FlashVSR+, and Face standalone flow.
+- Batch processing in SeedVR2, GAN, RIFE, FlashVSR+, RelayVSR, and Face standalone flow.
 - Batch overwrite/skip behavior controls.
 - Per-item batch output folder organization and run-dir management.
 - Application-level FIFO processing queue across tabs (single active job, waiting jobs).

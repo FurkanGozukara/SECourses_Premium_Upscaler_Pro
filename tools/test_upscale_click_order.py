@@ -65,14 +65,15 @@ class UpscaleClickOrderTests(unittest.TestCase):
             label = getattr(self.demo.blocks.get(button_id), "value", button_id)
             self.assertEqual(before, [], f"button {label!r}: server listeners run before its job: {before}")
             checked.append(label)
-        # SeedVR2, FlashVSR, Open-H3, LTX 2.5, SparkVSR, RTX, GAN, RIFE, Face (Upscale) and their previews.
+        # SeedVR2, FlashVSR, RelayVSR, Open-H3, LTX 2.5, SparkVSR, RTX, GAN, RIFE, Face (Upscale) and their previews.
         self.assertGreaterEqual(len(checked), 9, checked)
 
     def test_upscale_jobs_output_their_pre_run_signature(self):
         """Auto Transfer Output to Input reads the signature the job now captures as it starts."""
         functions = sorted(self.demo.fns.values(), key=lambda fn: fn._id)
         wrapped = [fn for fn in functions if fn.concurrency_id == QUEUE_ID and fn.name == "_run"]
-        self.assertEqual(len(wrapped), 7, [fn.name for fn in wrapped])
+        # SeedVR2, FlashVSR, RelayVSR, Open-H3, LTX 2.5, SparkVSR, RTX, GAN
+        self.assertEqual(len(wrapped), 8, [fn.name for fn in wrapped])
         for fn in wrapped:
             last = fn.outputs[-1]
             self.assertIsInstance(last, gr.State)

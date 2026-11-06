@@ -51,6 +51,7 @@ nvidia-vfx-python-samples/
 gfpgan/
 OpenH3_Models
 DLSS5_Models
+RelayVSR_Models
 
 # Local test artifacts (browser automation, test clips)
 output/

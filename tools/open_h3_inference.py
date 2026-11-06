@@ -17,6 +17,8 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parents[1]
 OPENH3_DIR = APP_DIR / "OpenH3"
 sys.path.insert(0, str(OPENH3_DIR))
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(1, str(APP_DIR))  # shared.video_io
 
 if sys.platform == "win32":
     try:

@@ -518,6 +518,27 @@ def ensure_open_h3_model(
     return run_model_downloader(base_dir, args, on_progress, cancel_event=cancel_event)
 
 
+def ensure_relayvsr_model(
+    base_dir: Path,
+    wan_model: str,
+    on_progress: ProgressCallback = None,
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """RelayVSR: the selected Wan file and the Flash decoder in RelayVSR_Models (our mirror first)."""
+    from shared.relayvsr_constants import (
+        RELAYVSR_FLASH_FILE,
+        RELAYVSR_MODELS_DIRNAME,
+        RELAYVSR_WAN_DEFAULT,
+        RELAYVSR_WAN_FILES,
+    )
+
+    wan_model = wan_model if wan_model in RELAYVSR_WAN_FILES else RELAYVSR_WAN_DEFAULT
+    models_dir = Path(base_dir) / RELAYVSR_MODELS_DIRNAME
+    if _all_files_exist([models_dir / RELAYVSR_WAN_FILES[wan_model], models_dir / RELAYVSR_FLASH_FILE]):
+        return True, ""
+    return run_model_downloader(base_dir, ["--ensure-relayvsr", wan_model], on_progress, cancel_event=cancel_event)
+
+
 def ensure_dlss5_model(
     base_dir: Path,
     on_progress: ProgressCallback = None,

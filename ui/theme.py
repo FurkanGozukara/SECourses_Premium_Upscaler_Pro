@@ -891,7 +891,7 @@ def hero_header(version: str, favicon_path: Path, patreon_url: str) -> gr.HTML:
     {logo_html}
     <div>
       <div class="sec-hero-title">SECourses Ultimate Video &amp; Image Upscaler Pro<span class="sec-hero-version">V{version}</span></div>
-      <div class="sec-hero-sub">SeedVR2 · FlashVSR · FlashVSR+ · Open-H3 Regenerate · LTX 2.5 · SparkVSR · RTX Super Resolution · DLSS 5 · Chains · GAN · RIFE · Face Restoration</div>
+      <div class="sec-hero-sub">SeedVR2 · FlashVSR · FlashVSR+ · RelayVSR · Open-H3 Regenerate · LTX 2.5 · SparkVSR · RTX Super Resolution · DLSS 5 · Chains · GAN · RIFE · Face Restoration</div>
     </div>
   </div>
   <div class="sec-hero-actions">

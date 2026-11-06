@@ -416,10 +416,10 @@ def create_video_comparison_html(
                 </div>
             </div>
 
-            <div id="{unique_id}_leftBadge" style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
+            <div id="{unique_id}_leftBadge" title="{original_badge}" style="position:absolute;top:10px;left:10px;max-width:calc(50% - 26px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
                 {original_badge}
             </div>
-            <div id="{unique_id}_rightBadge" style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
+            <div id="{unique_id}_rightBadge" title="{upscaled_badge}" style="position:absolute;top:10px;right:10px;max-width:calc(50% - 26px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">
                 {upscaled_badge}
             </div>
             {left_selector_html}
@@ -543,8 +543,8 @@ def create_video_comparison_html(
         function updateBadges() {{
             const leftItem = selectableMap.get(currentLeftPath);
             const rightItem = selectableMap.get(currentRightPath);
-            if (leftBadge && leftItem && leftItem.label) leftBadge.textContent = "Left: " + leftItem.label;
-            if (rightBadge && rightItem && rightItem.label) rightBadge.textContent = "Right: " + rightItem.label;
+            if (leftBadge && leftItem && leftItem.label) {{ leftBadge.textContent = "Left: " + leftItem.label; leftBadge.title = leftBadge.textContent; }}
+            if (rightBadge && rightItem && rightItem.label) {{ rightBadge.textContent = "Right: " + rightItem.label; rightBadge.title = rightBadge.textContent; }}
         }}
 
         function applySideSelection(side, selectedPath) {{
@@ -1172,8 +1172,8 @@ def create_image_comparison_html(
                 </div>
             </div>
 
-            <div id="{unique_id}_leftBadge" style="position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{left_badge}</div>
-            <div id="{unique_id}_rightBadge" style="position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{right_badge}</div>
+            <div id="{unique_id}_leftBadge" title="{left_badge}" style="position:absolute;top:10px;left:10px;max-width:calc(50% - 26px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{left_badge}</div>
+            <div id="{unique_id}_rightBadge" title="{right_badge}" style="position:absolute;top:10px;right:10px;max-width:calc(50% - 26px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box;background:rgba(0,0,0,0.7);color:#fff;padding:8px 15px;border-radius:20px;font-size:14px;z-index:20;">{right_badge}</div>
             {left_selector_html}
             {right_selector_html}
         </div>
@@ -1243,8 +1243,8 @@ def create_image_comparison_html(
         function updateBadges() {{
             const leftItem = selectableMap.get(currentLeftPath);
             const rightItem = selectableMap.get(currentRightPath);
-            if (leftBadgeEl && leftItem && leftItem.label) leftBadgeEl.textContent = "Left: " + leftItem.label;
-            if (rightBadgeEl && rightItem && rightItem.label) rightBadgeEl.textContent = "Right: " + rightItem.label;
+            if (leftBadgeEl && leftItem && leftItem.label) {{ leftBadgeEl.textContent = "Left: " + leftItem.label; leftBadgeEl.title = leftBadgeEl.textContent; }}
+            if (rightBadgeEl && rightItem && rightItem.label) {{ rightBadgeEl.textContent = "Right: " + rightItem.label; rightBadgeEl.title = rightBadgeEl.textContent; }}
         }}
 
         function applySideSelection(side, selectedPath) {{

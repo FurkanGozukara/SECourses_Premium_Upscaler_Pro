@@ -117,7 +117,7 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
             with gr.Group(elem_classes=["dlss5-card", "dlss5-post-card"]):
                 gr.Markdown("#### 🔗 Post-processing for every upscaler", elem_classes=["dlss5-card-title"])
                 global_postprocess = gr.Checkbox(
-                    label="Apply DLSS 5 automatically after every upscale (SeedVR2, FlashVSR, SparkVSR, GAN, RTX, LTX 2.5, Open-H3)",
+                    label="Apply DLSS 5 automatically after every upscale (SeedVR2, FlashVSR, RelayVSR, SparkVSR, GAN, RTX, LTX 2.5, Open-H3)",
                     value=bool(v("global_postprocess")),
                     info="Uses the settings of this tab on each finished video; the upscaled file is kept and a *_DLSS5.mp4 "
                          "is added. Runs before Global RIFE, so RIFE interpolates the DLSS 5 frames.",

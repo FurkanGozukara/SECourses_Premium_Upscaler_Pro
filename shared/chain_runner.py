@@ -42,10 +42,11 @@ ENGINES: Dict[str, ChainEngine] = {}
 VIDEO_ONLY = {"ltx25", "rife"}
 _RUNNING: Dict[str, Any] = {"engine": None}
 # Display order of the engine palette.
-ENGINE_ORDER = ["seedvr2", "flashvsr", "sparkvsr", "gan", "rtx", "ltx25", "open_h3", "dlss5", "face", "rife"]
+ENGINE_ORDER = ["seedvr2", "flashvsr", "relayvsr", "sparkvsr", "gan", "rtx", "ltx25", "open_h3", "dlss5", "face", "rife"]
 ENGINE_META = {
     "seedvr2": ("SeedVR2", "🎬", "scale", ("dit_model", "resolution")),
     "flashvsr": ("FlashVSR+", "⚡", "scale", ("version", "mode")),
+    "relayvsr": ("RelayVSR", "🔁", "scale", ("wan_model", "window_size")),
     "sparkvsr": ("SparkVSR", "✨", "scale", ("model_name", "upscale_mode")),
     "gan": ("Image GAN", "🖼️", "scale", ("model",)),
     "rtx": ("RTX Super Res", "🚀", "scale", ("quality_preset",)),

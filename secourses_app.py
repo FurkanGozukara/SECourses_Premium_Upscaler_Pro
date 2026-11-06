@@ -81,6 +81,7 @@ from ui.face_tab import face_tab
 from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
+from ui.relayvsr_tab import relayvsr_tab
 from ui.ltx25_tab import ltx25_tab
 from ui.open_h3_tab import open_h3_tab
 from ui.sparkvsr_tab import sparkvsr_tab
@@ -902,18 +903,18 @@ def main(argv=None):
     button.action-btn-source-seed:hover {
       box-shadow: 0 14px 30px rgba(3, 105, 161, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
     }
-    /* FlashVSR input source column: keep controls stacked at the top. */
-    .flashvsr-input-source-col {
+    /* Video SR tabs (FlashVSR, RelayVSR) input source column: keep controls stacked at the top. */
+    .video-sr-input-source-col {
       justify-content: flex-start !important;
       align-content: flex-start !important;
       gap: 0 !important;
     }
-    .flashvsr-input-source-col .flashvsr-copy-output-compact {
+    .video-sr-input-source-col .video-sr-copy-output-compact {
       margin-top: 0 !important;
     }
-    /* FlashVSR inline copy button: keep text readable, trim vertical height. */
-    .flashvsr-copy-output-compact button,
-    button.flashvsr-copy-output-compact {
+    /* Video SR tabs inline copy button: keep text readable, trim vertical height. */
+    .video-sr-copy-output-compact button,
+    button.video-sr-copy-output-compact {
       min-height: 34px !important;
       padding-top: 0.24rem !important;
       padding-bottom: 0.24rem !important;
@@ -1267,6 +1268,8 @@ def main(argv=None):
         ltx25_models = get_ltx25_model_names(BASE_DIR)
         from shared.open_h3_constants import OPENH3_DIT_NAMES
         open_h3_models = list(OPENH3_DIT_NAMES)
+        from shared.relayvsr_constants import RELAYVSR_WAN_NAMES
+        relayvsr_models = list(RELAYVSR_WAN_NAMES)
         rife_models = get_rife_model_names(BASE_DIR)
 
         all_models = sorted(list({
@@ -1276,6 +1279,7 @@ def main(argv=None):
             *sparkvsr_models,
             *ltx25_models,
             *open_h3_models,
+            *relayvsr_models,
             *rife_models,
         }))
         if not all_models:
@@ -1495,6 +1499,7 @@ def main(argv=None):
                 "gan_settings": startup_preset.get("gan", {}),
                 "rife_settings": startup_preset.get("rife", {}),
                 "flashvsr_settings": startup_preset.get("flashvsr", {}),
+                "relayvsr_settings": startup_preset.get("relayvsr", {}),
                 "sparkvsr_settings": startup_preset.get("sparkvsr", {}),
                 "ltx25_settings": startup_preset.get("ltx25", {}),
                 "open_h3_settings": startup_preset.get("open_h3", {}),
@@ -1871,6 +1876,7 @@ def main(argv=None):
         tab_sync_rife = gr.State(value="")
         tab_sync_gan = gr.State(value="")
         tab_sync_flashvsr = gr.State(value="")
+        tab_sync_relayvsr = gr.State(value="")
         tab_sync_sparkvsr = gr.State(value="")
         tab_sync_ltx25 = gr.State(value="")
         tab_sync_open_h3 = gr.State(value="")
@@ -1941,6 +1947,26 @@ def main(argv=None):
                 fn=_make_tab_sync("flashvsr"),
                 inputs=[shared_state, tab_sync_flashvsr],
                 outputs=flashvsr_ui["inputs_list"] + [flashvsr_ui["preset_dropdown"], flashvsr_ui["preset_status"], tab_sync_flashvsr],
+                queue=False,
+                show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+            with gr.Tab("🔁 RelayVSR", render_children=True) as tab_relayvsr:
+                relayvsr_ui = relayvsr_tab(
+                    preset_manager=preset_manager,
+                    runner=runner,
+                    run_logger=run_logger,
+                    global_settings=global_settings,
+                    shared_state=shared_state,
+                    base_dir=BASE_DIR,
+                    temp_dir=active_temp_dir,
+                    output_dir=active_output_dir,
+                )
+            tab_relayvsr.select(
+                fn=_make_tab_sync("relayvsr"),
+                inputs=[shared_state, tab_sync_relayvsr],
+                outputs=relayvsr_ui["inputs_list"] + [relayvsr_ui["preset_dropdown"], relayvsr_ui["preset_status"], tab_sync_relayvsr],
                 queue=False,
                 show_progress="hidden",
                 trigger_mode="always_last",
@@ -2148,7 +2174,8 @@ def main(argv=None):
             )
             from shared.chain_runner import register_chain_engine as _register_chain_engine
 
-            for _key, _ui in (("seedvr2", seedvr2_ui), ("flashvsr", flashvsr_ui), ("sparkvsr", sparkvsr_ui),
+            for _key, _ui in (("seedvr2", seedvr2_ui), ("flashvsr", flashvsr_ui), ("relayvsr", relayvsr_ui),
+                              ("sparkvsr", sparkvsr_ui),
                               ("gan", gan_ui), ("rtx", rtx_ui), ("ltx25", ltx25_ui), ("open_h3", open_h3_ui)):
                 _register_chain_engine(_key, _ui["run_action"], cancel=_ui.get("cancel_action"), preview_only=False)
             _register_chain_engine("dlss5", dlss5_ui["service"]["run_action"], snapshot=False,

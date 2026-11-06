@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from shared.services.seedvr2_service import SEEDVR2_ORDER, seedvr2_defaults
 from shared.services.gan_service import GAN_ORDER, gan_defaults
 from shared.services.rife_service import RIFE_ORDER, rife_defaults
+from shared.services.relayvsr_service import RELAYVSR_ORDER, relayvsr_defaults
 from shared.services.flashvsr_service import (
     FLASHVSR_ORDER,
     flashvsr_defaults,
@@ -124,6 +125,11 @@ TAB_CONFIGS = {
     "flashvsr": {
         "order": FLASHVSR_ORDER,
         "defaults_fn": flashvsr_defaults,
+        "needs_model_arg": False,
+    },
+    "relayvsr": {
+        "order": RELAYVSR_ORDER,
+        "defaults_fn": relayvsr_defaults,
         "needs_model_arg": False,
     },
     "sparkvsr": {
@@ -444,6 +450,14 @@ def _normalize_tab_settings(tab_name: str, data: Dict[str, Any], defaults: Dict[
         return cfg
     if tab_name == "flashvsr":
         return _normalize_flashvsr_settings(cfg)
+    if tab_name == "relayvsr":
+        try:
+            from shared.services.relayvsr_service import _enforce_relayvsr_guardrails
+
+            cfg = _enforce_relayvsr_guardrails(cfg, defaults or relayvsr_defaults())
+        except Exception:
+            pass
+        return cfg
     if tab_name == "sparkvsr":
         return _normalize_sparkvsr_settings(cfg)
     if tab_name == "ltx25":
@@ -528,6 +542,9 @@ def get_all_defaults(base_dir: Path = None, models_list: List[str] = None) -> Di
     
     # FlashVSR
     defaults["flashvsr"] = flashvsr_defaults()
+
+    # RelayVSR
+    defaults["relayvsr"] = relayvsr_defaults()
 
     # SparkVSR
     defaults["sparkvsr"] = sparkvsr_defaults()
@@ -682,6 +699,7 @@ def create_universal_preset(
         preset["rtx"] = defaults["rtx"]
     preset["dlss5"] = defaults["dlss5"]
     preset["chains"] = defaults["chains"]
+    preset["relayvsr"] = defaults["relayvsr"]
     
     if face_values is not None:
         preset["face"] = values_to_dict("face", face_values)
@@ -792,6 +810,7 @@ def update_shared_state_from_preset(
     seed_controls["gan_settings"] = preset.get("gan", {})
     seed_controls["rife_settings"] = preset.get("rife", {})
     seed_controls["flashvsr_settings"] = preset.get("flashvsr", {})
+    seed_controls["relayvsr_settings"] = preset.get("relayvsr", {})
     seed_controls["sparkvsr_settings"] = preset.get("sparkvsr", {})
     seed_controls["ltx25_settings"] = preset.get("ltx25", {})
     seed_controls["open_h3_settings"] = preset.get("open_h3", {})
@@ -899,6 +918,7 @@ def collect_preset_from_shared_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "gan": seed_controls.get("gan_settings", {}),
         "rife": seed_controls.get("rife_settings", {}),
         "flashvsr": seed_controls.get("flashvsr_settings", {}),
+        "relayvsr": seed_controls.get("relayvsr_settings", {}),
         "sparkvsr": seed_controls.get("sparkvsr_settings", {}),
         "ltx25": seed_controls.get("ltx25_settings", {}),
         "open_h3": seed_controls.get("open_h3_settings", {}),

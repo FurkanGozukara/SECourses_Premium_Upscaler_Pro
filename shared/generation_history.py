@@ -548,7 +548,10 @@ def record_from_chain_dir(chain_dir: Path) -> Optional[Dict[str, Any]]:
             if r.get("output") and Path(str(r["output"])).is_file():
                 output = Path(str(r["output"]))
                 break
-    rec = _base_record(output, "chain", chain_dir)
+    step_engines = [engine_key((s or {}).get("engine")) for s in (data.get("steps") or []) if (s or {}).get("enabled", True)]
+    # a one-step chain is a run of that engine (it still reloads as a chain)
+    engine = step_engines[0] if len(step_engines) == 1 and step_engines[0] in ENGINES else "chain"
+    rec = _base_record(output, engine, chain_dir)
     rec["dir"] = str(chain_dir)
     rec["src"] = "chain"
     rec["inp"] = str(data.get("source") or data.get("chain_input") or "")
@@ -616,6 +619,7 @@ class GenerationHistory:
 
     def __init__(self, root_fn: Callable[[], Path]):
         self.root_fn = root_fn
+        self.root_override: Optional[Path] = None
         self.lock = threading.RLock()
         self.dir_cache: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
         self.records: Dict[str, Dict[str, Any]] = {}
@@ -640,10 +644,21 @@ class GenerationHistory:
             pass
 
     def root(self) -> Path:
+        if self.root_override is not None:
+            return self.root_override
         try:
             return Path(self.root_fn())
         except Exception:
             return APP_DIR / "outputs"
+
+    def follow_state(self, state: Any) -> None:
+        """Use the outputs folder of the user's session (Global Settings), where the engines write new runs."""
+        try:
+            seed = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
+            folder = str(((seed or {}).get("global_settings") or {}).get("output_dir") or "").strip()
+            self.root_override = Path(folder) if folder and Path(folder).is_dir() else None
+        except Exception:
+            self.root_override = None
 
     # ---- scanning ---------------------------------------------------------------------------------
     def _journal(self) -> Dict[str, Dict[str, Any]]:
@@ -861,7 +876,7 @@ class GenerationHistory:
             "size": info.get("size"), "probed": bool(info) or not out,
             "playable": (browser_playable(info, Path(out)) if (out and rec["kind"] == "video" and info) else True),
             "scale": scale, "cmp_url": file_url(rec["cmp"]) if rec["cmp"] else "", "batch": rec["batch"],
-            "chain": rec["chain_name"], "steps": len(rec["steps"] or []), "fav": _norm(out) in self.favorites if out
+            "chain": rec["chain_name"], "steps": len(rec["steps"] or []), "chain_run": rec["src"] == "chain", "fav": _norm(out) in self.favorites if out
             else False, "search": search,
         }
 

@@ -383,7 +383,7 @@
     const scale = it.scale && it.scale !== 1 ? `<span class="x"> · ${it.scale}×</span>` : '';
     const dur = it.kind === 'video' ? `▶ ${fmtDur(it.dur) || 'video'}` : (it.kind === 'image' ? '🖼️ image' : '—');
     const st = it.status !== 'ok' ? `<span class="gh-badge gh-st ${it.status}">${esc(statusName[it.status] || it.status)}</span>` : '';
-    const sub = it.chain ? `🔗 ${it.model || it.chain}` : (it.model || it.label);
+    const sub = it.chain_run ? `🔗 ${it.model || it.chain}` : (it.model || it.label);
     const thumb = it.thumb ? U(it.thumb) : '';
     const noPrev = !it.out ? `<div class="gh-noprev"><div><b>${it.status === 'ok' ? '📄' : '⛔'}</b>${esc(statusName[it.status] || 'No output')}</div></div>` : '';
     return `<div class="gh-media${!it.out ? ' loaded' : ''}">
@@ -574,7 +574,7 @@
   }
   function sendAction(action, it, tab) {
     trigger('select', { index: 0, value: { action, id: it.id, tab: tab || '' } });
-    const target = tab || it.tab;
+    const target = tab || (it.chain_run ? 'chains' : it.tab);
     const eng = Object.values(S.engines).find((e) => e.tab === target);
     toast(action === 'send' ? `➜ Opening ${eng ? eng.label : target} with this file as input…` : `↻ Loading the settings of this run into ${eng ? eng.label : target}…`, '', 2600);
     closeViewer(); closeCompare();
@@ -851,6 +851,8 @@
         vids.forEach((v) => { v.muted = v !== m || this.muted; v.loop = this.loop; v.playbackRate = +this.tp.querySelector('[data-t="rate"]').value; });
         this.tp.querySelector('[data-t="mute"]').textContent = this.muted ? '🔇' : '🔊';
         m.addEventListener('play', () => this.syncLoop());
+        m.addEventListener('timeupdate', () => this.updTime());
+        m.addEventListener('seeked', () => this.updTime());
         m.addEventListener('pause', () => this.updPlay());
         m.addEventListener('ended', () => { if (this.loop) { vids.forEach((v) => { v.currentTime = 0; }); this.play(); } else this.updPlay(); });
         if (opts.autoplay !== false) this.play(); else this.updPlay();
@@ -1094,7 +1096,7 @@
   }
 
   function renderPanel(it, d) {
-    const isChain = it.engine === 'chain';
+    const isChain = !!it.chain_run;
     const canReload = isChain || it.has_args;
     const tabLabel = (Object.values(S.engines).find((e) => e.tab === it.tab) || {}).label || it.label;
     const reloadTitle = isChain ? 'Opens the Chains tab with these steps and this input' : `Opens ${tabLabel} with every setting of this run and its input`;

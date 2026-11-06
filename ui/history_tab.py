@@ -150,7 +150,7 @@ def history_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, outp
             if tab in upload_tabs:
                 uploads[upload_tabs.index(tab)] = gr.update(value=None)
 
-        if action == "reload" and rec["engine"] == "chain":
+        if action == "reload" and rec["src"] == "chain":
             from shared import chain_runner as cr
 
             chain_json = Path(rec["dir"]) / "chain.json"
@@ -213,4 +213,7 @@ def history_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, outp
                chain_steps if chain_steps is not None else nav, chain_path if chain_path is not None else nav]
     view.select(on_action, inputs=[shared_state], outputs=outputs, show_progress="hidden").then(
         fn=None, inputs=[nav], outputs=None, js=NAV_JS, show_progress="hidden")
-    return {"view": view, "history": history}
+    def sync_root(state):
+        history.follow_state(state)
+
+    return {"view": view, "history": history, "sync_root": sync_root}

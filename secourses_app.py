@@ -2192,7 +2192,7 @@ def main(argv=None):
                 ("rtx", "🚀 RTX Super Resolution"), ("dlss5", "💎 DLSS 5"), ("gan", "🖼️ Image-Based (GAN)"),
                 ("rife", "⏱️ RIFE / FPS / Edit Videos"), ("face", "👤 Face Restoration"), ("chains", "🔗 Chains"))}
             with gr.Tab("🗂️ Past Generations", render_children=True, elem_id="sec-tab-history") as tab_history:
-                history_tab(
+                history_ui = history_tab(
                     global_settings=global_settings,
                     shared_state=shared_state,
                     output_dir=active_output_dir,
@@ -2203,8 +2203,10 @@ def main(argv=None):
                     tab_targets=HISTORY_TAB_TARGETS,
                     chain_ui=chain_ui,
                 )
-            tab_history.select(fn=None, js="() => { if (window.__ghOnShow) window.__ghOnShow(); }",
-                               queue=False, show_progress="hidden")
+            # the tab follows the session's outputs folder (Global Settings), then refreshes in the browser
+            tab_history.select(fn=history_ui["sync_root"], inputs=[shared_state], outputs=None, queue=False,
+                               show_progress="hidden").then(
+                fn=None, js="() => { if (window.__ghOnShow) window.__ghOnShow(); }", queue=False, show_progress="hidden")
 
             with gr.Tab("⏳ Queue (0)", render_children=True) as tab_queue:
                 queue_ui = queue_tab(tab_queue)

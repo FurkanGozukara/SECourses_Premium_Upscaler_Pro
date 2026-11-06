@@ -80,9 +80,10 @@ def openh3_download_size_gb(dit: str, text_encoder: str, vae: str) -> float:
     )
 
 
-# JonXL H3 Upscale: JonXL's MiniMax H3 image upscaler (LoRA + workflow), the second Open-H3 workflow. Every picture
-# (an image, or every frame of a video) becomes the last frame of a 24-frame H3 clip that cross-fades from the blurry
-# input to a sharp picture (OpenH3/open_h3_engine/jxl.py). Needs only the DiT, the text encoder, the VAE and this LoRA.
+# JonXL H3 Upscale: JonXL's MiniMax H3 image upscaler (LoRA + workflow), the second Open-H3 workflow. Every image
+# becomes the last frame of a 24-frame H3 clip that cross-fades from the blurry input to a sharp picture
+# (OpenH3/open_h3_engine/jxl.py). Needs only the DiT, the text encoder, the VAE and this LoRA. Images only: a video input
+# is refused with OPENH3_JXL_VIDEO_MESSAGE (Preview First Frame still upscales one extracted frame of a video).
 OPENH3_WORKFLOW_REGEN = "Open-H3 Regenerate (default)"
 OPENH3_WORKFLOW_JXL = "JonXL H3 Upscale"
 OPENH3_WORKFLOWS = [OPENH3_WORKFLOW_REGEN, OPENH3_WORKFLOW_JXL]
@@ -93,6 +94,9 @@ OPENH3_JXL_SEED = 505817956432961   # the workflow's fixed seed (used while Seed
 OPENH3_JXL_STEPS = 20
 OPENH3_JXL_MAX_SIDES = [1920, 1536, 1280]
 OPENH3_JXL_MAX_SIDE_DEFAULT = 1920
+OPENH3_JXL_VIDEO_MESSAGE = ("JonXL H3 Upscale is an image upscaler: use it on images or a folder of images, not on "
+                            "videos. For a video, switch MiniMax H3 Workflow to Open-H3 Regenerate or use a video "
+                            "upscaler such as RelayVSR, FlashVSR+ or SeedVR2.")
 
 
 def is_jxl_workflow(settings) -> bool:

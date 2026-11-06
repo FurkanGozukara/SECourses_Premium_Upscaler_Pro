@@ -45,6 +45,7 @@ from shared.open_h3_constants import (
     OPENH3_JXL_MAX_SIDES,
     OPENH3_JXL_PROMPT,
     OPENH3_JXL_SEED,
+    OPENH3_JXL_VIDEO_MESSAGE,
     OPENH3_WORKFLOW_JXL,
     OPENH3_WORKFLOW_REGEN,
     OPENH3_WORKFLOWS,
@@ -52,7 +53,7 @@ from shared.open_h3_constants import (
     openh3_jxl_download_size_gb,
     openh3_download_size_gb,
 )
-from shared.path_utils import get_media_dimensions, normalize_path
+from shared.path_utils import detect_input_type, get_media_dimensions, normalize_path
 from ui.universal_preset_section import (
     universal_preset_section,
     wire_universal_preset_events,
@@ -197,9 +198,11 @@ def open_h3_tab(
                         "max_target_resolution": max_edge_val, "draft_size": draft_val,
                         "workflow": workflow_val, "jxl_max_side": jxl_side_val}
             tw, th, note = compute_target_size(int(dims[0]), int(dims[1]), settings)
-            if is_jxl_workflow(settings):
+            if is_jxl_workflow(settings) and Path(normalized).is_file() and detect_input_type(normalized) == "video":
+                text = f"**⚠️ {OPENH3_JXL_VIDEO_MESSAGE}**"
+            elif is_jxl_workflow(settings):
                 text = (f"**Output size:** `{int(dims[0])}x{int(dims[1])}` -> `{tw}x{th}` ({note}) | aspect ratio "
-                        "kept, no cropping | every frame of a video is upscaled as its own picture.")
+                        "kept, no cropping.")
             else:
                 draft = _draft_size(settings, int(dims[0]), int(dims[1]))
                 text = (f"**Output size:** `{int(dims[0])}x{int(dims[1])}` -> `{tw}x{th}` ({note}) | "
@@ -268,7 +271,8 @@ def open_h3_tab(
                         choices=list(OPENH3_WORKFLOWS),
                         value=_choice("workflow", OPENH3_WORKFLOWS, OPENH3_WORKFLOW_REGEN),
                         info=("Open-H3 Regenerate = NVIDIA's 3-step regenerate (default). JonXL H3 Upscale = "
-                              "JonXL's MiniMax H3 upscale LoRA: sharp detail out of blurry pictures, up to 1920 px."),
+                              "JonXL's MiniMax H3 upscale LoRA for IMAGES only: sharp detail out of blurry pictures, "
+                              "up to 1920 px."),
                         scale=2,
                         min_width=280,
                         elem_id="open-h3-workflow",
@@ -279,15 +283,18 @@ def open_h3_tab(
                 _jxl_on = is_jxl_workflow({"workflow": _choice("workflow", OPENH3_WORKFLOWS, OPENH3_WORKFLOW_REGEN)})
                 with gr.Group(visible=_jxl_on, elem_classes=["OPENH3-jxl-panel"]) as jxl_panel:
                     gr.Markdown(
-                        "**🔍 JonXL H3 Upscale**: JonXL's MiniMax H3 upscale LoRA and workflow. Each picture (an image, "
-                        "or every frame of a video) becomes the first frame of a 24-frame H3 clip that cross-fades from "
-                        "the blurry input into a sharp picture; the last frame is kept. It pulls real detail out of "
-                        "blurry, pixelated and compressed footage (an upscaler, not a detailer).\n\n"
+                        "**🔍 JonXL H3 Upscale (images only)**: JonXL's MiniMax H3 image upscaler LoRA and workflow. "
+                        "Each image becomes the first frame of a 24-frame H3 clip that cross-fades from the blurry input "
+                        "into a sharp picture; the last frame is kept. It pulls real detail out of blurry, pixelated and "
+                        "compressed photos and video stills (an upscaler, not a detailer).\n\n"
+                        "**⚠️ For images and folders of images. A video input is refused with a warning (videos in a "
+                        "batch folder are skipped); for videos use Open-H3 Regenerate or RelayVSR, FlashVSR+ or SeedVR2. "
+                        "Preview First Frame still upscales the first frame of a video as one picture.**\n\n"
                         f"Fixed prompt `{OPENH3_JXL_PROMPT}`, 20 steps, seed `{OPENH3_JXL_SEED}` while Seed holds the "
                         "Open-H3 default; base model FL2VA INT8 ConvRot and the Released H3 VAE as in JonXL's workflow (both "
                         "picked when you switch; the Sol fast VAE gives less fine detail with this LoRA). "
                         "Target Resolution, Draft Size, Prompt and Refine Sampling are not used; Max Edge still caps the "
-                        "size. Every frame is a full H3 run, so try a short frame range of a video first.",
+                        "size.",
                         elem_classes=["OPENH3-jxl-note"],
                     )
                     try:

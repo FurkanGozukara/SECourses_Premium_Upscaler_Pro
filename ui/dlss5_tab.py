@@ -8,6 +8,7 @@ import gradio as gr
 from ui.path_picker import path_textbox
 
 from shared.dlss5.motion import MOTION_QUALITY
+from shared.dlss5.ops import PROFILES
 from shared.dlss5.runner import MAX_PASSES, MOTION_CHOICES, PRECISION_CHOICES, PROFILE_CHOICES, SPEED_CHOICES
 from shared.services.dlss5_service import DLSS5_ORDER, build_dlss5_callbacks
 from shared.video_comparison_slider import get_video_comparison_js_on_load
@@ -100,7 +101,7 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
                                               value=float(v("detail_radius")), info="Split point between detail and colour strength.")
                 with gr.Row():
                     tone_strength = gr.Slider(label="Local tone", minimum=0.0, maximum=2.0, step=0.05, value=float(v("tone_strength")),
-                                              info="Network local tone-mapping control (profile default 1.0).")
+                                              info="Network local tone-mapping control (set by the profile: 1.0, Neutral 0).")
                     structure_strength = gr.Slider(label="Local structure", minimum=0.0, maximum=2.0, step=0.05,
                                                    value=float(v("structure_strength")),
                                                    info="Network local structure control; lower if the result looks over-detailed.")
@@ -172,6 +173,16 @@ def dlss5_tab(*, preset_manager, global_settings: Dict[str, Any], shared_state: 
                       outputs=[input_image_preview, input_video_preview], queue=False, show_progress="hidden")
     profile.change(fn=lambda p: PROFILE_INFO.get(p, ""), inputs=[profile], outputs=[profile_info], queue=False,
                    show_progress="hidden")
+
+    def _profile_sliders(p):
+        # A profile is a set of local tone / structure values (Neutral = 0 / 0). The sliders override the profile
+        # whenever they differ from its values, so a click on a profile sets them to its own (left at 1.0, Neutral
+        # rendered exactly like Standard). .input: a preset load keeps its saved slider values.
+        values = PROFILES.get(p) or PROFILES["Standard"]
+        return gr.update(value=values["local_tone_strength"]), gr.update(value=values["local_structure_strength"])
+
+    profile.input(fn=_profile_sliders, inputs=[profile], outputs=[tone_strength, structure_strength], queue=False,
+                  show_progress="hidden")
 
     outputs = [status_box, log_box, progress_indicator, output_image, output_video, image_slider, video_comparison_html, shared_state]
 

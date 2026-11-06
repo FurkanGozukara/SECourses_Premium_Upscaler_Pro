@@ -156,6 +156,12 @@ def cpu_checks() -> None:
 
     label = chain_tab._step_summary("open_h3", {"seed_controls": {"open_h3_settings": {**jxl_set, "model_name": "FL2VA Pruned W4A8"}}})
     check("Chains label names JonXL", label.startswith("JonXL H3 Upscale"), label)
+    clip = ROOT.parent / "test_media" / "test_640x360_24fps_3s.mp4"
+    if clip.is_file():  # images only: a video is refused before any model loads (single, queue, Chains and batch)
+        single = R.run_open_h3({**jxl_set, "input_path": str(clip)}, ROOT)
+        check("JonXL refuses a video", single.returncode == 1 and C.OPENH3_JXL_VIDEO_MESSAGE in single.log, single.log[:120])
+        regen = R._item_plan({"output_override": tempfile.gettempdir()}, ROOT, str(clip), "video")
+        check("Regenerate still plans a video", not isinstance(regen, str), str(regen)[:120])
 
     dl = subprocess.run([sys.executable, "-I", str(ROOT.parent / "Models_Downloader.py"), "--ensure-openh3", "FL2VA Pruned W4A8",
                          "--openh3-jxl", "--dry-run"], capture_output=True, text=True, encoding="utf-8", errors="replace",

@@ -72,11 +72,15 @@ def count_int8_linears(model: nn.Module) -> int:
 
 
 def quantize_linears(model: nn.Module, source_checkpoint: str | Path, *, log_prefix: str = "[INT8]",
-                     include: Optional[Callable[[str], bool]] = None) -> int:
-    """Convert the eligible Linear layers of a loaded model in place; returns the number converted."""
+                     include: Optional[Callable[[str], bool]] = None, lowrank_rank: Optional[int] = None) -> int:
+    """Convert the eligible Linear layers of a loaded model in place; returns the number converted.
+    lowrank_rank overrides the ARA rank (None = the engine default / SECOURSES_INT8_LOWRANK_RANK, 0 = no ARA)."""
     from shared.int8_convert_engine import Int8ConversionEngine
 
     engine = Int8ConversionEngine(source_checkpoint, log_prefix=log_prefix)
+    if lowrank_rank is not None:
+        engine.lowrank_rank = max(0, int(lowrank_rank))
+        engine.report.features["lowrank_rank"] = engine.lowrank_rank
     candidates: Dict[str, nn.Linear] = {
         name: m for name, m in model.named_modules()
         if isinstance(m, nn.Linear) and m.weight.ndim == 2 and m.weight.device.type != "meta"

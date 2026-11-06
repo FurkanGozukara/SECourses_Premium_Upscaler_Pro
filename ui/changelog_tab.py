@@ -13,22 +13,23 @@ CHANGELOG_ENTRIES = [
     (
         "V10.0 — 6 November 2026 — RelayVSR Fast 4x Video Upscaler, Multi-Pass DLSS 5, JonXL H3 Upscale in Open-H3, Batch Folders in Chains, Folder and File Picker Buttons on Every Path",
         """
-**Upscale videos 4x with the new, very fast RelayVSR tab, run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry footage with JonXL's MiniMax H3 upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
+**Upscale videos 4x with the new, very fast RelayVSR tab and our own Wan INT8 ConvRot model (only in this app), run DLSS 5 two or three times for a much stronger photoreal look, upscale blurry images with JonXL's MiniMax H3 image upscale workflow, push a whole folder of videos and images through a chain, and pick every folder and file with a 📂 / 📄 button.**
 
 **RelayVSR: a new, very fast 4x video upscaler tab**
 - New **🔁 RelayVSR** tab next to FlashVSR. RelayVSR upscales videos and images 4x: a large Wan model writes a sharp reference keyframe every 15 frames, and a small Flash decoder relays that detail to every frame in between, one frame at a time.
-- Very fast: our 306-frame 960 x 540 test clip took 72 seconds to 4K (3840 x 2160) on an RTX 5090, about 4x faster than FlashVSR+ Turbo (5 min 02 s) and 17x faster than SeedVR2 7B (20 min 26 s) on the same clip.
-- The models download automatically the first time from our Hugging Face mirror: **Wan INT8 ConvRot** (5.1 GB, the default, made for this app: half the size of BF16 with the same look) or **Wan BF16** (10 GB), plus the 0.13 GB Flash decoder. Models_Downloader.py has both as presets.
+- Very fast: our 306-frame 960 x 540 test clip took 60 seconds to 4K (3840 x 2160) on an RTX 5090, about 5x faster than FlashVSR+ Turbo (5 min 02 s) and 20x faster than SeedVR2 7B Sharp (20 min 26 s) on the same clip.
+- **Wan INT8 ConvRot: only in SECourses Upscaler Pro.** We built this INT8 ConvRot version of RelayVSR's Wan model ourselves; you will not find it anywhere else. It is the default: 5.1 GB instead of 10 GB, the same look (53.5 dB PSNR against BF16 on the raw frames), and its Wan step runs about 2.3x faster than BF16 (the whole 4K run: 60 s instead of 1 min 34 s).
+- The models download automatically the first time from our Hugging Face mirror: **Wan INT8 ConvRot** (5.1 GB) or **Wan BF16** (10 GB), plus the 0.13 GB Flash decoder. Models_Downloader.py has both as presets.
 - Settings: Wan Model, Precision (auto / BF16 / FP16), Keyframe Window (16 = the trained default; smaller = more keyframes, larger = faster), Wan Blocks on GPU, Seed.
 - VRAM: a 4K output needs about 19 GB with all of Wan on the GPU. On smaller GPUs, **Auto Tune** keeps as many Wan blocks (each with its memory of the last 4 keyframes) on the GPU as fit and copies the rest from RAM when Wan runs: the same result, just slower (a 10 GB limit made the identical 4K video). Memory depends on the output size, not on the clip length. Every run is capped at GPU total - in use - Save VRAM, so it never spills into shared GPU memory.
 - Everything the other tabs have: Upscale x 1-4 and Max Resolution from the Resolution tab (the model always runs at 4x; smaller factors downscale the input first), batch folders, Preview First Frame, scene / fixed-length chunks with Resume, Cancel, face restoration, presets, the queue, Chains steps, image and video comparison sliders, codec settings and metadata.
 
 **JonXL H3 Upscale: a second MiniMax H3 workflow in the Open-H3 tab**
 - New **MiniMax H3 Workflow** switch next to "Auto Transfer Output to Input": Open-H3 Regenerate (the default, unchanged) or **JonXL H3 Upscale**, JonXL's MiniMax H3 image upscaler LoRA and workflow, built into the app's own Open-H3 engine.
-- Every picture (an image, or every frame of a video) becomes the first frame of a 24-frame H3 clip that cross-fades from the blurry input into a sharp picture, and the last frame is the result: real detail pulled out of blurry, pixelated and compressed footage, up to 1920 px on the longest side (JonXL Max Size 1920 / 1536 / 1280). The picture keeps its exact aspect ratio (nothing stretched or cut off).
+- For images: every image becomes the first frame of a 24-frame H3 clip that cross-fades from the blurry input into a sharp picture, and the last frame is the result: real detail pulled out of blurry, pixelated and compressed photos and video stills, up to 1920 px on the longest side (JonXL Max Size 1920 / 1536 / 1280). The picture keeps its exact aspect ratio (nothing stretched or cut off).
 - Same recipe as JonXL's workflow: FL2VA + the `h3_upscale_1920` LoRA at strength 1, the fixed prompt "A static still blurry pixelated picture crossfades into a clear sharp detailed picture, 4psc4l3,", 20 steps er_sde on the beta57 schedule, CFG 1, Comfy Kitchen INT8 attention. Checked against JonXL's workflow run in ComfyUI: the same picture (45.7 dB).
 - The LoRA (0.6 GB) downloads from our Hugging Face mirror only the first time you use the workflow; it needs only the selected DiT, text encoder and VAE besides. Switching to JonXL picks FL2VA INT8 ConvRot and the Released H3 VAE, the models of JonXL's workflow (W4A8 renders slightly darker and the Sol fast VAE gives less fine detail with this LoRA). The model renders on JonXL's own canvas (1920 x 1056 for 16:9) and the result is resampled to the exact shape of your picture (1920 x 1080), because the LoRA is far sharper there than on a 1920 x 1088 canvas.
-- Works for images, videos, batch folders, Preview First Frame and Chains (the step card shows "JonXL H3 Upscale"). Every frame is a full 20-step H3 run, so try a short frame range of a video first.
+- Works for images, folders of images, Preview First Frame (the first frame of a video, as one picture) and Chains (the step card shows "JonXL H3 Upscale"). It is an image upscaler: a video input is refused with a warning and the videos of a batch folder are skipped; for videos use Open-H3 Regenerate, RelayVSR, FlashVSR+ or SeedVR2.
 
 **Multi-pass DLSS 5**
 - New **Passes** setting (1-4) on the DLSS 5 tab: pass 2 renders DLSS 5 again on the result of pass 1, and so on. Every pass adds more real skin, hair, light and material detail, so 2-3 passes give the strongest look on game graphics, CGI and plastic-looking AI footage. Footage that already looks real can look overdone with several passes; start with 1-2 there.
@@ -47,6 +48,7 @@ CHANGELOG_ENTRIES = [
 **Launch options and fixes**
 - New optional launch arguments `--server <IP>` and `--port <number>`, for example `Windows_Run_SECourses_Upscaler_Pro.bat --server 0.0.0.0 --port 7870`. Without them the app starts exactly as before.
 - Video comparison slider: the two labels no longer cover each other on narrow videos; long names are shortened and show in full on hover.
+- DLSS 5: the **Neutral** style profile works now. Picking a profile sets Local tone and Local structure to that profile's values (Neutral 0 / 0, the others 1 / 1); before, both sliders stayed at 1 and overrode Neutral, so it rendered exactly like Standard. Natural and Cinematic stay close to Standard, Neutral keeps much more of the original look.
 
 **Chains fixes**
 - The size shown after every step now follows each tab's Max Resolution and Open-H3's Target Resolution.

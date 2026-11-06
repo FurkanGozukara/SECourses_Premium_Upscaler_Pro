@@ -38,6 +38,7 @@ from .open_h3_constants import (
     OPENH3_JXL_PROMPT,
     OPENH3_JXL_SEED,
     OPENH3_JXL_STEPS,
+    OPENH3_JXL_VIDEO_MESSAGE,
     is_jxl_workflow,
     jxl_output_size,
     OPENH3_DIT_FILES,
@@ -488,6 +489,8 @@ def run_open_h3(
         input_kind = detect_input_type(input_path)
         if input_kind not in {"video", "image"}:
             return OpenH3Result(1, None, f"Open-H3 expects a video or an image (got: {input_kind}).")
+        if input_kind == "video" and is_jxl_workflow(settings):  # queue, Chains and API runs land here too
+            return OpenH3Result(1, None, OPENH3_JXL_VIDEO_MESSAGE)
 
         # Output-tab FPS override: convert the whole input to the requested CFR first so duration
         # and audio sync stay exact (same guard as LTX 2.5).
@@ -699,6 +702,9 @@ def run_open_h3_batch(
             kind = detect_input_type(input_path) if input_path and Path(input_path).exists() else "missing"
             if kind not in {"video", "image"}:
                 results[index] = OpenH3Result(1, None, f"Open-H3 input not usable ({kind}): {input_path}")
+                continue
+            if kind == "video" and is_jxl_workflow(settings):
+                results[index] = OpenH3Result(1, None, f"{OPENH3_JXL_VIDEO_MESSAGE} Skipped: {input_path}")
                 continue
             item = _item_plan(settings, base_dir, input_path, kind)
             if isinstance(item, str):

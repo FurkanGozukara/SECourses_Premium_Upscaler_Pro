@@ -45,7 +45,7 @@ from shared.int8_convrot_modules import is_int8_file, load_int8_state, quantize_
 from shared.vram_autotune import relayvsr as tune  # noqa: E402
 
 GIB = 1024 ** 3
-INT8_FORMAT = "relayvsr-wan-int8-convrot-v1"
+INT8_FORMAT = "relayvsr-wan-int8-convrot-v2"  # v2: no ARA branch
 INT8_MARKER = "relayvsr_int8_convrot"
 SCALE = 4
 
@@ -394,8 +394,11 @@ def convert_int8(args) -> int:
     src = Path(args.wan)
     config, _prompt_shape, metadata = _wan_header(src)
     wan = build_wan(src, torch.bfloat16)
-    n = quantize_linears(wan, src, log_prefix="[RelayVSR INT8]",
-                         include=lambda name: name.startswith("blocks."))
+    # No ARA low-rank branch: on RelayVSR it scored the same (48 frames 960x540 -> 4K, raw frames vs bf16: 53.05 dB
+    # without, 52.56 dB with) and its two extra passes per layer more than doubled the Wan step (399 vs 842 ms; bf16 902).
+    rank = os.environ.get("SECOURSES_INT8_LOWRANK_RANK", "").strip()
+    n = quantize_linears(wan, src, log_prefix="[RelayVSR INT8]", include=lambda name: name.startswith("blocks."),
+                         lowrank_rank=int(rank) if rank.isdigit() else 0)
     out = save_int8_model(wan, args.convert_int8, src, format_id=INT8_FORMAT, marker_key=INT8_MARKER,
                           extra_metadata={"config": metadata["config"], "relayvsr_format": "refvsr-wan-v1"})
     emit(f"INT8 ConvRot Wan: {n} layers -> {out} ({out.stat().st_size / GIB:.2f} GB)")

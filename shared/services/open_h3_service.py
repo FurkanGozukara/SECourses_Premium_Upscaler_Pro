@@ -47,6 +47,7 @@ from shared.open_h3_constants import (
     OPENH3_DIT_NAMES,
     OPENH3_JXL_MAX_SIDE_DEFAULT,
     OPENH3_JXL_MAX_SIDES,
+    OPENH3_JXL_VIDEO_MESSAGE,
     OPENH3_TE_NAMES,
     OPENH3_TE_NVFP4,
     OPENH3_VAE_NAMES,
@@ -1468,6 +1469,18 @@ def build_open_h3_callbacks(
                 except Exception:
                     items = []
 
+                jxl_skipped: List[str] = []
+                if is_jxl_workflow(settings):  # images only: the folder's videos are skipped
+                    jxl_skipped = [p.name for p in items if p.suffix.lower() not in IMAGE_EXTENSIONS]
+                    items = [p for p in items if p.suffix.lower() in IMAGE_EXTENSIONS]
+                    if jxl_skipped:
+                        gr.Warning(f"JonXL H3 Upscale is for images: {len(jxl_skipped)} video(s) in the batch folder "
+                                   f"are skipped.")
+                    if not items:
+                        yield _error_payload(state, "[WARNING] JonXL H3 Upscale is for images: no images in the batch "
+                                             "folder", OPENH3_JXL_VIDEO_MESSAGE)
+                        return
+
                 if not items:
                     yield _error_payload(
                         state,
@@ -1505,6 +1518,9 @@ def build_open_h3_callbacks(
                 if progress:
                     progress(0, desc=f"Batch: {len(items)} item(s) queued")
                 logs.append(f"Batch queued: {len(items)} item(s). Output: {batch_root}")
+                if jxl_skipped:
+                    logs.append(f"[SKIP] JonXL H3 Upscale is for images; {len(jxl_skipped)} video(s) skipped: "
+                                f"{', '.join(jxl_skipped[:10])}{' ...' if len(jxl_skipped) > 10 else ''}")
                 if not use_app_chunking:
                     logs.append(
                         "[OpenH3] App-level scene chunking is OFF (the engine plans its own windows). "
@@ -1851,6 +1867,11 @@ def build_open_h3_callbacks(
                         f"Detected input type: {input_kind_single}. Convert frame folders to a video first."
                     ),
                 )
+                return
+            if input_kind_single == "video" and is_jxl_workflow(settings):
+                gr.Warning(OPENH3_JXL_VIDEO_MESSAGE)
+                yield _error_payload(state, "[WARNING] JonXL H3 Upscale is for images, not videos",
+                                     OPENH3_JXL_VIDEO_MESSAGE)
                 return
             if input_kind_single == "image" and use_app_chunking:
                 use_app_chunking = False

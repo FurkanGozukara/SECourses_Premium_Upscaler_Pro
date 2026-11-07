@@ -3,6 +3,7 @@
 Output & Comparison: 'Default Zoom Level' and 'Show Difference Overlay' are hidden, and Comparison Mode no longer
 offers 'overlay' (no overlay view exists; it showed the slider). A preset saved with 'overlay' loads as 'slider'.
 Metadata & Logging: 'Metadata Format' and 'Log Verbosity' are hidden (metadata is always JSON).
+Face Restoration: the 14 settings nothing reads are hidden, with the two inner tabs they leave empty.
 The UI checks build the real interface without launching it.
 """
 
@@ -25,6 +26,7 @@ from shared.services.output_service import (  # noqa: E402
     normalize_comparison_mode,
     output_defaults,
 )
+from shared.services.face_service import face_defaults  # noqa: E402
 from shared.universal_preset import (  # noqa: E402
     _normalize_output_settings,
     dict_to_values,
@@ -59,8 +61,25 @@ def _walk(block):
         yield from _walk(child)
 
 
+FACE_UNUSED_LABELS = (
+    "Face Detection Model", "Detection Confidence Threshold", "Minimum Face Size (pixels)", "Maximum Faces Per Frame",
+    "Restore All Faces Blindly", "Upscale Face Region First", "Face Padding Ratio", "Use Face Landmarks",
+    "Apply Color Correction", "Batch Face Processing", "Output Quality", "Preserve Original When Better",
+    "Artifact Reduction", "Save Face Masks",
+)
+FACE_USED_LABELS = ("⚡ Enable Globally (All Upscalers)", "Restoration Model", "Face Enhancement Strength",
+                    "CodeFormer Fidelity", "Enable GPU Acceleration")
+
+
 def _top_tab(demo, label):
     return next(b for b in demo.blocks.values() if isinstance(b, gr.Tab) and b.label == label)
+
+
+def _inner_tab(root, label):
+    found = [b for b in _walk(root) if isinstance(b, gr.Tab) and b.label == label]
+    if len(found) != 1:
+        raise AssertionError(f"expected one inner tab {label!r}, found {len(found)}")
+    return found[0]
 
 
 def _by_label(root, label):
@@ -112,6 +131,18 @@ class OutputPresetLoadTests(unittest.TestCase):
         self.assertEqual(values[order.index("log_level")], "debug")
 
 
+class FacePresetLoadTests(unittest.TestCase):
+    def test_hidden_face_values_still_load(self):
+        saved = {"face_detector": "yunet", "detection_confidence": 0.45, "min_face_size": 32, "max_faces": 3,
+                 "restore_blindly": True, "upscale_faces": True, "face_padding": 0.6, "use_landmarks": False,
+                 "color_correction": False, "batch_faces": False, "output_quality": 0.55,
+                 "preserve_original": False, "artifact_reduction": True, "save_face_masks": True}
+        order = TAB_CONFIGS["face"]["order"]
+        values = dict_to_values("face", saved, face_defaults(["model"]))
+        for key, expected in saved.items():
+            self.assertEqual(values[order.index(key)], expected, key)
+
+
 class HiddenControlsUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -139,6 +170,19 @@ class HiddenControlsUiTests(unittest.TestCase):
             self.assertEqual(_wired_both_ways(self.demo, component), (True, True), label)
         for label in ("Save Processing Metadata", "Enable Run Telemetry"):
             self.assertIsNot(_by_label(self.output_tab, label).visible, False, label)
+
+    def test_unused_face_controls_hidden_but_wired(self):
+        face_tab = _top_tab(self.demo, "👤 Face Restoration")
+        for label in FACE_UNUSED_LABELS:
+            component = _by_label(face_tab, label)
+            self.assertIs(component.visible, False, label)
+            self.assertEqual(_wired_both_ways(self.demo, component), (True, True), label)
+        for label in FACE_USED_LABELS:
+            self.assertIsNot(_by_label(face_tab, label).visible, False, label)
+        for label in ("🔍 Face Detection", "🎨 Quality & Output"):
+            self.assertIs(_inner_tab(face_tab, label).visible, False, label)
+        for label in ("🧪 Standalone Processing", "🤖 Model Selection", "✨ Face Restoration", "⚙️ Advanced Settings"):
+            self.assertIsNot(_inner_tab(face_tab, label).visible, False, label)
 
 
 if __name__ == "__main__":

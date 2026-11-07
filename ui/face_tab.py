@@ -338,8 +338,9 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     outputs=backend_info
                 )
         
-        # Face Detection Settings
-        with gr.TabItem("🔍 Face Detection"):
+        # Face Detection Settings: hidden, nothing reads them (detection is facexlib RetinaFace). The controls stay
+        # so presets keep saving and loading their values.
+        with gr.TabItem("🔍 Face Detection", visible=False):
             gr.Markdown("#### Face Detection Configuration")
 
             with gr.Group():
@@ -347,28 +348,32 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     label="Face Detection Model",
                     choices=["retinaface", "yunet", "opencv", "dlib"],
                     value=values[0],  # FACE_ORDER index 0 = face_detector
-                    info="Algorithm for detecting faces in images/videos"
+                    info="Algorithm for detecting faces in images/videos",
+                    visible=False,
                 )
 
                 detection_confidence = gr.Slider(
                     label="Detection Confidence Threshold",
                     minimum=0.1, maximum=1.0, step=0.05,
                     value=values[1],  # FACE_ORDER index 1 = detection_confidence
-                    info="Minimum confidence for face detection (higher = fewer false positives)"
+                    info="Minimum confidence for face detection (higher = fewer false positives)",
+                    visible=False,
                 )
 
                 min_face_size = gr.Number(
                     label="Minimum Face Size (pixels)",
                     value=values[2],  # FACE_ORDER index 2 = min_face_size
                     precision=0,
-                    info="Skip faces smaller than this size"
+                    info="Skip faces smaller than this size",
+                    visible=False,
                 )
 
                 max_faces = gr.Number(
                     label="Maximum Faces Per Frame",
                     value=values[3],  # FACE_ORDER index 3 = max_faces
                     precision=0,
-                    info="Limit faces processed per frame (0 = unlimited)"
+                    info="Limit faces processed per frame (0 = unlimited)",
+                    visible=False,
                 )
 
         # Restoration Settings
@@ -401,13 +406,15 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                 restore_blindly = gr.Checkbox(
                     label="Restore All Faces Blindly",
                     value=values[6],  # FACE_ORDER index 6 = restore_blindly
-                    info="Apply restoration to all detected faces without quality checks"
+                    info="Apply restoration to all detected faces without quality checks",
+                    visible=False,
                 )
 
                 upscale_faces = gr.Checkbox(
                     label="Upscale Face Region First",
                     value=values[7],  # FACE_ORDER index 7 = upscale_faces
-                    info="Pre-upscale face areas before restoration"
+                    info="Pre-upscale face areas before restoration",
+                    visible=False,
                 )
 
         # Advanced Settings
@@ -419,19 +426,22 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     label="Face Padding Ratio",
                     minimum=0.1, maximum=1.0, step=0.1,
                     value=values[8],  # FACE_ORDER index 8 = face_padding
-                    info="Extra area around face for context"
+                    info="Extra area around face for context",
+                    visible=False,
                 )
 
                 face_landmarks = gr.Checkbox(
                     label="Use Face Landmarks",
                     value=values[9],  # FACE_ORDER index 9 = use_landmarks (key name differs)
-                    info="Guide restoration using facial feature detection"
+                    info="Guide restoration using facial feature detection",
+                    visible=False,
                 )
 
                 color_correction = gr.Checkbox(
                     label="Apply Color Correction",
                     value=values[10],  # FACE_ORDER index 10 = color_correction
-                    info="Match face colors to surrounding skin tone"
+                    info="Match face colors to surrounding skin tone",
+                    visible=False,
                 )
 
                 gpu_acceleration = gr.Checkbox(
@@ -443,11 +453,12 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                 batch_face_processing = gr.Checkbox(
                     label="Batch Face Processing",
                     value=values[12],  # FACE_ORDER index 12 = batch_faces (key name differs)
-                    info="Process multiple faces simultaneously"
+                    info="Process multiple faces simultaneously",
+                    visible=False,
                 )
 
-        # Quality & Output
-        with gr.TabItem("🎨 Quality & Output"):
+        # Quality & Output: hidden, nothing reads these settings (kept for presets, see Face Detection).
+        with gr.TabItem("🎨 Quality & Output", visible=False):
             gr.Markdown("#### Output Quality Settings")
 
             with gr.Group():
@@ -455,25 +466,29 @@ def face_tab(preset_manager, global_settings: Dict[str, Any], shared_state: gr.S
                     label="Output Quality",
                     minimum=0.1, maximum=1.0, step=0.05,
                     value=values[13],  # FACE_ORDER index 13 = output_quality
-                    info="Restoration output quality (higher = better but slower)"
+                    info="Restoration output quality (higher = better but slower)",
+                    visible=False,
                 )
 
                 preserve_original = gr.Checkbox(
                     label="Preserve Original When Better",
                     value=values[14],  # FACE_ORDER index 14 = preserve_original
-                    info="Keep original face if restoration doesn't improve quality"
+                    info="Keep original face if restoration doesn't improve quality",
+                    visible=False,
                 )
 
                 artifact_reduction = gr.Checkbox(
                     label="Artifact Reduction",
                     value=values[15],  # FACE_ORDER index 15 = artifact_reduction
-                    info="Apply additional filtering to reduce processing artifacts"
+                    info="Apply additional filtering to reduce processing artifacts",
+                    visible=False,
                 )
 
                 save_face_masks = gr.Checkbox(
                     label="Save Face Masks",
                     value=values[16],  # FACE_ORDER index 16 = save_face_masks
-                    info="Save debug masks showing detected face regions"
+                    info="Save debug masks showing detected face regions",
+                    visible=False,
                 )
 
     # UNIVERSAL PRESET MANAGEMENT

@@ -49,6 +49,7 @@ CHANGELOG_ENTRIES = [
 - Face Restoration: 14 settings that changed nothing (face detection model, confidence, face sizes, padding, landmarks, color correction, output quality and the others) are hidden, together with the Face Detection and Quality & Output tabs they filled. Restoration Model, Strength, CodeFormer Fidelity, GPU Acceleration and Enable Globally stay; presets that hold the hidden settings still load.
 - SeedVR2 and RTX Super Resolution: the Cancel notes and the SeedVR2 Processing Mode notes no longer tell you to check or switch the mode in Global Settings, where no mode setting is shown. Cancel works in the default subprocess mode.
 - Health Check: "What Each Check Does" now also lists the NVIDIA VFX / RTX Super Resolution runtime check, which the report already ran.
+- RunPod / SimplePod instructions: the NVIDIA driver must be 580 or newer (pick CUDA 13.0 or newer in the filters); the text said 570+, below the minimum the Health Check uses.
 """,
     ),
     (

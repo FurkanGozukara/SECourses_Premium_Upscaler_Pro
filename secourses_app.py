@@ -2202,6 +2202,11 @@ def main(argv=None):
                              "dlss5": dlss5_ui, "gan": gan_ui, "rife": rife_ui, "face": face_ui},
                     tab_targets=HISTORY_TAB_TARGETS,
                     chain_ui=chain_ui,
+                    tab_sync_states={"seedvr2": tab_sync_seedvr2, "flashvsr": tab_sync_flashvsr,
+                                     "relayvsr": tab_sync_relayvsr, "open_h3": tab_sync_open_h3,
+                                     "ltx25": tab_sync_ltx25, "sparkvsr": tab_sync_sparkvsr, "rtx": tab_sync_rtx,
+                                     "dlss5": tab_sync_dlss5, "gan": tab_sync_gan, "rife": tab_sync_rife,
+                                     "face": tab_sync_face},
                 )
             # the tab follows the session's outputs folder (Global Settings), then refreshes in the browser
             tab_history.select(fn=history_ui["sync_root"], inputs=[shared_state], outputs=None, queue=False,

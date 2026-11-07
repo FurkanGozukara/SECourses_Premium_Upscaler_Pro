@@ -563,7 +563,9 @@ def video_sr_tab(
             state,
         )
 
-    upload_clear_evt = input_file.change(
+    # .clear = the user's X on the box. Not .change: that also fires when Past Generations clears the box for
+    # Reload parameters / Send output to, and must not empty the Input Path it just restored.
+    upload_clear_evt = input_file.clear(
         fn=clear_input_path_on_upload_clear,
         inputs=[input_file, shared_state],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],

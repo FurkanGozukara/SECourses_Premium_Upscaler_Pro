@@ -1306,7 +1306,9 @@ def rtx_super_resolution_tab(
         img_prev, vid_prev = preview_updates(None)
         return "", gr.update(value="", visible=False), img_prev, vid_prev, gr.update(value="", visible=False), gr.update(value="", visible=False), state
 
-    input_file.change(
+    # .clear = the user's X on the box. Not .change: that also fires when Past Generations clears the box for
+    # Reload parameters / Send output to, and must not empty the Input Path it just restored.
+    input_file.clear(
         fn=clear_on_upload_clear,
         inputs=[input_file, shared_state],
         outputs=[input_path, input_cache_msg, input_image_preview, input_video_preview, input_detection_result, sizing_info, shared_state],

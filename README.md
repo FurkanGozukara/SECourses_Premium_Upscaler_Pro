@@ -68,12 +68,12 @@ static-frame skip, recursion depth.
 - FPS override support.
 - Global RIFE post-process for all upscaler outputs (multiplier, model, precision, CUDA device).
 - Chunk-safe Global RIFE mode (process per chunk before merge).
-- Comparison mode selector: native/slider/side-by-side/overlay-style options.
+- Comparison mode selector: native/slider/side-by-side.
 - Image comparison and custom HTML video comparison slider outputs.
 - Generated input-vs-output comparison video (auto/horizontal/vertical layout).
 - Direct “compare any 2 videos” tool with fullscreen-capable slider UI.
 - Pin/unpin reference frame for iterative comparisons across runs.
-- Fullscreen and zoom-oriented comparison preferences.
+- Fullscreen comparison preference.
 - Metadata/telemetry settings exposed in Output tab.
 
 ##   Tier 3: Scale, Throughput, and Long-Run Processing

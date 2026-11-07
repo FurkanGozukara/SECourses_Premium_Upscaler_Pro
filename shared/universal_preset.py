@@ -47,7 +47,7 @@ from shared.services.face_service import FACE_ORDER, face_defaults
 from shared.services.dlss5_service import DLSS5_ORDER, dlss5_defaults
 from shared.chain_runner import CHAINS_ORDER, chains_defaults
 from shared.services.resolution_service import RESOLUTION_ORDER, resolution_defaults
-from shared.services.output_service import OUTPUT_ORDER, output_defaults
+from shared.services.output_service import OUTPUT_ORDER, normalize_comparison_mode, output_defaults
 from shared.models.rife_meta import get_rife_default_model
 from shared.models.flashvsr_meta import flashvsr_version_to_ui
 from shared.gpu_utils import auto_select_global_gpu_device, resolve_global_gpu_device
@@ -404,6 +404,9 @@ def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["global_rife_precision"] = "fp16" if precision == "fp16" else "fp32"
     cfg["global_rife_cuda_device"] = str(cfg.get("global_rife_cuda_device", "") or "")
     cfg["global_rife_process_chunks"] = bool(cfg.get("global_rife_process_chunks", True))
+    if "comparison_mode" in cfg:
+        # The removed "overlay" mode always showed the slider; old presets load it as "slider".
+        cfg["comparison_mode"] = normalize_comparison_mode(cfg["comparison_mode"])
     return cfg
 
 

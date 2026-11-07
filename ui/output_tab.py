@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 from shared.services.output_service import (
-    build_output_callbacks, OUTPUT_ORDER
+    build_output_callbacks, OUTPUT_ORDER, COMPARISON_MODE_CHOICES, normalize_comparison_mode
 )
 from shared.models import (
     get_seedvr2_model_names,
@@ -413,8 +413,8 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                 with gr.Column(scale=1):
                     comparison_mode = gr.Dropdown(
                         label="Comparison Mode",
-                        choices=["native", "slider", "side_by_side", "overlay"],
-                        value=str(_value("comparison_mode", "slider") or "slider"),
+                        choices=list(COMPARISON_MODE_CHOICES),
+                        value=str(normalize_comparison_mode(_value("comparison_mode", "slider")) or "slider"),
                         info="Default visual mode for before/after comparisons."
                     )
                     pin_reference = gr.Checkbox(
@@ -429,18 +429,21 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                     )
 
                 with gr.Column(scale=1):
+                    # Hidden: nothing reads these two values. They stay so presets keep saving and loading them.
                     comparison_zoom = gr.Slider(
                         label="Default Zoom Level",
                         minimum=25,
                         maximum=400,
                         step=25,
                         value=int(_value("comparison_zoom", 100) or 100),
-                        info="Default zoom percentage for image comparison UI."
+                        info="Default zoom percentage for image comparison UI.",
+                        visible=False,
                     )
                     show_difference = gr.Checkbox(
                         label="Show Difference Overlay",
                         value=bool(_value("show_difference", False)),
-                        info="Overlay highlights differences between source and output."
+                        info="Overlay highlights differences between source and output.",
+                        visible=False,
                     )
                     generate_comparison_video = gr.Checkbox(
                         label="Generate Input vs Output Comparison Video",

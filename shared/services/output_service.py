@@ -16,6 +16,17 @@ from shared.video_codec_options import (
 )
 from shared.models.rife_meta import get_rife_default_model
 
+# Comparison viewer modes the app has. Older versions also offered "overlay", which never existed as a view
+# (it showed the slider); presets saved with it load as "slider".
+COMPARISON_MODE_CHOICES: List[str] = ["native", "slider", "side_by_side"]
+
+
+def normalize_comparison_mode(value: Any) -> Any:
+    """Map the removed "overlay" Comparison Mode to "slider"; every other value is returned unchanged."""
+    if str(value or "").strip().lower() == "overlay":
+        return "slider"
+    return value
+
 
 def output_defaults(models: List[str]) -> Dict[str, Any]:
     return {
@@ -192,6 +203,8 @@ def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["global_rife_precision"] = "fp16" if precision_raw == "fp16" else "fp32"
     cfg["global_rife_cuda_device"] = str(cfg.get("global_rife_cuda_device", "") or "")
     cfg["global_rife_process_chunks"] = bool(cfg.get("global_rife_process_chunks", True))
+    if "comparison_mode" in cfg:
+        cfg["comparison_mode"] = normalize_comparison_mode(cfg["comparison_mode"])
     return cfg
 
 

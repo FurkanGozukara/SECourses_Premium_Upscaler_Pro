@@ -47,6 +47,7 @@ from ui.shared_components import (
 )
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
+from shared.chunk_preview import clear_chunk_preview
 from shared.queue_state import (
     snapshot_queue_state,
     snapshot_global_settings,
@@ -1902,6 +1903,8 @@ def sparkvsr_tab(
 
     def _starting_runtime_output(state, action_label: str):
         safe_state = state or {}
+        # Start pressed: the previous run's chunk gallery goes away now, not when the job first reports.
+        clear_chunk_preview(safe_state, "sparkvsr_chunk_preview")
         title = f"{action_label} started"
         subtitle = "Initializing runtime and preparing input..."
         return (

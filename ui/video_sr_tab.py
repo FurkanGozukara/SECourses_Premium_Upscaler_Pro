@@ -18,6 +18,7 @@ import gradio as gr
 from shared.fixed_scale_analysis import build_fixed_scale_analysis_update
 from shared.path_utils import normalize_path
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
+from shared.chunk_preview import clear_chunk_preview
 from shared.queue_state import merge_payload_state, snapshot_global_settings, snapshot_queue_state
 from shared.video_comparison_slider import get_video_comparison_js_on_load
 from ui.media_preview import preview_updates
@@ -1066,6 +1067,8 @@ def video_sr_tab(
 
     def _starting_runtime_output(state, action_label: str):
         safe_state = state or {}
+        # Start pressed: the previous run's chunk gallery goes away now, not when the job first reports.
+        clear_chunk_preview(safe_state, f"{spec.key}_chunk_preview")
         title = f"{action_label} started"
         subtitle = "Initializing runtime and preparing input..."
         return (

@@ -10,6 +10,40 @@ from typing import Any, Dict, List, Optional, Tuple
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".flv", ".wmv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
+# Folders inside processed_chunks that are not chunks: the thumbnails folder of the run and the UI's own preview
+# copies (.ui_preview_cache, written by _safe_video_preview_copy below). The preview cache was listed as one more
+# "chunk" whose first video is chunk 1's copy, so the gallery showed chunk 1 twice and numbered the rest one too high.
+_NOT_CHUNK_DIRS = {"thumbs"}
+_PREVIEW_COPY_MARKERS = (".__ui_preview_", ".__h264_preview_")
+
+EMPTY_CHUNK_PREVIEW_MESSAGE = "No chunk preview available yet."
+
+
+def empty_chunk_preview(message: str = EMPTY_CHUNK_PREVIEW_MESSAGE) -> Dict[str, Any]:
+    """The chunk preview payload of a run that has no finished chunk (yet)."""
+    return {"message": message, "gallery": [], "videos": [], "count": 0}
+
+
+def clear_chunk_preview(state: Any, key: str) -> None:
+    """Forget the previous run's chunk preview in the live state when Start is pressed, so the tab's gallery
+    empties at once instead of showing the previous run until the new job reports its first progress."""
+    if not isinstance(state, dict):
+        return
+    seed_controls = state.get("seed_controls")
+    if not isinstance(seed_controls, dict):
+        seed_controls = {}
+        state["seed_controls"] = seed_controls
+    seed_controls[key] = empty_chunk_preview()
+
+
+def _is_chunk_entry(path: Path) -> bool:
+    name = path.name
+    if name.startswith(".") or any(marker in name for marker in _PREVIEW_COPY_MARKERS):
+        return False
+    if path.is_dir():
+        return name not in _NOT_CHUNK_DIRS
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTS.union(IMAGE_EXTS)
+
 
 def _collect_chunk_outputs(run_dir: Path) -> List[Path]:
     processed_dir = run_dir / "processed_chunks"
@@ -19,17 +53,7 @@ def _collect_chunk_outputs(run_dir: Path) -> List[Path]:
         return direct
 
     items: List[Path] = []
-    files = sorted(
-        [
-            p
-            for p in processed_dir.iterdir()
-            if p.exists()
-            and (
-                (p.is_file() and p.suffix.lower() in VIDEO_EXTS.union(IMAGE_EXTS))
-                or p.is_dir()
-            )
-        ]
-    )
+    files = sorted(p for p in processed_dir.iterdir() if p.exists() and _is_chunk_entry(p))
     items.extend(files)
     return items
 

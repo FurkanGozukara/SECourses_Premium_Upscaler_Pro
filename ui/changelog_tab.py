@@ -60,6 +60,7 @@ CHANGELOG_ENTRIES = [
 - RIFE / FPS / Edit Videos: after "Reload parameters" of a RIFE run, Process Video failed with "Value: h264 is not in the list of choices". The run's settings hold the Output tab's codec name (h264, h265, vp9), which the tab's Video Codec list (libx264, libx265, libvpx-vp9) does not have; it is now shown as the matching tab codec (h264 as libx264, h265 as libx265, vp9 as libvpx-vp9, other codecs as libx264), and an image-sequence run's 'png' Output Format as 'auto'.
 - Cancel (SeedVR2, RIFE / FPS / Edit Videos, Image-Based (GAN), RTX Super Resolution): a cancel before the job's first chunk finished could join the chunks of an older, unfinished run into a "cancelled_partial" video inside that older run's folder and show it as the cancelled job's partial result. Cancel now saves a partial result only from the cancelled job's own run folder, and nothing when that job has no finished chunk yet.
 - RIFE / FPS / Edit Videos: a run that went through the scene chunks (Auto Chunk on, the default) saved no settings, so its Past Generations card had "Reload parameters" disabled. It now saves them like every other run.
+- Chunk Preview gallery (FlashVSR, RelayVSR, Open-H3, LTX 2.5, SparkVSR, Image-Based (GAN), RTX Super Resolution): chunk 1 appeared twice and every later chunk was numbered one too high, because the gallery's own preview copies were listed as one more chunk. Each chunk is now listed once, in order. Pressing Start also clears the previous run's gallery at once instead of showing it until the new job reports.
 """,
     ),
     (

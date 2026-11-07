@@ -24,6 +24,7 @@ from shared.path_utils import normalize_path
 from ui.media_preview import preview_updates
 from ui.shared_components import warn_cancel_confirmation, with_pre_run_output_signature
 from shared.processing_queue import get_processing_queue_manager, resolve_queue_gpu_resources
+from shared.chunk_preview import clear_chunk_preview
 from shared.queue_state import (
     snapshot_queue_state,
     snapshot_global_settings,
@@ -1106,6 +1107,8 @@ def gan_tab(
 
     def _starting_runtime_output(state, action_label: str):
         safe_state = state or {}
+        # Start pressed: the previous run's chunk gallery goes away now, not when the job first reports.
+        clear_chunk_preview(safe_state, "gan_chunk_preview")
         title = f"{action_label} started"
         subtitle = "Initializing runtime and preparing input..."
         chunk_status_upd, chunk_gallery_upd, chunk_preview_upd = refresh_chunk_preview_ui(safe_state)

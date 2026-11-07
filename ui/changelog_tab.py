@@ -43,6 +43,7 @@ CHANGELOG_ENTRIES = [
 - `Models_Downloader.py` now calls FlashVSR+ Turbo the recommended FlashVSR+ model instead of "the app's default": the FlashVSR tab still starts on FlashVSR v1.1 (only its Precision default is INT8 ConvRot).
 - LTX 2.5 and Open-H3: the model notes still called INT8 ConvRot the recommended model. They now say W4A8 is the default (smallest and fastest on RTX 30 or newer) and INT8 ConvRot the automatic choice on older GPUs (and, in Open-H3, the model of JonXL H3 Upscale).
 - SeedVR2: the Attention Backend note said sdpa is the default. It now says flash_attn_2 is the default (the setting already started on it for the built-in models, the default W4A8 included) and sdpa the fallback.
+- RIFE: the RIFE Model note mentioned v4.6 and an 'anime' model that the list does not offer. It now lists the real choices: 4.14-4.26 (4.26 by default) and, on RTX 40 and 50 series GPUs, NVIDIA-FrameGen-High / Medium / Low.
 """,
     ),
     (

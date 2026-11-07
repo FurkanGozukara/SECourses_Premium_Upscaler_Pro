@@ -253,7 +253,7 @@ def rife_tab(
                                 choices=_rife_model_choices,
                                 value=_rife_model_value,
                                 allow_custom_value=True,
-                                info="RIFE model version. v4.6 = fastest. v4.15+ = best quality. 'anime' optimized for animation. Newer versions slower but smoother."
+                                info="RIFE model version: 4.14-4.26 (4.26 = default). On RTX 40 and 50 series GPUs the list also offers NVIDIA-FrameGen-High / Medium / Low (NVIDIA RTX Video Frame Generation quality modes). Other RIFE model folders you add to RIFE/models appear here too."
                             )
                             fps_multiplier = gr.Dropdown(
                                 label="FPS Multiplier",

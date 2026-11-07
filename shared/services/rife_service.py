@@ -3,6 +3,7 @@ RIFE Service Module - Clean Implementation
 Handles RIFE/FPS/Edit Videos processing logic, presets, and callbacks
 """
 
+import json
 import shutil
 import subprocess
 import queue
@@ -1449,10 +1450,41 @@ def build_rife_callbacks(
                     status = " Out of VRAM (GPU)  see banner above"
                     show_vram_oom_modal(state, title="Out of VRAM (GPU)  RIFE", duration=None)
                 
+                # Save the run's settings next to its result, as the whole-file path does: Past Generations reads
+                # run_summary.json for "Reload parameters" (a chunked run saved none, so its button was disabled).
+                if final_output and Path(final_output).exists():
+                    try:
+                        run_root = Path(settings.get("_run_dir") or "")
+                        summary_target = run_root if settings.get("_run_dir") and run_root.is_dir() else Path(final_output)
+                        run_logger.write_summary(
+                            summary_target,
+                            {
+                                "input": settings["input_path"],
+                                "output": final_output,
+                                "returncode": rc,
+                                # JSON-safe copy (a value json cannot write would lose the whole summary)
+                                "args": json.loads(json.dumps(settings, default=str)),
+                                "edit_mode": settings.get("edit_mode", "none"),
+                                "rife_enabled": True,
+                                "face_restoration": False,
+                                "pipeline": "rife",
+                                "chunking": {
+                                    "mode": "auto" if auto_chunk else "static",
+                                    "chunk_size_sec": 0.0 if auto_chunk else float(chunk_size_sec or 0),
+                                    "chunk_overlap_sec": float(chunk_overlap_sec or 0),
+                                    "scene_threshold": float(scene_threshold),
+                                    "min_scene_len": float(min_scene_len),
+                                    "chunks": int(chunk_count or 0),
+                                },
+                            },
+                        )
+                    except Exception as summary_exc:
+                        error_logger.warning(f"RIFE: could not save the run settings: {summary_exc}")
+
                 # Build comparison for chunked output
                 video_comp_html_update = gr.update(value="", visible=False)
                 image_slider_update = gr.update(value=None)
-                
+
                 if final_output and Path(final_output).exists():
                     if Path(final_output).suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv'):
                         from shared.video_comparison_slider import create_video_comparison_html

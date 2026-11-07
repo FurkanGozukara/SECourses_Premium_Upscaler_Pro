@@ -571,6 +571,30 @@ def _rife_processing_requested(cfg: Dict[str, Any]) -> bool:
     )
 
 
+def _rife_chunking_applies(
+    settings: Dict[str, Any],
+    *,
+    input_type: str,
+    chunking_enabled: bool,
+    rife_requested: bool,
+) -> bool:
+    """Whether a single-file RIFE / Video Editing run goes through scene/static chunking.
+
+    Chunks only run RIFE on each scene, so a run that only edits (trim, speed change, concatenate, effects) or
+    asks for no interpolation at all is processed as one whole file: the chunk path skipped the edit and still
+    interpolated every chunk (a 0.5x speed change came out at normal speed with doubled frames)."""
+    edit_mode = str(settings.get("edit_mode") or "none").strip().lower()
+    return bool(
+        chunking_enabled
+        and rife_requested
+        and edit_mode == "none"
+        and input_type == "video"
+        and not settings.get("batch_enable", False)
+        and not settings.get("img_mode", False)  # Don't chunk image sequences
+        and not bool(settings.get("png_output", False))  # Sequence export uses directory outputs; keep flow simple
+    )
+
+
 def _apply_global_rife_override(
     settings: Dict[str, Any],
     seed_controls: Dict[str, Any],
@@ -1191,12 +1215,11 @@ def build_rife_callbacks(
                     except Exception:
                         pass
 
-            should_use_chunking = (
-                (auto_chunk or chunk_size_sec > 0) and
-                input_type_check == "video" and
-                not settings.get("batch_enable", False) and
-                not settings.get("img_mode", False) and  # Don't chunk image sequences
-                not bool(settings.get("png_output", False))  # Sequence export uses directory outputs; keep flow simple
+            should_use_chunking = _rife_chunking_applies(
+                settings,
+                input_type=input_type_check,
+                chunking_enabled=(auto_chunk or chunk_size_sec > 0),
+                rife_requested=(_rife_processing_requested(settings) or global_rife_forced),
             )
             resume_requested = bool(settings.get("_resume_run_requested") or str(settings.get("resume_run_dir") or "").strip())
             if resume_requested and not should_use_chunking:
@@ -1572,7 +1595,13 @@ def build_rife_callbacks(
 
                         # Apply universal chunking (Resolution tab) for batch videos, same as single-file runs.
                         from shared.path_utils import detect_input_type as _detect_type
-                        should_chunk = (_detect_type(job.input_path) == "video") and (auto_chunk or chunk_size_sec > 0) and (not png_output_job)
+                        # A job with nothing to interpolate is copied below, never chunked (the chunk path always ran RIFE).
+                        should_chunk = (
+                            (_detect_type(job.input_path) == "video")
+                            and (auto_chunk or chunk_size_sec > 0)
+                            and (not png_output_job)
+                            and (_rife_processing_requested(single_settings) or global_rife_forced)
+                        )
                         if should_chunk:
                             from shared.chunking import chunk_and_process
 

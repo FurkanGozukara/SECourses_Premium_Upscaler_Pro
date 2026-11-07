@@ -1,5 +1,5 @@
 """
-Regression tests for the RIFE / FPS / Edit Videos tab (V10.1 fixes, 7 November 2026).
+Regression tests for the RIFE / FPS / Edit Videos tab (V10.2 fixes, 7 November 2026).
 
 1. The tab's Spatial Scale Factor ("scale": the resolution at which RIFE estimates motion; the output size never
    changes) was replaced by the Resolution tab's Upscale x. With Upscale x = 4 every run estimated motion at 4x the

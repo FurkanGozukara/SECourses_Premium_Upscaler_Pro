@@ -1,4 +1,4 @@
-"""The chunk preview gallery lists each chunk once, and Start clears the previous run's gallery (V10.1 fix).
+"""The chunk preview gallery lists each chunk once, and Start clears the previous run's gallery (V10.2 fix).
 
 Seen in the tutorial recording on 7 November 2026 (RelayVSR, a seven-scene movie): the gallery showed chunk 1 twice,
 and pressing Start Upscaling showed the previous run's gallery until the new job reported its first progress.

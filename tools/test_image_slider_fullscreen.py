@@ -1,4 +1,4 @@
-"""The Before/After image comparison lines up in fullscreen (V10.1 fix, 7 November 2026).
+"""The Before/After image comparison lines up in fullscreen (V10.2 fix, 7 November 2026).
 
 Seen in the tutorial recording (Image-Based (GAN), a 960x661 photo upscaled): the in-page slider was aligned, but in
 fullscreen the two sides showed the picture at different scales. Checked in the real app in Chrome: in fullscreen the

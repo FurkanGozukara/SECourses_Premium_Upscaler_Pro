@@ -1,4 +1,4 @@
-"""Settings that nothing reads are hidden, yet presets that hold them still load (V10.1 fixes).
+"""Settings that nothing reads are hidden, yet presets that hold them still load (V10.2 fixes).
 
 Output & Comparison: 'Default Zoom Level' and 'Show Difference Overlay' are hidden, and Comparison Mode no longer
 offers 'overlay' (no overlay view exists; it showed the slider). A preset saved with 'overlay' loads as 'slider'.

@@ -1,4 +1,4 @@
-"""Models_Downloader.py resumes an interrupted download instead of starting it again (V10.1 fix, 7 November 2026).
+"""Models_Downloader.py resumes an interrupted download instead of starting it again (V10.2 fix, 7 November 2026).
 
 Seen while recording the tutorial: Ctrl+C during a native Xet download printed "[INTERRUPTED] ...: the transferred
 bytes were kept for the next run", but the re-run printed "[DOWNLOADING]" (not "[RESUMING]") and fetched the whole

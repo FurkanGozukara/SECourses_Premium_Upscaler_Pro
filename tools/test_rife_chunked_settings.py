@@ -1,4 +1,4 @@
-"""A chunked RIFE run saves its settings, so Past Generations can reload it (V10.1 fix, 7 November 2026).
+"""A chunked RIFE run saves its settings, so Past Generations can reload it (V10.2 fix, 7 November 2026).
 
 Seen in the real app: a RIFE x2 run with Auto Chunk on (outputs/0089) wrote its result but no run_summary.json; its
 Past Generations card had "Reload parameters" disabled ("No saved settings"). The whole-file path saved the settings,

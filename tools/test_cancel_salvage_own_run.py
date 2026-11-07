@@ -1,4 +1,4 @@
-"""Cancel saves a partial result only from the cancelled job's own run folder (V10.1 fix, 7 November 2026).
+"""Cancel saves a partial result only from the cancelled job's own run folder (V10.2 fix, 7 November 2026).
 
 Seen in the real app: a SeedVR2 run (outputs/0087) was cancelled before its first chunk finished. The cancel salvage
 scanned the outputs root for "recent unfinished" run folders, skipped the job's own empty folder and joined the chunks

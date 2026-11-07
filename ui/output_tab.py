@@ -800,18 +800,22 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         info="Enable runtime stats logging for troubleshooting."
                     )
 
-                with gr.Column(scale=1):
+                with gr.Column(scale=1, visible=False):
+                    # Hidden: nothing reads these two values (run metadata is always written as JSON). They stay
+                    # so presets keep saving and loading them.
                     metadata_format = gr.Dropdown(
                         label="Metadata Format",
                         choices=["json", "xml", "exif", "none"],
                         value=str(_value("metadata_format", "json") or "json"),
-                        info="Serialization format for run metadata payloads."
+                        info="Serialization format for run metadata payloads.",
+                        visible=False,
                     )
                     log_level = gr.Dropdown(
                         label="Log Verbosity",
                         choices=["error", "warning", "info", "debug"],
                         value=str(_value("log_level", "info") or "info"),
-                        info="Verbosity level for per-run logs."
+                        info="Verbosity level for per-run logs.",
+                        visible=False,
                     )
 
     # UNIVERSAL PRESET MANAGEMENT

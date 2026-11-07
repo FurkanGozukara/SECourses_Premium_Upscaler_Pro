@@ -2,6 +2,7 @@
 
 Output & Comparison: 'Default Zoom Level' and 'Show Difference Overlay' are hidden, and Comparison Mode no longer
 offers 'overlay' (no overlay view exists; it showed the slider). A preset saved with 'overlay' loads as 'slider'.
+Metadata & Logging: 'Metadata Format' and 'Log Verbosity' are hidden (metadata is always JSON).
 The UI checks build the real interface without launching it.
 """
 
@@ -80,7 +81,7 @@ def _wired_both_ways(demo, component):
             any(component in fn.outputs for fn in fns if fn.fn is not None))
 
 
-class ComparisonModePresetTests(unittest.TestCase):
+class OutputPresetLoadTests(unittest.TestCase):
     def test_overlay_maps_to_slider(self):
         self.assertEqual(normalize_comparison_mode("overlay"), "slider")
         self.assertEqual(normalize_comparison_mode(" Overlay "), "slider")
@@ -104,6 +105,12 @@ class ComparisonModePresetTests(unittest.TestCase):
         self.assertEqual(values[order.index("comparison_zoom")], 150)
         self.assertIs(values[order.index("show_difference")], True)
 
+    def test_hidden_metadata_values_still_load(self):
+        order = TAB_CONFIGS["output"]["order"]
+        values = dict_to_values("output", {"metadata_format": "xml", "log_level": "debug"}, output_defaults(["model"]))
+        self.assertEqual(values[order.index("metadata_format")], "xml")
+        self.assertEqual(values[order.index("log_level")], "debug")
+
 
 class HiddenControlsUiTests(unittest.TestCase):
     @classmethod
@@ -123,6 +130,14 @@ class HiddenControlsUiTests(unittest.TestCase):
             self.assertEqual(_wired_both_ways(self.demo, component), (True, True), label)
         for label in ("Comparison Mode", "Pin Reference Image", "Enable Fullscreen Comparison",
                       "Generate Input vs Output Comparison Video"):
+            self.assertIsNot(_by_label(self.output_tab, label).visible, False, label)
+
+    def test_dead_metadata_controls_hidden_but_wired(self):
+        for label in ("Metadata Format", "Log Verbosity"):
+            component = _by_label(self.output_tab, label)
+            self.assertIs(component.visible, False, label)
+            self.assertEqual(_wired_both_ways(self.demo, component), (True, True), label)
+        for label in ("Save Processing Metadata", "Enable Run Telemetry"):
             self.assertIsNot(_by_label(self.output_tab, label).visible, False, label)
 
 

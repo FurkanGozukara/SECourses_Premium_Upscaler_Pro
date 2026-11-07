@@ -45,6 +45,7 @@ CHANGELOG_ENTRIES = [
 - SeedVR2: the Attention Backend note said sdpa is the default. It now says flash_attn_2 is the default (the setting already started on it for the built-in models, the default W4A8 included) and sdpa the fallback.
 - RIFE: the RIFE Model note mentioned v4.6 and an 'anime' model that the list does not offer. It now lists the real choices: 4.14-4.26 (4.26 by default) and, on RTX 40 and 50 series GPUs, NVIDIA-FrameGen-High / Medium / Low.
 - Output & Comparison: Comparison Mode no longer offers "overlay", which never had a view of its own and showed the slider; presets saved with it load as "slider". "Default Zoom Level" and "Show Difference Overlay" are hidden because they changed nothing; presets that hold them still load.
+- Output & Comparison > Metadata & Logging: "Metadata Format" and "Log Verbosity" are hidden because they changed nothing (run metadata is always saved as JSON); presets that hold them still load.
 """,
     ),
     (

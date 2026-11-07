@@ -50,6 +50,7 @@ CHANGELOG_ENTRIES = [
 - SeedVR2 and RTX Super Resolution: the Cancel notes and the SeedVR2 Processing Mode notes no longer tell you to check or switch the mode in Global Settings, where no mode setting is shown. Cancel works in the default subprocess mode.
 - Health Check: "What Each Check Does" now also lists the NVIDIA VFX / RTX Super Resolution runtime check, which the report already ran.
 - RunPod / SimplePod instructions: the NVIDIA driver must be 580 or newer (pick CUDA 13.0 or newer in the filters); the text said 570+, below the minimum the Health Check uses.
+- `Models_Downloader.py`: the SeedVR2 download sizes in the menu now match the real files, for example 7B and 7B Sharp about 16.5 GB (not 14 GB), the FP8 models about 8.5 GB, the VAE about 500 MB and all core models about 40 GB.
 """,
     ),
     (

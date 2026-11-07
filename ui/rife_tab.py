@@ -10,7 +10,8 @@ from typing import Dict, Any
 import html
 
 from shared.services.rife_service import (
-    build_rife_callbacks, RIFE_ORDER
+    build_rife_callbacks, RIFE_ORDER, RIFE_OUTPUT_FORMAT_CHOICES, RIFE_VIDEO_CODEC_CHOICES,
+    rife_tab_output_format, rife_tab_video_codec,
 )
 from shared.models import get_rife_model_names
 from shared.models.rife_meta import get_rife_default_model, rife_nvfg_mode
@@ -190,8 +191,8 @@ def rife_tab(
                         
                         output_format_rife = gr.Dropdown(
                             label="Output Format",
-                            choices=["auto", "mp4", "avi", "mov", "webm"],
-                            value=_value("output_format", "mp4"),
+                            choices=list(RIFE_OUTPUT_FORMAT_CHOICES),
+                            value=rife_tab_output_format(_value("output_format", "mp4")),
                             info="Container format for output video"
                         )
 
@@ -436,8 +437,8 @@ def rife_tab(
                     with gr.Group():
                         video_codec_rife = gr.Dropdown(
                             label="Video Codec",
-                            choices=["libx264", "libx265", "libvpx-vp9"],
-                            value=_value("video_codec", "libx264"),
+                            choices=list(RIFE_VIDEO_CODEC_CHOICES),
+                            value=rife_tab_video_codec(_value("video_codec", "libx264")),
                             info="Compression codec"
                         )
 

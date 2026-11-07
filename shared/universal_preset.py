@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 # Import ORDER constants from all services
 from shared.services.seedvr2_service import SEEDVR2_ORDER, seedvr2_defaults
 from shared.services.gan_service import GAN_ORDER, gan_defaults
-from shared.services.rife_service import RIFE_ORDER, rife_defaults
+from shared.services.rife_service import RIFE_ORDER, rife_defaults, rife_tab_output_format, rife_tab_video_codec
 from shared.services.relayvsr_service import RELAYVSR_ORDER, relayvsr_defaults
 from shared.services.flashvsr_service import (
     FLASHVSR_ORDER,
@@ -317,6 +317,14 @@ def _normalize_rife_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         seq_quality = 95
     cfg["sequence_quality"] = max(1, min(100, seq_quality))
+
+    # Keep the tab's Video Codec and Output Format inside their choices. A run's saved settings (Past Generations
+    # "Reload parameters") hold the Output tab's codec under the same key ('h264', not 'libx264') and 'png' for an
+    # image-sequence run; a value outside the choices made Process Video fail ("... is not in the list of choices").
+    if "video_codec" in cfg:
+        cfg["video_codec"] = rife_tab_video_codec(cfg.get("video_codec"))
+    if "output_format" in cfg:
+        cfg["output_format"] = rife_tab_output_format(cfg.get("output_format"))
     return cfg
 
 

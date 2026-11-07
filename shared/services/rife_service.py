@@ -155,6 +155,37 @@ RIFE_ORDER: List[str] = [
     "dedup_frames",
 ]
 
+# Choices of the tab's own Video Codec and Output Format dropdowns (ui/rife_tab.py).
+RIFE_VIDEO_CODEC_CHOICES: Tuple[str, ...] = ("libx264", "libx265", "libvpx-vp9")
+RIFE_OUTPUT_FORMAT_CHOICES: Tuple[str, ...] = ("auto", "mp4", "avi", "mov", "webm")
+_RIFE_CODEC_ALIASES = {
+    "h264": "libx264", "x264": "libx264", "avc": "libx264",
+    "h265": "libx265", "x265": "libx265", "hevc": "libx265",
+    "vp9": "libvpx-vp9",
+}
+
+
+def rife_tab_video_codec(value: Any) -> str:
+    """The tab's Video Codec choice for a stored value.
+
+    A run saves its settings with the Output tab's codec under the same key (h264, h265, vp9, av1, prores); that
+    name is mapped to the tab's encoder, and a codec the tab does not offer falls back to the tab default libx264.
+    """
+    codec = str(value or "").strip().lower()
+    if codec in RIFE_VIDEO_CODEC_CHOICES:
+        return codec
+    return _RIFE_CODEC_ALIASES.get(codec, "libx264")
+
+
+def rife_tab_output_format(value: Any) -> str:
+    """The tab's Output Format choice for a stored value.
+
+    A run saves 'png' when "auto" resolved to an image sequence (PNG Output / the Output tab); "auto" gives the same
+    result again, so a value the dropdown does not offer becomes "auto".
+    """
+    fmt = str(value or "").strip().lower().lstrip(".")
+    return fmt if fmt in RIFE_OUTPUT_FORMAT_CHOICES else "auto"
+
 
 # Video editing functions -----------------------------------------------------
 

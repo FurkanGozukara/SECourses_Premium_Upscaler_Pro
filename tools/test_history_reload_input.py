@@ -13,6 +13,10 @@ the previous input stayed.
 These checks build the real interface without launching it and replay the browser's order of events with the app's
 own handlers: the Past Generations event, then the change events of every upload box it sets (the cleared-upload
 handlers and the auto-sync of the tab's settings), then the click on the tab (its select sync).
+
+Also seen on 7 November 2026: Reload parameters of a RIFE run put the Output tab's codec name 'h264' (saved in the
+run's settings under the same key) into the RIFE / FPS / Edit Videos tab's Video Codec, whose choices are libx264,
+libx265 and libvpx-vp9, and Process Video failed with "Value: h264 is not in the list of choices".
 """
 
 from __future__ import annotations
@@ -194,12 +198,35 @@ class HistoryReloadInputTests(unittest.TestCase):
             [{"input": str(cls.input_file), "output": str(cls.output_file), "returncode": 0, "args": cls.args,
               "pipeline": "relayvsr", "timestamp": "2026-11-07 15:01:00"}]), encoding="utf-8")
 
+        # one finished RIFE run, saved the way rife_service.run_action saves it: the Output tab's codec ('h264') under
+        # video_codec, 'png' as the resolved output format of an image-sequence run, int multiplier, bool precision
+        from shared.services.rife_service import rife_defaults
+
+        rife_run = cls.tmp / "outputs" / "0001"
+        cls.rife_output = rife_run / "man_in_suit_960x540.mp4"
+        cls.rife_output.parent.mkdir(parents=True, exist_ok=True)
+        cls.rife_output.write_bytes(b"\0" * 1024)
+        cls.rife_args = {**rife_defaults(), "input_path": str(cls.input_file),
+                         "output_override": str(cls.rife_output), "_user_output_override_raw": "",
+                         "fps_multiplier": 1, "fp16_mode": False, "edit_mode": "speed_change", "speed_factor": 0.5,
+                         "video_codec": "h264", "output_format": "png", "png_output": True, "cuda_device": "0",
+                         "video_quality": 18, "pixel_format": "yuv420p", "_run_dir": str(rife_run)}
+        (rife_run / "run_context.json").write_text(json.dumps(
+            {"created_at": "2026-11-07 16:53:15", "input_path": str(cls.input_file),
+             "original_filename": cls.input_file.name, "model": "RIFE", "mode": "subprocess"}), encoding="utf-8")
+        (rife_run / "run_summary.json").write_text(json.dumps(
+            [{"input": str(cls.input_file), "output": str(cls.rife_output), "returncode": 0, "args": cls.rife_args,
+              "edit_mode": "speed_change", "rife_enabled": False, "timestamp": "2026-11-07 16:53:16"}]),
+            encoding="utf-8")
+
         cls._saved_journal = gh.JOURNAL_PATH
         gh.JOURNAL_PATH = cls.tmp / "history_data" / "journal.jsonl"
         cls.history = history_tab._HISTORY
         cls._saved_root = cls.history.root_override
         cls.history.root_override = cls.tmp / "outputs"
-        cls.rid = next(r["id"] for r in cls.history.scan().values() if r["out"] == str(cls.output_file))
+        records = cls.history.scan().values()
+        cls.rid = next(r["id"] for r in records if r["out"] == str(cls.output_file))
+        cls.rife_rid = next(r["id"] for r in records if r["out"] == str(cls.rife_output))
 
     @classmethod
     def tearDownClass(cls):
@@ -265,6 +292,49 @@ class HistoryReloadInputTests(unittest.TestCase):
                     self.assertEqual(page.get(self.tabs[tab]["input_path"]), str(self.output_file))
                     self.assertEqual(page.settings(tab).get("input_path"), str(self.output_file))
                     self.assertIsNone(page.get(self.tabs[tab]["box"]))
+
+    def _assert_dropdowns_valid(self, page, tab, label):
+        """What Gradio checks before Process runs: every dropdown value is one of its choices."""
+        info = self.tabs[tab]
+        for key, comp in zip(info["order"], info["inputs"]):
+            if isinstance(comp, gr.Dropdown):
+                try:
+                    comp.preprocess(page.get(comp))
+                except gr.Error as exc:
+                    self.fail(f"{label}: {key} = {page.get(comp)!r}: {exc}")
+
+    def test_reload_of_a_rife_run_keeps_the_rife_dropdowns_valid(self):
+        # Seen in the real app (7 November 2026): after Reload parameters of a RIFE run the tab's Video Codec held
+        # 'h264' and Process Video failed with "Value: h264 is not in the list of choices".
+        page = self._page("rife")
+        page.history("reload", self.rife_rid)
+        page.open_tab("rife")
+        self._assert_dropdowns_valid(page, "rife", "Reload parameters")
+        self.assertEqual(self._value(page, "rife", "video_codec"), "libx264")
+        self.assertEqual(self._value(page, "rife", "output_format"), "auto")
+        self.assertEqual(self._value(page, "rife", "fps_multiplier"), "x1")
+        self.assertEqual(self._value(page, "rife", "speed_factor"), 0.5)  # the run's own settings did arrive
+        self.assertEqual(page.get(self.tabs["rife"]["input_path"]), str(self.input_file))
+        # Send output to on the tab that now holds the reloaded settings
+        page.history("send", self.rife_rid, "rife")
+        page.open_tab("rife")
+        self._assert_dropdowns_valid(page, "rife", "Send output to")
+        self.assertEqual(page.get(self.tabs["rife"]["input_path"]), str(self.rife_output))
+
+    def test_rife_codec_names_map_to_the_tab_choices(self):
+        from shared.universal_preset import dict_to_values
+
+        order = TAB_CONFIGS["rife"]["order"]
+        cases = {"h264": "libx264", "H265": "libx265", "hevc": "libx265", "vp9": "libvpx-vp9", "av1": "libx264",
+                 "prores": "libx264", "libx265": "libx265", "libvpx-vp9": "libvpx-vp9", "": "libx264"}
+        for raw, expected in cases.items():
+            with self.subTest(codec=raw):
+                values = dict_to_values("rife", {"video_codec": raw}, {})
+                self.assertEqual(values[order.index("video_codec")], expected)
+        for raw, expected in {"png": "auto", "mp4": "mp4", "webm": "webm", "auto": "auto", "mkv": "auto"}.items():
+            with self.subTest(output_format=raw):
+                values = dict_to_values("rife", {"output_format": raw}, {})
+                self.assertEqual(values[order.index("output_format")], expected)
 
     def test_users_clear_button_still_empties_the_input_path(self):
         for tab in CLEAR_EMPTIES_PATH:

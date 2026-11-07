@@ -61,6 +61,7 @@ CHANGELOG_ENTRIES = [
 - Cancel (SeedVR2, RIFE / FPS / Edit Videos, Image-Based (GAN), RTX Super Resolution): a cancel before the job's first chunk finished could join the chunks of an older, unfinished run into a "cancelled_partial" video inside that older run's folder and show it as the cancelled job's partial result. Cancel now saves a partial result only from the cancelled job's own run folder, and nothing when that job has no finished chunk yet.
 - RIFE / FPS / Edit Videos: a run that went through the scene chunks (Auto Chunk on, the default) saved no settings, so its Past Generations card had "Reload parameters" disabled. It now saves them like every other run.
 - Chunk Preview gallery (FlashVSR, RelayVSR, Open-H3, LTX 2.5, SparkVSR, Image-Based (GAN), RTX Super Resolution): chunk 1 appeared twice and every later chunk was numbered one too high, because the gallery's own preview copies were listed as one more chunk. Each chunk is now listed once, in order. Pressing Start also clears the previous run's gallery at once instead of showing it until the new job reports.
+- `Models_Downloader.py` / `Windows_Download_Models_and_or_Resume.bat` on Windows: after Ctrl+C (or a failed download) the downloader said the fetched bytes were kept, but the next run downloaded the file again from zero. The map of the bytes already on disk could not be saved on Windows; it is saved now, so a re-run continues where the download stopped ("[RESUMING] ... already on disk") and checks the SHA-256 as before.
 """,
     ),
     (

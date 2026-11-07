@@ -454,6 +454,14 @@ def split_video(
     include_audio: bool = True,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
+    """
+    Cut `video_path` into one file per range of `scenes` (work_dir/chunk_0001.mp4 ...).
+
+    `scenes` must be the COMPLETE, ordered scene list of the source: the first start and the
+    last end are anchored to the source's decoded edges, and adjacent ranges share one exact
+    boundary. Do not call it once per scene: a one-range list is both the first and the last
+    range, so every call would return the whole video.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     remuxed: Optional[Path] = None
     if len(scenes) > 1 and shutil.which("ffmpeg") is not None and _is_mpegts_container(Path(video_path)):

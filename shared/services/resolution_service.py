@@ -1,4 +1,5 @@
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -22,6 +23,9 @@ from shared.resolution_calculator import (
     estimate_fixed_scale_upscale_plan_from_dims,
 )
 from shared.input_detector import detect_input, validate_batch_directory
+
+# split_video() reports "Splitting chunk <i>/<n> (...)" before each scene it cuts.
+_SPLIT_CHUNK_PROGRESS_RE = re.compile(r"Splitting chunk (\d+)/(\d+)")
 
 
 def resolution_defaults(models: List[str]) -> Dict[str, Any]:
@@ -735,58 +739,114 @@ def build_resolution_callbacks(
                 show_open=False,
             )
 
-            from shared.chunking import split_video
+            from shared.chunking import _verify_split_coverage, split_video
 
+            # split_video() takes the COMPLETE scene list of the source: it anchors the first
+            # start and the last end to the source's decoded edges and gives adjacent scenes
+            # one shared boundary. It is called once with every scene, exactly as the chunked
+            # upscale calls it. (Calling it once per scene made each one-scene list both the
+            # first and the last scene, so every scene file became the whole video.)
             source_resolved = source_path.resolve()
             final_paths: List[Path] = []
             total_scenes = max(1, len(scenes))
-            for idx, scene in enumerate(scenes, 1):
-                start_sec, end_sec = float(scene[0]), float(scene[1])
-                chunk_dir = work_root / f"scene_{idx:04d}"
-                chunk_dir.mkdir(parents=True, exist_ok=True)
-                target = split_dir / f"scene_{idx:04d}.mp4"
+            scene_ranges = [(float(scene[0]), float(scene[1])) for scene in scenes]
+            split_events: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+            split_result: Dict[str, Any] = {"paths": [], "error": None}
 
-                base_progress = 0.48 + (0.46 * (idx - 1) / total_scenes)
-                _emit_progress(base_progress, f"Writing scene {idx}/{total_scenes}")
-                yield _result(
-                    _status(
-                        f"Writing scene {idx}/{total_scenes}...",
-                        [
-                            f"Time range: {_scene_seconds_label(start_sec, end_sec)}",
-                            f"Output: {target.name}",
-                            f"Completed files: {len(final_paths)}/{total_scenes}",
-                        ],
-                    ),
-                    split_dir,
-                    show_open=False,
-                )
+            def _split_worker() -> None:
+                try:
+                    split_result["paths"] = split_video(
+                        str(source_path),
+                        scene_ranges,
+                        work_root,
+                        precise=bool(frame_accurate_split),
+                        preserve_quality=True,
+                        include_audio=True,
+                        on_progress=lambda msg: split_events.put(("log", msg)),
+                    )
+                except Exception as exc:
+                    split_result["error"] = exc
+                finally:
+                    split_events.put(("done", None))
 
-                raw_paths = split_video(
-                    str(source_path),
-                    [(start_sec, end_sec)],
-                    chunk_dir,
-                    precise=bool(frame_accurate_split),
-                    preserve_quality=True,
-                    include_audio=True,
-                    on_progress=_collect_progress,
-                )
+            split_thread = threading.Thread(target=_split_worker, daemon=True)
+            split_thread.start()
+            current_scene = 1
+            split_done = False
+            last_yield = 0.0
+            while not split_done:
+                try:
+                    kind, value = split_events.get(timeout=0.25)
+                    if kind == "log":
+                        match = _SPLIT_CHUNK_PROGRESS_RE.search(str(value))
+                        if match:
+                            current_scene = max(1, min(total_scenes, int(match.group(1))))
+                        _collect_progress(str(value))
+                    elif kind == "done":
+                        split_done = True
+                except queue.Empty:
+                    pass
 
-                raw_resolved = [Path(p).resolve() for p in raw_paths if p]
-                if len(raw_resolved) == 1 and raw_resolved[0] == source_resolved:
-                    if len(scenes) == 1 and _is_full_scene((start_sec, end_sec), total_duration):
-                        if not _copy_or_remux_full_video_to_mp4(source_path, target):
-                            yield _result("ERROR: Could not export the single-scene MP4.", split_dir, show_open=True)
-                            return
-                    else:
-                        yield _result(
-                            "ERROR: ffmpeg did not produce a split file for this scene. "
-                            "Try Frame-Accurate Split, or check ffmpeg support for this source file.",
-                            split_dir,
-                            show_open=True,
-                        )
+                now = time.monotonic()
+                if not split_done and (now - last_yield) >= 0.5:
+                    start_sec, end_sec = scene_ranges[current_scene - 1]
+                    _emit_progress(
+                        0.48 + (0.46 * (current_scene - 1) / total_scenes),
+                        f"Writing scene {current_scene}/{total_scenes}",
+                    )
+                    yield _result(
+                        _status(
+                            f"Writing scene {current_scene}/{total_scenes}...",
+                            [
+                                f"Time range: {_scene_seconds_label(start_sec, end_sec)}",
+                                f"Output: scene_{current_scene:04d}.mp4",
+                                f"Completed files: {current_scene - 1}/{total_scenes}",
+                            ],
+                        ),
+                        split_dir,
+                        show_open=False,
+                    )
+                    last_yield = now
+
+            split_thread.join(timeout=1.0)
+            if split_result.get("error") is not None:
+                raise split_result["error"]
+            raw_paths = [Path(p) for p in (split_result.get("paths") or []) if p]
+
+            if len(raw_paths) == 1 and raw_paths[0].resolve() == source_resolved:
+                # split_video returns the source itself for one whole-file scene, and as its
+                # fail-closed fallback when any scene could not be cut.
+                target = split_dir / "scene_0001.mp4"
+                if len(scenes) == 1 and _is_full_scene(scene_ranges[0], total_duration):
+                    if not _copy_or_remux_full_video_to_mp4(source_path, target):
+                        yield _result("ERROR: Could not export the single-scene MP4.", split_dir, show_open=True)
                         return
-                elif len(raw_paths) == 1:
-                    src = Path(raw_paths[0])
+                    final_paths.append(target)
+                else:
+                    yield _result(
+                        "ERROR: ffmpeg did not produce the scene files. "
+                        "Try Frame-Accurate Split, or check ffmpeg support for this source file.",
+                        split_dir,
+                        show_open=True,
+                    )
+                    return
+            elif len(raw_paths) != len(scenes):
+                yield _result(
+                    f"ERROR: Expected {len(scenes)} scene MP4 files, but ffmpeg returned {len(raw_paths)} file(s).",
+                    split_dir,
+                    show_open=True,
+                )
+                return
+            else:
+                # The chunks must cover the source exactly once, as in the chunked upscale.
+                coverage_ok, coverage_msg = _verify_split_coverage(
+                    str(source_path), raw_paths, work_root, on_progress=_collect_progress
+                )
+                if not coverage_ok:
+                    yield _result(f"ERROR: {coverage_msg}", split_dir, show_open=True)
+                    return
+                for idx, src in enumerate(raw_paths, 1):
+                    target = split_dir / f"scene_{idx:04d}.mp4"
                     if src.resolve() != target.resolve():
                         try:
                             src.replace(target)
@@ -796,31 +856,12 @@ def build_resolution_callbacks(
                                 src.unlink(missing_ok=True)
                             except Exception:
                                 pass
-                else:
-                    yield _result(
-                        f"ERROR: Expected one MP4 for scene {idx}, but ffmpeg returned {len(raw_paths)} file(s).",
-                        split_dir,
-                        show_open=True,
-                    )
-                    return
+                    if not target.exists() or target.stat().st_size <= 0:
+                        yield _result(f"ERROR: Scene {idx} output is missing or empty: {target}", split_dir, show_open=True)
+                        return
+                    final_paths.append(target)
 
-                if not target.exists() or target.stat().st_size <= 0:
-                    yield _result(f"ERROR: Scene {idx} output is missing or empty: {target}", split_dir, show_open=True)
-                    return
-
-                final_paths.append(target)
-                _emit_progress(0.48 + (0.46 * idx / total_scenes), f"Finished scene {idx}/{total_scenes}")
-                yield _result(
-                    _status(
-                        f"Finished scene {idx}/{total_scenes}.",
-                        [
-                            f"Created: {target.name}",
-                            f"Completed files: {len(final_paths)}/{total_scenes}",
-                        ],
-                    ),
-                    split_dir,
-                    show_open=False,
-                )
+            _emit_progress(0.94, f"Finished {len(final_paths)}/{total_scenes} scene file(s)")
 
             try:
                 shutil.rmtree(work_root, ignore_errors=True)

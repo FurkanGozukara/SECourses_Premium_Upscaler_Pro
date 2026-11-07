@@ -53,6 +53,7 @@ CHANGELOG_ENTRIES = [
 - `Models_Downloader.py`: the SeedVR2 download sizes in the menu now match the real files, for example 7B and 7B Sharp about 16.5 GB (not 14 GB), the FP8 models about 8.5 GB, the VAE about 500 MB and all core models about 40 GB.
 - `Clear_Triton_Cache.bat` now says at the start that it clears the Triton cache and also the temporary files folder (it always did both).
 - SeedVR2: the console's "Target Resolution" line showed the preset's old value at the start of a run (1080p during a 4K upscale). It is now printed after the size is worked out from Upscale x and Max Resolution, so it shows the real target.
+- Resolution & Scene Split: "Split Scenes to MP4" wrote one file per scene, but every file held the whole video. Each scene_0001.mp4, scene_0002.mp4 ... file now holds exactly its own frames (with the sound when the video has it), cut the same way the scene-by-scene upscale cuts its chunks. Upscales with Auto Chunk and Resume were not affected.
 """,
     ),
     (

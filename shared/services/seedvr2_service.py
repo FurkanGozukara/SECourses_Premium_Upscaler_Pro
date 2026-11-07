@@ -1129,7 +1129,6 @@ def _process_single_file(
     print("=" * 70, flush=True)
     print(f"Input Path: {settings.get('input_path', 'Not set')}", flush=True)
     print(f"Model: {settings.get('dit_model', 'Not set')}", flush=True)
-    print(f"Target Resolution: {settings.get('resolution', 'Auto')}p", flush=True)
     print(f"Batch Size: {settings.get('batch_size', 'Default')}", flush=True)
     print(f"CUDA Device: {settings.get('cuda_device', 'Default (0)')}", flush=True)
     print(f"Face Restore: {'Yes' if face_apply else 'No'}", flush=True)
@@ -1394,6 +1393,8 @@ def _process_single_file(
         except Exception as e:
             if progress_cb:
                 progress_cb(f"Preprocess sizing skipped: {str(e)[:120]}\n")
+        # The target size is final only here: the sizing step above sets it from Upscale x and Max Resolution
+        print(f"Target Resolution: {settings.get('resolution', 'Auto')}p (short side)", flush=True)
         # Model loading check
         model_manager = get_model_manager()
         dit_model = settings.get("dit_model", "")

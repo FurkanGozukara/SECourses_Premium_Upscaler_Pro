@@ -52,6 +52,7 @@ CHANGELOG_ENTRIES = [
 - RunPod / SimplePod instructions: the NVIDIA driver must be 580 or newer (pick CUDA 13.0 or newer in the filters); the text said 570+, below the minimum the Health Check uses.
 - `Models_Downloader.py`: the SeedVR2 download sizes in the menu now match the real files, for example 7B and 7B Sharp about 16.5 GB (not 14 GB), the FP8 models about 8.5 GB, the VAE about 500 MB and all core models about 40 GB.
 - `Clear_Triton_Cache.bat` now says at the start that it clears the Triton cache and also the temporary files folder (it always did both).
+- SeedVR2: the console's "Target Resolution" line showed the preset's old value at the start of a run (1080p during a 4K upscale). It is now printed after the size is worked out from Upscale x and Max Resolution, so it shows the real target.
 """,
     ),
     (

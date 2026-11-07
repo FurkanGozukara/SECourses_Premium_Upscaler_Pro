@@ -294,7 +294,9 @@ def ltx25_tab(
                     label="LTX 2.5 Transformer",
                     choices=available_ltx25_models,
                     value=model_name_value,
-                    info="All variants upscale exactly 2x. INT8 ConvRot = recommended balance. NVFP4 = fastest on RTX 50.",
+                    info=("All variants upscale exactly 2x. INT4 W4A8 ConvRot = the default: smallest download and "
+                          "fastest on RTX 30 or newer. INT8 ConvRot = the automatic fallback on GPUs older than "
+                          "RTX 30. NVFP4 = native FP4 on RTX 50, emulated (slower) on older GPUs."),
                 )
                 with gr.Row():
                     text_encoder = gr.Dropdown(

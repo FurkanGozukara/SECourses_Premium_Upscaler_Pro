@@ -416,7 +416,9 @@ def open_h3_tab(
                     label="MiniMax H3 Base (FL2VA)",
                     choices=list(OPENH3_DIT_NAMES),
                     value=_choice("model_name", OPENH3_DIT_NAMES, OPENH3_DIT_DEFAULT),
-                    info="FL2VA is the reference base of the regenerate recipe. INT8 ConvRot = recommended.",
+                    info=("FL2VA is the reference base of the regenerate recipe. W4A8 = the default: smallest and "
+                          "fastest on RTX 30 or newer. INT8 ConvRot = the automatic fallback on GPUs older than "
+                          "RTX 30, and the model of the JonXL H3 Upscale workflow."),
                 )
                 with gr.Row():
                     text_encoder = gr.Dropdown(

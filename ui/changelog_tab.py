@@ -41,6 +41,7 @@ CHANGELOG_ENTRIES = [
 
 **Fixed in V10.1**
 - `Models_Downloader.py` now calls FlashVSR+ Turbo the recommended FlashVSR+ model instead of "the app's default": the FlashVSR tab still starts on FlashVSR v1.1 (only its Precision default is INT8 ConvRot).
+- LTX 2.5 and Open-H3: the model notes still called INT8 ConvRot the recommended model. They now say W4A8 is the default (smallest and fastest on RTX 30 or newer) and INT8 ConvRot the automatic choice on older GPUs (and, in Open-H3, the model of JonXL H3 Upscale).
 """,
     ),
     (

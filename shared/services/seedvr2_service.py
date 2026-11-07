@@ -42,6 +42,9 @@ from shared.output_run_manager import (
     resolve_resume_input_from_run_dir,
     ensure_image_input_artifact,
     finalize_run_context,
+    begin_active_run,
+    set_active_run_dir,
+    cancel_salvage_run_dirs,
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
@@ -2150,9 +2153,9 @@ def build_seedvr2_callbacks(
         Cancel current processing and compile any partial outputs if available.
 
         Priority:
-        1) Current/recent output run directories (new architecture)
-        2) Recently completed batch outputs in outputs root
-        3) Legacy temp-folder fallback (backward compatibility)
+        1) The cancelled job's own run folder (single runs stop here: its partial result or nothing)
+        2) Recently completed batch outputs in outputs root (jobs without a run folder)
+        3) Legacy temp-folder fallback (backward compatibility, jobs without a run folder)
         """
         def _cancel_media_updates(path: Optional[str]) -> Tuple[Any, Any]:
             video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
@@ -2191,7 +2194,6 @@ def build_seedvr2_callbacks(
         except Exception:
             state_snapshot = {}
         seed_state = state_snapshot.get("seed_controls", {}) if isinstance(state_snapshot, dict) else {}
-        last_run_dir = seed_state.get("last_run_dir")
         audio_source = (
             seed_state.get("last_input_path")
             or seed_state.get("_original_input_path_before_preprocess")
@@ -2203,16 +2205,12 @@ def build_seedvr2_callbacks(
         if not isinstance(output_settings, dict):
             output_settings = {}
 
-        # Preferred: salvage from run directories in outputs.
+        # Preferred: salvage from this job's own run folder (never another run's chunks). When the job has a run
+        # folder, its partial result comes from there or nothing is written: the fallbacks below are for batch jobs.
+        own_run_dir, run_dirs = cancel_salvage_run_dirs("seedvr2")
         try:
             from shared.chunking import salvage_partial_from_run_dir
-            from shared.output_run_manager import recent_output_run_dirs
 
-            run_dirs = recent_output_run_dirs(
-                live_output_root,
-                last_run_dir=str(last_run_dir) if last_run_dir else None,
-                limit=30,
-            )
             for run_dir in run_dirs:
                 partial_path, method = salvage_partial_from_run_dir(
                     run_dir,
@@ -2230,7 +2228,7 @@ def build_seedvr2_callbacks(
             error_logger.warning(f"Output-run salvage failed during cancel: {e}")
 
         # Batch fallback: recently created outputs.
-        if not compiled_output:
+        if not compiled_output and own_run_dir is None:
             try:
                 batch_outputs: List[Path] = []
                 for ext in [".mp4", ".avi", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".webp"]:
@@ -2249,7 +2247,7 @@ def build_seedvr2_callbacks(
                 error_logger.warning(f"Batch partial recovery failed: {e}")
 
         # Legacy fallback: check temp files from older flow.
-        if not compiled_output:
+        if not compiled_output and own_run_dir is None:
             try:
                 temp_base = Path(global_settings.get("temp_dir", temp_dir))
                 temp_files: List[Path] = []
@@ -3080,6 +3078,8 @@ def build_seedvr2_callbacks(
             )
             state = state or {"seed_controls": {}, "operation_status": "ready"}
             state["operation_status"] = "running"
+            # This job has no run folder yet: a cancel now must not salvage another run's chunks.
+            begin_active_run("seedvr2")
             # Ensure a previous cancel does not block a fresh run.
             try:
                 reset_cancel = getattr(runner, "reset_cancel_state", None)
@@ -4107,6 +4107,7 @@ def build_seedvr2_callbacks(
                     processed_chunks_dir = effective_output_dir / "processed_chunks"
                     processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                     seed_controls["last_run_dir"] = str(effective_output_dir)
+                    set_active_run_dir("seedvr2", effective_output_dir)
                     seed_controls["processed_chunks_dir"] = str(processed_chunks_dir)
                     settings["_run_dir"] = str(effective_output_dir)
                     settings["_processed_chunks_dir"] = str(processed_chunks_dir)
@@ -4133,6 +4134,7 @@ def build_seedvr2_callbacks(
                         effective_output_dir = Path(run_paths.run_dir)
                         # Store for UI (chunk gallery, resume helpers, user visibility)
                         seed_controls["last_run_dir"] = str(effective_output_dir)
+                        set_active_run_dir("seedvr2", effective_output_dir)
                         seed_controls["processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         settings["_run_dir"] = str(effective_output_dir)
                         settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)

@@ -28,7 +28,13 @@ from shared.models.rife_meta import get_rife_metadata, get_rife_default_model
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.error_handling import logger as error_logger
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
-from shared.output_run_manager import prepare_single_video_run, resolve_resume_input_from_run_dir
+from shared.output_run_manager import (
+    begin_active_run,
+    cancel_salvage_run_dirs,
+    prepare_single_video_run,
+    resolve_resume_input_from_run_dir,
+    set_active_run_dir,
+)
 from shared.video_codec_options import build_ffmpeg_video_encode_args
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.global_rife import global_rife_enabled
@@ -891,6 +897,8 @@ def build_rife_callbacks(
             )
             state = state or {"seed_controls": {}, "operation_status": "ready"}
             state["operation_status"] = "running"
+            # This job has no run folder yet: a cancel now must not salvage another run's chunks.
+            begin_active_run("rife")
             # Clear any previous VRAM OOM banner at the start of a new run.
             clear_vram_oom_alert(state)
             seed_controls = state.get("seed_controls", {})
@@ -901,7 +909,7 @@ def build_rife_callbacks(
             seed_controls["global_gpu_device_val"] = global_gpu_device
             seed_controls["global_rife_cuda_device_val"] = "" if global_gpu_device == "cpu" else global_gpu_device
             state["seed_controls"] = seed_controls
-            
+
             raw_arg_values = list(args)
             if len(raw_arg_values) == len(RIFE_ORDER):
                 settings_values = raw_arg_values
@@ -1192,6 +1200,7 @@ def build_rife_callbacks(
                     processed_chunks_dir = run_dir / "processed_chunks"
                     processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                     seed_controls["last_run_dir"] = str(run_dir)
+                    set_active_run_dir("rife", run_dir)
                     settings["_run_dir"] = str(run_dir)
                     settings["_processed_chunks_dir"] = str(processed_chunks_dir)
                     settings["_resume_run_requested"] = True
@@ -1222,6 +1231,7 @@ def build_rife_callbacks(
                         )
                         run_dir = Path(run_paths.run_dir)
                         seed_controls["last_run_dir"] = str(run_dir)
+                        set_active_run_dir("rife", run_dir)
                         settings["_run_dir"] = str(run_dir)
                         settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         settings["_user_output_override_raw"] = str(settings.get("output_override") or "")
@@ -2243,14 +2253,12 @@ def build_rife_callbacks(
             return gr.update(value="No active process to cancel"), ""
 
         compiled_output: Optional[str] = None
-        live_output_root = Path(global_settings.get("output_dir", output_dir))
         state_snapshot = {}
         try:
             state_snapshot = shared_state.value if isinstance(shared_state.value, dict) else {}
         except Exception:
             state_snapshot = {}
         seed_controls = state_snapshot.get("seed_controls", {}) if isinstance(state_snapshot, dict) else {}
-        last_run_dir = seed_controls.get("last_run_dir")
         audio_source = seed_controls.get("last_input_path") or None
         audio_codec = str(seed_controls.get("audio_codec_val") or "copy")
         audio_bitrate = seed_controls.get("audio_bitrate_val") or None
@@ -2258,15 +2266,12 @@ def build_rife_callbacks(
         if not isinstance(output_settings, dict):
             output_settings = {}
 
+        # Only this job's own run folder: another run's chunks are never this job's partial result.
+        own_run_dir, salvage_dirs = cancel_salvage_run_dirs("rife")
         try:
             from shared.chunking import salvage_partial_from_run_dir
-            from shared.output_run_manager import recent_output_run_dirs
 
-            for run_dir in recent_output_run_dirs(
-                live_output_root,
-                last_run_dir=str(last_run_dir) if last_run_dir else None,
-                limit=20,
-            ):
+            for run_dir in salvage_dirs:
                 partial_path, _method = salvage_partial_from_run_dir(
                     run_dir,
                     partial_basename="cancelled_rife_partial",
@@ -2284,7 +2289,7 @@ def build_rife_callbacks(
                 "Processing cancelled but partial compilation failed",
             )
 
-        if not compiled_output:
+        if not compiled_output and own_run_dir is None:
             try:
                 temp_chunks_dir = Path(global_settings.get("temp_dir", temp_dir)) / "chunks"
                 if temp_chunks_dir.exists():

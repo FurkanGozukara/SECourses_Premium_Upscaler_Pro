@@ -38,6 +38,9 @@ from shared.output_run_manager import (
     prepare_batch_video_run_dir,
     prepare_single_video_run,
     resolve_resume_input_from_run_dir,
+    begin_active_run,
+    set_active_run_dir,
+    cancel_salvage_run_dirs,
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.path_utils import (
@@ -523,6 +526,8 @@ def build_rtx_super_resolution_callbacks(
             if isinstance(global_settings_snapshot, dict)
             else dict(_global_settings)
         )
+        # This job has no run folder yet: a cancel now must not salvage another run's chunks.
+        begin_active_run("rtx")
 
         progress_q: "queue.Queue[str]" = queue.Queue()
         result_holder: Dict[str, Any] = {}
@@ -1194,6 +1199,7 @@ def build_rtx_super_resolution_callbacks(
                     processed_chunks_dir = run_dir / "processed_chunks"
                     processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                     settings["_run_dir"] = str(run_dir)
+                    set_active_run_dir("rtx", run_dir)
                     settings["_processed_chunks_dir"] = str(processed_chunks_dir)
                     settings["_resume_run_requested"] = bool(detect_input_type(settings["input_path"]) == "video")
                     settings["_user_output_override_raw"] = settings.get("output_override") or ""
@@ -1212,6 +1218,7 @@ def build_rtx_super_resolution_callbacks(
                             mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                         )
                         settings["_run_dir"] = str(run_paths.run_dir)
+                        set_active_run_dir("rtx", run_paths.run_dir)
                         settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         settings["_user_output_override_raw"] = settings.get("output_override") or ""
                         settings["output_override"] = str(run_paths.run_dir)
@@ -1407,17 +1414,16 @@ def build_rtx_super_resolution_callbacks(
         compiled_output: Optional[str] = None
         state_obj = state or {}
         seed_controls = state_obj.get("seed_controls", {}) if isinstance(state_obj, dict) else {}
-        last_run_dir = seed_controls.get("last_run_dir")
-        output_root = Path(global_settings.get("output_dir", output_dir))
         output_settings = seed_controls.get("output_settings", {}) if isinstance(seed_controls, dict) else {}
         if not isinstance(output_settings, dict):
             output_settings = {}
 
+        # Only this job's own run folder: another run's chunks are never this job's partial result.
+        _own_run_dir, salvage_dirs = cancel_salvage_run_dirs("rtx")
         try:
             from shared.chunking import salvage_partial_from_run_dir
-            from shared.output_run_manager import recent_output_run_dirs
 
-            for run_dir in recent_output_run_dirs(output_root, last_run_dir=str(last_run_dir) if last_run_dir else None, limit=20):
+            for run_dir in salvage_dirs:
                 partial_path, _method = salvage_partial_from_run_dir(
                     run_dir,
                     partial_basename="cancelled_rtx_partial",

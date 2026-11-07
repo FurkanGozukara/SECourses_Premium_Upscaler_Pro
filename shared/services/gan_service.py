@@ -30,6 +30,9 @@ from shared.output_run_manager import (
     resolve_resume_input_from_run_dir,
     ensure_image_input_artifact,
     finalize_run_context,
+    begin_active_run,
+    set_active_run_dir,
+    cancel_salvage_run_dirs,
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
@@ -659,6 +662,8 @@ def build_gan_callbacks(
             if isinstance(global_settings_snapshot, dict)
             else dict(_global_settings)
         )
+        # This job has no run folder yet: a cancel now must not salvage another run's chunks.
+        begin_active_run("gan")
         progress_q: "queue.Queue[str]" = queue.Queue()
         result_holder: Dict[str, Any] = {}
 
@@ -1893,6 +1898,7 @@ def build_gan_callbacks(
                         processed_chunks_dir = current_output_dir / "processed_chunks"
                         processed_chunks_dir.mkdir(parents=True, exist_ok=True)
                         seed_controls["last_run_dir"] = str(current_output_dir)
+                        set_active_run_dir("gan", current_output_dir)
                         settings["_run_dir"] = str(current_output_dir)
                         settings["_processed_chunks_dir"] = str(processed_chunks_dir)
                         settings["_resume_run_requested"] = bool(input_type == "video")
@@ -1917,6 +1923,7 @@ def build_gan_callbacks(
                             )
                             current_output_dir = Path(run_paths.run_dir)
                             seed_controls["last_run_dir"] = str(current_output_dir)
+                            set_active_run_dir("gan", current_output_dir)
                             settings["_run_dir"] = str(current_output_dir)
                             settings["_user_output_override_raw"] = settings.get("output_override") or ""
                             # For GAN, we use the run folder as the output root; explicit file naming is handled later.
@@ -2121,10 +2128,8 @@ def build_gan_callbacks(
             pass
 
         compiled_output: Optional[str] = None
-        live_output_root = Path(global_settings.get("output_dir", output_dir))
         state_obj = state or {}
         seed_controls = state_obj.get("seed_controls", {}) if isinstance(state_obj, dict) else {}
-        last_run_dir = seed_controls.get("last_run_dir")
         audio_source = seed_controls.get("last_input_path") or None
         audio_codec = str(seed_controls.get("audio_codec_val") or "copy")
         audio_bitrate = seed_controls.get("audio_bitrate_val") or None
@@ -2132,15 +2137,12 @@ def build_gan_callbacks(
         if not isinstance(output_settings, dict):
             output_settings = {}
 
+        # Only this job's own run folder: another run's chunks are never this job's partial result.
+        own_run_dir, salvage_dirs = cancel_salvage_run_dirs("gan")
         try:
             from shared.chunking import salvage_partial_from_run_dir
-            from shared.output_run_manager import recent_output_run_dirs
 
-            for run_dir in recent_output_run_dirs(
-                live_output_root,
-                last_run_dir=str(last_run_dir) if last_run_dir else None,
-                limit=20,
-            ):
+            for run_dir in salvage_dirs:
                 partial_path, _method = salvage_partial_from_run_dir(
                     run_dir,
                     partial_basename="cancelled_gan_partial",
@@ -2159,7 +2161,7 @@ def build_gan_callbacks(
                 state_obj,
             )
 
-        if not compiled_output:
+        if not compiled_output and own_run_dir is None:
             try:
                 temp_chunks_dir = Path(global_settings.get("temp_dir", temp_dir)) / "chunks"
                 if temp_chunks_dir.exists():

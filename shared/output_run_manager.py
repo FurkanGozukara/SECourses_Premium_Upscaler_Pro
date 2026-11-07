@@ -1,6 +1,7 @@
 import json
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -504,6 +505,50 @@ def parse_output_override_as_root(override: Optional[str]) -> tuple[Optional[Pat
         return p, None
     except Exception:
         return None, None
+
+
+# Run folder of the job each engine is running now (seedvr2, rife, gan, rtx). Cancel salvages a partial result only
+# from this folder. It used to scan the outputs root for recent unfinished folders: a cancel before the job's first
+# chunk finished then joined the chunks of an OLDER run (seen: outputs/0041, a run from days before) into
+# cancelled_partial_0001.mp4 inside that folder and showed it as the cancelled job's partial.
+_ACTIVE_RUN_DIRS: Dict[str, Optional[str]] = {}
+_ACTIVE_RUN_LOCK = threading.Lock()
+
+
+def begin_active_run(engine: str) -> None:
+    """A job of ``engine`` starts; it has no run folder until set_active_run_dir() names one."""
+    with _ACTIVE_RUN_LOCK:
+        _ACTIVE_RUN_DIRS[str(engine)] = None
+
+
+def set_active_run_dir(engine: str, run_dir: Any) -> None:
+    """The run folder of the job ``engine`` is running now (a new run folder or the resumed one)."""
+    with _ACTIVE_RUN_LOCK:
+        _ACTIVE_RUN_DIRS[str(engine)] = str(run_dir) if run_dir else None
+
+
+def active_run_dir(engine: str) -> Optional[Path]:
+    with _ACTIVE_RUN_LOCK:
+        raw = _ACTIVE_RUN_DIRS.get(str(engine))
+    return Path(raw) if raw else None
+
+
+def cancel_salvage_run_dirs(engine: str) -> tuple[Optional[Path], list[Path]]:
+    """(the running job's run folder or None, the folders a cancel may salvage from).
+
+    Only the job's own folder is ever a candidate, and not once it holds run_summary.json (the job finished; a cancel
+    after that must not join its chunks again). When the folder is known, callers skip their older fallbacks too: a
+    cancelled single run gets its own partial result or nothing.
+    """
+    own = active_run_dir(engine)
+    if own is None:
+        return None, []
+    try:
+        if own.is_dir() and not (own / "run_summary.json").exists():
+            return own, [own]
+    except OSError:
+        pass
+    return own, []
 
 
 def recent_output_run_dirs(

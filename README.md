@@ -55,7 +55,7 @@ static-frame skip, recursion depth.
 - Past Generations (V10.1): one tab with every result of every tab (including Chains and batch folders): search, engine / type / date / status / favorite filters, sorting, grid or list, hover video previews, a full-screen viewer with zoom to actual pixels, an input vs output slider or side by side with synced video, every saved parameter, any two results compared with a synced slider and a table of the settings that differ, **Reload parameters** (opens the engine tab with every setting and the input of that run; Chains runs reload their steps), Send output to another tab, favorites, download (zip for several), show in folder and delete to the Recycle Bin. New results appear while the tab is open.
 - Folder and file pickers (V10.0): every path field has a 📂 / 📄 button that opens a native dialog at the current path (hidden on servers without a screen).
 - Face Restoration as both standalone processor and integrated post-processing across pipelines.
-- Global face restoration enable + global strength control from Global Settings.
+- Global face restoration: Enable Globally (All Upscalers) and the strength in the Face Restoration tab.
 - Unified cross-model resolution strategy: Upscale-x, max-edge cap, and pre-downscale-then-upscale behavior.
 - Instant Auto Tune for Max Quality on SeedVR2, FlashVSR+, RelayVSR, Open-H3, LTX 2.5, SparkVSR and RTX Super Resolution: sets the largest batch / chunk / window and the least offloading and tiling that fit GPU total - in use - Save VRAM, from measured memory formulas (no test runs); optionally applied automatically on every Upscale.
 
@@ -90,16 +90,15 @@ static-frame skip, recursion depth.
 - Application-level FIFO processing queue across tabs (single active job, waiting jobs).
 - Queue monitor tab with refresh, delete selected waiting jobs, and clear-all waiting.
 - Queue snapshot isolation so queued jobs run with their captured settings.
-- Queue-disabled mode option to ignore extra clicks while busy.
+- The queue is always on in the interface: a click while a job runs waits in the queue.
 
 ##  Tier 4: Universal preset system that stores all tab settings in one preset file.
 - Auto-load last-used universal preset at startup.
 - Shared-state sync so loading one preset propagates to all tabs.
-- Per-tab model-context presets still supported (save/load/delete/last-used).
+- Every tab shows the same universal preset block (save/load/delete/last-used); one preset holds every tab.
 - Preset migration/backward compatibility and auto-merge with new defaults.
 - Preset guardrails (auto-corrections for invalid combos).
-- Global settings persistence (global.json) for output/temp/telemetry/queue/mode/model-cache paths.
-- Named global config profiles (save/load/delete) in Global Settings.
+- Global settings (outputs and temp folders, theme, and the GPU picked in the top bar) are saved in the universal preset; an old global.json is removed at startup.
 
 ##   Tier 5: Reliability, Safety, and Recovery
 - Default subprocess execution mode with strong cancellation and cleanup behavior.
@@ -123,7 +122,7 @@ compatibility checks).
 - GPU detection utilities designed to avoid unwanted parent-process CUDA context allocation.
 - Model discovery registries for SeedVR2/RIFE/FlashVSR/GAN.
 - Launcher environment variable integration (TEMP/TMP, MODELS_DIR, HF_HOME, TRANSFORMERS_CACHE, HF_DATASETS_CACHE).
-- Editable model cache path controls in Global Settings with restart guidance.
+- Model cache paths come from the launcher's environment variables (MODELS_DIR, HF_HOME, TRANSFORMERS_CACHE); Global Settings shows no cache path controls.
 
 ##   Tier 7: UX and Operational Convenience (Least Important)
 

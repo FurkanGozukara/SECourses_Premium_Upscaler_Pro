@@ -1154,6 +1154,15 @@ def main(argv=None):
         grid-template-columns: 1fr;
       }
     }
+
+    /* Before/After image comparison in fullscreen (the shim in CUSTOM_HEAD makes its .image-container the
+       fullscreen element). Gradio's Image preview CSS has an unscoped ".image-container:fullscreen img
+       { object-fit: scale-down }" that also hits the slider's two pictures: the smaller input stayed at its own
+       pixel size while the larger result was scaled to the screen, so the two sides no longer lined up. Both
+       pictures are fitted the same way, as in the page. */
+    .native-image-comparison-slider .image-container:fullscreen img {
+      object-fit: contain;
+    }
     """
     # Per-hue button colours and the light/dark design layer come last so they win the
     # cascade over the component rules above at equal specificity.

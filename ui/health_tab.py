@@ -178,7 +178,7 @@ def health_tab(global_settings: Dict[str, Any], shared_state: gr.State, temp_dir
             return f"Repository scan failed: {exc}"
 
     gr.Markdown("### System Health Check")
-    gr.Markdown("Run diagnostics for Gradio, FFmpeg, CUDA/GPU, VS Build Tools, and disk paths.")
+    gr.Markdown("Run diagnostics for Gradio, FFmpeg, CUDA/GPU, the NVIDIA driver, the NVIDIA VFX / RTX Super Resolution runtime, VS Build Tools, and disk paths.")
 
     with gr.Row():
         health_btn = gr.Button(
@@ -200,6 +200,7 @@ def health_tab(global_settings: Dict[str, Any], shared_state: gr.State, temp_dir
             - **FFmpeg**: Confirms `ffmpeg` is available in PATH for video processing.
             - **CUDA + GPUs**: Detects NVIDIA GPUs, CUDA version, and free VRAM.
             - **NVIDIA driver version**: Validates installed NVIDIA driver is at least 580+.
+            - **NVIDIA VFX / RTX Super Resolution**: Checks that the `nvidia-vfx` Python runtime is installed, which RTX Super Resolution needs (and reports Frame Generation / TrueHDR support when present).
             - **VS Build Tools**: Validates MSVC toolchain availability for `torch.compile` on Windows.
             - **Directory access**: Checks write access for temp and output folders.
             - **Disk space**: Checks available free space for temp and output paths.

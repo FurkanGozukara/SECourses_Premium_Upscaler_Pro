@@ -48,6 +48,7 @@ CHANGELOG_ENTRIES = [
 - Output & Comparison > Metadata & Logging: "Metadata Format" and "Log Verbosity" are hidden because they changed nothing (run metadata is always saved as JSON); presets that hold them still load.
 - Face Restoration: 14 settings that changed nothing (face detection model, confidence, face sizes, padding, landmarks, color correction, output quality and the others) are hidden, together with the Face Detection and Quality & Output tabs they filled. Restoration Model, Strength, CodeFormer Fidelity, GPU Acceleration and Enable Globally stay; presets that hold the hidden settings still load.
 - SeedVR2 and RTX Super Resolution: the Cancel notes and the SeedVR2 Processing Mode notes no longer tell you to check or switch the mode in Global Settings, where no mode setting is shown. Cancel works in the default subprocess mode.
+- Health Check: "What Each Check Does" now also lists the NVIDIA VFX / RTX Super Resolution runtime check, which the report already ran.
 """,
     ),
     (

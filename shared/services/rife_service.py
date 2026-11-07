@@ -20,7 +20,6 @@ from shared.runner import Runner
 from shared.path_utils import (
     normalize_path,
     ffmpeg_set_fps,
-    get_media_dimensions,
     resolve_batch_output_dir,
     detect_input_type,
 )
@@ -1020,32 +1019,10 @@ def build_rife_callbacks(
                 yield (" ffmpeg not found in PATH. Install ffmpeg and retry.", "", gr.update(value="", visible=False), None, gr.update(value=None), gr.update(value="", visible=False), state)
                 return
 
-            # Apply cached values from Resolution & Scene Split tab (vNext Upscale-x)
-            scale_x = seed_controls.get("upscale_factor_val")
-            # Global max-edge cap is removed; keep per-upscaler sizing local.
-            max_edge = 0
-
-            if scale_x is not None:
-                try:
-                    scale_x = float(scale_x)
-                except Exception:
-                    scale_x = None
-
-            if scale_x is not None:
-                input_dims = get_media_dimensions(input_path)
-                if input_dims:
-                    input_w, input_h = input_dims
-                    long_side = max(input_w, input_h)
-
-                    # Apply max-edge cap (LONG side) to compute effective scale
-                    effective_scale = float(scale_x)
-                    if max_edge > 0 and long_side > 0:
-                        capped = max_edge / long_side
-                        effective_scale = min(effective_scale, capped)
-
-                    # Clamp to RIFE's reasonable range
-                    effective_scale = max(0.5, min(4.0, effective_scale))
-                    settings["scale"] = effective_scale
+            # "scale" is RIFE's own Spatial Scale Factor (the resolution at which it estimates motion; the output size
+            # never changes). It is NOT the Resolution tab's Upscale x: copying a 4x upscale factor here made RIFE
+            # estimate motion at 4x the input size (a 4K input filled 32 GB of VRAM and stalled) and made every
+            # RIFE / Video Editing run interpolate even at FPS Multiplier 1x.
 
             # Apply Output tab format preferences when RIFE tab format is not explicitly set.
             # Sequence export toggle is authoritative and must not be disabled by a video container choice.

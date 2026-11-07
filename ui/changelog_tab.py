@@ -54,6 +54,7 @@ CHANGELOG_ENTRIES = [
 - `Clear_Triton_Cache.bat` now says at the start that it clears the Triton cache and also the temporary files folder (it always did both).
 - SeedVR2: the console's "Target Resolution" line showed the preset's old value at the start of a run (1080p during a 4K upscale). It is now printed after the size is worked out from Upscale x and Max Resolution, so it shows the real target.
 - Resolution & Scene Split: "Split Scenes to MP4" wrote one file per scene, but every file held the whole video. Each scene_0001.mp4, scene_0002.mp4 ... file now holds exactly its own frames (with the sound when the video has it), cut the same way the scene-by-scene upscale cuts its chunks. Upscales with Auto Chunk and Resume were not affected.
+- RIFE / FPS / Edit Videos: the Spatial Scale Factor you set is used again. The tab replaced it with the Resolution tab's Upscale x, so with Upscale x 4 RIFE estimated motion at four times the video's size: a 4K video filled the GPU memory and stalled, and a run at FPS Multiplier 1x still interpolated.
 """,
     ),
     (

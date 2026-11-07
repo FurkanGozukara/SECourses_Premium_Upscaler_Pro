@@ -491,7 +491,7 @@ def seedvr2_tab(
                     label="Attention Backend",
                     choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
                     value=attention_value,
-                    info="sdpa (default, most compatible) | flash_attn_2/3 (faster, requires flash-attn install) | sageattn_2/3 (optimized, requires sageattention install). Auto-falls back to sdpa if unavailable.",
+                    info="flash_attn_2 (default for the built-in models, including the default W4A8; faster, requires flash-attn install) | sdpa (most compatible; the fallback) | flash_attn_3 (requires flash-attn install) | sageattn_2/3 (optimized, requires sageattention install). Auto-falls back to sdpa if unavailable.",
                     interactive=cuda_available,  # Disable if no CUDA (attention backends need GPU)
                     scale=3,
                 )

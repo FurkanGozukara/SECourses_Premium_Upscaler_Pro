@@ -69,6 +69,7 @@ from shared.output_run_manager import (
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.global_rife import maybe_apply_global_rife
+from shared.batch_naming import adopt_output_name
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
 
@@ -1321,8 +1322,11 @@ def build_open_h3_callbacks(
                 original_input: str,
                 logs_sink: Callable[[str], None],
                 chunk_count_value: int,
+                keep_name: bool = False,
             ) -> str:
-                """Face restore -> audio -> RIFE -> comparison video, in SparkVSR order (stills: face restore + format)."""
+                """Face restore -> audio -> RIFE -> comparison video, in SparkVSR order (stills: face restore + format).
+
+                keep_name: batch items keep the input's name (each post-step replaces the output)."""
                 if outp and Path(outp).exists() and Path(outp).suffix.lower() in image_exts:
                     if face_apply:
                         try:
@@ -1333,6 +1337,8 @@ def build_open_h3_callbacks(
                                                      on_progress=lambda x: logs_sink(x) if x else None,
                                                      gpu_device=settings.get("device"))
                             if restored and Path(restored).exists():
+                                if keep_name:
+                                    restored = adopt_output_name(outp, restored)
                                 outp = restored
                                 logs_sink(f"[OK] Face restoration complete: {restored}")
                         except Exception as face_exc:
@@ -1350,6 +1356,8 @@ def build_open_h3_callbacks(
                             gpu_device=settings.get("device"),
                         )
                         if restored and Path(restored).exists():
+                            if keep_name:
+                                restored = adopt_output_name(outp, restored)
                             outp = restored
                             logs_sink(f"[OK] Face restoration complete: {restored}")
                     except Exception as face_exc:
@@ -1394,6 +1402,7 @@ def build_open_h3_callbacks(
                             "frame_accurate_split": bool(frame_accurate_split),
                             "per_chunk_cleanup": bool(per_chunk_cleanup),
                         },
+                        keep_name=keep_name,
                     )
                     if rife_out and Path(rife_out).exists():
                         logs_sink(f"[OK] Global RIFE output: {Path(rife_out).name}")
@@ -1553,6 +1562,7 @@ def build_open_h3_callbacks(
                         model_label="open_h3",
                         mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                         overwrite_existing=overwrite_existing,
+                        flattened_output_counts=bool(settings.get("keep_only_output_files", False)),
                     )
                     if not run_paths:
                         if not overwrite_existing:
@@ -1718,6 +1728,7 @@ def build_open_h3_callbacks(
                             item_path,
                             lambda m: logs.append(str(m)),
                             chunk_count_item,
+                            keep_name=True,
                         )
 
                         if chunk_count_item:
@@ -1772,6 +1783,7 @@ def build_open_h3_callbacks(
                             batch_root,
                             outputs,
                             on_log=lambda msg: logs.append(str(msg)),
+                            inputs=[str(p) for p in items],
                         )
                         flattened_outputs = cleanup_result.get("final_outputs")
                         if isinstance(flattened_outputs, list) and flattened_outputs:

@@ -1,7 +1,9 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import gradio as gr
 
+from shared.batch_naming import same_name_target
 from shared.preset_manager import PresetManager
 from shared.path_utils import (
     normalize_path,
@@ -292,7 +294,27 @@ def build_face_callbacks(
     def _build_output_path(out_dir: Path, input_file: Path, suffix_tag: str = "_face_restored") -> Path:
         return collision_safe_path(out_dir / f"{input_file.stem}{suffix_tag}{input_file.suffix}")
 
-    def _collect_batch_files(batch_in: Path) -> List[Path]:
+    def _batch_output_path(out_dir: Path, input_file: Path, batch_in: Path) -> Path:
+        """Batch output keeps the input's name (and its subfolder below the batch input folder).
+        Only when that would be the input file itself (output folder = input folder) does it keep
+        the previous `_face_restored` name."""
+        sub_dir = out_dir
+        if batch_in.is_dir():
+            try:
+                rel = input_file.parent.resolve().relative_to(batch_in.resolve())
+                sub_dir = out_dir / rel
+            except (ValueError, OSError):
+                sub_dir = out_dir
+        return same_name_target(sub_dir, input_file, fallback_tag="_face_restored")
+
+    def _is_within_dir(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _collect_batch_files(batch_in: Path, batch_out: Optional[Path] = None) -> List[Path]:
         exts = sorted({*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS})
         batch_files: List[Path] = []
         if batch_in.is_dir():
@@ -300,7 +322,23 @@ def build_face_callbacks(
                 batch_files.extend(batch_in.glob(f"**/*{ext}"))
         elif batch_in.is_file() and batch_in.suffix.lower() in exts:
             batch_files = [batch_in]
-        return sorted(batch_files)
+        if batch_out is not None and batch_in.is_dir():
+            try:
+                same_folder = batch_out.resolve() == batch_in.resolve()
+            except OSError:
+                same_folder = False
+            if same_folder:
+                # Earlier results saved next to their inputs are not new inputs.
+                batch_files = [p for p in batch_files if not p.stem.endswith("_face_restored")]
+            else:
+                # The output folder inside the input folder (default `upscaled_files`) holds earlier results.
+                batch_files = [p for p in batch_files if not _is_within_dir(p, batch_out)]
+        unique: Dict[str, Path] = {}
+        for p in batch_files:
+            if p.name.startswith(".") and ".face_tmp" in p.name:
+                continue  # temporary file of an interrupted run
+            unique.setdefault(str(p).lower(), p)
+        return sorted(unique.values())
 
     def run_action(
         uploaded_file,
@@ -392,7 +430,7 @@ def build_face_callbacks(
             )
             settings["batch_output_path"] = str(batch_out_dir)
 
-            files = _collect_batch_files(batch_in)
+            files = _collect_batch_files(batch_in, batch_out_dir)
             if not files:
                 return (
                     gr.update(value=f"⚠️ No supported media found in: {batch_in}"),
@@ -411,39 +449,64 @@ def build_face_callbacks(
             last_img: Optional[str] = None
             last_vid: Optional[str] = None
 
+            overwrite_batch = bool(seed_controls.get("overwrite_existing_batch_val", False))
             for idx, fp in enumerate(files, start=1):
                 itype = detect_input_type(str(fp))
-                out_path = _build_output_path(batch_out_dir, fp)
+                # Same name as the input. An existing result is skipped, or replaced with
+                # "Overwrite Existing Outputs (Batch)"; the restorer writes a temporary file first,
+                # so a failed item never damages an existing output.
+                out_path = _batch_output_path(batch_out_dir, fp, batch_in)
+                if out_path.exists() and not overwrite_batch:
+                    logs.append(f"[{idx}/{len(files)}] ⏭️ {fp.name} skipped (output exists: {out_path.name})")
+                    continue
+                tmp_path = out_path.with_name(f".{out_path.stem}.face_tmp{out_path.suffix}")
                 try:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
                     if itype == "image":
                         restored = restore_image(
                             str(fp),
                             strength=strength,
                             backend=backend,
                             use_gpu=use_gpu,
-                            output_path=str(out_path),
+                            output_path=str(tmp_path),
                             gpu_device=face_gpu_device,
                             fidelity=fidelity,
                         )
-                        last_img = restored or None
-                        output_paths.append(str(restored or out_path))
                     elif itype == "video":
                         restored = restore_video(
                             str(fp),
                             strength=strength,
                             backend=backend,
                             use_gpu=use_gpu,
-                            output_path=str(out_path),
+                            output_path=str(tmp_path),
                             gpu_device=face_gpu_device,
                             fidelity=fidelity,
                         )
-                        last_vid = restored or None
-                        output_paths.append(str(restored or out_path))
                     else:
                         logs.append(f"⚠️ Skipped unsupported: {fp.name}")
                         continue
+                    if restored and Path(str(restored)) == tmp_path and tmp_path.exists():
+                        os.replace(str(tmp_path), str(out_path))
+                        restored = str(out_path)
+                    else:
+                        # The restorer returned its input (no backend / restoration error): no output written.
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        logs.append(f"[{idx}/{len(files)}] ❌ {fp.name}: face restoration failed, no output written")
+                        continue
+                    if itype == "image":
+                        last_img = restored
+                    else:
+                        last_vid = restored
+                    output_paths.append(str(restored))
                     logs.append(f"[{idx}/{len(files)}] ✅ {fp.name} → {Path(output_paths[-1]).name}")
                 except Exception as e:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     logs.append(f"[{idx}/{len(files)}] ❌ {fp.name}: {str(e)}")
 
             # Update shared state pointers (best-effort)

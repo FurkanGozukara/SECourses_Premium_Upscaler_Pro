@@ -4,6 +4,7 @@ Handles all SeedVR2 processing logic, presets, and callbacks
 """
 
 import html
+import os
 import re
 import shutil
 import queue
@@ -54,6 +55,7 @@ from shared.comparison_unified import create_unified_comparison, build_compariso
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.video_comparison import create_comparison_selector
 from shared.global_rife import maybe_apply_global_rife, global_rife_enabled
+from shared.batch_naming import BATCH_KEEP_NAME_KEY, adopt_output_name, batch_keep_name
 from shared.model_manager import get_model_manager, ModelType
 from shared.gpu_utils import (
     expand_cuda_device_spec,
@@ -229,15 +231,25 @@ def _apply_image_output_preferences(
 
         from PIL import Image
 
-        dst = collision_safe_path(src.with_suffix(target_ext))
+        same_ext = src.suffix.lower() == target_ext
+        if same_ext:
+            # Re-encode in place (JPG/WebP quality): write a temporary file and replace the output,
+            # instead of saving a `_0001` copy next to it because the output itself already exists.
+            dst = src
+            write_path = src.with_name(f".{src.stem}.reencode_tmp{target_ext}")
+        else:
+            dst = collision_safe_path(src.with_suffix(target_ext))
+            write_path = dst
         with Image.open(src) as img:
             if fmt == "jpg":
                 img = img.convert("RGB")
-                img.save(dst, format="JPEG", quality=quality)
+                img.save(write_path, format="JPEG", quality=quality)
             elif fmt == "webp":
-                img.save(dst, format="WEBP", quality=quality)
+                img.save(write_path, format="WEBP", quality=quality)
             else:
-                img.save(dst, format="PNG")
+                img.save(write_path, format="PNG")
+        if same_ext:
+            os.replace(str(write_path), str(dst))
 
         try:
             if dst.resolve() != src.resolve():
@@ -1797,6 +1809,9 @@ def _process_single_file(
                 gpu_device=settings.get("cuda_device"),
             )
             if restored:
+                if batch_keep_name(settings):
+                    # Batch output keeps the input's name.
+                    restored = adopt_output_name(output_video, restored)
                 local_logs.append(f"Face-restored video saved to {restored} (strength {face_strength})")
                 output_video = restored
 
@@ -1807,6 +1822,8 @@ def _process_single_file(
                 gpu_device=settings.get("cuda_device"),
             )
             if restored_img:
+                if batch_keep_name(settings):
+                    restored_img = adopt_output_name(output_image, restored_img)
                 local_logs.append(f"Face-restored image saved to {restored_img} (strength {face_strength})")
                 output_image = restored_img
 
@@ -1878,6 +1895,7 @@ def _process_single_file(
                         "frame_accurate_split": bool(settings.get("frame_accurate_split", True)),
                         "per_chunk_cleanup": bool(seed_controls.get("per_chunk_cleanup", False)),
                     },
+                    keep_name=batch_keep_name(settings),
                 )
                 if rife_out and Path(rife_out).exists():
                     local_logs.append(f"Global RIFE output: {rife_out}")
@@ -3837,6 +3855,8 @@ def build_seedvr2_callbacks(
                         single_settings["input_path"] = job.input_path
                         single_settings["batch_enable"] = False  # Disable batch for individual processing
                         single_settings["_original_filename"] = Path(job.input_path).name
+                        # Post-steps (face restore, global DLSS 5 / RIFE) keep the input's name.
+                        single_settings[BATCH_KEEP_NAME_KEY] = True
 
                         overwrite_existing = bool(seed_controls.get("overwrite_existing_batch_val", False))
 
@@ -3850,15 +3870,26 @@ def build_seedvr2_callbacks(
                             # Batch images: write directly into the batch output folder using the original name.
                             safe_name = sanitize_filename(input_file.name)
                             target_path = batch_output_folder / safe_name
-                            if target_path.exists() and not overwrite_existing:
+                            # The saved image takes the chosen image format's extension (photo.jpg -> photo.png).
+                            img_fmt = str(single_settings.get("image_output_format") or "png").strip().lower()
+                            img_ext = ".jpg" if img_fmt in {"jpg", "jpeg"} else (".webp" if img_fmt == "webp" else ".png")
+                            final_image_path = target_path.with_suffix(img_ext)
+                            if (target_path.exists() or final_image_path.exists()) and not overwrite_existing:
                                 job.status = "skipped"
-                                job.output_path = str(target_path)
+                                job.output_path = str(final_image_path if final_image_path.exists() else target_path)
                                 return True
                             if overwrite_existing:
-                                try:
-                                    target_path.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                                old_outputs = [target_path]
+                                if final_image_path != target_path and not any(
+                                    Path(j.input_path) == final_image_path for j in jobs
+                                ):
+                                    # The converted result of an earlier run (never another batch input).
+                                    old_outputs.append(final_image_path)
+                                for old_output in old_outputs:
+                                    try:
+                                        old_output.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
                             single_settings["output_override"] = str(target_path)
                             batch_work_dir = batch_output_folder
                         else:
@@ -3880,6 +3911,7 @@ def build_seedvr2_callbacks(
                                 model_label="SeedVR2",
                                 mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                                 overwrite_existing=overwrite_existing,
+                                flattened_output_counts=bool(single_settings.get("keep_only_output_files", False)),
                             )
                             if not run_paths:
                                 if not overwrite_existing:
@@ -4006,6 +4038,11 @@ def build_seedvr2_callbacks(
                             batch_output_folder,
                             batch_outputs,
                             on_log=cleanup_notes.append,
+                            also_keep=[
+                                str(job.output_path) for job in jobs
+                                if job.status == "skipped" and job.output_path and Path(job.output_path).exists()
+                            ],
+                            inputs=[str(job.input_path) for job in jobs],
                         )
                         flattened_outputs = cleanup_result.get("final_outputs")
                         if isinstance(flattened_outputs, list) and flattened_outputs:

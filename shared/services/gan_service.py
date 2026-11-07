@@ -42,6 +42,7 @@ from shared.video_comparison_slider import create_video_comparison_html
 from shared.gpu_utils import expand_cuda_device_spec, get_global_gpu_override, validate_cuda_device_spec
 from shared.oom_alert import clear_vram_oom_alert, maybe_set_vram_oom_alert, show_vram_oom_modal
 from shared.global_rife import maybe_apply_global_rife
+from shared.batch_naming import BATCH_KEEP_NAME_KEY, adopt_output_name, batch_keep_name
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
@@ -801,18 +802,15 @@ def build_gan_callbacks(
                         ps_base = prepare_single(job.input_path, settings, seed_controls)
                         ps_base["_original_filename"] = input_file.name
                         ps_base["_desired_output_path"] = str(desired_out)
+                        ps_base[BATCH_KEEP_NAME_KEY] = True  # post-steps keep the input's name
                         ps = maybe_downscale(ps_base, seed_controls, current_output_dir, current_temp_dir)
                         status, lg, outp, cmp_html, slider_upd = run_single(ps, progress_cb=progress_q.put)
                     else:
                         # Batch videos: stable per-input folder under outputs/<input_stem>/ with chunk artifacts inside.
                         item_out_dir = batch_item_dir(batch_root, input_file.name)
-                        predicted_final = resolve_output_location(
-                            input_path=str(input_file),
-                            output_format="mp4",
-                            global_output_dir=str(item_out_dir),
-                            batch_mode=False,
-                            original_filename=input_file.name,
-                        )
+                        # A plain path: resolve_output_location() creates the item folder, after which
+                        # prepare_batch_video_run_dir() found it "existing" and skipped every batch video.
+                        predicted_final = item_out_dir / f"{item_out_dir.name}.mp4"
                         run_paths = prepare_batch_video_run_dir(
                             batch_root,
                             input_file.name,
@@ -820,6 +818,7 @@ def build_gan_callbacks(
                             model_label="GAN",
                             mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                             overwrite_existing=overwrite_existing_batch,
+                            flattened_output_counts=_as_bool(settings.get("keep_only_output_files"), False),
                         )
                         if not run_paths:
                             if not overwrite_existing_batch:
@@ -837,6 +836,7 @@ def build_gan_callbacks(
                         ps_base["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         # Keep outputs inside the per-item folder (GAN runner chooses filenames).
                         ps_base["output_override"] = str(run_paths.run_dir)
+                        ps_base[BATCH_KEEP_NAME_KEY] = True  # post-steps keep the input's name
                         ps = maybe_downscale(ps_base, seed_controls, current_output_dir, current_temp_dir)
                         status, lg, outp, cmp_html, slider_upd = run_single(ps, progress_cb=progress_q.put)
                      
@@ -935,6 +935,11 @@ def build_gan_callbacks(
                         Path(current_output_dir),
                         outputs,
                         on_log=lambda msg: logs.append(str(msg)),
+                        also_keep=[
+                            str(job.output_path) for job in jobs
+                            if job.status == "skipped" and job.output_path and Path(str(job.output_path)).exists()
+                        ],
+                        inputs=[str(job.input_path) for job in jobs],
                     )
                     flattened_outputs = cleanup_result.get("final_outputs")
                     if isinstance(flattened_outputs, list) and flattened_outputs:
@@ -1523,7 +1528,8 @@ def build_gan_callbacks(
                                 on_log=progress_cb if progress_cb else None,
                             )
                             if outp_new and outp_new != outp:
-                                outp = outp_new
+                                # Batch output keeps the input's name (no `_final{W}x{H}` copy).
+                                outp = adopt_output_name(outp, outp_new) if batch_keep_name(runtime_settings) else outp_new
                             if resize_msg and progress_cb and (resized_final or "failed" in resize_msg.lower()):
                                 progress_cb(resize_msg)
                         if outp and Path(outp).exists() and face_apply:
@@ -1534,7 +1540,7 @@ def build_gan_callbacks(
                                 gpu_device=chunk_settings.get("cuda_device") or chunk_settings.get("gpu_device"),
                             )
                             if restored:
-                                outp = restored
+                                outp = adopt_output_name(outp, restored) if batch_keep_name(runtime_settings) else restored
 
                         # Global RIFE post-process (adds *_xFPS output and keeps original).
                         if (
@@ -1557,6 +1563,7 @@ def build_gan_callbacks(
                                     "frame_accurate_split": bool(frame_accurate_split),
                                     "per_chunk_cleanup": bool(per_chunk_cleanup),
                                 },
+                                keep_name=batch_keep_name(runtime_settings),
                             )
                             if rife_out and Path(rife_out).exists():
                                 outp = rife_out
@@ -1728,6 +1735,9 @@ def build_gan_callbacks(
                         on_log=progress_cb if progress_cb else None,
                     )
                     if final_out_new and final_out_new != final_out_path:
+                        # Batch output keeps the input's name (no `_final{W}x{H}` copy).
+                        if batch_keep_name(runtime_settings):
+                            final_out_new = adopt_output_name(final_out_path, final_out_new)
                         final_out_path = final_out_new
                         result.output_path = final_out_path
                     if resize_msg and progress_cb and (resized_final or "failed" in resize_msg.lower()):
@@ -1764,6 +1774,7 @@ def build_gan_callbacks(
                         output_video_path=final_out_path,
                         seed_controls=seed_controls,
                         on_log=(lambda m: progress_cb(m) if progress_cb and m else None),
+                        keep_name=batch_keep_name(runtime_settings),
                     )
                     if rife_out and Path(rife_out).exists():
                         final_out_path = rife_out
@@ -1851,12 +1862,10 @@ def build_gan_callbacks(
                     {".mp4", ".mov", ".mkv", ".avi"},
                 )
 
-                if image_files and len(image_files) > 1 and not video_files:
-                    # Treat as frame folder - process as single unit
-                    items = [folder]
-                else:
-                    # Regular batch processing - individual files
-                    items = sort_windows_names(image_files + video_files, key=lambda p: p.name)
+                # Every image and video is its own item, saved under its own name. (A folder of
+                # images used to be sent to the video pipeline as one frame folder, where ffmpeg
+                # cannot open a directory, so photo-folder batches produced nothing.)
+                items = sort_windows_names(image_files + video_files, key=lambda p: p.name)
 
                 if not items:
                     yield (

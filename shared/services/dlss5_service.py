@@ -220,9 +220,23 @@ def build_dlss5_callbacks(
                 return
             out_dir = Path(str(tab.get("batch_output_path") or "").strip().strip('"') or (root / f"{folder.name}_DLSS5"))
             out_dir.mkdir(parents=True, exist_ok=True)
+            from shared.batch_naming import same_name_target
+
+            image_format = render_settings(tab, seed_controls).get("image_output_format", "png")
+            image_ext = {"jpg": ".jpg", "jpeg": ".jpg", "webp": ".webp"}.get(str(image_format or "png").lower(), ".png")
+            taken: set = set()
             for item in _batch_items(folder):
-                suffix = ".mp4" if Path(item).suffix.lower() in VIDEO_EXTS else ".png"
-                jobs.append((item, str(out_dir / f"{Path(item).stem}_DLSS5{suffix}")))
+                # Batch outputs keep the input's name (images in the chosen image format, videos as .mp4).
+                suffix = ".mp4" if Path(item).suffix.lower() in VIDEO_EXTS else image_ext
+                target = same_name_target(out_dir, Path(item), ext=suffix, fallback_tag="_DLSS5")
+                counter = 0
+                base_target = target
+                while str(target).lower() in taken:
+                    # Two inputs with one name (clip.mov + clip.mp4) cannot share one output file.
+                    counter += 1
+                    target = base_target.with_name(f"{base_target.stem}_{counter:04d}{base_target.suffix}")
+                taken.add(str(target).lower())
+                jobs.append((item, str(target)))
         else:
             source = str(upload or "").strip() or str(tab.get("input_path") or "").strip().strip('"')
             if not source or not Path(source).exists():
@@ -240,7 +254,14 @@ def build_dlss5_callbacks(
         last_output: Optional[str] = None
         failures = 0
         started = time.time()
+        is_batch = bool(tab.get("batch_enable"))
+        overwrite_batch = bool(seed_controls.get("overwrite_existing_batch_val", False))
         for index, (source, target) in enumerate(jobs, 1):
+            if is_batch and not overwrite_batch and Path(target).is_file():
+                # "Overwrite Existing Outputs (Batch)" is off: keep the earlier result.
+                logs.append(f"[{index}/{len(jobs)}] {Path(source).name} skipped (output exists: {Path(target).name})")
+                last_output = target
+                continue
             settings = render_settings(tab, seed_controls)
             settings.update({"input_path": source, "output_path": target})
             lines: "queue.Queue[str]" = queue.Queue()

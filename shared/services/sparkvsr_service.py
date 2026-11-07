@@ -55,6 +55,7 @@ from shared.batch_output_cleanup import keep_only_batch_outputs
 from shared.ffmpeg_utils import scale_video
 from shared.fixed_scale_output import enforce_fixed_scale_output_size
 from shared.global_rife import maybe_apply_global_rife
+from shared.batch_naming import adopt_output_name
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
@@ -2389,6 +2390,7 @@ def build_sparkvsr_callbacks(
                             model_label="sparkvsr",
                             mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                             overwrite_existing=overwrite_existing,
+                            flattened_output_counts=bool(settings.get("keep_only_output_files", False)),
                         )
                     if not run_paths:
                         if not overwrite_existing:
@@ -2573,7 +2575,8 @@ def build_sparkvsr_callbacks(
                                         gpu_device=settings.get("device"),
                                     )
                                     if restored and Path(restored).exists():
-                                        outp = restored
+                                        # Batch output keeps the input's name.
+                                        outp = adopt_output_name(outp, restored)
                                 else:
                                     restored_img = restore_image(
                                         outp,
@@ -2630,6 +2633,7 @@ def build_sparkvsr_callbacks(
                                     "frame_accurate_split": bool(frame_accurate_split),
                                     "per_chunk_cleanup": bool(per_chunk_cleanup),
                                 },
+                                keep_name=True,
                             )
                             if rife_out and Path(rife_out).exists():
                                 logs.append(f"[OK] Global RIFE output: {Path(rife_out).name}")
@@ -2711,6 +2715,7 @@ def build_sparkvsr_callbacks(
                             batch_root,
                             outputs,
                             on_log=lambda msg: logs.append(str(msg)),
+                            inputs=[str(p) for p in items],
                         )
                         flattened_outputs = cleanup_result.get("final_outputs")
                         if isinstance(flattened_outputs, list) and flattened_outputs:

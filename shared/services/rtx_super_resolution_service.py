@@ -43,6 +43,8 @@ from shared.output_run_manager import (
     cancel_salvage_run_dirs,
 )
 from shared.batch_output_cleanup import keep_only_batch_outputs
+from shared.batch_naming import BATCH_KEEP_NAME_KEY, adopt_output_name, batch_keep_name
+from shared.output_run_manager import find_flattened_batch_output
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -396,6 +398,7 @@ def build_rtx_super_resolution_callbacks(
         face_strength: float,
         progress_cb: Optional[Callable[[str], None]] = None,
         gpu_device: Any = None,
+        keep_name: bool = False,
     ) -> Optional[str]:
         if not output_path or not face_apply:
             return output_path
@@ -422,6 +425,9 @@ def build_rtx_super_resolution_callbacks(
                     gpu_device=gpu_device,
                 )
             if restored and Path(restored).exists():
+                if keep_name:
+                    # Batch output keeps the input's name.
+                    return adopt_output_name(str(path_obj), restored)
                 return str(restored)
         except Exception:
             return output_path
@@ -751,6 +757,7 @@ def build_rtx_super_resolution_callbacks(
                     output_path_local = _apply_face_restore_if_enabled(
                         output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line,
                         gpu_device=runtime_settings.get("device"),
+                        keep_name=batch_keep_name(runtime_settings),
                     )
                     output_path_local = _apply_audio_policy(
                         output_path_local,
@@ -779,6 +786,7 @@ def build_rtx_super_resolution_callbacks(
                             "frame_accurate_split": bool(frame_accurate_split),
                             "per_chunk_cleanup": bool(per_chunk_cleanup),
                         },
+                        keep_name=batch_keep_name(runtime_settings),
                     )
                     if rife_out and Path(rife_out).exists():
                         output_path_local = rife_out
@@ -842,6 +850,7 @@ def build_rtx_super_resolution_callbacks(
                 output_path_local = _apply_face_restore_if_enabled(
                     output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line,
                     gpu_device=runtime_settings.get("device"),
+                    keep_name=batch_keep_name(runtime_settings),
                 )
                 output_path_local = _apply_audio_policy(
                     output_path_local,
@@ -860,6 +869,7 @@ def build_rtx_super_resolution_callbacks(
                     output_video_path=output_path_local,
                     seed_controls=seed_controls_local,
                     on_log=(lambda m: _emit_progress_line(m) if m else None),
+                    keep_name=batch_keep_name(runtime_settings),
                 )
                 if rife_out and Path(rife_out).exists():
                     output_path_local = rife_out
@@ -910,6 +920,21 @@ def build_rtx_super_resolution_callbacks(
             batch_root.mkdir(parents=True, exist_ok=True)
             overwrite_existing = bool(seed_controls_local.get("overwrite_existing_batch_val", False))
 
+            def _existing_batch_result(item_path: Path, keep_only_mode: bool) -> Path:
+                """The earlier result of a skipped item: its file inside the item folder, or (after a
+                keep-only run) the file in the batch folder; the item folder itself as a fallback."""
+                item_dir = batch_item_dir(batch_root, item_path.name)
+                stem = item_dir.name
+                for ext in (".mp4", ".png", ".jpg", ".webp"):
+                    candidate = item_dir / f"{stem}{ext}"
+                    if candidate.is_file():
+                        return candidate
+                if keep_only_mode:
+                    flattened = find_flattened_batch_output(batch_root, item_path.name, input_path=str(item_path))
+                    if flattened:
+                        return flattened
+                return item_dir
+
             def _process_job(job: BatchJob) -> bool:
                 if cancel_event.is_set():
                     job.status = "cancelled"
@@ -922,6 +947,9 @@ def build_rtx_super_resolution_callbacks(
                     item_settings["input_path"] = str(item_path)
                     item_settings["batch_enable"] = False
                     item_settings["_original_filename"] = item_path.name
+                    # Outputs and their post-steps keep the input's name.
+                    item_settings[BATCH_KEEP_NAME_KEY] = True
+                    keep_only_mode = bool(_to_bool(settings_local.get("keep_only_output_files"), False))
 
                     if item_kind == "video":
                         run_paths = prepare_batch_video_run_dir(
@@ -931,16 +959,27 @@ def build_rtx_super_resolution_callbacks(
                             model_label="RTX",
                             mode=str(getattr(runner, "get_mode", lambda: "subprocess")() or "subprocess"),
                             overwrite_existing=overwrite_existing,
+                            flattened_output_counts=keep_only_mode,
                         )
                         if not run_paths:
                             job.status = "skipped"
-                            job.output_path = str(batch_item_dir(batch_root, item_path.name))
+                            job.output_path = str(_existing_batch_result(item_path, keep_only_mode))
                             return True
                         item_settings["_run_dir"] = str(run_paths.run_dir)
                         item_settings["_processed_chunks_dir"] = str(run_paths.processed_chunks_dir)
                         item_settings["output_override"] = str(run_paths.run_dir)
                     else:
                         item_dir = batch_item_dir(batch_root, item_path.name)
+                        # "Overwrite Existing Outputs (Batch)" off: an earlier result is skipped, so a rerun
+                        # no longer writes photo_0001.png next to it. A folder left by a failed run (no
+                        # result inside) is cleared and the image runs again.
+                        earlier = _existing_batch_result(item_path, keep_only_mode)
+                        if not overwrite_existing and earlier.is_file():
+                            job.status = "skipped"
+                            job.output_path = str(earlier)
+                            return True
+                        if item_dir.exists():
+                            shutil.rmtree(item_dir, ignore_errors=True)
                         item_dir.mkdir(parents=True, exist_ok=True)
                         item_settings["output_override"] = str(item_dir)
                         item_settings["_run_dir"] = str(item_dir)
@@ -972,6 +1011,11 @@ def build_rtx_super_resolution_callbacks(
                         batch_root,
                         outputs,
                         on_log=lambda msg: logs.append(str(msg)),
+                        also_keep=[
+                            str(job.output_path) for job in jobs
+                            if job.status == "skipped" and job.output_path and Path(str(job.output_path)).is_file()
+                        ],
+                        inputs=[str(job.input_path) for job in jobs],
                     )
                     flattened_outputs = cleanup_result.get("final_outputs")
                     if isinstance(flattened_outputs, list) and flattened_outputs:

@@ -2781,6 +2781,11 @@ class Runner:
             and Path(output_path).suffix.lower() == ".mp4"
         ):
             adjusted = ffmpeg_set_fps(Path(output_path), settings["fps_override"])
+            if settings.get("_batch_keep_name"):
+                # Batch output keeps the input's name (no `_fps` copy next to it).
+                from .batch_naming import adopt_output_name
+
+                adjusted = adopt_output_name(output_path, adjusted)
             output_path = str(adjusted)
         if returncode_val == 0 and mux_source_audio:
             output_path = self._mux_rife_source_audio(output_path, effective_input, settings, on_progress)

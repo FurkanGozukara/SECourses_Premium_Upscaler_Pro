@@ -81,6 +81,7 @@ def prepare_batch_video_run_dir(
     model_label: str,
     mode: str,
     overwrite_existing: bool = False,
+    flattened_output_counts: bool = False,
 ) -> Optional[VideoRunPaths]:
     """
     Prepare a stable, per-input batch run folder (outputs/<input_stem>/) with
@@ -88,8 +89,15 @@ def prepare_batch_video_run_dir(
 
     Concurrency-safe: claims the folder via atomic mkdir. If it already exists and
     `overwrite_existing` is False, returns None (caller should skip).
+
+    flattened_output_counts: with "Keep only output files" the result of an earlier run sits
+    directly in the batch folder (outputs/<input_stem>.mp4) and its run folder is gone; pass True
+    so that result also counts as existing output and the item is skipped.
     """
     run_dir = Path(batch_item_dir(output_root, original_filename))
+    if flattened_output_counts and not overwrite_existing and not run_dir.exists():
+        if find_flattened_batch_output(output_root, original_filename, input_path=input_path):
+            return None
     if overwrite_existing and run_dir.exists():
         shutil.rmtree(run_dir, ignore_errors=True)
     try:
@@ -106,6 +114,27 @@ def prepare_batch_video_run_dir(
         model_label=model_label,
         mode=mode,
     )
+
+
+def find_flattened_batch_output(output_root: Path, original_filename: str, *, input_path: str = "") -> Optional[Path]:
+    """The result a keep-only batch left directly in the batch folder for this input, if any:
+    `<output_root>/<input_stem>.<ext>` of the input's kind (video or image), never the input itself."""
+    from .path_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+
+    stem = sanitize_filename(Path(original_filename).stem if original_filename else "") or "unnamed"
+    kind_exts = VIDEO_EXTENSIONS if Path(original_filename or "").suffix.lower() in VIDEO_EXTENSIONS else IMAGE_EXTENSIONS
+    try:
+        source = Path(input_path).resolve() if input_path else None
+    except OSError:
+        source = None
+    for ext in sorted({str(e).lower() for e in kind_exts}):
+        candidate = Path(output_root) / f"{stem}{ext}"
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0 and (source is None or candidate.resolve() != source):
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def batch_item_dir(output_root: Path, original_filename: str) -> Path:

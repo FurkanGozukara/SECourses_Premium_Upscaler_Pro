@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from shared.batch_naming import adopt_output_name
 from shared.models.rife_meta import get_rife_default_model
 from shared.gpu_utils import get_global_gpu_override
 from shared.path_utils import collision_safe_dir, collision_safe_path, get_media_dimensions
@@ -354,10 +355,14 @@ def maybe_apply_global_rife(
     seed_controls: Dict[str, Any],
     on_log: Optional[Callable[[str], None]] = None,
     chunking_context: Optional[Dict[str, Any]] = None,
+    keep_name: bool = False,
 ) -> Tuple[Optional[str], str]:
     """
     Apply the global post-processes to an already-produced video: DLSS 5 neural rendering
     (when enabled in the DLSS 5 tab), then RIFE frame interpolation on its result.
+
+    keep_name: batch runs pass True so each result replaces ``output_video_path`` under the
+    same name instead of adding ``_DLSS5`` / ``_2xFPS`` files next to it.
 
     Returns:
         (final_output_path_or_none, message)
@@ -372,16 +377,23 @@ def maybe_apply_global_rife(
     except Exception as exc:
         if on_log:
             on_log(f"DLSS 5 post-process skipped: {exc}" + chr(10))
+    if dlss5_out and keep_name:
+        dlss5_out = adopt_output_name(output_video_path, dlss5_out)
     if dlss5_out:
         rife_out, rife_msg = _maybe_apply_global_rife_only(
             runner, dlss5_out, seed_controls, on_log=on_log, chunking_context=chunking_context
         )
         if rife_out:
+            if keep_name:
+                rife_out = adopt_output_name(dlss5_out, rife_out)
             return rife_out, rife_msg
         return dlss5_out, f"DLSS 5 output: {dlss5_out}"
-    return _maybe_apply_global_rife_only(
+    rife_out, rife_msg = _maybe_apply_global_rife_only(
         runner, output_video_path, seed_controls, on_log=on_log, chunking_context=chunking_context
     )
+    if rife_out and keep_name:
+        rife_out = adopt_output_name(output_video_path, rife_out)
+    return rife_out, rife_msg
 
 
 def _maybe_apply_global_rife_only(

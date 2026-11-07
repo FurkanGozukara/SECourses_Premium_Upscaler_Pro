@@ -112,6 +112,7 @@ def _make_image_output_path(
     global_output_dir: Optional[str],
     output_override: Optional[str],
     original_filename: Optional[str] = None,
+    keep_name: bool = False,
 ) -> Path:
     fmt = str(image_format or "png").strip().lower()
     if fmt not in {"png", "jpg", "webp"}:
@@ -121,7 +122,8 @@ def _make_image_output_path(
     override_raw = str(output_override or "").strip()
     if override_raw:
         override_path = Path(normalize_path(override_raw))
-        if override_path.suffix:
+        # Batch: the per-input folder of `my.photo.jpg` is `my.photo/`, a folder, not a file name.
+        if override_path.suffix and not (keep_name and override_path.is_dir()):
             if override_path.suffix.lower() != ext:
                 override_path = override_path.with_suffix(ext)
             return collision_safe_path(override_path)
@@ -147,11 +149,13 @@ def _make_video_output_path(
     global_output_dir: Optional[str],
     output_override: Optional[str],
     original_filename: Optional[str] = None,
+    keep_name: bool = False,
 ) -> Path:
     override_raw = str(output_override or "").strip()
     if override_raw:
         override_path = Path(normalize_path(override_raw))
-        if override_path.suffix:
+        # Batch: the per-input folder of `my.clip.mp4` is `my.clip/`, a folder, not a file name.
+        if override_path.suffix and not (keep_name and override_path.is_dir()):
             if override_path.suffix.lower() != ".mp4":
                 override_path = override_path.with_suffix(".mp4")
             return collision_safe_path(override_path)
@@ -171,18 +175,33 @@ def _make_video_output_path(
     return collision_safe_path(target)
 
 
+def _same_dir(a: Any, b: Any) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return Path(normalize_path(str(a))).resolve() == Path(normalize_path(str(b))).resolve()
+    except Exception:
+        return False
+
+
 def _make_sequence_output_dir(
     *,
     input_path: str,
     global_output_dir: Optional[str],
     output_override: Optional[str],
     original_filename: Optional[str] = None,
+    keep_name: bool = False,
 ) -> Path:
     override_raw = str(output_override or "").strip()
     if override_raw:
         override_path = Path(normalize_path(override_raw))
-        if override_path.suffix:
+        if override_path.suffix and not (keep_name and override_path.is_dir()):
             return collision_safe_dir(override_path.parent / override_path.stem)
+        if keep_name:
+            # Batch: the per-input folder already exists, so the frames go into a folder named
+            # after the input inside it (clip/clip/) instead of a numbered sibling (clip_0001/).
+            base_stem = Path(original_filename or Path(input_path).name).stem or "frames"
+            return collision_safe_dir(override_path / base_stem)
         return collision_safe_dir(override_path)
 
     resolved = resolve_output_location(
@@ -746,6 +765,7 @@ def run_rtx_superres(
                 global_output_dir=global_output_dir,
                 output_override=output_override,
                 original_filename=original_filename,
+                keep_name=bool(settings.get("_batch_keep_name")),
             )
             output_img_path.parent.mkdir(parents=True, exist_ok=True)
             output_path = str(output_img_path)
@@ -758,6 +778,8 @@ def run_rtx_superres(
                 global_output_dir=global_output_dir,
                 output_override=output_override,
                 original_filename=original_filename,
+                # Only the batch item's own run folder (not a chunk's output folder).
+                keep_name=bool(settings.get("_batch_keep_name")) and _same_dir(output_override, settings.get("_run_dir")),
             )
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir_path = output_dir
@@ -768,6 +790,7 @@ def run_rtx_superres(
                 global_output_dir=global_output_dir,
                 output_override=output_override,
                 original_filename=original_filename,
+                keep_name=bool(settings.get("_batch_keep_name")),
             )
             output_video_path.parent.mkdir(parents=True, exist_ok=True)
             output_path = str(output_video_path)

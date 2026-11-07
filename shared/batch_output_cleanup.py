@@ -5,7 +5,11 @@ import shutil
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
-from shared.path_utils import collision_safe_path, sanitize_filename
+from shared.path_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, collision_safe_path, sanitize_filename
+
+# Media files directly in the batch output folder are results (this run's, a skipped item's, or an
+# earlier run's): the keep-only cleanup never deletes them.
+_ROOT_MEDIA_EXTS = {str(e).lower() for e in (*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS)}
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -57,6 +61,8 @@ def _cleanup_keep_files(
 
         if cand_resolved in preserve_files:
             continue
+        if cand_resolved.parent == root_resolved and cand_resolved.suffix.lower() in _ROOT_MEDIA_EXTS:
+            continue
 
         try:
             candidate.unlink(missing_ok=True)
@@ -92,6 +98,8 @@ def _flatten_target_for_file(
     root_resolved: Path,
     src_file: Path,
     src_output_root: Optional[Path] = None,
+    taken: Optional[Set[Path]] = None,
+    protected: Optional[Set[Path]] = None,
 ) -> Path:
     # If already at root, keep as-is.
     try:
@@ -100,27 +108,31 @@ def _flatten_target_for_file(
     except Exception:
         pass
 
-    # For files coming from a directory output, prefix by output dir name +
-    # relative parent to avoid collisions during flattening.
+    # Files of a directory output (a PNG frame sequence) stay where they are, inside the folder
+    # named after the input, so the frames keep their names (no `<dir>_<frame>` renaming).
     if src_output_root is not None:
         try:
-            rel = src_file.resolve().relative_to(src_output_root.resolve())
-            rel_parent_bits = [sanitize_filename(p) for p in rel.parts[:-1] if str(p).strip()]
-            stem = sanitize_filename(src_file.stem) or "output"
-            suffix = src_file.suffix or ""
-            prefix = sanitize_filename(src_output_root.name) or "output"
-            name_parts = [prefix]
-            if rel_parent_bits:
-                name_parts.extend(rel_parent_bits)
-            name_parts.append(stem)
-            final_name = "_".join([p for p in name_parts if p]) + suffix
-            return collision_safe_path(Path(root_resolved) / final_name).resolve()
+            return src_file.resolve()
         except Exception:
-            pass
+            return src_file
 
-    # Normal file output: keep filename, move to root with collision safety.
+    # Normal file output: keep the filename and move it to the root. A file already there under
+    # that name is an earlier run's result for the same input and is replaced; only two results of
+    # this run with one name, or a batch input itself (output folder = input folder), get a
+    # numbered name instead.
     safe_name = sanitize_filename(src_file.name) or src_file.name
-    return collision_safe_path(Path(root_resolved) / safe_name).resolve()
+    target = Path(root_resolved) / safe_name
+    try:
+        target_resolved = target.resolve()
+    except Exception:
+        target_resolved = target
+    if target.exists() and (
+        target.is_dir()
+        or (taken is not None and target_resolved in taken)
+        or (protected is not None and target_resolved in protected)
+    ):
+        return collision_safe_path(target).resolve()
+    return target_resolved
 
 
 def keep_only_batch_outputs(
@@ -129,11 +141,19 @@ def keep_only_batch_outputs(
     on_log: Optional[Callable[[str], None]] = None,
     *,
     preserve_recovery: bool = False,
+    also_keep: Optional[Iterable[str]] = None,
+    inputs: Optional[Iterable[str]] = None,
 ) -> Dict[str, int | str | List[str]]:
     """
     Flatten final outputs into the batch output folder root, then remove all
     other generated artifacts. With preserve_recovery, keep recovery folders in
     place without counting their contents as successful outputs.
+
+    also_keep: existing results of items this run skipped (output already there). They are
+    flattened and kept like outputs but not reported in final_outputs; without them the cleanup
+    deleted the earlier results of skipped items.
+    inputs: the batch's input files; a flattened output never replaces one of them (when the
+    batch output folder is the input folder it gets a numbered name instead).
     """
     root = Path(batch_output_root)
     if not root.exists() or not root.is_dir():
@@ -157,8 +177,19 @@ def keep_only_batch_outputs(
     final_outputs: List[str] = []
     moved_files = 0
     warned = 0
+    counted_kept = 0
+    protected: Set[Path] = set()
+    for raw_input in list(inputs or []):
+        try:
+            protected.add(Path(str(raw_input)).resolve())
+        except Exception:
+            continue
 
-    for raw in list(output_paths or []):
+    entries = [(raw, True) for raw in list(output_paths or [])]
+    entries += [(raw, False) for raw in list(also_keep or [])]
+    for raw, counted in entries:
+        if not counted and not counted_kept:
+            break  # No new outputs: the cleanup is skipped below, so leave skipped results untouched.
         p_text = str(raw or "").strip()
         if not p_text:
             continue
@@ -174,11 +205,16 @@ def keep_only_batch_outputs(
 
         # File output: one final file.
         if p_resolved.is_file():
-            dest = _flatten_target_for_file(root_resolved, p_resolved, src_output_root=None)
+            dest = _flatten_target_for_file(
+                root_resolved, p_resolved, src_output_root=None, taken=preserve_files, protected=protected
+            )
             if p_resolved != dest:
                 try:
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(p_resolved), str(dest))
+                    if dest.is_file():
+                        os.replace(str(p_resolved), str(dest))
+                    else:
+                        shutil.move(str(p_resolved), str(dest))
                     moved_files += 1
                 except Exception as move_err:
                     warned += 1
@@ -186,7 +222,9 @@ def keep_only_batch_outputs(
                         on_log(f"Keep-only cleanup warning: failed to move '{p_resolved.name}': {move_err}")
                     dest = p_resolved
             preserve_files.add(dest)
-            final_outputs.append(str(dest))
+            if counted:
+                final_outputs.append(str(dest))
+                counted_kept += 1
             continue
 
         # Directory output: treat contained files as final output files.
@@ -205,9 +243,11 @@ def keep_only_batch_outputs(
                             on_log(f"Keep-only cleanup warning: failed to move '{src_file.name}': {move_err}")
                         dest = src_file.resolve()
                 preserve_files.add(dest)
-                final_outputs.append(str(dest))
+                if counted:
+                    final_outputs.append(str(dest))
+                    counted_kept += 1
 
-    if not preserve_files:
+    if not preserve_files or not counted_kept:
         msg = (
             "Keep-only cleanup skipped: no final output files were found "
             "inside the batch output folder."

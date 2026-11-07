@@ -39,6 +39,7 @@ from shared.output_run_manager import (
 from shared.video_codec_options import build_ffmpeg_video_encode_args
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.global_rife import global_rife_enabled
+from shared.batch_naming import BATCH_KEEP_NAME_KEY, adopt_output_name
 
 
 def restore_video(*args, **kwargs):
@@ -1624,6 +1625,8 @@ def build_rife_callbacks(
                         single_settings["batch_enable"] = False  # Disable batch for individual processing
                         single_settings["output_override"] = None  # Will be set per-item for batch
                         single_settings["_original_filename"] = Path(job.input_path).name
+                        # Outputs and their post-steps (FPS override, face restore) keep the input's name.
+                        single_settings[BATCH_KEEP_NAME_KEY] = True
 
                         overwrite_existing = bool(seed_controls.get("overwrite_existing_batch_val", False))
 
@@ -1639,10 +1642,8 @@ def build_rife_callbacks(
                         item_out_dir = batch_item_dir(batch_output_folder, Path(job.input_path).name)
                         png_output_job = bool(single_settings.get("png_output", False))
                         if png_output_job:
-                            predicted_final = (
-                                item_out_dir
-                                / f"{Path(job.input_path).stem}_{_sequence_dir_suffix(single_settings)}"
-                            )
+                            # Frame folder named after the input (clip/clip/), no `_png` / `_jpg` tag.
+                            predicted_final = item_out_dir / Path(job.input_path).stem
                         else:
                             predicted_final = item_out_dir / f"{Path(job.input_path).stem}.{out_ext.lstrip('.')}"
 
@@ -1711,7 +1712,8 @@ def build_rife_callbacks(
                                         gpu_device=single_settings.get("cuda_device"),
                                     )
                                     if restored:
-                                        job.output_path = restored
+                                        # Batch output keeps the input's name.
+                                        job.output_path = adopt_output_name(job.output_path, restored)
                                 # Face restoration can drop audio; re-mux/strip according to preferences.
                                 try:
                                     from shared.audio_utils import ensure_audio_on_video
@@ -1802,7 +1804,8 @@ def build_rife_callbacks(
                                     gpu_device=single_settings.get("cuda_device"),
                                 )
                                 if restored:
-                                    job.output_path = restored
+                                    # Batch output keeps the input's name.
+                                    job.output_path = adopt_output_name(job.output_path, restored)
                             # Ensure audio is correct (RIFE/face-restore can produce video-only outputs).
                             try:
                                 from shared.audio_utils import ensure_audio_on_video

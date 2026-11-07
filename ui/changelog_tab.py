@@ -11,6 +11,27 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.3 — 8 November 2026 — Batch Outputs Keep the Input's Name, Image-Based (GAN) Batch Folders Work Again, Safer \"Keep only output files\"",
+        """
+**Every batch run now saves each result under the same name as its input file, in the batch output folder.**
+
+**Batch output names**
+- Face Restoration: batch results keep the input's name (`photo.png` stays `photo.png`, not `photo_face_restored.png`), and files from subfolders of the input folder go into the same subfolders of the output folder.
+- DLSS 5: batch results keep the input's name (`clip.mp4`, not `clip_DLSS5.mp4`); images are saved in the Image Output Format you chose.
+- Post-steps after an upscale no longer add extra letters in batch runs: Face Restoration (`_face_restored`, `_gfpgan`, `_codeformer`), the DLSS 5 post-process (`_DLSS5`), Global RIFE (`_2xFPS`), Image-Based (GAN) final sizing (`_final1920x1080`) and the RIFE Target FPS Override (`_fps`). Each step replaces the result under the input's name, so the batch folder holds one file per input. Single runs keep their names as before.
+- SeedVR2: with the JPG or WebP image format, a JPG or WebP image came out as `photo_0001.jpg`; it now stays `photo.jpg`.
+- RTX Super Resolution: a rerun no longer adds `photo_0001.png`; with PNG output a video's frames go into a folder named after it (`clip/clip/`) instead of `clip_0001/`; an input with dots in its name (`my.clip.mp4`) keeps its whole name.
+- RIFE / FPS / Edit Videos: a batch PNG/JPG sequence goes into `clip/clip/` instead of `clip/clip_png/`.
+- When the batch output folder is the input folder itself, Face Restoration and DLSS 5 keep the old `_face_restored` / `_DLSS5` names, so an input is never overwritten.
+
+**Fixed**
+- Image-Based (GAN): a batch folder of photos produced nothing (the folder was sent to the video pipeline as one frame sequence), and every batch video was skipped as "output exists" because its output folder was created before the check. Every photo and video in the folder is now upscaled and saved under its own name.
+- "Keep only output files": a rerun into the same folder processed finished videos again and saved them as `clip_0001.mp4`, then `clip.mp4` again on the next run, and it deleted the results of items the run skipped. Finished results in the batch folder now count as existing outputs (skipped unless Overwrite Existing Outputs is on), a rerun replaces the earlier file under the same name, the results of skipped items are kept, and image and video files directly in the batch folder are never deleted. Frame sequences keep their frame names in their folder instead of being renamed `<folder>_<frame>.png`.
+- Face Restoration batch: a rerun read its own earlier results from the default `upscaled_files` folder inside the input folder as new inputs (`photo_face_restored_face_restored.png`). That folder is now left out.
+- Face Restoration and DLSS 5 batch now follow Output & Comparison > Overwrite Existing Outputs (Batch) like the other tabs: when it is off, an existing result is skipped; when it is on, it is replaced.
+""",
+    ),
+    (
         "V10.2 — 7 November 2026 — 23 Fixes: Split Scenes Files, Video Editing with Auto Chunk, Reload Parameters, Safer Cancel, Chunk Previews, Resumable Model Downloads and Clearer Settings",
         """
 **A fix release: everything we found while recording the full V10.1 tutorial is fixed, so every button does what it says.**

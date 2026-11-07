@@ -741,7 +741,7 @@ def seedvr2_tab(
                     cancel_confirm = gr.Checkbox(
                         label=" Confirm cancel (subprocess mode only)",
                         value=False,
-                        info="Cancel only works in subprocess mode. Check Global Settings to verify mode.",
+                        info="Tick to confirm, then press Cancel. Cancel works in the default subprocess mode.",
                         scale=3,
                     )
                     cancel_btn = gr.Button(
@@ -1033,19 +1033,12 @@ def seedvr2_tab(
             # Mode information
             gr.Markdown("####  Processing Mode")
             gr.Markdown(
-                "**Current Mode:** Check Global Settings tab to view/change execution mode\n\n"
-                "**Available Modes:**\n"
-                "- **Subprocess (Default & RECOMMENDED):** Each run is isolated with full VRAM cleanup and **cancellation support**\n"
-                "  -  **Automatic vcvars wrapper** on Windows (enables torch.compile when VS Build Tools installed)\n"
-                "  -  **Full cancellation support** with proper cleanup\n"
-                "  -  **100% VRAM/RAM cleanup** after each run\n"
-                "- **In-app (EXPERIMENTAL - NOT RECOMMENDED FOR SEEDVR2):**\n"
-                "  - **SeedVR2 Limitation**: Models reload each run (CLI design) - **NO speed benefit**\n"
-                "  - **Cannot cancel** mid-process (no subprocess to kill)\n"
-                "  - **vcvars must be pre-activated** before app start (cannot activate after Python loaded)\n"
-                "  - **May work for GAN/RIFE** but SeedVR2 gains nothing from in-app mode\n\n"
-                "**IMPORTANT:** Cancel button only works in **subprocess mode**. In-app mode runs cannot be cancelled mid-process.\n\n"
-                "**SeedVR2 Recommendation:** **Always use subprocess mode**. In-app provides no benefits for SeedVR2 due to CLI architecture (models reload each run). Switch modes in Global Settings tab."
+                "Runs use **subprocess mode**, the default: each run is isolated with full VRAM cleanup and **cancellation support**.\n\n"
+                "-  **Automatic vcvars wrapper** on Windows (enables torch.compile when VS Build Tools installed)\n"
+                "-  **Full cancellation support** with proper cleanup\n"
+                "-  **100% VRAM/RAM cleanup** after each run\n\n"
+                "The experimental in-app mode is not offered in the interface: in it SeedVR2 models still reload every run "
+                "(no speed benefit), runs cannot be cancelled mid-process and vcvars must be activated before the app starts."
             )
             gr.Markdown("**Comparison:** Native Gradio ImageSlider with download and fullscreen support for images. Custom HTML5 slider for videos.")
 

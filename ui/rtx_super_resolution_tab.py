@@ -1054,7 +1054,7 @@ def rtx_super_resolution_tab(
                     cancel_confirm = gr.Checkbox(
                         label="Confirm cancel (subprocess mode only)",
                         value=False,
-                        info="Cancel only works in subprocess mode. Check Global Settings to verify mode.",
+                        info="Tick to confirm, then press Cancel. Cancel works in the default subprocess mode.",
                         scale=3,
                     )
                     cancel_btn = gr.Button("Cancel (subprocess only)", variant="stop", elem_classes=["action-btn", "action-btn-cancel", "sec-btn-red"], scale=1)

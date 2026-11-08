@@ -11,6 +11,26 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.4 — 8 November 2026 — Real ProRes Output and Your Own FFmpeg Video Arguments in Open-H3 Regenerate and RTX Super Resolution",
+        """
+**Choosing `prores` in Output & Comparison > Video Codec now gives a real ProRes video in Open-H3 Regenerate and RTX Super Resolution, and you can type your own FFmpeg video options for any codec FFmpeg has.**
+
+**New: Custom FFmpeg Video Arguments** (Output & Comparison > Video Output)
+- Type your own FFmpeg video options, starting at `-c:v`, for example `-c:v prores_ks -profile:v 4444xq -pix_fmt yuv444p10le`, `-c:v libx265 -crf 8 -preset slow -pix_fmt yuv444p10le` or `-c:v ffv1 -level 3`. They replace Video Codec, Video Quality, Encoding Preset and Pixel Format. Without `-c:v`, the selected Video Codec's encoder is used with your options.
+- Used by Open-H3 Regenerate and RTX Super Resolution, which hand their frames straight to FFmpeg, so your settings are the only compression the video gets.
+- The file type follows the encoder: `.mov` for ProRes, DNxHR and other QuickTime codecs, `.mkv` for FFV1, UT Video and other lossless codecs, `.mp4` for the rest. `-f mov`, `-f mp4` or `-f matroska` picks it yourself.
+- The box checks your options with a short test encode when you leave it and shows whether FFmpeg accepts them. A run with options FFmpeg refuses stops at the start with FFmpeg's message, before any model loads.
+- Options the app sets itself are refused with a clear note: the input and output files, `-map`, trimming (`-ss`, `-t`, `-frames`), the frame rate (`-r`) and audio options (use Audio Codec). A `-vf` filter of yours runs after the app's colour conversion.
+- Leave the box empty to use the settings above it, as before.
+
+**Fixed**
+- Open-H3 Regenerate and RTX Super Resolution ignored the ProRes choice and saved an H.264 MP4 (4:2:0, 8-bit, small bitrate), because an MP4 file cannot hold ProRes. They now save a `.mov` file with ProRes inside.
+- The Pixel Format picks the ProRes type: `yuv422p10le` gives ProRes 422 HQ, `yuv444p10le` gives ProRes 4444. The Video Quality (CRF) slider does not apply to ProRes. ProRes files are labelled correctly for editing apps (a 4:2:2 file is no longer marked as 4444).
+- Chunked runs (scene split, or a fixed chunk size in the Resolution tab): the chunks are saved without any quality loss and the joined video is converted to ProRes (or with your own FFmpeg options) once at the end, so a chunked run gives the same quality as a run without chunks.
+- RTX Super Resolution: with HDR10 output on, the video stays H.265 as before (HDR10 needs it; your own FFmpeg options are not used then). With VP9 selected, the log now says that H.264 is saved instead.
+""",
+    ),
+    (
         "V10.3 — 8 November 2026 — Batch Outputs Keep the Input's Name, Image-Based (GAN) Batch Folders Work Again, Safer \"Keep only output files\"",
         """
 **Every batch run now saves each result under the same name as its input file, in the batch output folder.**

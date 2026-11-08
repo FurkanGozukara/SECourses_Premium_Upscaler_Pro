@@ -13,6 +13,7 @@ from shared.video_codec_options import (
     H265_TUNE_OPTIONS,
     DEFAULT_AV1_FILM_GRAIN,
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
+    normalize_custom_video_args,
 )
 from shared.models.rife_meta import get_rife_default_model
 
@@ -62,6 +63,8 @@ def output_defaults(models: List[str]) -> Dict[str, Any]:
         "global_rife_precision": "fp32",
         "global_rife_cuda_device": "",
         "global_rife_process_chunks": True,
+        # Own FFmpeg video encoder arguments (from -c:v on); empty = the Video Codec settings.
+        "video_custom_args": "",
         "comparison_mode": "slider",
         "pin_reference": False,
         "fullscreen_enabled": True,
@@ -116,6 +119,7 @@ OUTPUT_ORDER: List[str] = [
     "log_level",
     "overwrite_existing_batch",
     "global_rife_process_chunks",
+    "video_custom_args",
 ]
 
 
@@ -203,6 +207,7 @@ def _normalize_output_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["global_rife_precision"] = "fp16" if precision_raw == "fp16" else "fp32"
     cfg["global_rife_cuda_device"] = str(cfg.get("global_rife_cuda_device", "") or "")
     cfg["global_rife_process_chunks"] = bool(cfg.get("global_rife_process_chunks", True))
+    cfg["video_custom_args"] = normalize_custom_video_args(cfg.get("video_custom_args", ""))
     if "comparison_mode" in cfg:
         cfg["comparison_mode"] = normalize_comparison_mode(cfg["comparison_mode"])
     return cfg

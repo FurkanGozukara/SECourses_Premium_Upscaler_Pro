@@ -72,11 +72,49 @@ from shared.global_rife import maybe_apply_global_rife
 from shared.batch_naming import adopt_output_name
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.chunk_preview import build_chunk_preview_payload
+from shared.prores_delivery import deliver_final_encode, final_encode_plan, lossless_chunk_settings
+from shared.video_codec_options import (
+    check_custom_video_args,
+    normalize_custom_video_args,
+    parse_custom_video_args,
+    video_output_suffix,
+)
 
 logger = logging.getLogger("OpenH3Service")
 
 # Cancel event for Open-H3 processing
 _open_h3_cancel_event = threading.Event()
+
+
+def _final_encode_chunk_settings(
+    chunk_settings: Dict[str, Any], log: Callable[[str], None]
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """(chunk settings, final encode plan or None) for an app-level chunked run.
+
+    The chunk pipeline works in MP4 files, which cannot hold ProRes (nor every codec custom FFmpeg arguments
+    name): such a run writes lossless H.264 chunks and `_final_encode_finish` encodes the merged video once."""
+    plan = final_encode_plan(chunk_settings)
+    if plan is None:
+        return chunk_settings, None
+    log(f"[OpenH3] Chunks are written as lossless H.264, then the merged video is encoded once with {plan['label']}.")
+    return lossless_chunk_settings(chunk_settings), plan
+
+
+def _final_encode_finish(final_output: Any, plan: Optional[Dict[str, Any]], rc: Any, log: Callable[[str], None]) -> Any:
+    """The final encode of a finished chunked run (it replaces the merged MP4); other runs unchanged."""
+    if plan is None or not final_output or _open_h3_cancel_event.is_set():
+        return final_output
+    try:
+        if int(rc) != 0 or not Path(str(final_output)).is_file():
+            return final_output
+    except Exception:
+        return final_output
+    final_path, err = deliver_final_encode(str(final_output), plan, on_progress=log)
+    if final_path:
+        return final_path
+    log(f"WARNING: {err}. The lossless H.264 video is kept: {final_output}")
+    return final_output
+
 
 OPENH3_DEFAULT_PROMPT = (
     "High-quality, sharp and detailed footage with natural fine textures and crisp, clean edges. Every subject, "
@@ -1186,8 +1224,10 @@ def build_open_h3_callbacks(
                 "av1_film_grain_denoise": seed_controls.get("av1_film_grain_denoise_val"),
                 "pixel_format": seed_controls.get("pixel_format_val"),
                 "two_pass_encoding": seed_controls.get("two_pass_encoding_val"),
+                "video_custom_args": seed_controls.get("video_custom_args_val"),
             }
             for key in (
+                "video_custom_args",
                 "video_codec",
                 "video_quality",
                 "video_preset",
@@ -1216,6 +1256,9 @@ def build_open_h3_callbacks(
                 "x265": "libx265",
                 "av1": "libsvtav1",
                 "libsvtav1": "libsvtav1",
+                # ProRes is written into a .mov (an MP4 file cannot hold it).
+                "prores": "prores_ks",
+                "prores_ks": "prores_ks",
             }
             output_codec_key = str(output_codec or "").strip().lower()
             mapped_codec = codec_map.get(output_codec_key, "libx264")
@@ -1234,6 +1277,25 @@ def build_open_h3_callbacks(
             except Exception:
                 output_quality_i = 15
             settings["crf"] = max(0, min(51, output_quality_i))
+
+            # Output & Comparison > Custom FFmpeg Video Arguments replace the codec settings; a test encode
+            # checks them before the models load.
+            custom_args_text = normalize_custom_video_args(settings.get("video_custom_args"))
+            settings["video_custom_args"] = custom_args_text
+            if custom_args_text:
+                settings.pop("_output_codec_note", None)
+                c_args, c_suffix, c_err = parse_custom_video_args(
+                    custom_args_text, default_codec=settings.get("video_codec")
+                )
+                if not c_err:
+                    c_err = check_custom_video_args(c_args, c_suffix)
+                if c_err:
+                    yield _error_payload(
+                        state,
+                        "[ERROR] Custom FFmpeg video arguments",
+                        f"Output & Comparison > Custom FFmpeg Video Arguments: {c_err}",
+                    )
+                    return
 
             face_apply = bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))
@@ -1554,7 +1616,10 @@ def build_open_h3_callbacks(
                     item_input = Path(item_path)
                     item_out_dir = batch_item_dir(batch_root, item_input.name)
                     item_is_image = item_input.suffix.lower() in IMAGE_EXTENSIONS
-                    predicted_output_file = item_out_dir / f"{item_input.stem}{'.png' if item_is_image else '.mp4'}"
+                    item_ext = ".png" if item_is_image else video_output_suffix(
+                        item_settings.get("codec"), item_settings.get("video_custom_args")
+                    )
+                    predicted_output_file = item_out_dir / f"{item_input.stem}{item_ext}"
                     run_paths = prepare_batch_video_run_dir(
                         batch_root,
                         item_input.name,
@@ -1687,6 +1752,9 @@ def build_open_h3_callbacks(
                         except Exception:
                             pass
 
+                        chunk_settings, final_plan = _final_encode_chunk_settings(
+                            chunk_settings, lambda msg: logs.append(str(msg))
+                        )
                         _prepass_chunks, _process_chunk = _chunk_handlers(chunk_settings)
 
                         rc, clog, final_output, chunk_count_item = chunk_and_process(
@@ -1707,6 +1775,7 @@ def build_open_h3_callbacks(
                             pre_process_chunks_func=_prepass_chunks,
                             model_type="open_h3",
                         )
+                        final_output = _final_encode_finish(final_output, final_plan, rc, lambda msg: logs.append(str(msg)))
                         result = RunResult(rc, final_output if final_output else None, clog)
                         outp = result.output_path
                     elif idx in grouped_results:
@@ -1995,8 +2064,6 @@ def build_open_h3_callbacks(
                                 "continuing remaining chunks (same settings required)."
                             )
 
-                        _prepass_chunks, _process_chunk = _chunk_handlers(chunk_settings)
-
                         def _chunk_progress_cb(progress_val, desc="", **kwargs):
                             try:
                                 pct = int(float(progress_val) * 100)
@@ -2013,6 +2080,11 @@ def build_open_h3_callbacks(
                                     state["seed_controls"] = dict(seed_controls)
                                 except Exception:
                                     pass
+
+                        chunk_settings, final_plan = _final_encode_chunk_settings(
+                            chunk_settings, lambda msg: progress_queue.put(msg)
+                        )
+                        _prepass_chunks, _process_chunk = _chunk_handlers(chunk_settings)
 
                         rc, clog, final_output, chunk_count = chunk_and_process(
                             runner=_CancelProbe(),
@@ -2033,6 +2105,9 @@ def build_open_h3_callbacks(
                             model_type="open_h3",
                         )
 
+                        final_output = _final_encode_finish(
+                            final_output, final_plan, rc, lambda msg: progress_queue.put(msg)
+                        )
                         result_holder["result"] = RunResult(rc, final_output if final_output else None, clog)
                         result_holder["chunk_count"] = int(chunk_count or 0)
                     else:

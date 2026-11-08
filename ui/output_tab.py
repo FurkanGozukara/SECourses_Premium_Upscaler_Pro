@@ -33,6 +33,10 @@ from shared.video_codec_options import (
     H265_TUNE_OPTIONS,
     DEFAULT_AV1_FILM_GRAIN,
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
+    check_custom_video_args,
+    describe_custom_video_args,
+    normalize_custom_video_args,
+    parse_custom_video_args,
 )
 from shared.video_comparison_slider import (
     create_image_comparison_html,
@@ -347,6 +351,20 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         value=bool(_value("two_pass_encoding", False)),
                         info="Slower but can improve quality/filesize efficiency."
                     )
+                    video_custom_args = gr.Textbox(
+                        label="Custom FFmpeg Video Arguments (advanced, optional)",
+                        value=str(_value("video_custom_args", "") or ""),
+                        placeholder="-c:v prores_ks -profile:v 4444xq -pix_fmt yuv444p10le",
+                        lines=1,
+                        max_lines=3,
+                        info=(
+                            "Your own FFmpeg video options, from -c:v on. When set, they replace Video Codec, "
+                            "Video Quality, Encoding Preset and Pixel Format. Used by Open-H3 Regenerate and RTX "
+                            "Super Resolution. Saved as .mov for ProRes / DNxHR, .mkv for FFV1 / UT Video, "
+                            ".mp4 otherwise. Leave empty to use the settings above."
+                        ),
+                    )
+                    video_custom_args_check = gr.Markdown("", visible=False)
 
                 with gr.Column(scale=1):
                     pixel_format = gr.Dropdown(
@@ -879,6 +897,7 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         log_level,
         overwrite_existing_batch,
         global_rife_process_chunks,
+        video_custom_args,
     ]
 
     # UNIVERSAL PRESET EVENT WIRING
@@ -935,6 +954,31 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
             gr.update(value=get_codec_info(codec)),
             gr.update(choices=pix_choices_local, value=pix_fmt),
             gr.update(value=get_pixel_format_info(pix_fmt)),
+        )
+
+    def _check_custom_video_args(text: str, codec_key: str):
+        """Parse the custom FFmpeg video arguments and run a short test encode; show the result under the box."""
+        normalized = normalize_custom_video_args(text)
+        if not normalized:
+            return gr.update(value="", visible=False)
+        args, suffix, err = parse_custom_video_args(normalized, default_codec=codec_key)
+        if not err:
+            err = check_custom_video_args(args, suffix)
+        if err:
+            return gr.update(value=f"❌ **Not usable:** {err}", visible=True)
+        return gr.update(
+            value=(f"✅ FFmpeg accepts these arguments ({describe_custom_video_args(args, suffix)}): "
+                   f"`{' '.join(args)}`"),
+            visible=True,
+        )
+
+    for _custom_event in (video_custom_args.blur, video_custom_args.submit):
+        _custom_event(
+            fn=_check_custom_video_args,
+            inputs=[video_custom_args, video_codec],
+            outputs=video_custom_args_check,
+            queue=False,
+            show_progress="hidden",
         )
 
     # Codec + pixel format sync updates

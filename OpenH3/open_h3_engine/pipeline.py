@@ -104,6 +104,7 @@ class OpenH3Settings:
     pixel_format: str = "yuv420p"
     keep_audio: bool = True
     keep_latents: bool = False
+    video_args: str = ""               # own FFmpeg video encoder arguments (replace codec/crf/preset/pix_fmt)
 
 
 @dataclass
@@ -545,7 +546,8 @@ class OpenH3Pipeline:
             audio_offset = indices[0] / float(self._source_fps)
         writer = video_io.FfmpegWriter(s.output_path, geometry.target_w, geometry.target_h, fps,
                                        audio_source=audio_source, codec=s.codec, crf=int(s.crf),
-                                       preset=s.preset, pixel_format=s.pixel_format, audio_offset_s=audio_offset)
+                                       preset=s.preset, pixel_format=s.pixel_format, audio_offset_s=audio_offset,
+                                       video_args=s.video_args)
         merger = video_io.StreamingChunkMerger(writer, plan.overlap_frames, plan.total_frames)
         ok = False
         try:

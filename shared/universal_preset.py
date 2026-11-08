@@ -59,6 +59,7 @@ from shared.video_codec_options import (
     H265_TUNE_OPTIONS,
     DEFAULT_AV1_FILM_GRAIN,
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
+    normalize_custom_video_args,
 )
 
 
@@ -412,6 +413,7 @@ def _normalize_output_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     cfg["global_rife_precision"] = "fp16" if precision == "fp16" else "fp32"
     cfg["global_rife_cuda_device"] = str(cfg.get("global_rife_cuda_device", "") or "")
     cfg["global_rife_process_chunks"] = bool(cfg.get("global_rife_process_chunks", True))
+    cfg["video_custom_args"] = normalize_custom_video_args(cfg.get("video_custom_args", ""))
     if "comparison_mode" in cfg:
         # The removed "overlay" mode always showed the slider; old presets load it as "slider".
         cfg["comparison_mode"] = normalize_comparison_mode(cfg["comparison_mode"])
@@ -892,6 +894,7 @@ def update_shared_state_from_preset(
     seed_controls["global_gpu_device_val"] = global_gpu_device
     seed_controls["global_rife_cuda_device_val"] = out_settings["global_rife_cuda_device"]
     seed_controls["global_rife_process_chunks_val"] = bool(out_settings.get("global_rife_process_chunks", True))
+    seed_controls["video_custom_args_val"] = normalize_custom_video_args(out_settings.get("video_custom_args", ""))
     seed_controls["output_format_val"] = out_settings.get("output_format", "auto")
     seed_controls["comparison_mode_val"] = out_settings.get("comparison_mode", "slider")
     seed_controls["pin_reference_val"] = out_settings.get("pin_reference", False)

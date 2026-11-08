@@ -20,6 +20,7 @@ from shared.video_codec_options import (
     get_pixel_format_choices,
     DEFAULT_AV1_FILM_GRAIN,
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
+    normalize_custom_video_args,
 )
 from shared.universal_preset import (
     TAB_CONFIGS,
@@ -651,6 +652,7 @@ def sync_tab_to_shared_state(
         tab_dict["global_rife_cuda_device"] = "" if global_gpu_device == "cpu" else global_gpu_device
         seed_controls["global_rife_cuda_device_val"] = tab_dict["global_rife_cuda_device"]
         seed_controls["global_rife_process_chunks_val"] = bool(tab_dict.get("global_rife_process_chunks", True))
+        seed_controls["video_custom_args_val"] = normalize_custom_video_args(tab_dict.get("video_custom_args", ""))
         seed_controls["output_format_val"] = tab_dict.get("output_format", "auto") or "auto"
         seed_controls["comparison_mode_val"] = tab_dict.get("comparison_mode", "slider") or "slider"
         seed_controls["pin_reference_val"] = bool(tab_dict.get("pin_reference", False))

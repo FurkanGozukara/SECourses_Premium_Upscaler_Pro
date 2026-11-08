@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from shared.image_io import imwrite, load_image_bgr8
+from shared.video_codec_options import normalize_custom_video_args, parse_custom_video_args
 from shared.vram_autotune.rtx import check_or_pick as rtx_check_or_pick
 from shared.path_utils import (
     IMAGE_EXTENSIONS,
@@ -150,17 +151,20 @@ def _make_video_output_path(
     output_override: Optional[str],
     original_filename: Optional[str] = None,
     keep_name: bool = False,
+    suffix: str = ".mp4",
 ) -> Path:
+    """Output video path; `suffix` is the container (.mov for ProRes, .mp4 otherwise, or the custom arguments')."""
+    suffix = suffix if suffix in (".mp4", ".mov", ".mkv") else ".mp4"
     override_raw = str(output_override or "").strip()
     if override_raw:
         override_path = Path(normalize_path(override_raw))
         # Batch: the per-input folder of `my.clip.mp4` is `my.clip/`, a folder, not a file name.
         if override_path.suffix and not (keep_name and override_path.is_dir()):
-            if override_path.suffix.lower() != ".mp4":
-                override_path = override_path.with_suffix(".mp4")
+            if override_path.suffix.lower() != suffix:
+                override_path = override_path.with_suffix(suffix)
             return collision_safe_path(override_path)
         base_stem = Path(original_filename or Path(input_path).name).stem or "video"
-        return collision_safe_path(override_path / f"{base_stem}.mp4")
+        return collision_safe_path(override_path / f"{base_stem}{suffix}")
 
     resolved = resolve_output_location(
         input_path=input_path,
@@ -169,10 +173,42 @@ def _make_video_output_path(
         batch_mode=False,
         original_filename=original_filename,
     )
-    target = resolved if resolved.suffix else (resolved / f"{Path(input_path).stem}.mp4")
-    if target.suffix.lower() != ".mp4":
-        target = target.with_suffix(".mp4")
+    target = resolved if resolved.suffix else (resolved / f"{Path(input_path).stem}{suffix}")
+    if target.suffix.lower() != suffix:
+        target = target.with_suffix(suffix)
     return collision_safe_path(target)
+
+
+# Output tab codec names -> the encoder keys this runner writes.
+_RTX_CODEC_ALIASES = {
+    "libx264": "h264", "x264": "h264", "avc": "h264", "libx265": "h265", "x265": "h265", "hevc": "h265",
+    "libsvtav1": "av1", "svtav1": "av1", "libvpx-vp9": "vp9", "prores_ks": "prores", "prores_aw": "prores",
+}
+
+
+def _pop_video_filter(args: List[str]) -> str:
+    """Remove -vf / -filter:v pairs from custom arguments (in place) and return their chain ('' when none)."""
+    chains: List[str] = []
+    i = 0
+    while i < len(args) - 1:
+        if args[i].lower() in ("-vf", "-filter:v"):
+            chains.append(args[i + 1])
+            del args[i:i + 2]
+            continue
+        i += 1
+    return ",".join(c for c in chains if c)
+
+
+def _rtx_video_codec_key(codec_raw: Any) -> Tuple[str, Optional[str]]:
+    """(codec key, note) for the Output tab codec: H.264 / H.265 / AV1 in MP4, ProRes in MOV.
+
+    VP9 (a WebM codec) is written as H.264, with a note in the log.
+    """
+    requested = str(codec_raw or "h264").strip().lower() or "h264"
+    key = _RTX_CODEC_ALIASES.get(requested, requested)
+    if key in ("h264", "h265", "av1", "prores"):
+        return key, None
+    return "h264", f"[RTX] The Output tab codec '{requested}' is not written by RTX Super Resolution; using H.264."
 
 
 def _same_dir(a: Any, b: Any) -> bool:
@@ -757,6 +793,7 @@ def run_rtx_superres(
 
         output_path: Optional[str] = None
         output_dir_path: Optional[Path] = None
+        custom_video_args: List[str] = []
 
         if input_kind == "image":
             output_img_path = _make_image_output_path(
@@ -785,12 +822,27 @@ def run_rtx_superres(
             output_dir_path = output_dir
             output_path = str(output_dir)
         else:
+            # ProRes goes into a .mov (an MP4 cannot hold it); HDR10 output is H.265, so it stays MP4.
+            video_codec_key, _codec_note = _rtx_video_codec_key(settings.get("video_codec"))
+            video_suffix = ".mov" if (video_codec_key == "prores" and not use_hdr) else ".mp4"
+            # Output & Comparison > Custom FFmpeg Video Arguments replace the codec settings (not with HDR10).
+            if normalize_custom_video_args(settings.get("video_custom_args")):
+                if use_hdr:
+                    log("[RTX] HDR10 output keeps its H.265 HDR10 encode; the custom FFmpeg video arguments are not used.")
+                else:
+                    custom_video_args, custom_suffix, custom_err = parse_custom_video_args(
+                        settings.get("video_custom_args"), default_codec=video_codec_key
+                    )
+                    if custom_err:
+                        return _fail(f"Custom FFmpeg video arguments: {custom_err}")
+                    video_suffix = custom_suffix
             output_video_path = _make_video_output_path(
                 input_path=input_path,
                 global_output_dir=global_output_dir,
                 output_override=output_override,
                 original_filename=original_filename,
                 keep_name=bool(settings.get("_batch_keep_name")),
+                suffix=video_suffix,
             )
             output_video_path.parent.mkdir(parents=True, exist_ok=True)
             output_path = str(output_video_path)
@@ -937,21 +989,22 @@ def run_rtx_superres(
         # produced MPEG-4 Part 2 ("mp4v"), a lower-quality codec many players and editors handle poorly, and is
         # only used when ffmpeg is missing.
         if output_path and Path(output_path).suffix.lower() in VIDEO_EXTENSIONS:
-            from .video_codec_options import build_ffmpeg_video_encode_args
+            from .video_codec_options import build_ffmpeg_video_encode_args, prores_pixel_format
 
             ffmpeg_exe = shutil.which("ffmpeg")
             if ffmpeg_exe:
-                codec_key = str(settings.get("video_codec") or "h264").strip().lower()
-                codec_key = {"libx264": "h264", "x264": "h264", "avc": "h264", "libx265": "h265", "x265": "h265",
-                             "hevc": "h265", "libsvtav1": "av1", "svtav1": "av1", "libvpx-vp9": "vp9"}.get(codec_key, codec_key)
-                if codec_key not in ("h264", "h265", "av1", "vp9") or (
-                        codec_key == "vp9" and Path(output_path).suffix.lower() != ".webm"):
-                    codec_key = "h264"  # ProRes / VP9 need .mov / .webm containers; the MP4 path stays H.264
+                codec_key, codec_note = _rtx_video_codec_key(settings.get("video_codec"))
+                if codec_note and not custom_video_args:
+                    log(codec_note)
                 if use_hdr and codec_key not in ("h265", "av1"):
                     log(f"[RTX] HDR10 output uses H.265 10-bit (the selected {codec_key.upper()} has no HDR10 path here).")
                     codec_key = "h265"
+                if codec_key == "prores" and Path(output_path).suffix.lower() != ".mov":
+                    codec_key = "h264"  # an MP4 file cannot hold ProRes
                 pixel_format = str(settings.get("pixel_format") or "yuv420p")
-                if deep_out and "10" not in pixel_format:
+                if codec_key == "prores":
+                    pixel_format = prores_pixel_format(pixel_format)  # 10-bit 4:2:2 / 4:4:4 already
+                elif deep_out and "10" not in pixel_format:
                     pixel_format = "yuv420p10le"
                 encode_args = build_ffmpeg_video_encode_args(
                     codec=codec_key,
@@ -991,10 +1044,21 @@ def run_rtx_superres(
                             encode_args += [svt, extra]
                 else:
                     color_args = _sdr_color_args(src_color)
+                if custom_video_args:
+                    # The user's own encoder options; a -vf of theirs runs after the colour conversion.
+                    encode_args = list(custom_video_args) + ["-an"]
+                    user_vf = _pop_video_filter(encode_args)
+                    if user_vf:
+                        if "-vf" in color_args:
+                            i = color_args.index("-vf") + 1
+                            color_args = color_args[:i] + [f"{color_args[i]},{user_vf}"] + color_args[i + 1:]
+                        else:
+                            color_args = color_args + ["-vf", user_vf]
+                mux_args = ["-movflags", "+faststart"] if Path(output_path).suffix.lower() in (".mp4", ".mov") else []
                 ffmpeg_cmd = [
                     ffmpeg_exe, "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le" if deep_out else "rgb24",
                     "-s:v", f"{out_w}x{out_h}", "-r", f"{float(output_fps):.8f}", "-i", "-",
-                    *color_args, *encode_args, "-movflags", "+faststart", str(output_path),
+                    *color_args, *encode_args, *mux_args, str(output_path),
                 ]
                 ffmpeg_writer = subprocess.Popen(
                     ffmpeg_cmd,
@@ -1003,7 +1067,15 @@ def run_rtx_superres(
                     stderr=subprocess.DEVNULL,
                     creationflags=_NO_WINDOW,
                 )
-                log(f"[RTX] Encoding {codec_key.upper()} with FFmpeg ({' '.join(encode_args[:6])})"
+                codec_label = codec_key.upper()
+                if codec_key == "prores":
+                    codec_label = "ProRes 4444 (.mov)" if "444" in pixel_format else "ProRes 422 HQ (.mov)"
+                if custom_video_args:
+                    log(f"[RTX] Encoding with the custom FFmpeg video arguments into {Path(output_path).suffix} "
+                        f"({' '.join(custom_video_args)})"
+                        + (f", colours tagged {src_color.get('color_space')}." if color_args else "."))
+                else:
+                    log(f"[RTX] Encoding {codec_label} with FFmpeg ({' '.join(encode_args[:6])})"
                     + (" as HDR10 (BT.2020 PQ)." if use_hdr else (f", colours tagged {src_color.get('color_space')}." if color_args else ".")))
             else:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")

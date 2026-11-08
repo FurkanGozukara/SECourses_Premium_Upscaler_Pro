@@ -71,6 +71,7 @@ from shared.gpu_utils import (
 )
 from shared.video_codec_options import (
     get_pixel_format_choices,
+    normalize_custom_video_args,
     DEFAULT_AV1_FILM_GRAIN,
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
 )
@@ -1484,6 +1485,9 @@ def main(argv=None):
         startup_output_settings["global_rife_process_chunks"] = bool(
             startup_output_settings.get("global_rife_process_chunks", True)
         )
+        startup_output_settings["video_custom_args"] = normalize_custom_video_args(
+            startup_output_settings.get("video_custom_args", "")
+        )
         startup_preset["output"] = startup_output_settings
         startup_auto_chunk = bool((startup_res_settings or {}).get("auto_chunk", True))
         startup_res_settings = dict(startup_res_settings) if isinstance(startup_res_settings, dict) else {}
@@ -1560,6 +1564,7 @@ def main(argv=None):
                     else resolve_global_gpu_device(startup_global_settings.get("global_gpu_device"))
                 ),
                 "global_rife_process_chunks_val": bool(startup_output_settings.get("global_rife_process_chunks", True)),
+                "video_custom_args_val": startup_output_settings.get("video_custom_args", ""),
                 "output_format_val": startup_output_settings.get("output_format", "auto"),
                 "png_sequence_enabled_val": bool(startup_output_settings.get("png_sequence_enabled", False)),
                 "comparison_mode_val": startup_output_settings.get("comparison_mode", "slider"),

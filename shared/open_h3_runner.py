@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .command_logger import get_command_logger
+from .video_codec_options import parse_custom_video_args, video_output_suffix
 from .vram_autotune.open_h3 import auto_apply as open_h3_auto_apply
 from .ltx25_runner import (
     _build_env,
@@ -75,6 +76,15 @@ class OpenH3Result:
     log: str
     input_fps: float = 24.0
     output_fps: float = 24.0
+
+
+def _custom_video_args_text(settings: Dict[str, Any]) -> str:
+    """The Output tab's custom FFmpeg video arguments for the engine writer ('' = the codec settings)."""
+    import shlex
+
+    args, _suffix, err = parse_custom_video_args(settings.get("video_custom_args"),
+                                                 default_codec=settings.get("codec") or settings.get("video_codec"))
+    return shlex.join(args) if (args and not err) else ""
 
 
 def _parse_int(value: Any, default: int) -> int:
@@ -331,6 +341,9 @@ def build_command(python_exe: str, script_path: Path, settings: Dict[str, Any], 
         "--preset", str(settings.get("video_preset") or settings.get("preset") or "medium"),
         "--pixel_format", str(settings.get("pixel_format") or "yuv420p"),
     ]
+    video_args = _custom_video_args_text(settings)
+    if video_args:
+        cmd += ["--video_args", video_args]
     if prompt_file is not None:
         cmd += ["--prompt_file", str(prompt_file)]
     if not _bool(settings.get("sparse_attention"), True):
@@ -433,7 +446,10 @@ def _item_plan(settings: Dict[str, Any], base_dir: Path, input_path: str, input_
     input_fps = (get_media_fps(input_path) or 24.0) if input_kind == "video" else 24.0
     output_fps = 24.0 if (fps_mode(settings) == "24" and input_kind == "video") else input_fps
 
-    out_ext = ".png" if input_kind == "image" else ".mp4"
+    # Videos: .mov for ProRes (an MP4 file cannot hold it), .mp4 for the other codecs; custom FFmpeg video
+    # arguments pick their own container (.mov / .mkv / .mp4).
+    out_ext = ".png" if input_kind == "image" else video_output_suffix(settings.get("codec"),
+                                                                        settings.get("video_custom_args"))
     base_name = settings.get("_original_filename") or Path(input_path).name
     base_stem = Path(str(base_name)).stem or "output"
     explicit_output = normalize_path(settings.get("output_path") or "")

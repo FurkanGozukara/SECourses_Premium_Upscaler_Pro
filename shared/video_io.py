@@ -144,7 +144,7 @@ class FfmpegWriter:
 
     def __init__(self, output_path: str, width: int, height: int, fps, audio_source: Optional[str] = None,
                  codec: str = "libx264", crf: int = 15, preset: str = "medium", pixel_format: str = "yuv420p",
-                 audio_offset_s: float = 0.0):
+                 audio_offset_s: float = 0.0, video_args: str = ""):
         self.output_path = str(output_path)
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
         cmd = [find_ffmpeg(), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -154,12 +154,26 @@ class FfmpegWriter:
                 cmd += ["-ss", f"{audio_offset_s:.6f}"]
             cmd += ["-i", str(audio_source), "-map", "0:v:0", "-map", "1:a:0?"]
         codec = str(codec or "libx264")
-        cmd += ["-c:v", codec]
-        if codec in ("libx264", "libx265"):
-            cmd += ["-crf", str(int(crf)), "-preset", str(preset)]
-        elif codec == "libsvtav1":
-            cmd += ["-crf", str(int(crf)), "-preset", "8"]
-        cmd += ["-pix_fmt", pixel_format]
+        if codec in ("prores", "prores_aw"):
+            codec = "prores_ks"
+        if str(video_args or "").strip():
+            # The Output tab's custom FFmpeg video arguments (checked by the app) replace the codec settings.
+            import shlex
+
+            cmd += shlex.split(str(video_args), posix=True)
+        else:
+            cmd += ["-c:v", codec]
+            if codec in ("libx264", "libx265"):
+                cmd += ["-crf", str(int(crf)), "-preset", str(preset)]
+            elif codec == "libsvtav1":
+                cmd += ["-crf", str(int(crf)), "-preset", "8"]
+            elif codec == "prores_ks":
+                # ProRes (in a .mov): the profile follows the pixel format, 422 HQ or 4444; CRF does not apply.
+                from .video_codec_options import prores_pixel_format, prores_profile_for_pixel_format
+
+                pixel_format = prores_pixel_format(pixel_format)
+                cmd += ["-profile:v", prores_profile_for_pixel_format(pixel_format), "-vendor", "apl0"]
+            cmd += ["-pix_fmt", pixel_format]
         if audio_source:
             # never let a shorter audio track stop the video before every frame is written
             cmd += ["-c:a", "aac", "-b:a", "192k"]

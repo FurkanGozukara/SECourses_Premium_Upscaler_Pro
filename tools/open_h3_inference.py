@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crf", type=int, default=15)
     p.add_argument("--preset", default="medium")
     p.add_argument("--pixel_format", default="yuv420p")
+    p.add_argument("--video_args", default="",
+                   help="Own FFmpeg video encoder arguments (from -c:v on); replace codec/crf/preset/pixel_format")
     p.add_argument("--no_audio", action="store_true")
     p.add_argument("--keep_latents", action="store_true")
     p.add_argument("--plan_only", action="store_true", help="Print the geometry / window plan and exit")
@@ -148,7 +150,7 @@ def main() -> int:
         bytes_per_token=args.bytes_per_token, token_budget_mode=args.token_budget_mode, max_tokens=args.max_tokens,
         max_gpu_blocks=args.max_gpu_blocks,
         codec=args.codec, crf=args.crf, preset=args.preset, pixel_format=args.pixel_format,
-        keep_audio=not args.no_audio, keep_latents=args.keep_latents,
+        keep_audio=not args.no_audio, keep_latents=args.keep_latents, video_args=args.video_args,
     )
 
     from open_h3_engine.pipeline import STAGES, run_many

@@ -55,6 +55,15 @@ from shared.path_utils import (
 )
 from shared.preset_manager import PresetManager
 from shared.preview_utils import prepare_preview_input
+from shared.prores_delivery import (
+    ENCODE_KEYS as PRORES_ENCODE_KEYS,
+    custom_video_args_error as _custom_video_args_error,
+    deliver_final_encode,
+    final_encode_plan,
+    lossless_chunk_settings,
+    restore_requested_encode,
+    wants_prores,
+)
 from shared.global_rife import maybe_apply_global_rife
 from shared.rtx_superres_runner import run_rtx_superres
 from shared.video_fps_utils import apply_video_fps_override_preprocess
@@ -384,7 +393,7 @@ def build_rtx_super_resolution_callbacks(
         # Output tab video encoding: the RTX runner encodes with FFmpeg using these (H.264 by default).
         output_settings_local = seed_controls_local.get("output_settings") or {}
         for key in ("video_codec", "video_quality", "video_preset", "pixel_format", "h265_tune",
-                    "av1_film_grain", "av1_film_grain_denoise"):
+                    "av1_film_grain", "av1_film_grain_denoise", "video_custom_args"):
             value = seed_controls_local.get(f"{key}_val")
             if value is None and isinstance(output_settings_local, dict):
                 value = output_settings_local.get(key)
@@ -715,6 +724,27 @@ def build_rtx_super_resolution_callbacks(
                 chunk_settings["per_chunk_cleanup"] = per_chunk_cleanup
                 chunk_settings["output_format"] = _resolve_output_format(chunk_settings.get("output_format"))
 
+                # ProRes / custom FFmpeg video arguments: the chunk pipeline works in MP4 files, so the chunks
+                # are lossless H.264 and the merged video gets the requested encode once, below.
+                requested_encode = {k: chunk_settings[k] for k in PRORES_ENCODE_KEYS if k in chunk_settings}
+                final_plan = (
+                    final_encode_plan(chunk_settings) if chunk_settings.get("output_format") != "png" else None
+                )
+                if final_plan and _to_bool(chunk_settings.get("rtx_hdr_output"), False):
+                    # HDR10 output is H.265 in MP4 (as in a single-pass run); no final encode.
+                    if wants_prores(chunk_settings):
+                        chunk_settings["video_codec"] = "h264"
+                    chunk_settings["video_custom_args"] = ""
+                    final_plan = None
+                if final_plan:
+                    chunk_settings = lossless_chunk_settings(
+                        chunk_settings, deep=_to_bool(chunk_settings.get("rtx_10bit"), False)
+                    )
+                    _emit_progress_line(
+                        "[RTX] Chunks are written as lossless H.264, then the merged video is encoded once with "
+                        f"{final_plan['label']}."
+                    )
+
                 def _process_chunk(s: Dict[str, Any], on_progress=None) -> RunResult:
                     res = run_rtx_superres(
                         s,
@@ -753,6 +783,24 @@ def build_rtx_super_resolution_callbacks(
                 )
 
                 output_path_local = final_output if final_output else None
+                if (
+                    final_plan
+                    and output_path_local
+                    and int(rc) == 0
+                    and not cancel_event.is_set()
+                    and Path(output_path_local).is_file()
+                ):
+                    final_path, final_err = deliver_final_encode(
+                        output_path_local, final_plan, on_progress=_emit_progress_line
+                    )
+                    if final_path:
+                        output_path_local = final_path
+                    else:
+                        _emit_progress_line(
+                            f"WARNING: {final_err}. The lossless H.264 video is kept: {output_path_local}"
+                        )
+                if final_plan:
+                    chunk_settings = restore_requested_encode(chunk_settings, requested_encode)
                 if output_path_local:
                     output_path_local = _apply_face_restore_if_enabled(
                         output_path_local, face_apply, face_strength, progress_cb=_emit_progress_line,
@@ -925,7 +973,7 @@ def build_rtx_super_resolution_callbacks(
                 keep-only run) the file in the batch folder; the item folder itself as a fallback."""
                 item_dir = batch_item_dir(batch_root, item_path.name)
                 stem = item_dir.name
-                for ext in (".mp4", ".png", ".jpg", ".webp"):
+                for ext in (".mp4", ".mov", ".mkv", ".png", ".jpg", ".webp"):
                     candidate = item_dir / f"{stem}{ext}"
                     if candidate.is_file():
                         return candidate
@@ -1091,6 +1139,19 @@ def build_rtx_super_resolution_callbacks(
                     progress_upd=gr.update(value="", visible=False),
                     output_path=None,
                     last_processed="CUDA Error",
+                    state=state,
+                )
+                return
+
+            # Output & Comparison > Custom FFmpeg Video Arguments: checked with a test encode before the run.
+            custom_err = _custom_video_args_error(seed_controls) if not preview_only else None
+            if custom_err:
+                yield _build_payload(
+                    status="ERROR: Custom FFmpeg video arguments",
+                    logs=f"Output & Comparison > Custom FFmpeg Video Arguments: {custom_err}",
+                    progress_upd=gr.update(value="", visible=False),
+                    output_path=None,
+                    last_processed="Custom FFmpeg arguments",
                     state=state,
                 )
                 return

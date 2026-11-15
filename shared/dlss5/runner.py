@@ -35,21 +35,21 @@ SPEED_CHOICES = ["CUDA Graphs (fast)", "Eager (safest)"]
 
 DLSS5_DEFAULTS: Dict[str, Any] = {
     "profile": "Standard",
-    "intensity": 1.0,
-    "detail_strength": 1.0,
-    "colour_strength": 1.0,
-    "detail_radius": 4.0,
+    "intensity": 0.4,
+    "detail_strength": 1.6,
+    "colour_strength": 0.9,
+    "detail_radius": 16.0,
     "processing_scale": 1.0,
     "temporal": True,
     "motion_quality": DEFAULT_MOTION_QUALITY,
     "scene_cut_threshold": 0.3,
     "tone_strength": 1.0,
-    "structure_strength": 1.0,
-    "precision": PRECISION_CHOICES[0],
+    "structure_strength": 2.0,
+    "precision": PRECISION_CHOICES[1],
     "speed_mode": SPEED_CHOICES[0],
     "max_frames": 0,
-    "keep_model_loaded": False,
-    "passes": 1,
+    "keep_model_loaded": True,
+    "passes": 2,
 }
 MAX_PASSES = 4
 

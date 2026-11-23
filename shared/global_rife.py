@@ -166,7 +166,7 @@ def build_global_rife_settings(
             seed_controls.get("seedvr2_use_10bit_val", False),
         )
     )
-    if video_codec not in {"h265", "hevc", "x265", "libx265"}:
+    if video_codec not in {"h265", "hevc", "x265", "libx265", "hevc_nvenc"}:
         use_10bit = False
     if use_10bit and "10le" not in pixel_format:
         pixel_format = "yuv420p10le"
@@ -210,6 +210,10 @@ def build_global_rife_settings(
         "pixel_format": pixel_format,
         "use_10bit": use_10bit,
         "two_pass_encoding": bool(output_settings.get("two_pass_encoding", False)),
+        # Output & Comparison > Custom FFmpeg Video Arguments (replace the codec settings of RIFE's encoder).
+        "video_custom_args": str(
+            output_settings.get("video_custom_args", seed_controls.get("video_custom_args_val", "")) or ""
+        ),
         "concat_videos": "",
         "save_metadata": bool(seed_controls.get("save_metadata_val", True)),
         "audio_codec": str(seed_controls.get("audio_codec_val", "copy") or "copy"),

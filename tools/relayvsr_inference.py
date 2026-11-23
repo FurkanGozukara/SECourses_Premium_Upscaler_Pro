@@ -354,7 +354,8 @@ def _stream(args, src, wan, flash, device, dtype, WanVSRPipeline, CollaborativeF
         audio = args.input if (args.keep_audio and src.has_audio) else None
         writer = video_io.FfmpegWriter(args.output, out_w, out_h, src.fps, audio_source=audio, codec=args.codec,
                                        crf=args.crf, preset=args.preset, pixel_format=args.pixel_format,
-                                       audio_offset_s=(src.first / src.fps) if src.first else 0.0)
+                                       audio_offset_s=(src.first / src.fps) if src.first else 0.0,
+                                       video_args=args.video_args)
     packets = (InputFrame(i, torch.from_numpy(f).permute(2, 0, 1).contiguous(), source_time=i / src.fps)
                for i, f in enumerate(src.frames()))
     started = time.time()
@@ -424,6 +425,8 @@ def parse_args(argv=None):
     p.add_argument("--crf", type=int, default=15)
     p.add_argument("--preset", default="medium")
     p.add_argument("--pixel_format", default="yuv420p")
+    p.add_argument("--video_args", default="",
+                   help="Own FFmpeg video encoder arguments (from -c:v on); replace codec/crf/preset/pixel_format")
     p.add_argument("--no_audio", dest="keep_audio", action="store_false")
     p.add_argument("--convert_int8", default="", help="build the INT8 ConvRot Wan file at this path and exit")
     return p.parse_args(argv)

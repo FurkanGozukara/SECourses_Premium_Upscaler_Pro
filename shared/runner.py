@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -18,6 +18,7 @@ from .path_utils import (
     collision_safe_path,
     emit_metadata,
     ffmpeg_set_fps,
+    get_media_dimensions,
     get_media_fps,
     normalize_path,
     resolve_output_location,
@@ -28,7 +29,7 @@ from .path_utils import (
 from .process_control import terminate_process_tree
 from .model_manager import get_model_manager, ModelType
 from .command_logger import get_command_logger
-from .video_codec_options import build_ffmpeg_video_encode_args
+from .video_codec_options import build_ffmpeg_video_encode_args, cli_takes_app_video_args
 from .processing_queue import queue_resource_keys_for_gpu_selection
 from .model_downloads import ensure_rife_model, ensure_seedvr2_model
 from .models.seedvr2_w4a8 import apply_w4a8_fallback
@@ -52,6 +53,30 @@ _SEEDVR2_ATTENTION_MODES = {
     "sageattn_2",
     "sageattn_3",
 }
+
+
+def _estimate_seedvr2_output_size(settings: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """Approximate SeedVR2 output size (short side = Resolution, long side capped by Max Resolution) or (None, None)."""
+    try:
+        from .path_utils import get_media_dimensions as _dims
+
+        source = Path(str(normalize_path(settings.get("input_path")) or ""))
+        if source.is_dir():  # a frame folder: the size of its first image
+            frames = sorted(p for p in source.iterdir()
+                            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
+            source = frames[0] if frames else source
+        dims = _dims(str(source))
+        if not dims:
+            return None, None
+        w, h = int(dims[0]), int(dims[1])
+        target_short = int(float(settings.get("resolution") or 0) or min(w, h))
+        scale = target_short / float(max(1, min(w, h)))
+        max_res = int(float(settings.get("max_resolution") or 0))
+        if max_res > 0 and max(w, h) * scale > max_res:
+            scale = max_res / float(max(w, h))
+        return int(round(w * scale / 2.0) * 2), int(round(h * scale / 2.0) * 2)
+    except Exception:
+        return None, None
 
 
 def _normalize_seedvr2_attention_mode(value: Any) -> str:
@@ -945,6 +970,15 @@ class Runner:
         cmd, gpu_isolation_note = self._enforce_seedvr2_gpu_visibility(cmd, settings, env)
         if gpu_isolation_note:
             log_output(gpu_isolation_note + "\n")
+
+        # Output tab NVENC codec: checked for this video and GPU, handed to the CLI's ffmpeg writer.
+        try:
+            self._seedvr2_nvenc_env(settings, env, log_output)
+        except Exception as nvenc_exc:
+            from .video_codec_options import ENGINE_VIDEO_ARGS_ENV
+
+            env.pop(ENGINE_VIDEO_ARGS_ENV, None)
+            log_output(f"[SeedVR2] NVENC check failed ({nvenc_exc}); encoding with the CPU codec.\n")
 
         # Log the (final) command being executed for debugging
         cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
@@ -2223,6 +2257,10 @@ class Runner:
             "libsvtav1": "libsvtav1",
             "prores": "prores_ks",
             "prores_ks": "prores_ks",
+            # NVIDIA NVENC: the CLI gets the CPU codec; _seedvr2_nvenc_env hands it the checked NVENC arguments.
+            "h264_nvenc": "libx264",
+            "hevc_nvenc": "libx265",
+            "av1_nvenc": "libsvtav1",
         }
         seed_codec = codec_map.get(codec_raw, "")
         if not seed_codec:
@@ -2258,6 +2296,11 @@ class Runner:
             "veryslow",
         }
         if preset_raw in allowed_presets:
+            if seed_codec == "libsvtav1":
+                # SVT-AV1 takes a numeric preset (the CLI passes the value to ffmpeg as it is).
+                from .video_codec_options import SVT_AV1_PRESET_MAP
+
+                preset_raw = str(SVT_AV1_PRESET_MAP.get(preset_raw, preset_raw))
             cmd.extend(["--video_preset", preset_raw])
 
         if seed_codec == "libx265":
@@ -2506,11 +2549,37 @@ class Runner:
                 png_keep_basename=settings.get("png_keep_basename", False),
             )
 
+        # RIFE's encoder: NVIDIA NVENC (checked for this video size on RIFE's GPU) or the Output tab's custom
+        # FFmpeg video arguments, handed to inference_video.py in ENGINE_VIDEO_ARGS_ENV; --video-codec keeps the
+        # CPU codec, so an older RIFE checkout (or a GPU without NVENC) still encodes correctly.
+        from .video_codec_options import ENGINE_VIDEO_ARGS_ENV, engine_args_env_value
+
+        rife_gpu_raw = str(settings.get("cuda_device", "") or "").strip().lower()
+        if rife_gpu_raw.startswith("cuda:"):
+            rife_gpu_raw = rife_gpu_raw.split(":", 1)[1].strip()
+        rife_gpu_raw = rife_gpu_raw.split(",", 1)[0].strip()
+        if rife_gpu_raw.isdigit():
+            rife_visible_gpu: Optional[str] = rife_gpu_raw
+        elif rife_gpu_raw in {"cpu", "none"} or str(os.environ.get("SECOURSES_GLOBAL_GPU_DEVICE", "")).strip().lower() == "cpu":
+            rife_visible_gpu = ""
+        else:
+            rife_visible_gpu = None
+        rife_video_args, rife_codec_override = self._rife_encode_plan(
+            settings,
+            effective_input,
+            Path(predicted_output),
+            not cli_png_output,
+            rife_visible_gpu,
+            on_progress=on_progress,
+        )
+        cmd_settings = settings if rife_codec_override is None else {**settings, "video_codec": rife_codec_override}
+        rife_video_args_env = engine_args_env_value(rife_video_args)
+
         cmd = self._build_rife_cmd(
             cli_path,
             effective_input,
             predicted_output,
-            settings,
+            cmd_settings,
             on_progress=on_progress,
         )
         # RIFE's own audio transfer muxes with `-c copy -shortest`: whenever the source audio
@@ -2549,10 +2618,15 @@ class Runner:
         if self._active_mode == "in_app":
             buf = io.StringIO()
             rc = 0
+            previous_video_args = os.environ.get(ENGINE_VIDEO_ARGS_ENV)
             try:
                 from tools.rife_inference_wrapper import install_numpy_binary_fromstring_compat
 
                 install_numpy_binary_fromstring_compat()
+                if rife_video_args_env:
+                    os.environ[ENGINE_VIDEO_ARGS_ENV] = rife_video_args_env
+                else:
+                    os.environ.pop(ENGINE_VIDEO_ARGS_ENV, None)
                 with redirect_stdout(buf), redirect_stderr(buf):
                     sys.argv = cmd[1:]
                     runpy.run_path(str(cli_path), run_name="__main__")
@@ -2563,6 +2637,10 @@ class Runner:
                 rc = 1
             finally:
                 sys.argv = [sys.executable]
+                if previous_video_args is None:
+                    os.environ.pop(ENGINE_VIDEO_ARGS_ENV, None)
+                else:
+                    os.environ[ENGINE_VIDEO_ARGS_ENV] = previous_video_args
             output_path = str(predicted_output)
             if cli_png_output:
                 finalized_path, finalize_note = _finalize_rife_sequence_output(
@@ -2608,6 +2686,10 @@ class Runner:
         legacy_alloc_conf = env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         if legacy_alloc_conf and not env.get("PYTORCH_ALLOC_CONF"):
             env["PYTORCH_ALLOC_CONF"] = legacy_alloc_conf
+        if rife_video_args_env:
+            env[ENGINE_VIDEO_ARGS_ENV] = rife_video_args_env
+        else:
+            env.pop(ENGINE_VIDEO_ARGS_ENV, None)
         cuda_device = str(settings.get("cuda_device", "") or "").strip().lower()
         if cuda_device.startswith("cuda:"):
             cuda_device = cuda_device.split(":", 1)[1].strip()
@@ -2913,6 +2995,10 @@ class Runner:
             "libsvtav1": "libsvtav1",
             "prores": "prores_ks",
             "prores_ks": "prores_ks",
+            # NVIDIA GPU encoding (resolved per run by _rife_encode_plan; the CPU encoder when NVENC cannot).
+            "h264_nvenc": "h264_nvenc",
+            "hevc_nvenc": "hevc_nvenc",
+            "av1_nvenc": "av1_nvenc",
         }
         return codec_map.get(text, "libx264")
 
@@ -2925,8 +3011,153 @@ class Runner:
             "libvpx-vp9": "vp9",
             "libsvtav1": "av1",
             "prores_ks": "prores",
+            "h264_nvenc": "h264_nvenc",
+            "hevc_nvenc": "hevc_nvenc",
+            "av1_nvenc": "av1_nvenc",
         }
         return codec_map.get(codec_name, "h264")
+
+    def _rife_cli_takes_app_video_args(self) -> bool:
+        """True when RIFE/inference_video.py reads the app's FFmpeg video arguments (RIFE checkout of V10.5+)."""
+        return cli_takes_app_video_args(self.base_dir / "RIFE" / "inference_video.py")
+
+    def _seedvr2_nvenc_env(self, settings: Dict[str, Any], env: Dict[str, str],
+                           log: Callable[[str], None]) -> None:
+        """NVENC for the SeedVR2 CLI's ffmpeg writer: the checked arguments in ENGINE_VIDEO_ARGS_ENV.
+
+        The command line already holds the CPU codec (libx264 / libx265 / libsvtav1), which an older SeedVR2
+        checkout, the OpenCV backend or a machine without NVENC uses."""
+        from .video_codec_options import (
+            ENGINE_VIDEO_ARGS_ENV,
+            engine_args_env_value,
+            engine_encoder_for_run,
+            is_nvenc_codec,
+            nvenc_codec_key,
+            nvenc_video_args,
+            resolve_nvenc_video_args,
+        )
+
+        env.pop(ENGINE_VIDEO_ARGS_ENV, None)
+        nv_key = nvenc_codec_key(settings.get("video_codec"))
+        if not nv_key:
+            return
+        if str(settings.get("video_backend") or "ffmpeg").strip().lower() == "opencv":
+            log(f"[SeedVR2] {nv_key} needs Video Backend = ffmpeg; the OpenCV writer is used.\n")
+            return
+        if not cli_takes_app_video_args(self.base_dir / "SeedVR2" / "inference_cli.py"):
+            log(f"[SeedVR2] This SeedVR2 checkout cannot encode with {nv_key} yet (update it with "
+                f"Windows_Install_and_Update.bat); encoding with the CPU codec instead.\n")
+            return
+        try:
+            quality = int(float(settings.get("video_quality", settings.get("output_quality", 18)) or 18))
+        except Exception:
+            quality = 18
+        # The SeedVR2 writer encodes 4:2:0: 10-bit with "SeedVR2 Enable 10-bit Encoding", else 8-bit.
+        use_10bit = bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False))
+        pixel_format = "yuv420p10le" if use_10bit else "yuv420p"
+        preset = str(settings.get("video_preset", "medium") or "medium").strip().lower()
+        width, height = _estimate_seedvr2_output_size(settings)
+        gpu = env.get("CUDA_VISIBLE_DEVICES")
+        encoder = engine_encoder_for_run(nv_key, quality, pixel_format, preset, width, height, gpu=gpu,
+                                         log=lambda m: log(m + "\n"), tag="SeedVR2")
+        if not is_nvenc_codec(encoder):
+            return
+        args, _reason = resolve_nvenc_video_args(nv_key, quality, pixel_format, preset, width, height, gpu=gpu)
+        env[ENGINE_VIDEO_ARGS_ENV] = engine_args_env_value(args or nvenc_video_args(nv_key, quality, pixel_format,
+                                                                                     preset))
+
+    def _rife_encode_plan(
+        self,
+        settings: Dict[str, Any],
+        effective_input: str,
+        output_path: Path,
+        writes_video: bool,
+        visible_gpu: Optional[str],
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        """(FFmpeg video arguments for RIFE's encoder or None, codec override for --video-codec or None).
+
+        Output & Comparison > Custom FFmpeg Video Arguments are used when the RIFE output file can hold their
+        encoder; an NVENC codec is checked for this video size and GPU and becomes its CPU encoder when NVENC
+        cannot encode here (or the RIFE checkout predates the app's arguments)."""
+        from .video_codec_options import (
+            describe_custom_video_args,
+            engine_encoder_for_run,
+            is_nvenc_codec,
+            nvenc_cpu_fallback_key,
+            nvenc_video_args,
+            parse_custom_video_args,
+            resolve_nvenc_video_args,
+            video_suffix_fits,
+        )
+
+        def say(msg: str) -> None:
+            if on_progress:
+                on_progress(msg.rstrip("\n") + "\n")
+
+        if not writes_video:
+            return None, None
+        codec_raw = settings.get("video_codec", "h264")
+        takes_args = self._rife_cli_takes_app_video_args()
+        custom_text = settings.get("video_custom_args")
+        if str(custom_text or "").strip():
+            custom, custom_suffix, custom_err = parse_custom_video_args(custom_text, default_codec=codec_raw)
+            if custom and not custom_err:
+                # A test encode (once per argument set) so options FFmpeg refuses never break the RIFE encode.
+                checked = getattr(self, "_rife_custom_args_checked", None)
+                if checked is None:
+                    checked = self._rife_custom_args_checked = {}
+                check_key = (tuple(custom), custom_suffix)
+                if check_key not in checked:
+                    from .video_codec_options import check_custom_video_args
+
+                    checked[check_key] = check_custom_video_args(custom, custom_suffix)
+                custom_err = checked[check_key]
+                if custom_err:
+                    say(f"RIFE: FFmpeg refuses the custom FFmpeg video arguments ({custom_err}); encoding with "
+                        "the Video Codec settings.")
+                    custom = []
+            if custom and not custom_err:
+                if not takes_args:
+                    say("RIFE: this RIFE checkout does not take the Custom FFmpeg Video Arguments yet (update it "
+                        "with Windows_Install_and_Update.bat); encoding with the Video Codec settings.")
+                elif video_suffix_fits(custom_suffix, output_path.suffix):
+                    say(f"RIFE: encoding with the custom FFmpeg video arguments "
+                        f"({describe_custom_video_args(custom, output_path.suffix)}): {' '.join(custom)}")
+                    return list(custom), None
+                else:
+                    say(f"RIFE: the custom FFmpeg video arguments need a {custom_suffix} file and this RIFE output "
+                        f"is {output_path.suffix}; encoding with the Video Codec settings.")
+        if not is_nvenc_codec(self._normalize_rife_video_codec(codec_raw)):
+            return None, None
+        nv_codec = self._normalize_rife_video_codec(codec_raw)
+        cpu_key = nvenc_cpu_fallback_key(nv_codec)
+        if not takes_args:
+            say(f"RIFE: this RIFE checkout cannot encode with {nv_codec} yet (update it with "
+                f"Windows_Install_and_Update.bat); encoding with the CPU codec instead.")
+            return None, cpu_key
+        try:
+            quality = int(float(settings.get("video_quality", settings.get("output_quality", 23)) or 23))
+        except Exception:
+            quality = 23
+        pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower() or "yuv420p"
+        if nv_codec == "hevc_nvenc" and bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False)) \
+                and "10le" not in pixel_format:
+            pixel_format = "yuv420p10le"
+        preset = str(settings.get("video_preset", "slow") or "slow").strip().lower() or "slow"
+        dims = None
+        with suppress(Exception):
+            dims = get_media_dimensions(effective_input)
+        width, height = (int(dims[0]), int(dims[1])) if dims else (None, None)
+        if width and settings.get("montage"):
+            width *= 2  # --montage writes the source and the result side by side
+        encoder = engine_encoder_for_run(nv_codec, quality, pixel_format, preset, width, height, gpu=visible_gpu,
+                                         log=say, tag="RIFE")
+        if not is_nvenc_codec(encoder):
+            return None, cpu_key
+        nv_args, _reason = resolve_nvenc_video_args(nv_codec, quality, pixel_format, preset, width, height,
+                                                    gpu=visible_gpu)
+        return (nv_args or nvenc_video_args(nv_codec, quality, pixel_format, preset)), cpu_key
 
     @staticmethod
     def _infer_rife_sequence_pattern(frame_dir: Path) -> Tuple[Optional[str], Optional[int]]:
@@ -3026,7 +3257,7 @@ class Runner:
         video_preset = str(settings.get("video_preset", "slow") or "slow").strip().lower() or "slow"
         pixel_format = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower() or "yuv420p"
         use_10bit = bool(settings.get("use_10bit", False) or settings.get("seedvr2_use_10bit", False))
-        if codec_key == "h265" and use_10bit and "10le" not in pixel_format:
+        if codec_key in ("h265", "hevc_nvenc") and use_10bit and "10le" not in pixel_format:
             pixel_format = "yuv420p10le"
 
         h265_tune = str(settings.get("h265_tune", "none") or "none").strip().lower() or "none"
@@ -3037,6 +3268,10 @@ class Runner:
         av1_film_grain = max(0, min(50, av1_film_grain))
         av1_film_grain_denoise = bool(settings.get("av1_film_grain_denoise", False))
 
+        frame_dims = None
+        with suppress(Exception):
+            first_frame = sorted(p for p in sequence_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg"})[0]
+            frame_dims = get_media_dimensions(str(first_frame))
         codec_args = build_ffmpeg_video_encode_args(
             codec=codec_key,
             quality=quality_val,
@@ -3044,6 +3279,8 @@ class Runner:
             preset=video_preset,
             audio_codec="none",
             audio_bitrate=None,
+            width=int(frame_dims[0]) if frame_dims else None,
+            height=int(frame_dims[1]) if frame_dims else None,
             h265_tune=h265_tune,
             av1_film_grain=av1_film_grain,
             av1_film_grain_denoise=av1_film_grain_denoise,
@@ -3330,6 +3567,11 @@ class Runner:
         video_preset = str(settings.get("video_preset", "slow") or "slow").strip().lower()
         if not video_preset:
             video_preset = "slow"
+        if video_codec == "libsvtav1":
+            # SVT-AV1 takes a numeric preset (inference_video.py passes the value to ffmpeg as it is).
+            from .video_codec_options import SVT_AV1_PRESET_MAP
+
+            video_preset = str(SVT_AV1_PRESET_MAP.get(video_preset, video_preset))
         cmd.extend(["--video-preset", video_preset])
 
         if video_codec == "libx265":

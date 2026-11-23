@@ -83,6 +83,10 @@ def _normalize_video_codec_key(codec_raw: Any) -> str:
         "av1": "av1",
         "prores": "prores",
         "prores_ks": "prores",
+        # NVIDIA GPU encoding (checked by build_ffmpeg_video_encode_args, CPU encoder when NVENC cannot).
+        "h264_nvenc": "h264_nvenc",
+        "hevc_nvenc": "hevc_nvenc",
+        "av1_nvenc": "av1_nvenc",
     }
     return mapping.get(codec, "h264")
 
@@ -824,6 +828,9 @@ def _run_gan_video(
                 "vp9": "vp9",
                 "av1": "av1",
                 "prores": "prores",
+                "h264_nvenc": "h264",
+                "hevc_nvenc": "hevc",
+                "av1_nvenc": "av1",
             }.get(codec_key, "h264")
 
             probed_codec, probed_fps = _probe_video_codec_and_fps(video_path)
@@ -852,7 +859,15 @@ def _run_gan_video(
 
             out_tmp = collision_safe_path(video_path.with_name(f"{video_path.stem}_normalized{video_path.suffix}"))
             fps_target = float(desired_fps if desired_fps > 0 else (probed_fps or 30.0))
+            try:
+                from .path_utils import get_media_dimensions
+
+                norm_dims = get_media_dimensions(str(video_path))
+            except Exception:
+                norm_dims = None
             ffmpeg_args = build_ffmpeg_video_encode_args(
+                width=int(norm_dims[0]) if norm_dims else None,
+                height=int(norm_dims[1]) if norm_dims else None,
                 codec=codec_key,
                 quality=quality,
                 pixel_format=pixel_format,

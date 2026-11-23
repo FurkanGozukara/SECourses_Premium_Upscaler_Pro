@@ -35,7 +35,9 @@ from shared.video_codec_options import (
     DEFAULT_AV1_FILM_GRAIN_DENOISE,
     check_custom_video_args,
     describe_custom_video_args,
+    is_nvenc_codec,
     normalize_custom_video_args,
+    nvenc_status_text,
     parse_custom_video_args,
 )
 from shared.video_comparison_slider import (
@@ -316,15 +318,24 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         label="Video Codec",
                         choices=codec_choices,
                         value=default_codec,
-                        info="Select codec based on compatibility/quality goals."
+                        info=(
+                            "Select codec based on compatibility/quality goals. h264_nvenc / hevc_nvenc / av1_nvenc "
+                            "encode on the NVIDIA GPU (fast, frees the CPU; ideal on cloud GPUs with few vCPUs)."
+                        ),
                     )
                     codec_info_display = gr.Markdown(get_codec_info(default_codec))
+                    _initial_nvenc_status = nvenc_status_text(default_codec, default_pix_fmt) if is_nvenc_codec(
+                        default_codec) else ""
+                    nvenc_status_display = gr.Markdown(_initial_nvenc_status, visible=bool(_initial_nvenc_status))
 
                     video_preset = gr.Dropdown(
                         label="Encoding Preset",
                         choices=ENCODING_PRESETS,
                         value=str(_value("video_preset", "medium") or "medium"),
-                        info="ultrafast = fastest encode, veryslow = best compression."
+                        info=(
+                            "ultrafast = fastest encode, veryslow = best compression. NVENC: ultrafast/superfast/"
+                            "veryfast = p1, faster = p2, fast = p3, medium = p4, slow = p5, slower = p6, veryslow = p7."
+                        ),
                     )
                     gr.Markdown("**Film Grain (FFmpeg post-encode)**")
                     h265_tune = gr.Dropdown(
@@ -358,9 +369,11 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                         lines=1,
                         max_lines=3,
                         info=(
-                            "Your own FFmpeg video options, from -c:v on. When set, they replace Video Codec, "
-                            "Video Quality, Encoding Preset and Pixel Format. Used by Open-H3 Regenerate and RTX "
-                            "Super Resolution. Saved as .mov for ProRes / DNxHR, .mkv for FFV1 / UT Video, "
+                            "Your own FFmpeg video options, from -c:v on (for example -c:v hevc_nvenc -preset p7 "
+                            "-tune hq -rc vbr -cq 16 -b:v 0 -profile:v main10 -pix_fmt p010le). When set, they "
+                            "replace Video Codec, Video Quality, Encoding Preset and Pixel Format. Used by Open-H3 "
+                            "Regenerate, RTX Super Resolution, RelayVSR, RIFE (RIFE tab and Global RIFE) and the "
+                            "final fixed-size resize. Saved as .mov for ProRes / DNxHR, .mkv for FFV1 / UT Video, "
                             ".mp4 otherwise. Leave empty to use the settings above."
                         ),
                     )
@@ -376,12 +389,15 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
                     pixel_format_info = gr.Markdown(get_pixel_format_info(default_pix_fmt))
 
                     video_quality = gr.Slider(
-                        label="Video Quality (CRF, lower = better)",
+                        label="Video Quality (CRF / NVENC CQ, lower = better)",
                         minimum=0,
                         maximum=51,
                         step=1,
                         value=int(_value("video_quality", 18) or 18),
-                        info="18 ~ visually lossless, 23 ~ high quality, 28 ~ medium."
+                        info=(
+                            "18 ~ visually lossless, 23 ~ high quality, 28 ~ medium. With an NVENC codec this is "
+                            "its constant-quality CQ value (same scale, 1 = best; 0 counts as 1)."
+                        ),
                     )
 
                     audio_codec = gr.Dropdown(
@@ -993,6 +1009,24 @@ def output_tab(preset_manager, shared_state: gr.State, base_dir: Path, global_se
         inputs=pixel_format,
         outputs=pixel_format_info
     )
+
+    def _nvenc_status(codec_key: str, pix_fmt: str):
+        """For an NVENC codec: whether this machine's GPU and FFmpeg encode it (a short test encode)."""
+        if not is_nvenc_codec(codec_key):
+            return gr.update(value="", visible=False)
+        try:
+            text = nvenc_status_text(codec_key, pix_fmt)
+        except Exception as exc:
+            text = f"⚠️ Could not check NVIDIA GPU encoding here ({exc})."
+        return gr.update(value=text, visible=bool(text))
+
+    for _nvenc_event in (video_codec.change, pixel_format.change):
+        _nvenc_event(
+            fn=_nvenc_status,
+            inputs=[video_codec, pixel_format],
+            outputs=nvenc_status_display,
+            show_progress="hidden",
+        )
 
     codec_index = OUTPUT_ORDER.index("video_codec")
     pix_fmt_index = OUTPUT_ORDER.index("pixel_format")

@@ -20,6 +20,26 @@ from typing import Dict, Any, Optional, Callable
 from .video_codec_options import build_ffmpeg_video_encode_args
 
 
+def _first_frame_size(input_frames_path: str):
+    """(width, height) of the first frame of a numbered pattern (frame_%06d.png) or a file; (None, None) if unknown."""
+    import glob
+    import re
+
+    try:
+        from .path_utils import get_media_dimensions
+
+        pattern = str(input_frames_path or "")
+        if "%" in pattern:
+            matches = sorted(glob.glob(glob.escape(re.sub(r"%0?\d*d", "\0", pattern)).replace("\0", "*")))
+            pattern = matches[0] if matches else ""
+        dims = get_media_dimensions(pattern) if pattern else None
+        if dims:
+            return int(dims[0]), int(dims[1])
+    except Exception:
+        pass
+    return None, None
+
+
 def encode_video(
     input_frames_path: str,
     output_video_path: str,
@@ -77,7 +97,8 @@ def encode_video(
             metadata_str = json.dumps(metadata)
             base_cmd.extend(["-metadata", f"comment={metadata_str}"])
         
-        # Use comprehensive codec builder
+        # Use comprehensive codec builder (NVENC is checked for the frames' real size)
+        frame_w, frame_h = _first_frame_size(input_frames_path)
         codec_args = build_ffmpeg_video_encode_args(
             codec=codec,
             quality=crf,
@@ -87,9 +108,15 @@ def encode_video(
             av1_film_grain=av1_film_grain,
             av1_film_grain_denoise=av1_film_grain_denoise,
             audio_codec=audio_codec,
-            audio_bitrate=audio_bitrate
+            audio_bitrate=audio_bitrate,
+            width=frame_w,
+            height=frame_h,
+            on_note=(lambda note: on_progress(f"{note}\n")) if on_progress else None,
         )
-        
+        if two_pass and len(codec_args) > 1 and str(codec_args[1]).endswith("_nvenc"):
+            # NVENC has no FFmpeg two-pass log; its constant-quality mode is a single pass.
+            two_pass = False
+
         if two_pass:
             # Two-pass encoding for better quality/size ratio
             if on_progress:

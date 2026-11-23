@@ -36,7 +36,12 @@ from shared.output_run_manager import (
     resolve_resume_input_from_run_dir,
     set_active_run_dir,
 )
-from shared.video_codec_options import build_ffmpeg_video_encode_args
+from shared.video_codec_options import (
+    build_ffmpeg_video_encode_args,
+    check_custom_video_args,
+    normalize_custom_video_args,
+    parse_custom_video_args,
+)
 from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
 from shared.global_rife import global_rife_enabled
 from shared.batch_naming import BATCH_KEEP_NAME_KEY, adopt_output_name
@@ -170,6 +175,7 @@ _RIFE_CODEC_ALIASES = {
     "h264": "libx264", "x264": "libx264", "avc": "libx264",
     "h265": "libx265", "x265": "libx265", "hevc": "libx265",
     "vp9": "libvpx-vp9",
+    "h264_nvenc": "libx264", "hevc_nvenc": "libx265",
 }
 
 
@@ -226,6 +232,19 @@ def _parse_time_to_seconds(time_str: str) -> float:
     return 0.0
 
 
+def _video_size(path: str) -> Tuple[Optional[int], Optional[int]]:
+    """(width, height) of a video (NVENC is checked for the real size), or (None, None)."""
+    try:
+        from shared.path_utils import get_media_dimensions
+
+        dims = get_media_dimensions(str(path))
+        if dims:
+            return int(dims[0]), int(dims[1])
+    except Exception:
+        pass
+    return None, None
+
+
 def _normalize_video_codec_key(codec_raw: str) -> str:
     codec = str(codec_raw or "h264").strip().lower()
     codec_map = {
@@ -243,6 +262,10 @@ def _normalize_video_codec_key(codec_raw: str) -> str:
         "av1": "av1",
         "prores": "prores",
         "prores_ks": "prores",
+        # NVIDIA GPU encoding; build_ffmpeg_video_encode_args checks it and falls back to the CPU encoder.
+        "h264_nvenc": "h264_nvenc",
+        "hevc_nvenc": "hevc_nvenc",
+        "av1_nvenc": "av1_nvenc",
     }
     return codec_map.get(codec, "h264")
 
@@ -276,6 +299,7 @@ def _trim_video(
         if end_time > 0:
             cmd.extend(["-to", str(end_time)])
 
+        size = _video_size(input_path)
         codec_key = _normalize_video_codec_key(video_codec)
         selected_audio_codec = "none" if no_audio else str(audio_codec or "aac")
         cmd.extend(
@@ -289,6 +313,8 @@ def _trim_video(
                 av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
+                width=size[0],
+                height=size[1],
             )
         )
 
@@ -338,6 +364,7 @@ def _change_video_speed(
         if audio_filter:
             cmd.extend(["-filter:a", audio_filter])
 
+        size = _video_size(input_path)
         codec_key = _normalize_video_codec_key(video_codec)
         selected_audio_codec = "none" if no_audio else str(audio_codec or "aac")
         cmd.extend(
@@ -351,6 +378,8 @@ def _change_video_speed(
                 av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
+                width=size[0],
+                height=size[1],
             )
         )
 
@@ -399,6 +428,7 @@ def _concatenate_videos(
 
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
 
+        size = _video_size(str(normalized_paths[0]))
         codec_key = _normalize_video_codec_key(video_codec)
         selected_audio_codec = "none" if no_audio else str(audio_codec or "copy")
         cmd.extend(
@@ -412,6 +442,8 @@ def _concatenate_videos(
                 av1_film_grain_denoise=bool(av1_film_grain_denoise),
                 audio_codec=selected_audio_codec,
                 audio_bitrate=str(audio_bitrate) if audio_bitrate else None,
+                width=size[0],
+                height=size[1],
             )
         )
 
@@ -1128,6 +1160,7 @@ def build_rife_callbacks(
                 "av1_film_grain_denoise": seed_controls.get("av1_film_grain_denoise_val"),
                 "pixel_format": seed_controls.get("pixel_format_val"),
                 "two_pass_encoding": seed_controls.get("two_pass_encoding_val"),
+                "video_custom_args": seed_controls.get("video_custom_args_val"),
             }
             for key in (
                 "video_codec",
@@ -1138,6 +1171,7 @@ def build_rife_callbacks(
                 "av1_film_grain_denoise",
                 "pixel_format",
                 "two_pass_encoding",
+                "video_custom_args",
                 "metadata_format",
                 "log_level",
             ):
@@ -1147,6 +1181,27 @@ def build_rife_callbacks(
                 if value is not None:
                     settings[key] = value
 
+            # Output & Comparison > Custom FFmpeg Video Arguments replace the codec settings of RIFE's encoder; a
+            # short test encode checks them before the run.
+            settings["video_custom_args"] = normalize_custom_video_args(settings.get("video_custom_args"))
+            if settings["video_custom_args"]:
+                c_args, c_suffix, c_err = parse_custom_video_args(
+                    settings["video_custom_args"], default_codec=settings.get("video_codec")
+                )
+                if not c_err:
+                    c_err = check_custom_video_args(c_args, c_suffix)
+                if c_err:
+                    yield (
+                        "❌ Custom FFmpeg video arguments",
+                        f"Output & Comparison > Custom FFmpeg Video Arguments: {c_err}",
+                        gr.update(value="", visible=False),
+                        None,
+                        gr.update(value=None),
+                        gr.update(value="", visible=False),
+                        state,
+                    )
+                    return
+
             use_10bit_val = seed_controls.get("seedvr2_use_10bit_val")
             if use_10bit_val is None and output_settings:
                 use_10bit_val = output_settings.get("seedvr2_use_10bit", output_settings.get("use_10bit"))
@@ -1154,7 +1209,7 @@ def build_rife_callbacks(
                 settings["use_10bit"] = bool(use_10bit_val)
 
             codec_norm = str(settings.get("video_codec", "h264") or "h264").strip().lower()
-            if codec_norm in {"h265", "hevc", "x265", "libx265"} and bool(settings.get("use_10bit", False)):
+            if codec_norm in {"h265", "hevc", "x265", "libx265", "hevc_nvenc"} and bool(settings.get("use_10bit", False)):
                 pix_fmt = str(settings.get("pixel_format", "yuv420p") or "yuv420p").strip().lower()
                 if "10le" not in pix_fmt:
                     settings["pixel_format"] = "yuv420p10le"

@@ -160,6 +160,7 @@ RELAYVSR_ENGINE = VideoSREngine(
     is_progress_line=lambda text_lc: text_lc.startswith("frame_progress "),
     preview_frame_dir=False,
     fixed_model_scale=RELAYVSR_SCALE,
+    custom_video_args=True,
 )
 
 

@@ -61,29 +61,96 @@ def _emit(on_log: Optional[Callable[[str], None]], message: str) -> None:
             pass
 
 
-def _resize_video(
-    src: Path,
-    dst: Path,
+def _cpu_video_args(codec: str, preset: str, crf: int, pixel_format: str) -> list[str]:
+    video_args = ["-c:v", codec]
+    if codec in {"libx264", "libx265", "libsvtav1"}:
+        if codec == "libsvtav1":
+            # SVT-AV1 takes a numeric preset; a name such as "medium" makes ffmpeg refuse the encode.
+            from .video_codec_options import SVT_AV1_PRESET_MAP
+
+            preset = str(SVT_AV1_PRESET_MAP.get(str(preset).strip().lower(), preset))
+        video_args.extend(["-preset", preset, "-crf", str(crf)])
+    if pixel_format and codec in {"libx264", "libx265", "libsvtav1"}:
+        video_args.extend(["-pix_fmt", pixel_format])
+    return video_args
+
+
+def resize_video_args(
+    settings: Optional[Dict[str, Any]],
     target_w: int,
     target_h: int,
-    settings: Optional[Dict[str, Any]],
-) -> Tuple[bool, str]:
-    if shutil.which("ffmpeg") is None:
-        return False, "ffmpeg not available"
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[list[str], Optional[list[str]], str]:
+    """(video arguments, CPU arguments to retry with or None, container suffix) for the final-size encode.
+
+    Output & Comparison > Custom FFmpeg Video Arguments win when set (suffix: the container they need); an NVENC
+    codec is checked for the target size and replaced by its CPU encoder when it cannot encode here; other codecs
+    keep their arguments. The suffix is "" when the result keeps the file type of the video it resizes.
+    """
+    from .video_codec_options import (
+        nvenc_codec_key,
+        nvenc_cpu_fallback_encoder,
+        nvenc_fallback_note,
+        parse_custom_video_args,
+        resolve_nvenc_video_args,
+    )
 
     settings = settings or {}
     codec = _normalize_codec(settings.get("video_codec") or settings.get("codec"))
     preset = str(settings.get("video_preset") or settings.get("preset") or "medium").strip() or "medium"
     crf = max(0, min(51, _to_int(settings.get("video_quality", settings.get("crf", 18)), 18)))
     pixel_format = str(settings.get("pixel_format") or "yuv420p").strip() or "yuv420p"
+
+    custom, custom_suffix, custom_err = parse_custom_video_args(
+        settings.get("video_custom_args"), default_codec=settings.get("video_codec") or settings.get("codec")
+    )
+    if custom and not custom_err:
+        return list(custom), None, custom_suffix
+
+    nv_key = nvenc_codec_key(codec)
+    if nv_key:
+        cpu_args = _cpu_video_args(str(nvenc_cpu_fallback_encoder(nv_key)), preset, crf, pixel_format)
+        nv_args, reason = resolve_nvenc_video_args(nv_key, crf, pixel_format, preset, target_w, target_h)
+        if nv_args:
+            return nv_args, cpu_args, ""
+        _emit(on_log, nvenc_fallback_note(nv_key, reason, tag="Final size:"))
+        return cpu_args, None, ""
+    return _cpu_video_args(codec, preset, crf, pixel_format), None, ""
+
+
+def _split_video_filters(args: list[str]) -> Tuple[list[str], str]:
+    """(arguments without -vf / -filter:v, their filter chain joined with ',')."""
+    rest: list[str] = []
+    chains: list[str] = []
+    i = 0
+    while i < len(args):
+        if str(args[i]).lower() in ("-vf", "-filter:v") and i + 1 < len(args):
+            chains.append(str(args[i + 1]))
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+    return rest, ",".join(c for c in chains if c)
+
+
+def _resize_video(
+    src: Path,
+    dst: Path,
+    target_w: int,
+    target_h: int,
+    settings: Optional[Dict[str, Any]],
+    on_log: Optional[Callable[[str], None]] = None,
+    video_plan: Optional[Tuple[list[str], Optional[list[str]], str]] = None,
+) -> Tuple[bool, str]:
+    if shutil.which("ffmpeg") is None:
+        return False, "ffmpeg not available"
+
+    settings = settings or {}
     audio_bitrate = str(settings.get("audio_bitrate") or "").strip()
 
     scale_filter = f"scale={int(target_w)}:{int(target_h)}:flags=lanczos"
-    video_args = ["-c:v", codec]
-    if codec in {"libx264", "libx265", "libsvtav1"}:
-        video_args.extend(["-preset", preset, "-crf", str(crf)])
-    if pixel_format and codec in {"libx264", "libx265", "libsvtav1"}:
-        video_args.extend(["-pix_fmt", pixel_format])
+    video_args, cpu_retry_args, _suffix = video_plan or resize_video_args(settings, target_w, target_h, on_log)
+    mux_args = ["-movflags", "+faststart"] if dst.suffix.lower() in (".mp4", ".mov", ".m4v") else []
 
     def run(cmd: list[str]) -> Tuple[bool, str]:
         try:
@@ -95,46 +162,39 @@ def _resize_video(
             return True, ""
         return False, (proc.stderr or proc.stdout or "ffmpeg resize failed").strip()
 
-    base = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src),
-        "-vf",
-        scale_filter,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        *video_args,
-    ]
-    ok, err = run(
-        [
-            *base,
-            "-c:a",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(dst),
-        ]
-    )
-    if ok:
-        return True, ""
-
     audio_args = ["-c:a", "aac"]
     if audio_bitrate:
         audio_args.extend(["-b:a", audio_bitrate])
     else:
         audio_args.extend(["-b:a", "192k"])
-    return run(
-        [
-            *base,
-            *audio_args,
-            "-movflags",
-            "+faststart",
-            str(dst),
+
+    err = ""
+    for attempt_args in ([video_args] + ([cpu_retry_args] if cpu_retry_args else [])):
+        # A -vf of the custom arguments runs after the resize (two -vf options would drop the scale filter).
+        encoder_args, user_filters = _split_video_filters(list(attempt_args))
+        base = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src),
+            "-vf",
+            f"{scale_filter},{user_filters}" if user_filters else scale_filter,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            *encoder_args,
         ]
-    )
+        ok, err = run([*base, "-c:a", "copy", *mux_args, str(dst)])
+        if ok:
+            return True, ""
+        ok, err = run([*base, *audio_args, *mux_args, str(dst)])
+        if ok:
+            return True, ""
+        if attempt_args is video_args and cpu_retry_args:
+            _emit(on_log, f"Final size: NVIDIA GPU encoding failed ({' '.join(err.split())[-200:]}); "
+                          f"retrying with {cpu_retry_args[1]} (CPU).")
+    return False, err
 
 
 def _resize_image(src: Path, dst: Path, target_w: int, target_h: int, settings: Optional[Dict[str, Any]]) -> bool:
@@ -240,9 +300,15 @@ def enforce_fixed_scale_output_size(
     kind = detect_input_type(str(out_path))
     suffix = out_path.suffix.lower()
     if out_path.is_file() and (kind == "video" or suffix in VIDEO_EXTENSIONS):
-        dst = collision_safe_path(out_path.with_name(f"{out_path.stem}_final{target_w}x{target_h}{out_path.suffix}"))
+        from .video_codec_options import video_suffix_fits
+
+        video_plan = resize_video_args(settings, target_w, target_h, on_log)
+        dst_suffix = out_path.suffix
+        if video_plan[2] and not video_suffix_fits(video_plan[2], dst_suffix):
+            dst_suffix = video_plan[2]  # custom arguments for a codec this file type cannot hold (ProRes -> .mov)
+        dst = collision_safe_path(out_path.with_name(f"{out_path.stem}_final{target_w}x{target_h}{dst_suffix}"))
         _emit(on_log, f"{label}: resizing final video to {target_w}x{target_h}.")
-        ok, err = _resize_video(out_path, dst, target_w, target_h, settings)
+        ok, err = _resize_video(out_path, dst, target_w, target_h, settings, on_log=on_log, video_plan=video_plan)
         if ok:
             return str(dst), True, f"Final output resized to {target_w}x{target_h}: {dst.name}"
         return str(out_path), False, f"Final video resize failed: {err}"

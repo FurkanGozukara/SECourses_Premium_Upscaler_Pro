@@ -93,6 +93,24 @@ class FfmpegWriter:
         pixel_format: str = "yuv420p",
     ):
         self.output_path = str(output_path)
+        self._delegate = None
+        if str(codec or "").strip().lower() in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+            # NVIDIA GPU encoding: the app's shared writer checks NVENC for this size and GPU, falls back to the
+            # CPU encoder when it cannot encode, and redoes a failed start on the CPU without losing frames.
+            import sys
+            from pathlib import Path as _Path
+
+            app_dir = str(_Path(__file__).resolve().parents[2])
+            if app_dir not in sys.path:
+                sys.path.append(app_dir)
+            from shared.video_io import FfmpegWriter as _SharedWriter
+
+            self._delegate = _SharedWriter(self.output_path, width, height, fps, audio_source=audio_source,
+                                           codec=str(codec).strip().lower(), crf=crf, preset=preset,
+                                           pixel_format=pixel_format)
+            self.proc = self._delegate.proc
+            self.frames_written = 0
+            return
         ffmpeg = find_ffmpeg()
         fps_str = _format_fps_rate(fps)
         cmd = [
@@ -125,12 +143,21 @@ class FfmpegWriter:
 
     def write(self, frames_uint8: torch.Tensor) -> None:
         """frames_uint8: [F, H, W, 3] uint8 on CPU."""
+        if self._delegate is not None:
+            self._delegate.write(frames_uint8)
+            self.proc = self._delegate.proc
+            self.frames_written = self._delegate.frames_written
+            return
         data = frames_uint8.contiguous().numpy().tobytes()
         assert self.proc.stdin is not None
         self.proc.stdin.write(data)
         self.frames_written += frames_uint8.shape[0]
 
     def close(self) -> None:
+        if self._delegate is not None:
+            self._delegate.close()
+            self.proc = self._delegate.proc
+            return
         assert self.proc.stdin is not None
         self.proc.stdin.close()
         stderr = b""

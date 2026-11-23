@@ -430,7 +430,7 @@ def _encoder_command(settings: Dict[str, Any], output: Path, width: int, height:
     codec = str(settings.get("video_codec") or "h264").strip().lower()
     codec = {"libx264": "h264", "x264": "h264", "avc": "h264", "libx265": "h265", "x265": "h265", "hevc": "h265",
              "libsvtav1": "av1", "svtav1": "av1"}.get(codec, codec)
-    if codec not in ("h264", "h265", "av1"):
+    if codec not in ("h264", "h265", "av1", "h264_nvenc", "hevc_nvenc", "av1_nvenc"):
         codec = "h264"
     pixel_format = str(settings.get("pixel_format") or "yuv420p")
     if deep and "10" not in pixel_format:
@@ -444,8 +444,11 @@ def _encoder_command(settings: Dict[str, Any], output: Path, width: int, height:
         av1_film_grain=_int(settings.get("av1_film_grain"), 8),
         av1_film_grain_denoise=_bool(settings.get("av1_film_grain_denoise"), False),
         audio_codec="none",
+        width=width,
+        height=height,
     )
-    if deep and "-pix_fmt" in args:
+    nvenc_encode = len(args) > 1 and str(args[1]).endswith("_nvenc")  # NVENC keeps its own pixel format
+    if deep and "-pix_fmt" in args and not nvenc_encode:
         args[args.index("-pix_fmt") + 1] = pixel_format if "10" in pixel_format else "yuv420p10le"
     return [shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-v", "error", "-nostats", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le" if deep else "rgb24",
             "-s:v", f"{width}x{height}", "-r", rate, "-i", "-", *color_args, *args, "-movflags", "+faststart", str(output)]

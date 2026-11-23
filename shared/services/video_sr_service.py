@@ -57,6 +57,46 @@ from shared.comparison_video_service import maybe_generate_input_vs_output_compa
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
+from shared.prores_delivery import deliver_final_encode, final_encode_plan, lossless_chunk_settings
+from shared.video_codec_options import (
+    check_custom_video_args,
+    normalize_custom_video_args,
+    parse_custom_video_args,
+    video_output_suffix,
+)
+
+
+def _custom_args_chunk_settings(
+    chunk_settings: Dict[str, Any], label: str, log: Callable[[str], None]
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """(chunk settings, final encode plan or None) for a chunked run with custom FFmpeg video arguments.
+
+    The chunk pipeline works in MP4 files, which cannot hold every codec custom arguments name: such a run writes
+    lossless H.264 chunks and `_custom_args_finish` encodes the merged video once with the user's arguments."""
+    if not normalize_custom_video_args(chunk_settings.get("video_custom_args")):
+        return chunk_settings, None
+    plan = final_encode_plan(chunk_settings)
+    if plan is None:
+        return chunk_settings, None
+    log(f"[{label}] Chunks are written as lossless H.264, then the merged video is encoded once with {plan['label']}.")
+    return lossless_chunk_settings(chunk_settings), plan
+
+
+def _custom_args_finish(final_output: Any, plan: Optional[Dict[str, Any]], rc: Any, cancel_event: threading.Event,
+                        log: Callable[[str], None]) -> Any:
+    """The final encode of a finished chunked run (it replaces the merged MP4); other runs unchanged."""
+    if plan is None or not final_output or cancel_event.is_set():
+        return final_output
+    try:
+        if int(rc) != 0 or not Path(str(final_output)).is_file():
+            return final_output
+    except Exception:
+        return final_output
+    final_path, err = deliver_final_encode(str(final_output), plan, on_progress=log)
+    if final_path:
+        return final_path
+    log(f"WARNING: {err}. The lossless H.264 video is kept: {final_output}")
+    return final_output
 
 
 @dataclass
@@ -81,6 +121,8 @@ class VideoSREngine:
     fixed_model_scale: int = 0
     # Preview First Frame input: a one-frame folder (FlashVSR's frame-sequence path) or the frame image itself.
     preview_frame_dir: bool = True
+    # The engine writer takes Output & Comparison > Custom FFmpeg Video Arguments (RelayVSR).
+    custom_video_args: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
     def dict_from_args(self, args: List[Any]) -> Dict[str, Any]:
@@ -633,6 +675,10 @@ def build_video_sr_callbacks(
                 "x265": "libx265",
                 "av1": "libsvtav1",
                 "libsvtav1": "libsvtav1",
+                # NVIDIA GPU encoding; each run checks it and uses the CPU encoder when NVENC cannot encode.
+                "h264_nvenc": "h264_nvenc",
+                "hevc_nvenc": "hevc_nvenc",
+                "av1_nvenc": "av1_nvenc",
             }
             output_codec_key = str(output_codec or "").strip().lower()
             mapped_codec = codec_map.get(output_codec_key, "libx264")
@@ -651,6 +697,25 @@ def build_video_sr_callbacks(
             except Exception:
                 output_quality_i = 18
             settings["crf"] = max(0, min(51, output_quality_i))
+
+            # Output & Comparison > Custom FFmpeg Video Arguments: they replace the codec settings in engines whose
+            # writer takes them (RelayVSR); a short test encode checks them before the models load.
+            custom_args_raw = seed_controls.get("video_custom_args_val")
+            if custom_args_raw is None and isinstance(output_settings, dict):
+                custom_args_raw = output_settings.get("video_custom_args")
+            custom_args_text = normalize_custom_video_args(custom_args_raw)
+            settings["video_custom_args"] = custom_args_text if engine.custom_video_args else ""
+            custom_args_error: Optional[str] = None
+            if custom_args_text and not engine.custom_video_args:
+                settings["_custom_args_note"] = (
+                    f"Custom FFmpeg Video Arguments are not used by {_label}; it encodes with the Video Codec settings."
+                )
+            elif custom_args_text:
+                settings.pop("_output_codec_note", None)
+                c_args, c_suffix, c_err = parse_custom_video_args(custom_args_text, default_codec=settings.get("video_codec"))
+                if not c_err:
+                    c_err = check_custom_video_args(c_args, c_suffix)
+                custom_args_error = c_err  # reported after the ffmpeg pre-flight check below
 
             face_apply = bool(settings.get("face_restore_after_upscale", False)) or bool(global_settings.get("face_global", False))
             face_strength = float(global_settings.get("face_strength", 0.5))
@@ -1103,7 +1168,20 @@ def build_video_sr_callbacks(
                     state
                 )
                 return
-            
+
+            if custom_args_error:
+                vid_upd, img_upd = _media_updates(None)
+                yield (
+                    "❌ Custom FFmpeg video arguments",
+                    f"Output & Comparison > Custom FFmpeg Video Arguments: {custom_args_error}",
+                    vid_upd,
+                    img_upd,
+                    gr.update(visible=False),
+                    gr.update(value="", visible=False),
+                    state,
+                )
+                return
+
             # Check disk space (require at least 5GB free)
             output_path_check = Path(global_settings.get("output_dir", output_dir))
             has_space, space_warning = check_disk_space(output_path_check, required_mb=5000)
@@ -1358,7 +1436,9 @@ def build_video_sr_callbacks(
                         item_out_dir = batch_item_dir(batch_root, item_input.name)
 
                         base_no_ext = item_input.stem
-                        predicted_output_file = item_out_dir / f"{base_no_ext}.mp4"
+                        # .mp4, or the container custom FFmpeg video arguments need (.mov / .mkv).
+                        predicted_output_file = item_out_dir / f"{base_no_ext}" \
+                            f"{video_output_suffix(item_settings.get('codec'), item_settings.get('video_custom_args'))}"
 
                         from shared.output_run_manager import prepare_batch_video_run_dir
 
@@ -1456,6 +1536,9 @@ def build_video_sr_callbacks(
                             )
                             return RunResult(r.returncode, r.output_path, r.log)
 
+                        chunk_settings, final_plan = _custom_args_chunk_settings(
+                            chunk_settings, _label, lambda msg: logs.append(str(msg))
+                        )
                         rc, clog, final_output, chunk_count_item = chunk_and_process(
                             runner=_CancelProbe(),
                             settings=chunk_settings,
@@ -1472,6 +1555,9 @@ def build_video_sr_callbacks(
                             progress_tracker=None,
                             process_func=_process_chunk,
                             model_type=_key,
+                        )
+                        final_output = _custom_args_finish(
+                            final_output, final_plan, rc, _cancel_event, lambda msg: logs.append(str(msg))
                         )
                         result = RunResult(rc, final_output if final_output else None, clog)
                         outp = result.output_path
@@ -1993,6 +2079,9 @@ def build_video_sr_callbacks(
                                 except Exception:
                                     pass
 
+                        chunk_settings, final_plan = _custom_args_chunk_settings(
+                            chunk_settings, _label, lambda msg: progress_queue.put(str(msg))
+                        )
                         rc, clog, final_output, chunk_count = chunk_and_process(
                             runner=_CancelProbe(),
                             settings=chunk_settings,
@@ -2009,6 +2098,9 @@ def build_video_sr_callbacks(
                             progress_tracker=_chunk_progress_cb,
                             process_func=_process_chunk,
                             model_type=_key,
+                        )
+                        final_output = _custom_args_finish(
+                            final_output, final_plan, rc, _cancel_event, lambda msg: progress_queue.put(str(msg))
                         )
 
                         result_holder["result"] = RunResult(rc, final_output if final_output else None, clog)
@@ -2185,7 +2277,9 @@ def build_video_sr_callbacks(
                 log_buffer.append(str(settings.get("_preprocess_error_note")))
             if settings.get("_output_codec_note"):
                 log_buffer.append(str(settings.get("_output_codec_note")))
-            
+            if settings.get("_custom_args_note"):
+                log_buffer.append(str(settings.get("_custom_args_note")))
+
             while thread.is_alive() or not progress_queue.empty():
                 # Check for cancellation
                 if _cancel_event.is_set():

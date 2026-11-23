@@ -34,6 +34,17 @@ from .path_utils import (
     resolve_output_location,
 )
 from .process_control import terminate_process_tree
+from .video_codec_options import (
+    ENGINE_VIDEO_ARGS_ENV,
+    cli_takes_app_video_args,
+    engine_args_env_value,
+    engine_encoder_for_run,
+    is_nvenc_codec,
+    nvenc_codec_key,
+    nvenc_cpu_fallback_encoder,
+    nvenc_video_args,
+    resolve_nvenc_video_args,
+)
 from .vram_autotune.common import apply_vram_cap_env, is_tight
 from .vram_autotune.flashvsr import FLASHVSR_PROCESS_OVERHEAD_GB, MAX_PASS_FRAMES as FLASHVSR_MAX_PASS_FRAMES
 from .vram_autotune.flashvsr import auto_apply as flashvsr_auto_apply
@@ -707,6 +718,35 @@ def run_flashvsr(
             av1_film_grain = 8
         av1_film_grain = max(0, min(50, av1_film_grain))
         av1_film_grain_denoise = _bool(settings.get("av1_film_grain_denoise", False), default=False)
+        # Output tab NVENC codec: checked for this output size and GPU, then handed to the CLI's ffmpeg writer in
+        # ENGINE_VIDEO_ARGS_ENV; --codec carries the CPU encoder (older FlashVSR checkouts, no NVENC here).
+        flashvsr_video_args_env = ""
+        nv_key = nvenc_codec_key(codec)
+        if nv_key:
+            cpu_codec = str(nvenc_cpu_fallback_encoder(nv_key))
+            if cli_takes_app_video_args(flashvsr_script):
+                out_w = out_h = None
+                with suppress(Exception):
+                    in_dims = get_media_dimensions(effective_input_path)
+                    if in_dims:
+                        out_w = int(int(in_dims[0]) * resize_factor) * scale
+                        out_h = int(int(in_dims[1]) * resize_factor) * scale
+                encoder = engine_encoder_for_run(nv_key, crf, pixel_format, video_preset, out_w, out_h,
+                                                 gpu=visible_gpu, log=log, tag="FlashVSR")
+                if is_nvenc_codec(encoder):
+                    nv_args, _nv_reason = resolve_nvenc_video_args(nv_key, crf, pixel_format, video_preset,
+                                                                   out_w, out_h, gpu=visible_gpu)
+                    flashvsr_video_args_env = engine_args_env_value(
+                        nv_args or nvenc_video_args(nv_key, crf, pixel_format, video_preset))
+            else:
+                log(f"[FlashVSR] This FlashVSR checkout cannot encode with {nv_key} yet (update it with "
+                    f"Windows_Install_and_Update.bat); encoding with {cpu_codec} (CPU) instead.")
+            codec = cpu_codec
+        if codec == "libsvtav1":
+            # SVT-AV1 takes a numeric preset (the CLI passes the value to ffmpeg as it is).
+            from .video_codec_options import SVT_AV1_PRESET_MAP
+
+            video_preset = str(SVT_AV1_PRESET_MAP.get(video_preset, video_preset))
         fps = _parse_float(settings.get("fps"), 0.0)
         single_image_profile_applied = False
         single_image_repeat_frames = 1
@@ -966,6 +1006,10 @@ def run_flashvsr(
                 )
             if visible_gpu is not None:
                 proc_env["CUDA_VISIBLE_DEVICES"] = visible_gpu
+            if flashvsr_video_args_env:
+                proc_env[ENGINE_VIDEO_ARGS_ENV] = flashvsr_video_args_env
+            else:
+                proc_env.pop(ENGINE_VIDEO_ARGS_ENV, None)
             triton_cache_dir = base_dir / "temp" / "triton_cache"
             with suppress(Exception):
                 triton_cache_dir.mkdir(parents=True, exist_ok=True)

@@ -206,7 +206,7 @@ def _rtx_video_codec_key(codec_raw: Any) -> Tuple[str, Optional[str]]:
     """
     requested = str(codec_raw or "h264").strip().lower() or "h264"
     key = _RTX_CODEC_ALIASES.get(requested, requested)
-    if key in ("h264", "h265", "av1", "prores"):
+    if key in ("h264", "h265", "av1", "prores", "h264_nvenc", "hevc_nvenc", "av1_nvenc"):
         return key, None
     return "h264", f"[RTX] The Output tab codec '{requested}' is not written by RTX Super Resolution; using H.264."
 
@@ -1015,8 +1015,12 @@ def run_rtx_superres(
                     av1_film_grain=_to_int(settings.get("av1_film_grain"), 8),
                     av1_film_grain_denoise=_bool(settings.get("av1_film_grain_denoise"), False),
                     audio_codec="none",
+                    width=out_w,
+                    height=out_h,
+                    on_note=lambda note: log(f"[RTX] {note}"),
                 )
-                if deep_out and "-pix_fmt" in encode_args:
+                nvenc_encode = len(encode_args) > 1 and str(encode_args[1]).endswith("_nvenc")
+                if deep_out and "-pix_fmt" in encode_args and not nvenc_encode:
                     # libx264 and SVT-AV1 encode 10-bit too; the app's profile list only names 8-bit for them.
                     encode_args[encode_args.index("-pix_fmt") + 1] = pixel_format if "10" in pixel_format else "yuv420p10le"
                 if use_hdr:
@@ -1068,6 +1072,8 @@ def run_rtx_superres(
                     creationflags=_NO_WINDOW,
                 )
                 codec_label = codec_key.upper()
+                if codec_key.endswith("_nvenc") and len(encode_args) > 1:
+                    codec_label = str(encode_args[1])  # the NVENC encoder, or the CPU one it fell back to
                 if codec_key == "prores":
                     codec_label = "ProRes 4444 (.mov)" if "444" in pixel_format else "ProRes 422 HQ (.mov)"
                 if custom_video_args:

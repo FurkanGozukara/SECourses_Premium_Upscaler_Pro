@@ -2331,6 +2331,10 @@ def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) 
         "av1": "av1",
         "prores": "prores",
         "prores_ks": "prores",
+        # NVIDIA GPU encoding (checked by build_ffmpeg_video_encode_args, CPU encoder when NVENC cannot).
+        "h264_nvenc": "h264_nvenc",
+        "hevc_nvenc": "hevc_nvenc",
+        "av1_nvenc": "av1_nvenc",
     }
     codec = codec_map.get(codec_raw, "h264")
     try:
@@ -2350,7 +2354,7 @@ def _normalize_video_encode_settings(encode_settings: Optional[Dict[str, Any]]) 
     # SeedVR2's `--10bit` should dominate downstream ffmpeg enforcement/merge settings.
     # Without this, a stale/default Output-tab pix_fmt (yuv420p) can silently collapse
     # chunk/final outputs back to 8-bit during best-effort normalization.
-    if codec == "h265" and use_10bit and "10le" not in pixel_format:
+    if codec in ("h265", "hevc_nvenc") and use_10bit and "10le" not in pixel_format:
         pixel_format = "yuv420p10le"
     return {
         "codec": codec,
@@ -2720,6 +2724,13 @@ def concat_videos(
         # Exact rational when possible ("24000/1001"); a snapped/rounded value would
         # change playback speed and desync audio.
         fps_str = merge_fps_str or _pick_merge_fps_str(signatures, stable_chunks) or "30"
+        merge_dims = None
+        if "_nvenc" in str(enc["codec"]):
+            # NVENC is checked for the real size (H.264 NVENC stops at 4096 pixels).
+            with suppress(Exception):
+                from .path_utils import get_media_dimensions as _merge_dims
+
+                merge_dims = _merge_dims(str(stable_chunks[0])) if stable_chunks else None
         video_encode_args = build_ffmpeg_video_encode_args(
             codec=enc["codec"],
             quality=int(enc["quality"]),
@@ -2730,6 +2741,8 @@ def concat_videos(
             h265_tune=str(enc["h265_tune"]),
             av1_film_grain=int(enc["av1_film_grain"]),
             av1_film_grain_denoise=bool(enc["av1_film_grain_denoise"]),
+            width=int(merge_dims[0]) if merge_dims else None,
+            height=int(merge_dims[1]) if merge_dims else None,
         )
         return video_encode_args, fps_str
 
@@ -3230,8 +3243,11 @@ def _concat_videos_with_blending_legacy(
                 av1_film_grain=enc["av1_film_grain"],
                 av1_film_grain_denoise=enc["av1_film_grain_denoise"],
                 audio_codec="none",
+                width=width,
+                height=height,
             )
-            bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1"} else []
+            bf_args = ["-bf", "0"] if enc["codec"] in {"h264", "h265", "vp9", "av1", "h264_nvenc", "hevc_nvenc",
+                                                       "av1_nvenc"} else []
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-f", "rawvideo",
@@ -3468,6 +3484,8 @@ def _blend_concat_once(
                             av1_film_grain=enc["av1_film_grain"],
                             av1_film_grain_denoise=enc["av1_film_grain_denoise"],
                             audio_codec="none",
+                            width=width,
+                            height=height,
                         )
                         ffmpeg_cmd = [
                             "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",

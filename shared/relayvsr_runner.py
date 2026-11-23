@@ -13,7 +13,14 @@ from typing import Any, Callable, Dict, List, Optional
 from .command_logger import get_command_logger
 from .ltx25_runner import _build_env, _format_command_for_log, _probe_ltx25_video, _resolve_python_executable, _stream_process
 from .open_h3_runner import _popen, _resolve_device
-from .path_utils import collision_safe_path, detect_input_type, get_media_fps, normalize_path, resolve_output_location
+from .path_utils import (
+    collision_safe_path,
+    detect_input_type,
+    get_media_dimensions,
+    get_media_fps,
+    normalize_path,
+    resolve_output_location,
+)
 from .relayvsr_constants import (
     RELAYVSR_FLASH_FILE,
     RELAYVSR_MODELS_DIRNAME,
@@ -23,10 +30,20 @@ from .relayvsr_constants import (
     RELAYVSR_WINDOW_MAX,
     RELAYVSR_WINDOW_MIN,
 )
+from .video_codec_options import engine_encoder_for_run, is_nvenc_codec, parse_custom_video_args, video_output_suffix
 from .vram_autotune.common import apply_vram_cap_env, is_tight
 
 TAG = "RelayVSR"
-CODECS = {"libx264", "libx265", "libsvtav1"}
+CODECS = {"libx264", "libx265", "libsvtav1", "h264_nvenc", "hevc_nvenc", "av1_nvenc"}
+
+
+def custom_video_args_text(settings: Dict[str, Any]) -> str:
+    """The Output tab's custom FFmpeg video arguments for the RelayVSR writer ('' = the codec settings)."""
+    import shlex
+
+    args, _suffix, err = parse_custom_video_args(settings.get("video_custom_args"),
+                                                 default_codec=settings.get("codec") or settings.get("video_codec"))
+    return shlex.join(args) if (args and not err) else ""
 
 
 @dataclass
@@ -71,6 +88,9 @@ def build_command(python_exe: str, script: Path, settings: Dict[str, Any], paths
         "--preset", str(settings.get("video_preset") or "medium"),
         "--pixel_format", str(settings.get("pixel_format") or "yuv420p"),
     ]
+    video_args = custom_video_args_text(settings)
+    if video_args:
+        cmd += ["--video_args", video_args]
     try:
         fps = float(settings.get("fps") or 0.0)
     except Exception:
@@ -81,7 +101,8 @@ def build_command(python_exe: str, script: Path, settings: Dict[str, Any], paths
 
 
 def _output_file(settings: Dict[str, Any], base_dir: Path, original: str, effective: str, is_image: bool) -> Path:
-    ext = ".png" if is_image else ".mp4"
+    # Videos: .mp4, or the container custom FFmpeg video arguments need (.mov for ProRes, .mkv for FFV1, ...).
+    ext = ".png" if is_image else video_output_suffix(settings.get("codec"), settings.get("video_custom_args"))
     stem = Path(str(settings.get("_original_filename") or original or effective)).stem or "output"
     override = str(settings.get("output_override") or "").strip()
     if override:
@@ -148,6 +169,15 @@ def run_relayvsr(
         visible_gpu, gpu_note = _resolve_device(settings.get("device", "auto"))
         if gpu_note:
             log(gpu_note)
+        if not is_image and is_nvenc_codec(settings.get("codec")) and not custom_video_args_text(settings):
+            # NVENC is checked here for the 4x output size and this run's GPU; the CPU encoder when it cannot.
+            dims = None
+            with suppress(Exception):
+                dims = get_media_dimensions(effective)
+            settings["codec"] = engine_encoder_for_run(
+                settings.get("codec"), settings.get("crf"), settings.get("pixel_format"), settings.get("video_preset"),
+                width=int(dims[0]) * 4 if dims else None, height=int(dims[1]) * 4 if dims else None,
+                gpu=visible_gpu, log=log, tag=TAG)
         cmd = build_command(python_exe, script, settings, paths, effective, output_file)
         log(f"Running RelayVSR 4x ({settings.get('wan_model') or RELAYVSR_WAN_DEFAULT}, window "
             f"{settings.get('window_size') or RELAYVSR_WINDOW_DEFAULT})")

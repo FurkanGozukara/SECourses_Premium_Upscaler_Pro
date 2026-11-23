@@ -1073,6 +1073,10 @@ def build_ltx25_callbacks(
                 "x265": "libx265",
                 "av1": "libsvtav1",
                 "libsvtav1": "libsvtav1",
+                # NVIDIA GPU encoding; the engine writer checks it and uses the CPU encoder when NVENC cannot.
+                "h264_nvenc": "h264_nvenc",
+                "hevc_nvenc": "hevc_nvenc",
+                "av1_nvenc": "av1_nvenc",
             }
             output_codec_key = str(output_codec or "").strip().lower()
             mapped_codec = codec_map.get(output_codec_key, "libx264")

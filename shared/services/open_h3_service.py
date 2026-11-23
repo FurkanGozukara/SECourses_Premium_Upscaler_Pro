@@ -1259,6 +1259,10 @@ def build_open_h3_callbacks(
                 # ProRes is written into a .mov (an MP4 file cannot hold it).
                 "prores": "prores_ks",
                 "prores_ks": "prores_ks",
+                # NVIDIA GPU encoding; the engine writer checks it and uses the CPU encoder when NVENC cannot.
+                "h264_nvenc": "h264_nvenc",
+                "hevc_nvenc": "hevc_nvenc",
+                "av1_nvenc": "av1_nvenc",
             }
             output_codec_key = str(output_codec or "").strip().lower()
             mapped_codec = codec_map.get(output_codec_key, "libx264")

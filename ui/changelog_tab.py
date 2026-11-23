@@ -11,6 +11,33 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.5 — 23 November 2026 — NVIDIA GPU Video Encoding (NVENC H.265 10-bit, H.264, AV1) and Your Own FFmpeg Arguments in RelayVSR, RIFE and the Final Resize",
+        """
+**Videos can now be encoded by the NVIDIA GPU instead of the CPU: much faster runs on cloud GPUs with few vCPUs, where the CPU encoder was the slowest part of the run while the GPU waited.**
+
+**New: NVIDIA GPU encoding (NVENC)** (Output & Comparison > Video Output > Video Codec)
+- Three new Video Codec choices: `hevc_nvenc` (H.265; Pixel Format `yuv420p10le` gives 10-bit Main10), `h264_nvenc` and `av1_nvenc` (RTX 40 and 50 series, RTX 6000 Ada, L4, L40 and newer). The GPU's own video encoder chip does the work, so the CPU is free.
+- Video Quality is NVENC's constant quality value (CQ, the same scale as CRF: lower = better, 0 counts as 1). Encoding Preset picks NVENC p1 (fastest) to p7 (best quality): ultrafast / superfast / veryfast = p1, faster = p2, fast = p3, medium = p4, slow = p5, slower = p6, veryslow = p7.
+- Used by every tab that encodes video: RelayVSR, FlashVSR, SeedVR2 (Video Backend ffmpeg), Open-H3, LTX 2.5, RTX Super Resolution, DLSS 5, Image-Based (GAN), RIFE / FPS / Edit Videos, Global RIFE, chunk joins and the final fixed-size resize. SparkVSR keeps its own H.264 writer.
+- Safe on every machine: each run first checks NVENC with a 3-frame test encode at its own video size on its own GPU. When NVENC cannot encode (no NVIDIA GPU or driver, an FFmpeg without NVENC, AV1 on an RTX 30 series / A6000 / A100, H.264 larger than 4096 pixels), the run uses the matching CPU encoder (`libx265`, `libx264` or `libsvtav1`) with the same quality value, and the log says why. In RelayVSR, Open-H3 and LTX 2.5, if the GPU encoder still cannot start when the first frames arrive (for example no free video memory at that moment), the video is encoded on the CPU without losing a frame; the final fixed-size resize retries on the CPU the same way.
+- A line under Video Codec shows whether the selected NVENC codec works on this machine.
+- For final masters at the smallest file size, `libx265` (h265) still compresses better per bit; NVENC is the fast choice.
+- RIFE, SeedVR2 and FlashVSR use NVENC after you update them with Windows_Install_and_Update.bat (or the RunPod / Massed Compute installer, which updates them too). An older copy keeps encoding on the CPU and says so in the log.
+
+**Custom FFmpeg Video Arguments now also in RelayVSR, RIFE and the final fixed-size resize**
+- RelayVSR writes its video with your own FFmpeg options. Chunked RelayVSR runs save the chunks without quality loss and encode the joined video once with your options, as Open-H3 does.
+- RIFE (the RIFE / FPS / Edit Videos tab and Global RIFE) encodes with your options when its output file type can hold the codec: an `.mp4` takes H.264, H.265, AV1 and NVENC options; ProRes needs a `.mov` and FFV1 an `.mkv` output. Otherwise RIFE uses the Video Codec settings and the log says so.
+- The final fixed-size resize after RelayVSR (Upscale x / Max Resolution sizing) uses your options too; a ProRes or FFV1 result is saved as `.mov` / `.mkv`.
+- RelayVSR and RIFE check your options with a short test encode first; options FFmpeg refuses stop the run at the start with FFmpeg's message.
+- Example for fast cloud runs: `-c:v hevc_nvenc -preset p7 -tune hq -rc vbr -cq 16 -b:v 0 -profile:v main10 -pix_fmt p010le`.
+
+**Also**
+- AV1 (`libsvtav1`) now offers 10-bit (`yuv420p10le`) in Pixel Format, so a 10-bit AV1 NVENC choice stays 10-bit when it falls back to the CPU.
+- AV1 (`libsvtav1`) in RIFE, SeedVR2, FlashVSR and the final fixed-size resize: the Encoding Preset is now given to SVT-AV1 as its number (slow = 4, medium = 6, ...). The preset name made FFmpeg refuse the encode there.
+- FlashVSR: the log says when Custom FFmpeg Video Arguments are set, as FlashVSR encodes with the Video Codec settings.
+""",
+    ),
+    (
         "V10.4 — 8 November 2026 — Real ProRes Output and Your Own FFmpeg Video Arguments in Open-H3 Regenerate and RTX Super Resolution",
         """
 **Choosing `prores` in Output & Comparison > Video Codec now gives a real ProRes video in Open-H3 Regenerate and RTX Super Resolution, and you can type your own FFmpeg video options for any codec FFmpeg has.**

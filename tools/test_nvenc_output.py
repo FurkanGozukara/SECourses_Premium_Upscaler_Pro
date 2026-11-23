@@ -410,6 +410,44 @@ class RifeEncodePlanTests(_TempCase):
         args, override = old._rife_encode_plan(settings, str(clip), self.root / "o.mp4", True, "0", logs.append)
         self.assertEqual((args, override), (None, "h265"))
 
+    def test_rife_command_keeps_lossless_quality(self):
+        from shared.prores_delivery import lossless_chunk_settings
+        from shared.runner import Runner
+
+        runner = Runner.__new__(Runner)
+        runner.base_dir = ROOT
+        runner._get_python_executable = lambda: "python"
+        clip = _make_clip(self.root / "clip.mp4", audio=False)
+        cmd = runner._build_rife_cmd(Path("cli.py"), str(clip), self.root / "o.mp4",
+                                     lossless_chunk_settings({"video_codec": "h265", "video_quality": 18,
+                                                              "model": "4.26", "model_dir": "train_log"}))
+        self.assertEqual(cmd[cmd.index("--video-crf") + 1], "0")
+        self.assertEqual(cmd[cmd.index("--video-codec") + 1], "libx264")
+        cmd = runner._build_rife_cmd(Path("cli.py"), str(clip), self.root / "o.mp4",
+                                     {"video_codec": "av1", "video_preset": "slow", "model_dir": "train_log"})
+        self.assertEqual(cmd[cmd.index("--video-crf") + 1], "23")  # unset keeps the old default
+        self.assertEqual(cmd[cmd.index("--video-preset") + 1], "4")  # SVT-AV1 numeric preset
+
+    def test_chunked_rife_plan_for_mov_codecs(self):
+        from shared.prores_delivery import custom_args_chunk_plan, finish_chunk_plan
+
+        same, plan = custom_args_chunk_plan({"video_codec": "h265", "video_custom_args": "-c:v hevc_nvenc -cq 16"})
+        self.assertIsNone(plan)  # MP4 codecs: every chunk uses the arguments directly
+        self.assertEqual(same["video_custom_args"], "-c:v hevc_nvenc -cq 16")
+        self.assertIsNone(custom_args_chunk_plan({"video_codec": "prores"})[1])  # no custom arguments: unchanged
+        logs = []
+        chunk, plan = custom_args_chunk_plan({"video_codec": "h264", "video_custom_args": "-c:v prores_ks -profile:v 3"},
+                                             logs.append)
+        self.assertEqual((chunk["video_codec"], chunk["video_quality"], chunk["video_custom_args"]), ("h264", 0, ""))
+        self.assertEqual(plan["suffix"], ".mov")
+        self.assertTrue(logs)
+        merged = _make_clip(self.root / "run" / "clip_2xFPS.mp4")
+        out = finish_chunk_plan(str(merged), plan, 0)
+        self.assertEqual(Path(out).suffix, ".mov")
+        self.assertEqual(_probe(Path(out))["codec_name"], "prores")
+        self.assertEqual(finish_chunk_plan("x.mp4", plan, 1), "x.mp4")  # a failed run is left alone
+        self.assertEqual(finish_chunk_plan("x.mp4", None, 0), "x.mp4")
+
     def test_rife_cli_hook(self):
         """The RIFE checkout's encoder arguments: the app's list wins, its -vf runs after the colour conversion."""
         cli = ROOT / "RIFE" / "inference_video.py"

@@ -72,6 +72,50 @@ def final_encode_plan(settings: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
     return None
 
 
+def custom_args_chunk_plan(
+    settings: Dict[str, Any], log: Optional[Callable[[str], None]] = None, tag: str = "RIFE"
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """(chunk settings, final encode plan or None) for a chunked run whose custom FFmpeg video arguments need a
+    file type the MP4 chunks cannot be (ProRes .mov, FFV1 .mkv): lossless H.264 chunks, then one final encode.
+
+    Custom arguments for an MP4 codec (H.264, H.265, AV1, NVENC) are used by every chunk directly: (settings, None).
+    """
+    custom = normalize_custom_video_args(settings.get("video_custom_args"))
+    if not custom:
+        return settings, None
+    plan = final_encode_plan(settings)
+    if plan is None or str(plan.get("suffix") or ".mp4").lower() == ".mp4":
+        return settings, None
+    if log is not None:
+        try:
+            log(f"[{tag}] Chunks are written as lossless H.264, then the merged video is encoded once with "
+                f"{plan['label']}.")
+        except Exception:
+            pass
+    return lossless_chunk_settings(settings), plan
+
+
+def finish_chunk_plan(final_output: Any, plan: Optional[Dict[str, Any]], rc: Any, cancelled: bool = False,
+                      log: Optional[Callable[[str], None]] = None) -> Any:
+    """The final encode of a finished chunked run from custom_args_chunk_plan (other runs unchanged)."""
+    if plan is None or not final_output or cancelled:
+        return final_output
+    try:
+        if int(rc) != 0 or not Path(str(final_output)).is_file():
+            return final_output
+    except Exception:
+        return final_output
+    final_path, err = deliver_final_encode(str(final_output), plan, on_progress=log)
+    if final_path:
+        return final_path
+    if log is not None:
+        try:
+            log(f"WARNING: {err}. The lossless H.264 video is kept: {final_output}")
+        except Exception:
+            pass
+    return final_output
+
+
 def _output_value(seed_controls: Dict[str, Any], key: str) -> Any:
     value = seed_controls.get(f"{key}_val")
     if value is None:

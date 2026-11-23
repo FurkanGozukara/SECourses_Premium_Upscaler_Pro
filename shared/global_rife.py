@@ -316,6 +316,12 @@ def _run_global_rife_chunked(
         mode_label = "Auto scenes" if auto_chunk else f"Static {chunk_size_sec:g}s"
         on_log(f"Global RIFE: chunk-safe mode ({mode_label})\n")
 
+    # Custom FFmpeg video arguments for a .mov / .mkv codec (ProRes, FFV1): lossless MP4 chunks, one final encode.
+    from shared.prores_delivery import custom_args_chunk_plan, finish_chunk_plan
+
+    _log_line = (lambda msg: on_log(f"{msg}\n")) if on_log else None
+    settings, final_plan = custom_args_chunk_plan(settings, _log_line, tag="Global RIFE")
+
     rc, log_blob, final_out, chunk_count = chunk_and_process(
         runner=runner,
         settings=settings,
@@ -333,6 +339,7 @@ def _run_global_rife_chunked(
         process_func=None,
         model_type="rife",
     )
+    final_out = finish_chunk_plan(final_out, final_plan, rc, log=_log_line)
 
     if rc == 0 and final_out and Path(final_out).exists():
         msg = f"Global RIFE complete (chunked, {int(chunk_count or 0)} chunks): {final_out}"

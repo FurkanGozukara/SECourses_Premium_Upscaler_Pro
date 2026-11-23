@@ -1390,11 +1390,18 @@ def build_rife_callbacks(
                         return
                     progress_queue.put(("progress", line))
 
+                # Custom FFmpeg video arguments for a .mov / .mkv codec: lossless MP4 chunks, one final encode.
+                from shared.prores_delivery import custom_args_chunk_plan, finish_chunk_plan
+
+                chunk_run_settings, chunk_final_plan = custom_args_chunk_plan(
+                    settings, lambda msg: progress_queue.put(("progress", str(msg)))
+                )
+
                 def _chunk_worker():
                     try:
                         rc_local, clog_local, final_output_local, chunk_count_local = chunk_and_process(
                             runner=runner,
-                            settings=settings,
+                            settings=chunk_run_settings,
                             scene_threshold=scene_threshold,
                             min_scene_len=min_scene_len,
                             work_dir=Path(settings.get("_run_dir") or output_dir),
@@ -1408,6 +1415,10 @@ def build_rife_callbacks(
                             progress_tracker=_chunk_progress_cb,
                             process_func=None,
                             model_type="rife",  # Route to runner.run_rife
+                        )
+                        final_output_local = finish_chunk_plan(
+                            final_output_local, chunk_final_plan, rc_local,
+                            log=lambda msg: progress_queue.put(("progress", str(msg))),
                         )
                         chunk_result["payload"] = (
                             rc_local,
@@ -1733,10 +1744,12 @@ def build_rife_callbacks(
                         )
                         if should_chunk:
                             from shared.chunking import chunk_and_process
+                            from shared.prores_delivery import custom_args_chunk_plan, finish_chunk_plan
 
+                            batch_chunk_settings, batch_final_plan = custom_args_chunk_plan(single_settings)
                             rc, clog, final_output, _chunk_count = chunk_and_process(
                                 runner=runner,
-                                settings=single_settings,
+                                settings=batch_chunk_settings,
                                 scene_threshold=scene_threshold,
                                 min_scene_len=min_scene_len,
                                 work_dir=Path(single_settings.get("_run_dir") or item_out_dir),
@@ -1751,6 +1764,7 @@ def build_rife_callbacks(
                                 process_func=None,
                                 model_type="rife",
                             )
+                            final_output = finish_chunk_plan(final_output, batch_final_plan, rc)
 
                             if final_output and Path(final_output).exists():
                                 job.output_path = final_output

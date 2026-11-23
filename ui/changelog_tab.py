@@ -26,7 +26,7 @@ CHANGELOG_ENTRIES = [
 
 **Custom FFmpeg Video Arguments now also in RelayVSR, RIFE and the final fixed-size resize**
 - RelayVSR writes its video with your own FFmpeg options. Chunked RelayVSR runs save the chunks without quality loss and encode the joined video once with your options, as Open-H3 does.
-- RIFE (the RIFE / FPS / Edit Videos tab and Global RIFE) encodes with your options when its output file type can hold the codec: an `.mp4` takes H.264, H.265, AV1 and NVENC options; ProRes needs a `.mov` and FFV1 an `.mkv` output. Otherwise RIFE uses the Video Codec settings and the log says so.
+- RIFE (the RIFE / FPS / Edit Videos tab and Global RIFE) encodes with your options when its output file type can hold the codec: an `.mp4` takes H.264, H.265, AV1 and NVENC options; ProRes needs a `.mov` and FFV1 an `.mkv` output. Chunked RIFE runs and chunk-safe Global RIFE save lossless chunks and encode the joined video once with ProRes / FFV1 options. Otherwise RIFE uses the Video Codec settings and the log says so.
 - The final fixed-size resize after RelayVSR (Upscale x / Max Resolution sizing) uses your options too; a ProRes or FFV1 result is saved as `.mov` / `.mkv`.
 - RelayVSR and RIFE check your options with a short test encode first; options FFmpeg refuses stop the run at the start with FFmpeg's message.
 - Example for fast cloud runs: `-c:v hevc_nvenc -preset p7 -tune hq -rc vbr -cq 16 -b:v 0 -profile:v main10 -pix_fmt p010le`.

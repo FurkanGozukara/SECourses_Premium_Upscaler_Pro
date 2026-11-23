@@ -3557,8 +3557,10 @@ class Runner:
         video_codec = self._normalize_rife_video_codec(settings.get("video_codec", "h264"))
         cmd.extend(["--video-codec", video_codec])
 
+        # An explicit 0 stays 0 (lossless; the lossless chunks of a custom-argument chunked run rely on it).
+        quality_raw = settings.get("video_quality", settings.get("output_quality", 23))
         try:
-            quality_val = int(float(settings.get("video_quality", settings.get("output_quality", 23)) or 23))
+            quality_val = int(float(quality_raw)) if str(quality_raw).strip() not in ("", "None") else 23
         except Exception:
             quality_val = 23
         quality_val = max(0, min(63, quality_val))

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -7,6 +10,38 @@ from shared.video_comparison_advanced import create_input_vs_output_comparison_v
 
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".flv", ".wmv"}
+
+
+def prepare_frame_range_comparison_source(source: str, start: int, end: int, temp_dir: Path) -> str:
+    """Render the exact decoded source frames on the same CFR timeline as a RelayVSR export."""
+    from shared.video_io import find_ffmpeg, format_fps_rate, probe_video, resolve_frame_range
+
+    info = probe_video(source)
+    first, last = resolve_frame_range(info.frames, start, end)
+    if first == 0 and last == info.frames - 1:
+        return source
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(tempfile.mkdtemp(prefix="relayvsr_comparison_", dir=temp_dir))
+    reference = cache_dir / f"{Path(source).stem}_frames_{first}-{last}.mp4"
+    fps = format_fps_rate(info.fps)
+    command = [find_ffmpeg(), "-y", "-v", "error", "-nostdin", "-i", source]
+    if info.has_audio:
+        command += [
+            "-ss", f"{first / float(info.fps):.6f}", "-t", f"{(last - first + 1) / float(info.fps):.6f}",
+            "-i", source, "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k",
+        ]
+    command += [
+        "-map", "0:v:0",
+        "-vf", f"trim=start_frame={first}:end_frame={last + 1},setpts=N/({fps}*TB),pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-r", fps, "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p",
+        "-threads", "2", "-movflags", "+faststart", str(reference),
+    ]
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0
+    result = subprocess.run(command, capture_output=True, text=True, timeout=1800, creationflags=flags)
+    if result.returncode or not reference.is_file() or not reference.stat().st_size:
+        raise RuntimeError(result.stderr.strip() or "FFmpeg produced no comparison source")
+    return str(reference)
 
 
 def maybe_generate_input_vs_output_comparison(

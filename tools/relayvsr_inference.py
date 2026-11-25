@@ -269,8 +269,7 @@ class Source:
         self.width, self.height = w, h
         self.source_fps = fps
         self.fps = float(fps_override) if fps_override and fps_override > 0 else fps
-        last = frames - 1 if end < 0 else min(frames - 1, end)
-        self.first = max(0, min(start, last))
+        self.first, last = video_io.resolve_frame_range(frames, start, end)
         self.total = last - self.first + 1
         self.has_frame_range = self.first > 0 or self.total < frames
 

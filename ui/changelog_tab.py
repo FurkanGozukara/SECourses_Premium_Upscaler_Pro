@@ -18,7 +18,7 @@ CHANGELOG_ENTRIES = [
 - Choose **Native 2x BF16** under Wan Model to run the dedicated 2× model on the full-resolution input. Selecting it sets the local output to 2×. Change the local output factor or re-enable Resolution tab settings whenever you need a different size. The native checkpoint pair downloads on first use.
 - **INT8 Temporal Cache** lowers the memory used by Wan keyframes. In one 4K test it reduced peak GPU memory from 23.0 to 17.8 GiB and added about eight seconds. **FP8 Wan Weights** are available with BF16 checkpoints on supported RTX 40-series and newer GPUs.
 - **Resize in First Encode** writes the requested dimensions in a single encode with standard encoder settings. **Temporal Checkpoint Folder** saves Wan state and completed segments so an interrupted libx264 job can resume.
-- **Start Frame** and **End Frame** export the selected range with matching audio, including when automatic scene splitting is enabled in the app.
+- **Start Frame** and **End Frame** export the selected range with matching audio, including when automatic scene splitting is enabled. The comparison slider and saved comparison video use the same source frames.
 
 **FlashVSR and SeedVR2**
 

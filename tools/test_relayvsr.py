@@ -5,6 +5,7 @@ CPU (default):
 2. VRAM plan: KV cache and activation formula, blocks on the GPU per budget (one formula for Auto Tune and the engine).
 3. Runner command flags and model paths; downloader knows the files (mirror first, pinned upstream files).
 4. INT8 ConvRot modules: quantize a small model, save, load into a meta-built model, same outputs.
+5. Comparison source: match the exported first and last frames on a timeline starting at zero.
 --gpu [clip]: the real CLI on 17 frames: INT8 vs BF16 (> 40 dB) and a 10 GB-capped run identical to the uncapped one.
 Run: venv/Scripts/python.exe tools/test_relayvsr.py [--gpu]
 """
@@ -126,6 +127,26 @@ def cpu_checks() -> None:
               and rel < 0.05, f"{n} layers, rel err {rel:.4f}")
 
 
+def comparison_source_check() -> None:
+    from shared.comparison_video_service import prepare_frame_range_comparison_source
+    from shared.video_io import find_ffmpeg, iter_video_frames, probe_video
+
+    with tempfile.TemporaryDirectory() as tmp:
+        temp_dir = Path(tmp)
+        source = str(temp_dir / "source.mp4")
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.run([
+            find_ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:r=25,geq=lum=16+N*25:cb=128:cr=128",
+            "-frames:v", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", source,
+        ], check=True, capture_output=True, creationflags=flags)
+        aligned = prepare_frame_range_comparison_source(source, 2, 4, temp_dir)
+        expected = [frame.mean() for frame in iter_video_frames(source)][2:5]
+        actual = [frame.mean() for frame in iter_video_frames(aligned)]
+        check("Comparison uses the same inclusive range as the export",
+              len(actual) == 3 and probe_video(aligned).fps == 25
+              and all(abs(a - b) <= 2 for a, b in zip(actual, expected)))
+
+
 def gpu_check(clip: str) -> None:
     py = sys.executable
     models = ROOT / "RelayVSR_Models"
@@ -156,6 +177,7 @@ def gpu_check(clip: str) -> None:
 
 if __name__ == "__main__":
     cpu_checks()
+    comparison_source_check()
     if "--gpu" in sys.argv:
         rest = [a for a in sys.argv[1:] if a != "--gpu"]
         gpu_check(rest[0] if rest else str(ROOT.parent / "relayvsr_work/out/probe_960x540.mp4"))

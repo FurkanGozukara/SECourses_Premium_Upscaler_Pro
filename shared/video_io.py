@@ -100,6 +100,12 @@ def iter_video_frames(path: str) -> Iterator[np.ndarray]:
             yield frame.to_ndarray(format="rgb24")
 
 
+def resolve_frame_range(frames: int, start: int, end: int) -> tuple[int, int]:
+    """Resolve an inclusive range, with a negative end meaning the last frame."""
+    last = frames - 1 if end < 0 else min(frames - 1, end)
+    return max(0, min(start, last)), last
+
+
 def read_image(path: str) -> np.ndarray:
     from PIL import Image, ImageOps
 

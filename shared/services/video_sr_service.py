@@ -53,7 +53,10 @@ from shared.ffmpeg_utils import scale_video
 from shared.fixed_scale_output import enforce_fixed_scale_output_size
 from shared.global_rife import maybe_apply_global_rife
 from shared.batch_naming import adopt_output_name
-from shared.comparison_video_service import maybe_generate_input_vs_output_comparison
+from shared.comparison_video_service import (
+    maybe_generate_input_vs_output_comparison,
+    prepare_frame_range_comparison_source,
+)
 from shared.chunk_preview import build_chunk_preview_payload
 from shared.preview_utils import prepare_preview_input
 from shared.video_fps_utils import apply_video_fps_override_preprocess
@@ -68,6 +71,19 @@ from shared.video_codec_options import (
 
 def _relayvsr_uses_frame_range(engine_key: str, settings: Dict[str, Any]) -> bool:
     return engine_key == "relayvsr" and (settings.get("start_frame", 0) > 0 or settings.get("end_frame", -1) >= 0)
+
+
+def _relayvsr_comparison_source(
+    input_path: str, settings: Dict[str, Any], temp_dir: Path, log: Callable[[str], None]
+) -> Optional[str]:
+    source = settings.get("_fps_override_preprocessed_input_path") or input_path
+    try:
+        return prepare_frame_range_comparison_source(
+            source, settings.get("start_frame", 0), settings.get("end_frame", -1), temp_dir
+        )
+    except Exception as exc:
+        log(f"Comparison unavailable: could not align the selected source frames ({exc}).")
+        return None
 
 
 def _custom_args_chunk_settings(
@@ -1313,7 +1329,7 @@ def build_video_sr_callbacks(
 
                 logs: List[str] = []
                 outputs: List[str] = []
-                last_input_path: Optional[str] = None
+                last_comparison_input: Optional[str] = None
                 last_output_path: Optional[str] = None
                 last_chunk_run_dir: Optional[Path] = None
                 total_items = max(1, len(items))
@@ -1372,7 +1388,6 @@ def build_video_sr_callbacks(
                         return
 
                     item_path = str(item)
-                    last_input_path = item_path
                     item_name = Path(item_path).name
                     logs.append(f"[{idx}/{len(items)}] Processing {item_name}")
                     yield _batch_live_payload(f"Batch {idx}/{len(items)}: processing {item_name}")
@@ -1635,6 +1650,7 @@ def build_video_sr_callbacks(
                             if saved_pre:
                                 logs.append(f"🧩 Preprocessed input saved: {saved_pre}")
 
+                        comparison_input = item_path
                         if Path(outp).suffix.lower() in video_exts:
                             rife_out, rife_msg = maybe_apply_global_rife(
                                 runner=runner,
@@ -1658,8 +1674,13 @@ def build_video_sr_callbacks(
                                 outp = rife_out
                             elif rife_msg:
                                 logs.append(f"⚠️ {rife_msg}")
+                            comparison_video_input = item_settings.get("_original_input_path_before_preprocess") or item_path
+                            if item_kind == "video" and _relayvsr_uses_frame_range(_key, item_settings):
+                                comparison_input = comparison_video_input = _relayvsr_comparison_source(
+                                    comparison_video_input, item_settings, temp_dir, logs.append
+                                )
                             comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                                item_settings.get("_original_input_path_before_preprocess") or item_path,
+                                comparison_video_input,
                                 outp,
                                 seed_controls,
                                 label_output=f"{_label}",
@@ -1675,6 +1696,7 @@ def build_video_sr_callbacks(
 
                         outputs.append(outp)
                         last_output_path = outp
+                        last_comparison_input = comparison_input
                         if chunk_count_item:
                             logs.append(f"✅ [{idx}/{len(items)}] {Path(item_path).name} → {Path(outp).name} ({int(chunk_count_item)} chunks)")
                         else:
@@ -1762,10 +1784,10 @@ def build_video_sr_callbacks(
                 # Comparison for last item only
                 html_comp = gr.update(value="", visible=False)
                 img_slider = gr.update(visible=False)
-                if last_input_path and last_output_path:
+                if last_comparison_input and last_output_path:
                     try:
                         h, sld = create_unified_comparison(
-                            input_path=last_input_path,
+                            input_path=last_comparison_input,
                             output_path=last_output_path,
                             mode=(
                                 "slider"
@@ -2543,6 +2565,7 @@ def build_video_sr_callbacks(
             else:
                 _cache_chunk_preview(None)
 
+            comparison_input = input_path
             # Global RIFE post-process (keep original + create *_xFPS).
             if (
                 output_path
@@ -2569,8 +2592,13 @@ def build_video_sr_callbacks(
                     output_path = rife_out
                 elif rife_msg:
                     log_buffer.append(rife_msg)
+                comparison_video_input = settings.get("_original_input_path_before_preprocess") or input_path
+                if input_kind_single == "video" and _relayvsr_uses_frame_range(_key, settings):
+                    comparison_input = comparison_video_input = _relayvsr_comparison_source(
+                        comparison_video_input, settings, temp_dir, log_buffer.append
+                    )
                 comp_vid_path, comp_vid_err = maybe_generate_input_vs_output_comparison(
-                    settings.get("_original_input_path_before_preprocess") or input_path,
+                    comparison_video_input,
                     output_path,
                     seed_controls,
                     label_output=f"{_label}",
@@ -2602,7 +2630,7 @@ def build_video_sr_callbacks(
 
             # Create comparison
             html_comp, img_slider = create_unified_comparison(
-                input_path=input_path,
+                input_path=comparison_input,
                 output_path=output_path,
                 mode="slider" if output_path and output_path.endswith(".mp4") else "native"
             )

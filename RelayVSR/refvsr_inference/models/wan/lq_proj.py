@@ -63,10 +63,12 @@ class LQ4xProj(nn.Module):
         out_dim: int = 3072,
         hidden_dim1: int = 2048,
         hidden_dim2: int = 3072,
+        unshuffle: int = 16,
     ):
         super().__init__()
 
-        self.patch_size = 32
+        # The 4x model unshuffles a 4x-upsampled frame by 16, the 2x model the native frame by 8.
+        self.patch_size = 2 * unshuffle
 
         self.pixel_unshuffle = PixelUnshuffle2d(
             self.patch_size // 2,

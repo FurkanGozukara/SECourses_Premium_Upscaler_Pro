@@ -1,7 +1,7 @@
-"""RelayVSR 4x video / image super-resolution (https://github.com/kopperx/RelayVSR) for SECourses Premium Upscaler Pro.
+"""RelayVSR video / image super-resolution for SECourses Premium Upscaler Pro.
 
 A large Wan model writes sparse reference latents (one keyframe every window_size - 1 frames, one step, KV cache of
-recent keyframes) and a small conditional Flash decoder turns every low-resolution frame into a 4x frame, streaming
+recent keyframes) and a small conditional Flash decoder upscales every low-resolution frame, streaming
 one frame at a time. The vendored inference package lives in RelayVSR/refvsr_inference.
 
 App integration: the shared ffmpeg writer (codec / CRF / preset / pixel format, source audio with the frame-range
@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import time
+import weakref
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -47,7 +48,8 @@ from shared.vram_autotune import relayvsr as tune  # noqa: E402
 GIB = 1024 ** 3
 INT8_FORMAT = "relayvsr-wan-int8-convrot-v2"  # v2: no ARA branch
 INT8_MARKER = "relayvsr_int8_convrot"
-SCALE = 4
+WAN_FORMAT_SCALES = {"refvsr-wan-v1": 4, "relayvsr-wan-x2-v1": 2}
+FLASH_FORMAT_SCALES = {"refvsr-flash-v1": 4, "relayvsr-flash-x2-v1": 2}
 
 
 def emit(msg: str) -> None:
@@ -56,13 +58,23 @@ def emit(msg: str) -> None:
 
 # ------------------------------------------------------------------ models
 
+def _checkpoint_config(path: Path, metadata: dict, formats: dict):
+    model_format = metadata.get("relayvsr_format") or metadata.get("format")
+    scale = formats.get(model_format)
+    if scale is None:
+        raise ValueError(f"{path.name} is not a supported RelayVSR checkpoint ({model_format})")
+    config = json.loads(metadata["config"])
+    if config.pop("upscale_factor", scale) != scale:
+        raise ValueError(f"{path.name}: checkpoint format and upscale factor disagree")
+    return config, scale
+
+
 def _wan_header(path: Path):
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
         prompt_shape = tuple(handle.get_slice("prompt_embeds").get_shape())
-    if metadata.get("format") != "refvsr-wan-v1" and metadata.get("relayvsr_format") != "refvsr-wan-v1":
-        raise ValueError(f"{path.name} is not a RelayVSR Wan checkpoint")
-    return json.loads(metadata["config"]), prompt_shape, metadata
+    config, scale = _checkpoint_config(path, metadata, WAN_FORMAT_SCALES)
+    return config, prompt_shape, metadata, scale
 
 
 def build_wan(path: Path, dtype: torch.dtype) -> nn.Module:
@@ -70,10 +82,10 @@ def build_wan(path: Path, dtype: torch.dtype) -> nn.Module:
     from accelerate import init_empty_weights
     from refvsr_inference.models.wan.transformer import WanTransformer3DModel
 
-    config, prompt_shape, _ = _wan_header(path)
+    config, prompt_shape, _, scale = _wan_header(path)
     with init_empty_weights():
         wan = WanTransformer3DModel.from_config(config)
-        wan.lq_proj = wan.build_lq_proj()
+        wan.lq_proj = wan.build_lq_proj(scale)
         wan.register_buffer("prompt_embeds", torch.empty(prompt_shape))
     state = load_file(str(path), device="cpu")
     if is_int8_file(path, INT8_MARKER):
@@ -94,18 +106,18 @@ def build_wan(path: Path, dtype: torch.dtype) -> nn.Module:
     return wan.eval().requires_grad_(False)
 
 
-def build_flash(path: Path, dtype: torch.dtype, device: torch.device) -> nn.Module:
+def build_flash(path: Path, dtype: torch.dtype, device: torch.device, expected_scale: int = 4) -> nn.Module:
     from accelerate import init_empty_weights
     from refvsr_inference.models.flash.model import FlashVSRConditionNet
 
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
-    if metadata.get("format") != "refvsr-flash-v1":
-        raise ValueError(f"{path.name} is not a RelayVSR Flash checkpoint")
-    config = json.loads(metadata["config"])
+    config, scale = _checkpoint_config(path, metadata, FLASH_FORMAT_SCALES)
+    if scale != expected_scale:
+        raise ValueError(f"Flash checkpoint {path.name} is {scale}x, but the Wan checkpoint is {expected_scale}x")
     variant = config.pop("variant", "S")
     with init_empty_weights():
-        flash = FlashVSRConditionNet.from_variant(variant, **config)
+        flash = FlashVSRConditionNet.from_variant(variant, upscale_factor=scale, **config)
     flash.load_state_dict(load_file(str(path), device="cpu"), strict=True, assign=True)
     return flash.to(device=device, dtype=dtype).eval().requires_grad_(False)
 
@@ -138,6 +150,7 @@ class _BlockSwap:
                 holders.append(module)
         self._park()
         self._kv_pinned = None
+        self._kv_owner = None
         block._relay_swapped = True
         block.register_forward_pre_hook(self._block_pre, with_kwargs=True)
         block.register_forward_hook(self._block_post, with_kwargs=True)
@@ -153,13 +166,6 @@ class _BlockSwap:
             if isinstance(value, WanSelfAttentionKVCache):
                 return value
         return None
-
-    @staticmethod
-    def _point(cache, storage):
-        valid = cache.key_value[0].shape[1] if cache.key_value is not None else 0
-        cache._storage = storage
-        if cache.key_value is not None:
-            cache.key_value = (storage[0][:, :valid], storage[1][:, :valid])
 
     def _set(self, module, kind, key, value):
         if kind == "_parameters":
@@ -183,16 +189,17 @@ class _BlockSwap:
         self._load()
         cache = self._kv_cache(args, kwargs)  # the block's KV cache lives in pinned RAM between its calls
         if cache is not None and cache._storage is not None and cache._storage[0].device.type == "cpu":
-            self._point(cache, tuple(t.to(self.device, non_blocking=True) for t in cache._storage))
+            cache.move_storage(tuple(t.to(self.device, non_blocking=True) for t in cache._storage))
 
     def _block_post(self, _m, args, kwargs, _o):
         self.in_block = False
         self._park()
         cache = self._kv_cache(args, kwargs)
         if cache is not None and cache._storage is not None and cache._storage[0].device.type == "cuda":
-            fresh = self._kv_pinned is None or self._kv_pinned[0].shape != cache._storage[0].shape
+            fresh = self._kv_owner is None or self._kv_owner() is not cache
             if fresh:
                 self._kv_pinned = tuple(torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in cache._storage)
+                self._kv_owner = weakref.ref(cache)
                 for dst, src in zip(self._kv_pinned, cache._storage):
                     dst.copy_(src, non_blocking=True)
             else:
@@ -201,7 +208,7 @@ class _BlockSwap:
                 start = ((cache.next_frame - 1) % cache.window_size) * tokens
                 for dst, src in zip(self._kv_pinned, cache._storage):
                     dst[:, start:start + tokens].copy_(src[:, start:start + tokens], non_blocking=True)
-            self._point(cache, self._kv_pinned)
+            cache.move_storage(self._kv_pinned)
 
     def _layer_pre(self, _m, _a):
         self._load()
@@ -260,21 +267,23 @@ class Source:
             info = video_io.probe_video(path)
             w, h, frames, fps, self.has_audio = info.width, info.height, info.frames, float(info.fps), info.has_audio
         self.width, self.height = w, h
+        self.source_fps = fps
         self.fps = float(fps_override) if fps_override and fps_override > 0 else fps
         last = frames - 1 if end < 0 else min(frames - 1, end)
         self.first = max(0, min(start, last))
         self.total = last - self.first + 1
+        self.has_frame_range = self.first > 0 or self.total < frames
 
-    def frames(self):
+    def frames(self, skip=0):
         if self.is_image:
             yield self._image
             return
         if self.sequence is not None:
-            for f in self.sequence[self.first:self.first + self.total]:
+            for f in self.sequence[self.first + skip:self.first + self.total]:
                 yield video_io.read_image(str(f))
             return
         for i, frame in enumerate(video_io.iter_video_frames(self.path)):
-            if i < self.first:
+            if i < self.first + skip:
                 continue
             if i >= self.first + self.total:
                 break
@@ -299,19 +308,28 @@ def run(args) -> int:
         dtype = torch.float16
         emit("This GPU has no bf16: running in fp16")
     src = Source(args.input, args.start_frame, args.end_frame, args.fps)
-    out_w, out_h = src.width * SCALE, src.height * SCALE
+    _, _, _, scale = _wan_header(Path(args.wan))
+    out_w, out_h = src.width * scale, src.height * scale
     emit(f"Plan: {src.width}x{src.height} -> {out_w}x{out_h} ({'image' if src.is_image else f'{src.total} frames @ {src.fps:.3f} fps'}), "
          f"window {args.window_size}, {args.dtype}")
     t_load = time.time()
-    flash = build_flash(Path(args.flash), dtype, device)
+    flash = build_flash(Path(args.flash), dtype, device, scale)
     wan = build_wan(Path(args.wan), dtype)
     budget = _budget_bytes(device, args.save_vram_gb)
     kind = "int8" if is_int8_file(Path(args.wan), INT8_MARKER) else "bf16"
-    fit = tune.blocks_on_gpu(budget / GIB, kind, out_w, out_h)
+    if args.fp8_wan and kind == "bf16":
+        from shared.fp8_linear import convert_fp8_blocks
+
+        if convert_fp8_blocks(wan.blocks, device, dtype, emit):
+            kind = "fp8"
+    elif args.fp8_wan:
+        emit("FP8 Wan uses a BF16 checkpoint. Using the selected INT8 ConvRot checkpoint.")
+    fit = tune.blocks_on_gpu(budget / GIB, kind, out_w, out_h, args.int8_kv_cache)
     resident = fit if args.max_gpu_blocks < 0 else min(fit, int(args.max_gpu_blocks))
     emit(f"VRAM budget {budget / GIB:.1f} GB at {out_w}x{out_h}: Wan {module_bytes(wan) / GIB:.1f} GB + KV cache "
-         f"{tune.kv_block_gb(out_w, out_h) * tune.WAN_BLOCKS:.1f} GB, activations ~{tune.activation_gb(out_w, out_h):.1f} GB"
-         f" -> estimated peak {tune.peak_gb(kind, out_w, out_h, resident):.1f} GB")
+         f"{tune.kv_block_gb(out_w, out_h, args.int8_kv_cache) * tune.WAN_BLOCKS:.1f} GB "
+         f"({'INT8' if args.int8_kv_cache else 'native'}), activations ~{tune.activation_gb(out_w, out_h):.1f} GB"
+         f" -> estimated peak {tune.peak_gb(kind, out_w, out_h, resident, args.int8_kv_cache):.1f} GB")
     resident = place_wan(wan, device, resident)
     emit(f"Models ready in {time.time() - t_load:.1f}s")
 
@@ -347,26 +365,61 @@ def _stream(args, src, wan, flash, device, dtype, WanVSRPipeline, CollaborativeF
     sampler.prepare_streaming(model=wan, prompt_embeds=wan.prompt_embeds, device=device, compute_dtype=dtype)
     stream = CollaborativeFrameStream(wan_model=wan, flash_model=flash, wan_pipeline=sampler,
                                       prompt_embeds=wan.prompt_embeds, device=device, compute_dtype=dtype,
-                                      window_size=args.window_size, seed=args.seed)
-    out_w, out_h = src.width * SCALE, src.height * SCALE
-    writer = None
-    if not src.is_image:
-        audio = args.input if (args.keep_audio and src.has_audio) else None
-        writer = video_io.FfmpegWriter(args.output, out_w, out_h, src.fps, audio_source=audio, codec=args.codec,
-                                       crf=args.crf, preset=args.preset, pixel_format=args.pixel_format,
-                                       audio_offset_s=(src.first / src.fps) if src.first else 0.0,
-                                       video_args=args.video_args)
+                                      window_size=args.window_size, seed=args.seed, quantized_kv=args.int8_kv_cache)
+    out_w, out_h = src.width * stream.scale, src.height * stream.scale
+    output_size = tuple(args.output_size) if args.output_size else None
+    audio = args.input if not src.is_image and args.keep_audio and src.has_audio else None
+    store, resume = None, None
+    if args.temporal_resume_dir:
+        if src.is_image or src.sequence is not None or args.video_args or args.codec != "libx264":
+            raise ValueError("Temporal resume needs a video input and standard libx264 settings.")
+        from refvsr_inference.runtime.resume import ResumeStore, file_identity
+        identity = {name: getattr(args, name) for name in (
+            "seed", "window_size", "int8_kv_cache", "fp8_wan", "codec", "crf", "preset", "pixel_format",
+            "output_size", "checkpoint_windows",
+        )}
+        identity.update(source=file_identity(args.resume_source or src.path), wan=file_identity(args.wan),
+                        flash=file_identity(args.flash), input_size=(src.width, src.height), start=src.first,
+                        frames=src.total, fps=src.fps, dtype=str(dtype))
+        store = ResumeStore(args.temporal_resume_dir, identity)
+        store.lock.acquire()
+        try:
+            resume = store.load()
+        except BaseException:
+            store.lock.release()
+            raise
+        if resume:
+            emit(f"Resuming after frame {store.frame} from {store.root}")
+
+    def new_writer():
+        return video_io.FfmpegWriter(
+            str(store.part(store.count)) if store else args.output, out_w, out_h, src.fps,
+            audio_source=None if store else audio, codec=args.codec, crf=args.crf, preset=args.preset,
+            pixel_format=args.pixel_format, video_args=args.video_args, audio_offset_s=src.first / src.source_fps,
+            audio_duration_s=src.total / src.fps if src.has_frame_range else None, output_size=output_size,
+        )
+
+    skipped = store.frame if resume else 0
     packets = (InputFrame(i, torch.from_numpy(f).permute(2, 0, 1).contiguous(), source_time=i / src.fps)
-               for i, f in enumerate(src.frames()))
+               for i, f in enumerate(src.frames(skipped), start=skipped))
     started = time.time()
-    done = 0
+    done = skipped + int(resume is not None)
+    writer = None
+    checkpoint_every = (args.window_size - 1) * max(1, args.checkpoint_windows)
     try:
-        for result in stream.frames(packets):
+        for result in stream.frames(packets, resume=resume, checkpoint=store is not None):
             rgb = result.rgb[0].add(1).mul_(127.5).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().cpu()
-            if writer is None:
+            if src.is_image:
                 video_io.write_image(args.output, rgb.numpy())
             else:
+                if writer is None:
+                    writer = new_writer()
                 writer.write(rgb.unsqueeze(0))
+                if store and result.index and result.index % checkpoint_every == 0:
+                    writer.close()
+                    writer = None
+                    store.commit(stream.checkpoint(result.index))
+                    emit(f"Saved temporal checkpoint at frame {result.index}")
             done += 1
             if done == 1 or done % 5 == 0 or done == src.total:
                 elapsed = max(1e-6, time.time() - started)
@@ -374,15 +427,21 @@ def _stream(args, src, wan, flash, device, dtype, WanVSRPipeline, CollaborativeF
                 eta = (src.total - done) / speed if speed > 0 else 0
                 print(f"FRAME_PROGRESS {done}/{src.total} frames | {100.0 * done / max(1, src.total):.1f}% | "
                       f"{speed:.2f} fps | ETA {int(eta // 60)}m {int(eta % 60):02d}s", flush=True)
-        if writer is not None:
+        has_tail = writer is not None
+        if has_tail:
             writer.close()
             writer = None
+        if store:
+            store.finalize(video_io.find_ffmpeg(), args.output, audio, src.first / src.source_fps,
+                           src.total / src.fps, has_tail)
     except BaseException:
         if writer is not None:
             writer.abort()
         raise
     finally:
         packets.close()
+        if store:
+            store.lock.release()
     total_s = time.time() - started
     peak = (f", peak VRAM {torch.cuda.max_memory_allocated(device) / GIB:.1f} GB" if device.type == "cuda" else "")
     emit(f"Done: {done} frame(s) in {total_s:.1f}s ({done / max(total_s, 1e-6):.2f} fps){peak}")
@@ -393,7 +452,7 @@ def _stream(args, src, wan, flash, device, dtype, WanVSRPipeline, CollaborativeF
 def convert_int8(args) -> int:
     """One-time build of the INT8 ConvRot Wan file from the bf16 release file."""
     src = Path(args.wan)
-    config, _prompt_shape, metadata = _wan_header(src)
+    _, _, metadata, _ = _wan_header(src)
     wan = build_wan(src, torch.bfloat16)
     # No ARA low-rank branch: on RelayVSR it scored the same (48 frames 960x540 -> 4K, raw frames vs bf16: 53.05 dB
     # without, 52.56 dB with) and its two extra passes per layer more than doubled the Wan step (399 vs 842 ms; bf16 902).
@@ -401,13 +460,13 @@ def convert_int8(args) -> int:
     n = quantize_linears(wan, src, log_prefix="[RelayVSR INT8]", include=lambda name: name.startswith("blocks."),
                          lowrank_rank=int(rank) if rank.isdigit() else 0)
     out = save_int8_model(wan, args.convert_int8, src, format_id=INT8_FORMAT, marker_key=INT8_MARKER,
-                          extra_metadata={"config": metadata["config"], "relayvsr_format": "refvsr-wan-v1"})
+                          extra_metadata={"config": metadata["config"], "relayvsr_format": metadata["format"]})
     emit(f"INT8 ConvRot Wan: {n} layers -> {out} ({out.stat().st_size / GIB:.2f} GB)")
     return 0
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="RelayVSR 4x video / image super-resolution")
+    p = argparse.ArgumentParser(description="RelayVSR 2x and 4x video / image super-resolution")
     p.add_argument("--input", default="")
     p.add_argument("--output", default="")
     p.add_argument("--wan", required=True, help="Wan checkpoint (bf16 release file or the INT8 ConvRot file)")
@@ -421,6 +480,8 @@ def parse_args(argv=None):
     p.add_argument("--fps", type=float, default=0.0, help="override the input frame rate (0 = source)")
     p.add_argument("--save_vram_gb", type=float, default=1.0)
     p.add_argument("--max_gpu_blocks", type=int, default=-1, help="cap of GPU-resident Wan blocks (-1 = as many as fit)")
+    p.add_argument("--int8_kv_cache", action="store_true", help="compress the temporal Wan cache to INT8")
+    p.add_argument("--fp8_wan", action="store_true", help="use FP8 Wan block linears on supported GPUs")
     p.add_argument("--codec", default="libx264")
     p.add_argument("--crf", type=int, default=15)
     p.add_argument("--preset", default="medium")
@@ -428,6 +489,11 @@ def parse_args(argv=None):
     p.add_argument("--video_args", default="",
                    help="Own FFmpeg video encoder arguments (from -c:v on); replace codec/crf/preset/pixel_format")
     p.add_argument("--no_audio", dest="keep_audio", action="store_false")
+    p.add_argument("--output_size", nargs=2, type=int, metavar=("WIDTH", "HEIGHT"),
+                   help="Resize a video to these exact dimensions before encoding")
+    p.add_argument("--temporal_resume_dir", default="", help="Store recoverable video segments and Wan state here")
+    p.add_argument("--resume_source", default="", help="Stable identity of source media before deterministic pre-sizing")
+    p.add_argument("--checkpoint_windows", default=8, type=int, help="Complete keyframe windows per checkpoint")
     p.add_argument("--convert_int8", default="", help="build the INT8 ConvRot Wan file at this path and exit")
     return p.parse_args(argv)
 

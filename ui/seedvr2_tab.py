@@ -461,6 +461,12 @@ def seedvr2_tab(
                     info="Overlap during decoding. Higher overlap = smoother seams but slower. Must be < tile size."
                 )
             
+            adaptive_vae_decode = gr.Checkbox(
+                label="Adaptive VAE Time Slices",
+                value=bool(merged_defaults.get("adaptive_vae_decode", False)),
+                info="Use available VRAM to choose the number of frames decoded together in each VAE slice.",
+            )
+
             # Tile validation warnings
             tile_encode_warning = gr.Markdown("", visible=False)
             tile_decode_warning = gr.Markdown("", visible=False)
@@ -1093,6 +1099,7 @@ def seedvr2_tab(
         int8_convrot,
         # Apply Auto Tune automatically on every Upscale
         auto_tune_on_run,
+        adaptive_vae_decode,
     ]
     
     # Validate synchronization at tab initialization (development-time check)

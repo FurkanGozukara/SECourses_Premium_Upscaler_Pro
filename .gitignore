@@ -52,6 +52,7 @@ gfpgan/
 OpenH3_Models
 DLSS5_Models
 RelayVSR_Models
+/experimental_models/
 
 # Local test artifacts (browser automation, test clips)
 output/

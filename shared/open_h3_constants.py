@@ -56,6 +56,12 @@ OPENH3_VAE_SIZES_GB = {OPENH3_VAE_SOL_FP16: 3.6, OPENH3_VAE_SOL_INT8: 2.0, OPENH
 OPENH3_LORA_FILE = "open_h3_regenerate_2k_lora.safetensors"
 OPENH3_CURVES_FILE = "sharp_curve_branches.safetensors"
 OPENH3_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+OPENH3_UPSAMPLER_REVISION = "44db226f25f55955b3d3362a10c4de530711cd1b"
+OPENH3_2D_WEIGHTS_REPO = "LBH-123-AI/Minimax_h3_latent_Upscaler"
+OPENH3_2D_WEIGHTS_REVISION = "85a0187096046badc0a71ab6bd6be182ab06c0f4"
+OPENH3_2D_WEIGHTS_FILE = (
+    "minimax_h3_latent_upscaler_2d_conv_v1/minimax_h3_latent_upscaler_2d_conv_v1_bf16.safetensors"
+)
 OPENH3_AUDIO_VAE_FILE = "minimax_h3_audio_vae_fp32.safetensors"
 OPENH3_TABLE_FILE = "open_h3_reference_adaln_t_table.safetensors"
 OPENH3_ALWAYS_FILES = (OPENH3_LORA_FILE, OPENH3_CURVES_FILE, OPENH3_UPSCALER_FILE, OPENH3_AUDIO_VAE_FILE)

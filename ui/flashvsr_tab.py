@@ -351,6 +351,22 @@ def _build_runtime_extra(ctx: TabContext) -> None:
     ctx.c.update(frame_chunk_size=frame_chunk_size, local_range=local_range, sparse_ratio=sparse_ratio,
                  kv_ratio=kv_ratio, keep_models_on_cpu=keep_models_on_cpu, force_offload=force_offload,
                  enable_debug=enable_debug)
+    with gr.Row():
+        ctx.c["plus_resident_frames"] = gr.Checkbox(
+            label="FlashVSR+ Resident Input",
+            value=bool(_value("plus_resident_frames", False)),
+            info="Keep prepared frames in GPU memory when the untiled clip fits and Temporal Compression is 4.",
+        )
+        ctx.c["plus_fp8_weights"] = gr.Checkbox(
+            label="FlashVSR+ FP8 Weights",
+            value=bool(_value("plus_fp8_weights", False)),
+            info="Try FP8 matrix multiplication with BF16 or Auto on RTX 40 series and newer.",
+        )
+    ctx.c["legacy_tiled_stream"] = gr.Checkbox(
+        label="Legacy FlashVSR Tiled Stream",
+        value=bool(_value("legacy_tiled_stream", False)),
+        info="For v1.1 Tiny and Tiny-long, use short overlapping windows with spatial tiling.",
+    )
 
 
 def _build_sections(ctx: TabContext) -> None:

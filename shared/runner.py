@@ -2186,6 +2186,8 @@ class Runner:
         _add_int("--vae_encode_tile_overlap", "vae_encode_tile_overlap")
         if settings.get("vae_decode_tiled"):
             cmd.append("--vae_decode_tiled")
+        if settings.get("adaptive_vae_decode"):
+            cmd.append("--adaptive_vae_decode")
         _add_int("--vae_decode_tile_size", "vae_decode_tile_size")
         _add_int("--vae_decode_tile_overlap", "vae_decode_tile_overlap")
         if settings.get("tile_debug") and settings["tile_debug"] != "false":

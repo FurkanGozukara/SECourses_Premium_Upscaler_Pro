@@ -1,7 +1,7 @@
 """RelayVSR checks.
 
 CPU (default):
-1. Settings: defaults / guardrails / ORDER, the requested scale (1-4x, model always 4x), universal preset round trip.
+1. Settings: defaults / guardrails / ORDER, checkpoint and export scales, universal preset round trip.
 2. VRAM plan: KV cache and activation formula, blocks on the GPU per budget (one formula for Auto Tune and the engine).
 3. Runner command flags and model paths; downloader knows the files (mirror first, pinned upstream files).
 4. INT8 ConvRot modules: quantize a small model, save, load into a meta-built model, same outputs.
@@ -33,7 +33,7 @@ def cpu_checks() -> None:
     import torch
     import torch.nn as nn
 
-    from shared.relayvsr_constants import RELAYVSR_WAN_FILES, RELAYVSR_WAN_INT8
+    from shared.relayvsr_constants import RELAYVSR_WAN_2X, RELAYVSR_WAN_FILES, RELAYVSR_WAN_INT8
     from shared.relayvsr_runner import build_command, model_paths
     from shared.services.relayvsr_service import (
         RELAYVSR_ENGINE,
@@ -47,6 +47,12 @@ def cpu_checks() -> None:
 
     # 1) settings
     d = relayvsr_defaults()
+    native = relayvsr_defaults(RELAYVSR_WAN_2X)
+    check("Native checkpoint defaults to a local 2x export",
+          native["scale"] == "2" and native["upscale_factor"] == 2 and not native["use_resolution_tab"])
+    native = _enforce_relayvsr_guardrails({"wan_model": RELAYVSR_WAN_2X, "upscale_factor": 3.5}, d)
+    check("Native checkpoint keeps an explicitly saved export factor",
+          native["scale"] == "2" and native["upscale_factor"] == 3.5)
     check("defaults cover ORDER", all(k in d for k in RELAYVSR_ORDER), str([k for k in RELAYVSR_ORDER if k not in d]))
     g = _enforce_relayvsr_guardrails({"upscale_factor": 2.2, "window_size": 500, "wan_model": "x", "scale": "2"}, d)
     check("guardrails", g["scale"] == "4" and g["upscale_factor"] == 2.0 and g["window_size"] == 64

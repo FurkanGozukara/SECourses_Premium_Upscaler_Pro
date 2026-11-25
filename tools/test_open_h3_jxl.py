@@ -159,7 +159,10 @@ def cpu_checks() -> None:
     defaults = S.open_h3_defaults() if hasattr(S, "open_h3_defaults") else None
     cfg = S._enforce_open_h3_guardrails({"workflow": "jonxl h3 upscale", "jxl_max_side": 777}, defaults or {})
     check("service keeps the workflow, resets a bad max size", cfg["workflow"] == C.OPENH3_WORKFLOW_JXL and cfg["jxl_max_side"] == 1920)
-    check("settings order has the new keys last", S.OPENH3_ORDER[-3:] == ["workflow", "jxl_max_side", "jxl_steps"])
+    check("JonXL settings retain their original positions",
+          S.OPENH3_ORDER[47:50] == ["workflow", "jxl_max_side", "jxl_steps"])
+    check("Regenerate options follow the shipped settings",
+          S.OPENH3_ORDER[50:] == ["refine_tile_px", "small_face_redraw", "latent_upscale_sharpness"])
     check("JonXL Steps default 20", S.open_h3_defaults()["jxl_steps"] == C.OPENH3_JXL_STEPS == 20)
     check("service clamps JonXL Steps", S._enforce_open_h3_guardrails({"jxl_steps": 35}, defaults)["jxl_steps"] == 35
           and S._enforce_open_h3_guardrails({"jxl_steps": "0"}, defaults)["jxl_steps"] == 1

@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -324,6 +325,13 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                 run_btn = gr.Button("▶️ Run Chain", variant="primary", elem_classes=["action-btn", "sec-btn-emerald"], scale=3)
                 cancel_btn = gr.Button("⏹️ Cancel", variant="stop", elem_classes=["action-btn", "sec-btn-red"], scale=1)
             resume_btn = gr.Button("↻ Resume unfinished run", elem_classes=["sec-btn-amber"], visible=False)
+            with gr.Accordion("Compare a video segment", open=False):
+                compare_preset = gr.Dropdown(label="Compare current chain with", choices=cr.list_chain_presets(base_dir),
+                                             allow_custom_value=False)
+                with gr.Row():
+                    compare_start = gr.Number(label="Start (seconds)", value=0, minimum=0)
+                    compare_duration = gr.Number(label="Duration (seconds)", value=3, minimum=0.1, maximum=30)
+                compare_btn = gr.Button("Compare chains")
             with gr.Group(elem_classes=["chain-card", "chain-batch-card"]):
                 gr.Markdown("#### 📁 Batch processing (folder)", elem_classes=["chain-card-title"])
                 gr.Markdown(BATCH_NOTE, elem_classes=["resolution-info"])
@@ -597,6 +605,76 @@ def chain_tab(*, global_settings: Dict[str, Any], shared_state: gr.State, base_d
                   outputs=run_outputs, concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
     resume_btn.click(resume_chain_ui, inputs=[runs_state, steps_state, preset_dd, batch_in, batch_out, batch_skip, shared_state],
                      outputs=run_outputs, concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
+
+    def compare_chains(uploads, path_text, steps, other, start, duration, state):
+        from shared.comparison_unified import create_video_comparison_slider
+        from shared.output_run_manager import allocate_sequential_run_dir
+
+        sources = _sources(uploads, path_text, None, None, False, state)
+        alternate = cr.load_chain_preset(base_dir, other) if other else None
+        if len(sources) != 1 or Path(sources[0]).suffix.lower() not in cr.VIDEO_EXTS:
+            yield "Choose one input video for comparison.", NO, NO
+            return
+        if not alternate or not any(s.get("enabled", True) for s in cr.normalize_steps(steps)):
+            yield "Select a saved comparison chain and enable a step in the current chain.", NO, NO
+            return
+
+        queued_state = snapshot_queue_state(state or {})
+        queued_globals = snapshot_global_settings(global_settings)
+        manager = get_processing_queue_manager()
+        keys, label = resolve_queue_gpu_resources(queued_state, queued_globals)
+        cancel.clear()
+        ticket = manager.submit("Chain", "Compare chains", resource_keys=keys, resource_label=label)
+
+        def cancelled():
+            return cancel.is_set() or ticket.cancel_event.is_set()
+
+        try:
+            while not ticket.start_event.wait(timeout=0.5):
+                if cancelled():
+                    yield "Comparison cancelled.", NO, NO
+                    return
+                yield "Waiting in the processing queue…", NO, NO
+            comparison_root = _out_root(queued_state) / "chain_comparisons"
+            run_dir = allocate_sequential_run_dir(comparison_root)
+            try:
+                clip = cr.prepare_comparison_segment(sources[0], float(start), float(duration), run_dir / "segment.mp4")
+            except (OSError, ValueError, TypeError) as exc:
+                yield f"Could not prepare the selected range. {exc}", NO, NO
+                return
+            renders = []
+            timings = []
+            logs = []
+            for name, chain in (("Current chain", steps), (other, alternate)):
+                if cancelled():
+                    yield "Comparison cancelled.", NO, "\n".join(logs)
+                    return
+                started = time.monotonic()
+                final = None
+                step_log = []
+                for event in cr.run_chain([clip], chain, queued_state, base_dir=base_dir, output_root=run_dir,
+                                          chain_name=name, cancel_flag=cancelled,
+                                          global_settings_snapshot=queued_globals):
+                    if event.final_output:
+                        final = event.final_output
+                    step_log = event.log[-500:]
+                    yield f"**{html.escape(name)}** · {event.status}", NO, "\n".join(logs + step_log)
+                logs.extend(step_log)
+                if cancelled() or not final:
+                    yield f"Comparison ended during {html.escape(name)}.", NO, "\n".join(logs)
+                    return
+                renders.append(final)
+                timings.append(time.monotonic() - started)
+            yield (f"Current chain {timings[0]:.1f} s · {html.escape(other)} {timings[1]:.1f} s",
+                   gr.update(value=create_video_comparison_slider(*renders), visible=True), "\n".join(logs))
+        finally:
+            manager.cancel_waiting([ticket.job_id])
+            manager.complete(ticket.job_id)
+
+    compare_preset.focus(lambda: gr.update(choices=cr.list_chain_presets(base_dir)), outputs=[compare_preset], queue=False)
+    compare_btn.click(compare_chains, inputs=[files, path_box, steps_state, compare_preset, compare_start,
+                                             compare_duration, shared_state], outputs=[status, comparison, log_box],
+                      concurrency_limit=32, concurrency_id="app_processing_queue", trigger_mode="multiple")
 
     def _view_step(label, choices):
         for name, pair in choices or []:

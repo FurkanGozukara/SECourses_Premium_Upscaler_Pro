@@ -60,7 +60,7 @@ class _VariantSpec:
 
 
 class _LRFrameEncoder(nn.Module):
-    """Encode an LR frame into normalized tokens at 1/4 resolution."""
+    """Encode an LR frame into normalized tokens at 1/4 (4x model) or 1/8 (2x) resolution."""
 
     def __init__(
         self,
@@ -68,6 +68,7 @@ class _LRFrameEncoder(nn.Module):
         dim: int,
         channels: tuple[int, int, int],
         norm_eps: float,
+        downsample: int = 4,
     ) -> None:
         super().__init__()
         if len(channels) != 3 or any(channel <= 0 for channel in channels):
@@ -77,7 +78,7 @@ class _LRFrameEncoder(nn.Module):
 
         layers: list[nn.Module] = []
         in_channels = 3
-        for out_channels, stride in zip(channels, (2, 2, 1), strict=True):
+        for out_channels, stride in zip(channels, (2, 2, downsample // 4), strict=True):
             layers.extend(
                 [
                     nn.Conv2d(
@@ -721,8 +722,11 @@ class FlashVSRConditionNet(nn.Module):
         self.depth = depth
         self.window_size = window_size
         self.gradient_checkpointing = gradient_checkpointing
+        if upscale_factor not in (2, 4):
+            raise ValueError(f"upscale_factor must be 2 or 4, got {upscale_factor}.")
         self.upscale_factor = upscale_factor
-        self.encoder_downsample_factor = 4
+        # Tokens sit on the Wan latent grid, 1/16 of the output: LR/4 at 4x, LR/8 at 2x.
+        self.encoder_downsample_factor = 16 // upscale_factor
         self.pixel_shuffle_factor = self.encoder_downsample_factor * upscale_factor
 
         rope = _RotaryEmbedding3D(theta=rope_theta)
@@ -737,6 +741,7 @@ class FlashVSRConditionNet(nn.Module):
             dim=dim,
             channels=encoder_channels,
             norm_eps=norm_eps,
+            downsample=self.encoder_downsample_factor,
         )
         self.condition_encoder = _ConditionEncoder(
             latent_channels=condition_channels,
@@ -790,6 +795,11 @@ class FlashVSRConditionNet(nn.Module):
         config.update(overrides)
         return cls(**config)
 
+    def _token_grid(self, height: int, width: int) -> tuple[int, int]:
+        """Token rows and columns of an LR frame, which is padded up to the encoder stride."""
+        factor = self.encoder_downsample_factor
+        return (height + factor - 1) // factor, (width + factor - 1) // factor
+
     def init_state(self) -> FlashVSRConditionState:
         return FlashVSRConditionState(
             video=(None,) * self.depth,
@@ -823,7 +833,7 @@ class FlashVSRConditionNet(nn.Module):
         """Create a fresh LR history using two independently prepared endpoints."""
         if self.training or self.condition_mode != "endpoints":
             raise RuntimeError("begin_stream requires eval() and endpoint mode.")
-        expected = ((input_height + 3) // 4, (input_width + 3) // 4)
+        expected = self._token_grid(input_height, input_width)
         if total_frames < 2 or start.owner != id(self) or end.owner != id(self):
             raise ValueError("Invalid frame count or prepared condition owner.")
         if (start.height, start.width) != expected or (
@@ -862,7 +872,7 @@ class FlashVSRConditionNet(nn.Module):
             raise ValueError("RoPE preparation requires eval() and at least 2 frames.")
         parameter = next(self.parameters())
         self.backbone._inference_rope_plans = {}
-        h, w = (height + 3) // 4, (width + 3) // 4
+        h, w = self._token_grid(height, width)
         for index in range(min(total_frames, self.window_size)):
             self.backbone._build_video_rope(
                 frame_index=index,
@@ -934,7 +944,8 @@ class FlashVSRConditionNet(nn.Module):
         )
 
         # Preserve the caller's size in stream state; pad only the model input.
-        pad_h, pad_w = (-height) % 4, (-width) % 4
+        factor = self.encoder_downsample_factor
+        pad_h, pad_w = (-height) % factor, (-width) % factor
         if pad_h or pad_w:
             lr_frame = F.pad(lr_frame, (0, pad_w, 0, pad_h), mode="replicate")
         token_height = (height + pad_h) // self.encoder_downsample_factor

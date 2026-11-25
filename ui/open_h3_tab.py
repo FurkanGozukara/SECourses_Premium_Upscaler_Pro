@@ -858,6 +858,24 @@ def open_h3_tab(
             - Audio is copied from the source; the Output tab's audio and codec settings apply afterwards.
             """)
 
+    refine_tile_px = gr.Dropdown(
+        label="Guided Spatial Refine Tile",
+        choices=[("Whole frame", 0), ("512 pixels", 512), ("768 pixels", 768), ("1024 pixels", 1024)],
+        value=_value("refine_tile_px", 0),
+        info="Regenerate mode refines overlapping regions using the input latent as a guide.",
+    )
+    small_face_redraw = gr.Checkbox(
+        label="Re-draw Small Faces",
+        value=bool(_value("small_face_redraw", False)),
+        info="Regenerate mode gives eligible faces their own tracked close-up pass.",
+    )
+    latent_upscale_sharpness = gr.Dropdown(
+        label="Latent Upscaler",
+        choices=[("Standard 3D", 0)] + [(f"2D sharpness tier {tier}", tier) for tier in range(1, 7)],
+        value=_value("latent_upscale_sharpness", 0),
+        info="Optional latent upscaler for the Regenerate resize pass. Higher 2D tiers sharpen more strongly.",
+    )
+
     # Collect inputs - MUST match OPENH3_ORDER positions exactly.
     inputs_list = [
         input_path, output_override, output_format,
@@ -875,6 +893,9 @@ def open_h3_tab(
         auto_tune_on_run,
         sparse_dense_steps,
         workflow, jxl_max_side, jxl_steps,
+        refine_tile_px,
+        small_face_redraw,
+        latent_upscale_sharpness,
     ]
 
     if len(inputs_list) != len(OPENH3_ORDER):

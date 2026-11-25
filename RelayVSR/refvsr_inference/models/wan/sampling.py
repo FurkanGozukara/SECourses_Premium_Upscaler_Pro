@@ -154,6 +154,8 @@ class WanVSRPipeline:
     def create_streaming_state(
         self,
         model: torch.nn.Module,
+        *,
+        quantized_kv: bool = False,
     ) -> WanVSRStreamingState:
         """Create one bounded Wan state per configured sampling timestep."""
         if self.sampling.execution_mode != "streaming":
@@ -169,6 +171,7 @@ class WanVSRPipeline:
             model_state=model.create_streaming_state(
                 kv_cache_window_size=self.sampling.kv_cache_window_size,
                 conditioning_cache=self._streaming_conditioning_cache,
+                **({"quantized_kv": True} if quantized_kv else {}),
             )
         )
 

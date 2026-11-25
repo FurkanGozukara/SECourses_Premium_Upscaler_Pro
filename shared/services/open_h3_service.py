@@ -492,6 +492,9 @@ def open_h3_defaults() -> Dict[str, Any]:
         "workflow": OPENH3_WORKFLOW_REGEN,
         "jxl_max_side": OPENH3_JXL_MAX_SIDE_DEFAULT,
         "jxl_steps": OPENH3_JXL_STEPS,
+        "refine_tile_px": 0,
+        "small_face_redraw": False,
+        "latent_upscale_sharpness": 0,
     }
 
 
@@ -546,6 +549,9 @@ OPENH3_ORDER: List[str] = [
     "workflow",
     "jxl_max_side",
     "jxl_steps",
+    "refine_tile_px",
+    "small_face_redraw",
+    "latent_upscale_sharpness",
 ]
 
 

@@ -469,7 +469,7 @@ def build_video_sr_callbacks(
         if media is None:
             return {"status": "Auto Tune needs an input first (upload a file or enter an Input Path).",
                     "report": "", "updates": {}, "state": state}
-        model_scale = engine.fixed_model_scale or engine.canonical_scale(
+        model_scale = int(cfg.get("scale") or engine.fixed_model_scale) if engine.fixed_model_scale else engine.canonical_scale(
             scale_value=cfg.get("scale"), upscale_factor_value=cfg.get("upscale_factor"))
         requested = float(cfg.get("upscale_factor") or model_scale)
         if bool(cfg.get("use_resolution_tab", True)) and seed_controls.get("upscale_factor_val") is not None:
@@ -564,7 +564,8 @@ def build_video_sr_callbacks(
                             upscale_factor_value=global_scale,
                             default=settings.get("upscale_factor", settings.get("scale", 4)),
                         )
-                        settings["scale"] = str(engine.fixed_model_scale or fixed_scale)
+                        if not engine.fixed_model_scale:
+                            settings["scale"] = str(fixed_scale)
                         settings["upscale_factor"] = float(fixed_scale)
                         if abs(global_scale - float(fixed_scale)) > 0.01:
                             settings["_scale_clamp_note"] = (

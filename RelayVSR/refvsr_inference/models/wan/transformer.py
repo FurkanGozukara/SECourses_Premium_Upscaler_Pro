@@ -66,7 +66,14 @@ class WanSelfAttentionKVCache:
     key_value: tuple[torch.Tensor, torch.Tensor] | None = None
     tokens_per_frame: int | None = None
     next_frame: int = 0
-    _storage: tuple[torch.Tensor, torch.Tensor] | None = None
+    _storage: tuple[torch.Tensor, ...] | None = None
+    quantized: bool = False
+
+    def move_storage(self, storage: tuple[torch.Tensor, ...]) -> None:
+        self._storage = storage
+        if self.key_value is not None:
+            valid = self.key_value[0].shape[1]
+            self.key_value = storage[0][:, :valid], storage[1][:, :valid]
 
     def update(
         self, key: torch.Tensor, value: torch.Tensor, frame_index: int
@@ -79,23 +86,41 @@ class WanSelfAttentionKVCache:
         if self._storage is None:
             self.tokens_per_frame = tokens
             shape = (b, self.window_size * tokens, heads, dim)
-            self._storage = key.new_empty(shape), value.new_empty(shape)
-        cached_key, cached_value = self._storage
+            if self.quantized:
+                scale_shape = (*shape[:-1], 1)
+                self._storage = (
+                    key.new_empty(shape, dtype=torch.int8), value.new_empty(shape, dtype=torch.int8),
+                    key.new_empty(scale_shape), value.new_empty(scale_shape),
+                )
+            else:
+                self._storage = key.new_empty(shape), value.new_empty(shape)
+        cached_key, cached_value = self._storage[:2]
         if (
             self.tokens_per_frame != tokens
             or cached_key.shape[0] != b
             or cached_key.shape[2:] != key.shape[2:]
             or cached_key.device != key.device
-            or cached_key.dtype != key.dtype
+            or self._storage[-1].dtype != key.dtype
         ):
             raise ValueError("Streaming KV cache shape, device and dtype must remain constant.")
         start = (frame_index % self.window_size) * tokens
-        cached_key[:, start : start + tokens].copy_(key.detach())
-        cached_value[:, start : start + tokens].copy_(value.detach())
+        slot = slice(start, start + tokens)
         valid_tokens = min(frame_index + 1, self.window_size) * tokens
-        self.key_value = cached_key[:, :valid_tokens], cached_value[:, :valid_tokens]
+        if self.quantized:
+            for current, codes, scales in zip((key, value), self._storage[:2], self._storage[2:]):
+                current = current.detach().float()
+                scale = current.abs().amax(dim=-1, keepdim=True).div_(127).clamp_min_(torch.finfo(key.dtype).tiny)
+                scales[:, slot].copy_(scale)
+                codes[:, slot].copy_(current.div_(scale).round_().clamp_(-127, 127))
+            result = tuple(codes[:, :valid_tokens].to(key.dtype).mul_(scales[:, :valid_tokens])
+                           for codes, scales in zip(self._storage[:2], self._storage[2:]))
+        else:
+            cached_key[:, slot].copy_(key.detach())
+            cached_value[:, slot].copy_(value.detach())
+            self.key_value = cached_key[:, :valid_tokens], cached_value[:, :valid_tokens]
+            result = self.key_value
         self.next_frame += 1
-        return self.key_value
+        return result
 
 
 @dataclass(frozen=True)
@@ -1097,7 +1122,7 @@ class WanTransformer3DModel(
             device=device,
         )
 
-    def build_lq_proj(self):
+    def build_lq_proj(self, upscale_factor: int = 4):
         from .lq_proj import LQ4xProj
 
         return LQ4xProj(
@@ -1105,6 +1130,7 @@ class WanTransformer3DModel(
             out_dim=self.config.num_attention_heads * self.config.attention_head_dim,
             hidden_dim1=self.config.lq_proj_hidden_dim1,
             hidden_dim2=self.config.lq_proj_hidden_dim2,
+            unshuffle=4 * upscale_factor,
         )
 
     def create_streaming_state(
@@ -1112,6 +1138,7 @@ class WanTransformer3DModel(
         *,
         kv_cache_window_size: int = -1,
         conditioning_cache: WanConditioningCache | None = None,
+        quantized_kv: bool = False,
     ) -> WanStreamingState:
         """Create an empty KV cache for one timestep and video batch."""
         if not self.config.use_block_causal_attention:
@@ -1135,7 +1162,7 @@ class WanTransformer3DModel(
                 "Streaming requires 1 <= temporal_context_frames <= training_frames <= rope_max_seq_len."
             )
         return WanStreamingState(
-            block_caches=[WanSelfAttentionKVCache(window_size=window) for _ in self.blocks],
+            block_caches=[WanSelfAttentionKVCache(window_size=window, quantized=quantized_kv) for _ in self.blocks],
             conditioning_cache=conditioning_cache,
         )
 

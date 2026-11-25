@@ -27,6 +27,8 @@ import gc
 import json
 import logging
 import os
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -641,12 +643,17 @@ class H3AudioVAE:
 
 
 class H3LatentUpscaler:
-    def __init__(self, path: str, device: torch.device, emit: Emit = None):
+    def __init__(self, path: str, device: torch.device, emit: Emit = None, sharpness: int = 0):
+        self.dtype = mm.vae_dtype(device, [torch.float16, torch.bfloat16, torch.float32])
+        self.device = device
+        self.sharpness = sharpness
+        if sharpness:
+            self.model = self._load_2d(emit)
+            return
         _emit(emit, f"Loading H3 latent upscaler: {path}")
         sd = comfy.utils.load_torch_file(str(path), safe_load=True)
         if not ("in_blocks.0.emb_layers.1.weight" in sd and "conv_in.weight" in sd and "in_blocks.1.dwconv.weight" in sd):
             raise RuntimeError("This file is not the MiniMax H3 3D-conv latent upscaler.")
-        self.dtype = mm.vae_dtype(device, [torch.float16, torch.bfloat16, torch.float32])
         self.model = MiniMaxH3LatentUpscaler(
             in_channels=sd["conv_in.weight"].shape[1],
             channels=sd["conv_in.weight"].shape[0],
@@ -658,7 +665,32 @@ class H3LatentUpscaler:
         )
         self.model.load_state_dict(sd, strict=False)
         self.model = self.model.to(self.dtype).eval().requires_grad_(False)
-        self.device = device
+
+    def _load_2d(self, emit: Emit):
+        from huggingface_hub import hf_hub_download
+        from shared.open_h3_constants import (
+            OPENH3_2D_WEIGHTS_FILE, OPENH3_2D_WEIGHTS_REPO, OPENH3_2D_WEIGHTS_REVISION,
+            OPENH3_UPSAMPLER_REVISION,
+        )
+        from tools.experimental_vsr_inference import ensure_source
+
+        assets = Path(__file__).resolve().parents[2] / "experimental_models"
+        revision = OPENH3_UPSAMPLER_REVISION
+        source = assets / "source" / f"h3-upsampler-{revision}"
+        ensure_source("sandpies/ComfyUI-H3-Video-Upsampler", revision, source, "tiled_upsampler.py")
+        spec = spec_from_file_location("openh3_latent_resize", source / "tiled_upsampler.py")
+        upstream = module_from_spec(spec)
+        spec.loader.exec_module(upstream)
+        _emit(emit, f"Loading H3 2D latent upscaler at sharpness tier {self.sharpness}.")
+        weight = hf_hub_download(
+            OPENH3_2D_WEIGHTS_REPO, OPENH3_2D_WEIGHTS_FILE,
+            revision=OPENH3_2D_WEIGHTS_REVISION, local_dir=assets / "openh3",
+        )
+        state = comfy.utils.load_torch_file(weight, safe_load=True)
+        with torch.device("meta"):
+            model = upstream.LatentUpscaler2D(state)
+        model.load_state_dict(state, strict=True, assign=True)
+        return model.to(self.dtype).eval().requires_grad_(False)
 
     @torch.no_grad()
     def upscale(self, video: torch.Tensor, latent_h: int, latent_w: int) -> torch.Tensor:
@@ -667,7 +699,8 @@ class H3LatentUpscaler:
         if size == tuple(video.shape[2:]):
             return video
         self.model.to(self.device)
-        out = self.model(video.to(device=self.device, dtype=self.dtype), size)
+        video = video.to(device=self.device, dtype=self.dtype)
+        out = self.model(video, size, tier=self.sharpness) if self.sharpness else self.model(video, size)
         return out.float().cpu()
 
     def offload(self) -> None:

@@ -58,6 +58,7 @@ class OpenH3Settings:
     decode_vae_path: str = ""          # empty = same file as vae_path
     audio_vae_path: str = ""
     upscaler_path: str = ""
+    latent_upscale_sharpness: int = 0
     lora_path: str = ""
     curve_path: str = ""
     table_path: str = ""
@@ -86,6 +87,7 @@ class OpenH3Settings:
     sparse_end_percent: float = 0.9
     sparse_dense_steps: int = -1       # -1 = start/end percent window; N >= 0 = first N refine steps dense, rest sparse
     second_pass_sigma: float = 0.0     # > 0: refine the refined latent again at the same size from this noise level
+    refine_tile_px: int = 0
     dense_blocks: str = "0,1,49"
     sparse_min_tokens: int = 12288
     sparse_extra_tokens: int = 256
@@ -392,7 +394,7 @@ class OpenH3Pipeline:
 
     @torch.no_grad()
     def _refine(self, model, dtype, base_options, patch, context, tags, video0: torch.Tensor,
-                audio0: torch.Tensor, seed: int, step_cb, start_sigma=None) -> torch.Tensor:
+                audio0: torch.Tensor, seed: int, step_cb, start_sigma=None, noise_override=None) -> torch.Tensor:
         s = self.s
         device = self.device
         start = float(s.start_sigma) if start_sigma is None else float(start_sigma)
@@ -407,8 +409,11 @@ class OpenH3Pipeline:
                 patch.sigma_start = float(sigmas[k - 1] + sigmas[k]) / 2.0
             else:
                 patch.sigma_start = -1.0
-        generator = torch.manual_seed(int(seed))  # comfy.sample.prepare_noise: video stream first
-        noise = torch.randn(video0.size(), dtype=torch.float32, generator=generator, device="cpu")
+        if noise_override is None:
+            generator = torch.manual_seed(int(seed))  # comfy.sample.prepare_noise: video stream first
+            noise = torch.randn(video0.size(), dtype=torch.float32, generator=generator, device="cpu")
+        else:
+            noise = noise_override
         x0 = video0.to(device, torch.float32)
         x = float(sigmas[0]) * noise.to(device) + (1.0 - float(sigmas[0])) * x0  # CONST.noise_scaling
         del noise
@@ -440,6 +445,44 @@ class OpenH3Pipeline:
         if patch is not None:
             patch.reset()
         return x.float().cpu()
+
+    def _refine_window(self, model, dtype, options, patch, context, tags, video, audio, seed, step_cb,
+                       start_sigma=None):
+        # H3's VAE downsamples each spatial axis by 16. Keep tiles aligned to the 2×2 DiT patch grid.
+        size = self.s.refine_tile_px // 32 * 2
+        height, width = video.shape[-2:]
+        if size <= 8 or max(height, width) <= size:
+            return self._refine(model, dtype, options, patch, context, tags, video, audio, seed, step_cb, start_sigma)
+        overlap = 8
+
+        def starts(length):
+            return list(range(0, max(1, length - overlap), size - overlap))
+
+        def weight(length, offset, extent):
+            ramp = torch.ones(length, dtype=torch.float32)
+            blend = torch.arange(1, min(length, overlap) + 1, dtype=torch.float32) / (overlap + 1)
+            if offset:
+                ramp[:len(blend)] *= blend
+            if offset + length < extent:
+                ramp[-len(blend):] *= blend.flip(0)
+            return ramp
+
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        noise = torch.randn(video.shape, dtype=torch.float32, generator=generator, device="cpu")
+        output = torch.zeros_like(noise)
+        weight_sum = torch.zeros((height, width), dtype=torch.float32)
+        tiles = [(y, x) for y in starts(height) for x in starts(width)]
+        for index, (y, x) in enumerate(tiles):
+            h, w = min(size, height - y), min(size, width - x)
+            self.line(f"Guided refine tile {index + 1}/{len(tiles)} ({w * 16}x{h * 16})")
+            cut = (..., slice(y, y + h), slice(x, x + w))
+            tile = self._refine(model, dtype, options, patch, context, tags, video[cut], audio, seed,
+                                step_cb if index + 1 == len(tiles) else lambda _: None,
+                                start_sigma, noise_override=noise[cut])
+            feather = weight(h, y, height)[:, None] * weight(w, x, width)[None, :]
+            output[cut] += tile * feather
+            weight_sum[y:y + h, x:x + w] += feather
+        return output.div_(weight_sum)
 
     # -------------------------------------------------------------- plan
     def plan(self):
@@ -717,7 +760,9 @@ def run_many(pipelines: List["OpenH3Pipeline"], progress: Optional[OpenH3Progres
         t0 = time.time()
         vae = loader_mod.H3VideoVAE(s0.vae_path, device, emit=line)
         needs_upscaler = any(info[4].passes for _i, _p, info in jobs)
-        upscaler = loader_mod.H3LatentUpscaler(s0.upscaler_path, device, emit=line) if needs_upscaler else None
+        upscaler = loader_mod.H3LatentUpscaler(
+            s0.upscaler_path, device, emit=line, sharpness=s0.latent_upscale_sharpness,
+        ) if needs_upscaler else None
         for i, p, info in jobs:
             indices, fps, has_audio, is_image, geometry, plan, _max_tokens, _lines = info
             try:
@@ -792,14 +837,14 @@ def run_many(pipelines: List["OpenH3Pipeline"], progress: Optional[OpenH3Progres
                             weights_now = torch.cuda.memory_allocated(device)
                         failed = None
                         try:
-                            out = p._refine(model, dtype, options, patch, context_dev, tags, latent, audio[w_index],
+                            out = p._refine_window(model, dtype, options, patch, context_dev, tags, latent, audio[w_index],
                                             int(p.s.seed) + w_index, _cb)
                             if float(p.s.second_pass_sigma) > 0:
                                 # same size again from a lower noise level (Open-H3 4K ladder: 0.7, then 0.6)
                                 if patch is not None:
                                     patch.reset()
                                 first_steps = len(core.refine_sigmas(int(p.s.steps), float(p.s.start_sigma))) - 1
-                                out = p._refine(model, dtype, options, patch, context_dev, tags, out, audio[w_index],
+                                out = p._refine_window(model, dtype, options, patch, context_dev, tags, out, audio[w_index],
                                                 int(p.s.seed) + w_index, lambda st: _cb(first_steps + st),
                                                 start_sigma=float(p.s.second_pass_sigma))
                             break

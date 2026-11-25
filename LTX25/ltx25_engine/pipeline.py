@@ -76,6 +76,7 @@ class Ltx25Settings:
     fps_override: float = 0.0             # 0 = keep source fps
     start_frame: int = 0
     end_frame: int = -1                   # -1 = all
+    hdr_input_space: str = ""
 
     # Output encode (final app-level re-encode may follow)
     codec: str = "libx264"
@@ -258,7 +259,8 @@ class Ltx25Pipeline:
         )
         self.model = model
 
-        self.vae = Ltx25VideoVae(s.video_vae_path, self.device, self.dtype)
+        vae_dtype = torch.float32 if s.hdr_input_space else self.dtype
+        self.vae = Ltx25VideoVae(s.video_vae_path, self.device, vae_dtype)
         self.progress.line(f"Models ready in {time.time() - start:.1f}s")
 
         # Run the embedding connectors once per prompt (ComfyUI does this in
@@ -522,7 +524,9 @@ class Ltx25Pipeline:
                     f" (window {plan.chunk_length})"
                 )
 
-                chunk_float = frames_u8[start:start + keep_length].to(torch.float32) / 255.0
+                chunk_float = frames_u8[start:start + keep_length].to(torch.float32)
+                if frames_u8.dtype == torch.uint8:
+                    chunk_float = chunk_float / 255.0
                 chunk_float = planner_mod.slice_chunk(
                     chunk_float, 0, keep_length, plan.chunk_length
                 )
@@ -625,7 +629,10 @@ class Ltx25Pipeline:
                 pixels = pixels[:plan.chunk_length, : plan.output_height, : plan.output_width, :]
                 if writer is None:
                     writer = make_writer(plan)
-                    merger = StreamingChunkMerger(writer, plan.overlap_frames, out_total)
+                    if s.hdr_input_space and spec.final:
+                        merger = StreamingChunkMerger(writer, plan.overlap_frames, out_total, convert=lambda frames: frames)
+                    else:
+                        merger = StreamingChunkMerger(writer, plan.overlap_frames, out_total)
                 assert merger is not None
                 merger.add_chunk(
                     pixels, keep_length, is_last=(chunk_index == plan.chunk_count - 1)
@@ -656,7 +663,17 @@ class Ltx25Pipeline:
         # Save VRAM: never ask for more than (free now - Save VRAM); no shared GPU memory.
         loader_mod.apply_vram_cap(self.device, float(s.reserve_vram_gb), emit=self.progress.line)
 
-        frames_u8, src_fps, has_audio = read_video_frames(s.input_path)
+        if s.hdr_input_space:
+            from .hdr_io import HdrWriter, read_exr_sequence
+
+            if s.preclean_lora_path or s.pre_resize_longer_edge:
+                raise ValueError("HDR restore expects the original EXR canvas without an SDR pre-clean pass.")
+            frames_u8 = read_exr_sequence(s.input_path, s.hdr_input_space)
+            src_fps, has_audio = float(s.fps_override), False
+            if src_fps <= 0:
+                raise ValueError("Specify the frame rate of the EXR sequence.")
+        else:
+            frames_u8, src_fps, has_audio = read_video_frames(s.input_path)
         fps = float(s.fps_override) if float(s.fps_override or 0) > 0 else src_fps
         start_f = max(0, int(s.start_frame))
         end_f = int(s.end_frame)
@@ -743,6 +760,9 @@ class Ltx25Pipeline:
         # VAE/sampling work leaves an audio-only MP4 when inference fails early; older runner
         # code then mistook that artifact for a successful video and entered concat fallbacks.
         def _make_writer(p: planner_mod.ChunkPlan) -> FfmpegWriter:
+            if s.hdr_input_space:
+                return HdrWriter(s.output_path, p.output_width, p.output_height, fps, crf=s.crf,
+                                 source=frames_u8[:out_total])
             return FfmpegWriter(
                 s.output_path,
                 width=p.output_width,

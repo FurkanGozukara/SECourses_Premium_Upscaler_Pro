@@ -143,6 +143,8 @@ def _codec_video_args(codec: str, crf: int, preset: str, pixel_format: str) -> l
     """Encoder arguments for the CPU / ProRes codecs this writer has always written."""
     args = ["-c:v", codec]
     if codec in ("libx264", "libx265"):
+        if str(preset).lower() in {f"p{n}" for n in range(1, 8)}:
+            preset = "medium"
         args += ["-crf", str(int(crf)), "-preset", str(preset)]
     elif codec == "libsvtav1":
         args += ["-crf", str(int(crf)), "-preset", "8"]
@@ -169,7 +171,8 @@ class FfmpegWriter:
 
     def __init__(self, output_path: str, width: int, height: int, fps, audio_source: Optional[str] = None,
                  codec: str = "libx264", crf: int = 15, preset: str = "medium", pixel_format: str = "yuv420p",
-                 audio_offset_s: float = 0.0, video_args: str = ""):
+                 audio_offset_s: float = 0.0, video_args: str = "", audio_duration_s: Optional[float] = None,
+                 output_size: Optional[tuple[int, int]] = None):
         self.output_path = str(output_path)
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
         head = [find_ffmpeg(), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -177,6 +180,8 @@ class FfmpegWriter:
         if audio_source:
             if audio_offset_s > 0:
                 head += ["-ss", f"{audio_offset_s:.6f}"]
+            if audio_duration_s is not None and audio_duration_s > 0:
+                head += ["-t", f"{audio_duration_s:.6f}"]
             head += ["-i", str(audio_source), "-map", "0:v:0", "-map", "1:a:0?"]
         tail = []
         if audio_source:
@@ -206,7 +211,7 @@ class FfmpegWriter:
             if nv_key:
                 cpu = str(nvenc_cpu_fallback_encoder(nv_key))
                 cpu_video = _codec_video_args(cpu, crf, preset, pixel_format)
-                nv_args, reason = resolve_nvenc_video_args(nv_key, crf, pixel_format, preset, width, height)
+                nv_args, reason = resolve_nvenc_video_args(nv_key, crf, pixel_format, preset, *(output_size or (width, height)))
                 if nv_args:
                     video = nv_args
                     self._fallback_video, self._fallback_label = cpu_video, cpu
@@ -216,6 +221,12 @@ class FfmpegWriter:
                     video = cpu_video
             else:
                 video = _codec_video_args(codec, crf, preset, pixel_format)
+        if output_size and tuple(output_size) != (width, height):
+            target_w, target_h = output_size
+            scale = ["-vf", f"scale={target_w}:{target_h}:flags=lanczos"]
+            video = scale + video
+            if self._fallback_video:
+                self._fallback_video = scale + self._fallback_video
         # NVENC: keep the frames until the encoder runs, so a failed start can be redone on the CPU.
         self._pending: Optional[list] = [] if self._fallback_video else None
         self._pending_bytes = 0

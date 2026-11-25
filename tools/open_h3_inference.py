@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decode_vae", default="")
     p.add_argument("--audio_vae", required=True)
     p.add_argument("--upscaler", required=True)
+    p.add_argument("--latent_upscale_sharpness", type=int, choices=range(7), default=0,
+                   help="Use the standard 3D upscaler at 0 or select a 2D sharpness tier from 1 to 6")
     p.add_argument("--lora", required=True)
     p.add_argument("--curves", default="")
     p.add_argument("--table", default="")
@@ -74,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--second_pass_sigma", type=float, default=0.0,
                    help="> 0: refine each window a second time at the same size from this noise level "
                         "(experimental: at 4K a 0.7 + 0.6 ladder added grain and changed objects, so it is off)")
+    p.add_argument("--refine_tile_px", type=int, default=0, help="Guided spatial refine tile edge in pixels (0 = whole frame)")
+    p.add_argument("--small_face_redraw", action="store_true", help="Re-draw tracked small faces as close-ups")
     p.add_argument("--dense_blocks", default="0,1,49")
     p.add_argument("--sparse_min_tokens", type=int, default=12288)
     p.add_argument("--sparse_extra_tokens", type=int, default=256)
@@ -137,6 +141,7 @@ def main() -> int:
         input_path=args.input, output_path=args.output, dit_path=args.dit, text_encoder_path=args.text_encoder,
         vae_path=args.vae, decode_vae_path=args.decode_vae, audio_vae_path=args.audio_vae,
         upscaler_path=args.upscaler, lora_path=args.lora, curve_path=args.curves, table_path=args.table,
+        latent_upscale_sharpness=args.latent_upscale_sharpness,
         cache_dir=args.cache_dir, prompt=prompt, seed=args.seed, steps=args.steps, start_sigma=args.start_sigma,
         lora_strength=args.lora_strength, curve_strength=args.curve_strength,
         target_width=args.target_width, target_height=args.target_height, draft_size=args.draft_size,
@@ -144,6 +149,7 @@ def main() -> int:
         audio_mode=args.audio_mode, start_frame=args.start_frame, end_frame=args.end_frame,
         sparse_attention=not args.no_sparse, sparse_tau=args.sparse_tau, sparse_end_percent=args.sparse_end_percent,
         sparse_dense_steps=args.sparse_dense_steps, second_pass_sigma=args.second_pass_sigma,
+        refine_tile_px=args.refine_tile_px,
         dense_blocks=args.dense_blocks, sparse_min_tokens=args.sparse_min_tokens,
         sparse_extra_tokens=args.sparse_extra_tokens, sink_conditioning=args.sink_conditioning,
         ffn_chunk_tokens=args.ffn_chunk_tokens, reserve_vram_gb=args.reserve_vram_gb,
@@ -174,6 +180,12 @@ def main() -> int:
             emit(f"[Plan] {line}")
         return 0
 
+    def finish_faces(pipeline, output):
+        if args.small_face_redraw and output and "decode" in stages:
+            from open_h3_face_redraw import apply_small_face_redraw
+            return apply_small_face_redraw(pipeline, str(output), APP_DIR / "experimental_models/source")
+        return output
+
     if args.batch_json:
         import dataclasses
         import json
@@ -189,6 +201,7 @@ def main() -> int:
         started = time.time()
         try:
             results = run_many(pipelines, OpenH3Progress(on_line=emit), stages=stages, work_dir=work_dir)
+            results = [(finish_faces(pipeline, out), error) for pipeline, (out, error) in zip(pipelines, results)]
         except KeyboardInterrupt:
             emit("[OpenH3] Cancelled by user")
             return 130
@@ -210,6 +223,7 @@ def main() -> int:
         output, error = run_many([pipeline], pipeline.progress, stages=stages, work_dir=work_dir)[0]
         if error is not None:
             raise error
+        output = finish_faces(pipeline, output)
     except KeyboardInterrupt:
         emit("[OpenH3] Cancelled by user")
         return 130

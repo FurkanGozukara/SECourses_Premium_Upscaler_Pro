@@ -175,10 +175,11 @@ def to_uint8(frames_float: torch.Tensor) -> torch.Tensor:
 class StreamingChunkMerger:
     """LTX25MergeVideoChunks cross-fade with immediate flush of settled frames."""
 
-    def __init__(self, writer: FfmpegWriter, overlap_frames: int, total_frames: int):
+    def __init__(self, writer: FfmpegWriter, overlap_frames: int, total_frames: int, convert=to_uint8):
         self.writer = writer
         self.overlap = int(overlap_frames)
         self.total = int(total_frames)
+        self.convert = convert
         self.tail: Optional[torch.Tensor] = None  # float frames still blendable
         self.emitted = 0
 
@@ -189,7 +190,7 @@ class StreamingChunkMerger:
         if remaining <= 0:
             return
         frames_float = frames_float[:remaining]
-        self.writer.write(to_uint8(frames_float))
+        self.writer.write(self.convert(frames_float))
         self.emitted += frames_float.shape[0]
 
     def add_chunk(self, images_float: torch.Tensor, keep_length: int, is_last: bool) -> None:

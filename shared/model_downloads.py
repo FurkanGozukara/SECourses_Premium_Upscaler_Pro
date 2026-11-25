@@ -127,8 +127,10 @@ def run_model_downloader(
     arguments: Sequence[str],
     on_progress: ProgressCallback = None,
     cancel_event=None,
+    *,
+    script_path: Path | None = None,
 ) -> tuple[bool, str]:
-    """Run the downloader one folder above the app and stream every line.
+    """Stream a model download subprocess, using the bundle downloader by default.
 
     When ``cancel_event`` (a threading.Event) is set mid-download the
     downloader process tree is terminated and (False, "Cancelled by user")
@@ -136,7 +138,7 @@ def run_model_downloader(
     resumes where it stopped.
     """
     app_dir = Path(base_dir).resolve()
-    downloader_path = app_dir.parent / "Models_Downloader.py"
+    downloader_path = script_path or app_dir.parent / "Models_Downloader.py"
     if not downloader_path.is_file():
         error = f"Model downloader not found: {downloader_path}"
         _emit(f"[Model Downloader] ERROR: {error}", on_progress)
@@ -526,16 +528,23 @@ def ensure_relayvsr_model(
 ) -> tuple[bool, str]:
     """RelayVSR: the selected Wan file and the Flash decoder in RelayVSR_Models (our mirror first)."""
     from shared.relayvsr_constants import (
-        RELAYVSR_FLASH_FILE,
         RELAYVSR_MODELS_DIRNAME,
+        RELAYVSR_WAN_2X,
         RELAYVSR_WAN_DEFAULT,
         RELAYVSR_WAN_FILES,
+        relayvsr_flash_file,
     )
 
     wan_model = wan_model if wan_model in RELAYVSR_WAN_FILES else RELAYVSR_WAN_DEFAULT
     models_dir = Path(base_dir) / RELAYVSR_MODELS_DIRNAME
-    if _all_files_exist([models_dir / RELAYVSR_WAN_FILES[wan_model], models_dir / RELAYVSR_FLASH_FILE]):
+    if _all_files_exist([models_dir / RELAYVSR_WAN_FILES[wan_model], models_dir / relayvsr_flash_file(wan_model)]):
         return True, ""
+    if wan_model == RELAYVSR_WAN_2X:
+        app_dir = Path(base_dir).resolve()
+        return run_model_downloader(
+            app_dir, [str(app_dir / RELAYVSR_MODELS_DIRNAME)], on_progress, cancel_event=cancel_event,
+            script_path=app_dir / "tools" / "download_relayvsr_native.py",
+        )
     return run_model_downloader(base_dir, ["--ensure-relayvsr", wan_model], on_progress, cancel_event=cancel_event)
 
 

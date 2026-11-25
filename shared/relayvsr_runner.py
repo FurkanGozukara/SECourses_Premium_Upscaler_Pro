@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .command_logger import get_command_logger
+from .fixed_scale_output import fixed_scale_target
 from .ltx25_runner import _build_env, _format_command_for_log, _probe_ltx25_video, _resolve_python_executable, _stream_process
 from .open_h3_runner import _popen, _resolve_device
 from .path_utils import (
@@ -22,13 +23,14 @@ from .path_utils import (
     resolve_output_location,
 )
 from .relayvsr_constants import (
-    RELAYVSR_FLASH_FILE,
     RELAYVSR_MODELS_DIRNAME,
     RELAYVSR_WAN_DEFAULT,
     RELAYVSR_WAN_FILES,
     RELAYVSR_WINDOW_DEFAULT,
     RELAYVSR_WINDOW_MAX,
     RELAYVSR_WINDOW_MIN,
+    relayvsr_flash_file,
+    relayvsr_model_scale,
 )
 from .video_codec_options import engine_encoder_for_run, is_nvenc_codec, parse_custom_video_args, video_output_suffix
 from .vram_autotune.common import apply_vram_cap_env, is_tight
@@ -64,8 +66,9 @@ def _int(value: Any, default: int) -> int:
 
 def model_paths(base_dir: Path, settings: Dict[str, Any]) -> Dict[str, Path]:
     models = Path(base_dir) / RELAYVSR_MODELS_DIRNAME
-    wan = RELAYVSR_WAN_FILES.get(str(settings.get("wan_model") or ""), RELAYVSR_WAN_FILES[RELAYVSR_WAN_DEFAULT])
-    return {"wan": models / wan, "flash": models / RELAYVSR_FLASH_FILE}
+    name = str(settings.get("wan_model") or RELAYVSR_WAN_DEFAULT)
+    wan = RELAYVSR_WAN_FILES.get(name, RELAYVSR_WAN_FILES[RELAYVSR_WAN_DEFAULT])
+    return {"wan": models / wan, "flash": models / relayvsr_flash_file(name)}
 
 
 def build_command(python_exe: str, script: Path, settings: Dict[str, Any], paths: Dict[str, Path], input_path: str,
@@ -89,6 +92,14 @@ def build_command(python_exe: str, script: Path, settings: Dict[str, Any], paths
         "--pixel_format", str(settings.get("pixel_format") or "yuv420p"),
     ]
     video_args = custom_video_args_text(settings)
+    if settings.get("int8_kv_cache"):
+        cmd.append("--int8_kv_cache")
+    if settings.get("fp8_wan"):
+        cmd.append("--fp8_wan")
+    if settings.get("temporal_resume_dir"):
+        cmd += ["--temporal_resume_dir", normalize_path(settings["temporal_resume_dir"])]
+        if settings.get("_original_input_path_before_preprocess"):
+            cmd += ["--resume_source", normalize_path(settings["_original_input_path_before_preprocess"])]
     if video_args:
         cmd += ["--video_args", video_args]
     try:
@@ -147,6 +158,7 @@ def run_relayvsr(
         if not effective or not Path(effective).exists():
             return RelayVSRResult(1, None, "Invalid input path")
         is_image = detect_input_type(original or effective) == "image"
+        model_scale = relayvsr_model_scale(str(settings.get("wan_model") or ""))
         paths = model_paths(base_dir, settings)
         if not all(p.is_file() for p in paths.values()):
             from .model_downloads import ensure_relayvsr_model
@@ -170,16 +182,25 @@ def run_relayvsr(
         if gpu_note:
             log(gpu_note)
         if not is_image and is_nvenc_codec(settings.get("codec")) and not custom_video_args_text(settings):
-            # NVENC is checked here for the 4x output size and this run's GPU; the CPU encoder when it cannot.
+            # Probe NVENC at the native output size for this checkpoint and GPU.
             dims = None
             with suppress(Exception):
                 dims = get_media_dimensions(effective)
             settings["codec"] = engine_encoder_for_run(
                 settings.get("codec"), settings.get("crf"), settings.get("pixel_format"), settings.get("video_preset"),
-                width=int(dims[0]) * 4 if dims else None, height=int(dims[1]) * 4 if dims else None,
+                width=int(dims[0]) * model_scale if dims else None, height=int(dims[1]) * model_scale if dims else None,
                 gpu=visible_gpu, log=log, tag=TAG)
         cmd = build_command(python_exe, script, settings, paths, effective, output_file)
-        log(f"Running RelayVSR 4x ({settings.get('wan_model') or RELAYVSR_WAN_DEFAULT}, window "
+        if settings.get("direct_final_size") and not is_image and not custom_video_args_text(settings):
+            size_source = settings.get("_original_input_path_before_preprocess") or original or effective
+            dims = get_media_dimensions(str(size_source))
+            if dims:
+                target = fixed_scale_target(dims, settings.get("upscale_factor"), model_scale,
+                                            settings.get("max_target_resolution"), settings.get("pre_downscale_then_upscale"))
+                if min(target) > 0:
+                    cmd += ["--output_size", *map(str, target)]
+                    log(f"RelayVSR final canvas: {target[0]}x{target[1]} in the first encode")
+        log(f"Running RelayVSR {model_scale}x ({settings.get('wan_model') or RELAYVSR_WAN_DEFAULT}, window "
             f"{settings.get('window_size') or RELAYVSR_WINDOW_DEFAULT})")
         log(f"Command: {_format_command_for_log(cmd)}")
         env = _build_env(Path(base_dir), visible_gpu, log, tag=TAG)

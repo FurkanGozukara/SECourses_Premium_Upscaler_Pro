@@ -241,6 +241,19 @@ def _resize_directory(
         return False, str(exc)
 
 
+def fixed_scale_target(input_size, requested_scale, model_scale, max_edge, pre_downscale, min_side=64):
+    plan = estimate_fixed_scale_upscale_plan_from_dims(
+        int(input_size[0]), int(input_size[1]),
+        requested_scale=_to_float(requested_scale, _to_float(model_scale, 4.0)),
+        model_scale=max(2, _to_int(model_scale, 4)),
+        max_edge=max(0, _to_int(max_edge, 0)),
+        force_pre_downscale=bool(pre_downscale),
+        min_side=max(2, int(min_side or 64)),
+    )
+    return (_floor_even(int(plan.final_saved_width or plan.resize_width or 0)),
+            _floor_even(int(plan.final_saved_height or plan.resize_height or 0)))
+
+
 def enforce_fixed_scale_output_size(
     *,
     output_path: Any,
@@ -276,20 +289,12 @@ def enforce_fixed_scale_output_size(
         return str(out_path), False, f"Could not read source dimensions: {src_path}"
 
     try:
-        plan = estimate_fixed_scale_upscale_plan_from_dims(
-            int(source_dims[0]),
-            int(source_dims[1]),
-            requested_scale=_to_float(requested_scale, _to_float(model_scale, 4.0)),
-            model_scale=max(2, _to_int(model_scale, 4)),
-            max_edge=max(0, _to_int(max_edge, 0)),
-            force_pre_downscale=bool(pre_downscale_then_upscale),
-            min_side=max(2, int(min_side or 2)),
+        target_w, target_h = fixed_scale_target(
+            source_dims, requested_scale, model_scale, max_edge, pre_downscale_then_upscale, min_side,
         )
     except Exception as exc:
         return str(out_path), False, f"Could not build final-size plan: {exc}"
 
-    target_w = _floor_even(int(plan.final_saved_width or plan.resize_width or 0))
-    target_h = _floor_even(int(plan.final_saved_height or plan.resize_height or 0))
     if target_w <= 0 or target_h <= 0:
         return str(out_path), False, "Final-size plan did not produce valid dimensions."
 

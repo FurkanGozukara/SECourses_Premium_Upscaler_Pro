@@ -420,6 +420,7 @@ def seedvr2_defaults(model_name: Optional[str] = None, base_dir: Optional[Path] 
         "auto_transfer_output_to_input": False,
         "save_vram_gb": DEFAULT_SAVE_VRAM_GB,
         "auto_tune_on_run": True,
+        "adaptive_vae_decode": False,
         "skip_first_frames": 0,
         "load_cap": 0,
         "prepend_frames": 0,
@@ -702,6 +703,7 @@ SEEDVR2_ORDER: List[str] = [
     "int8_convrot",
     # Apply Auto Tune automatically at the start of every Upscale.
     "auto_tune_on_run",
+    "adaptive_vae_decode",
 ]
 
 
@@ -804,6 +806,7 @@ def _enforce_seedvr2_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any], s
         cfg.get("auto_tune_on_run", defaults.get("auto_tune_on_run", True)),
         default=bool(defaults.get("auto_tune_on_run", True)),
     )
+    cfg["adaptive_vae_decode"] = _coerce_bool(cfg.get("adaptive_vae_decode"), default=False)
     
     # Apply model-specific metadata constraints
     model_name = cfg.get("dit_model", "")

@@ -19,11 +19,12 @@ import os
 from typing import Any, Callable, Dict, Optional
 
 from .common import TunePlan, VramBudget, mark_tightness, probe_media, resolve_budget
+from ..relayvsr_constants import relayvsr_model_scale
 
 RELAYVSR_PROCESS_OVERHEAD_GB = 0.8           # CUDA context + kernels of the engine process
 WAN_BLOCKS = 30
 WAN_FIXED_GB = 0.23
-WAN_BLOCK_GB = {"int8": 0.163, "bf16": 0.305}
+WAN_BLOCK_GB = {"int8": 0.163, "bf16": 0.305, "fp8": 0.17}
 FLASH_GB = 0.13
 KV_FRAMES, HIDDEN, KV_BYTES = 4, 3072, 2
 ACT_BASE_GB, ACT_GB_PER_OUT_MP = 0.4, 0.25  # measured 0.74 GB at 2.1 MP, 2.34 GB at 8.3 MP output (peak - weights - KV)
@@ -36,52 +37,62 @@ def wan_kind(settings_or_name: Any) -> str:
     return "bf16" if "bf16" in str(name or "").lower() else "int8"
 
 
-def kv_block_gb(out_w: int, out_h: int) -> float:
+def kv_block_gb(out_w: int, out_h: int, int8_kv_cache: bool = False) -> float:
     tokens = math.ceil(out_h / 32) * math.ceil(out_w / 32)
-    return tokens * KV_FRAMES * HIDDEN * 2 * KV_BYTES / GIB
+    bytes_per_token = HIDDEN + 24 * KV_BYTES if int8_kv_cache else HIDDEN * KV_BYTES
+    return tokens * KV_FRAMES * bytes_per_token * 2 / GIB
 
 
 def activation_gb(out_w: int, out_h: int) -> float:
     return ACT_BASE_GB + ACT_GB_PER_OUT_MP * out_w * out_h / 1e6
 
 
-def blocks_on_gpu(cap_gb: float, kind: str, out_w: int, out_h: int) -> int:
+def blocks_on_gpu(cap_gb: float, kind: str, out_w: int, out_h: int, int8_kv_cache: bool = False) -> int:
     """Wan blocks (weights + KV cache) that fit in cap_gb next to everything else."""
     fixed = FLASH_GB + WAN_FIXED_GB + activation_gb(out_w, out_h) + SAFETY_GB
-    per = WAN_BLOCK_GB[kind] + kv_block_gb(out_w, out_h)
+    if int8_kv_cache:
+        fixed += kv_block_gb(out_w, out_h)  # Dequantized K/V of the active block.
+    per = WAN_BLOCK_GB[kind] + kv_block_gb(out_w, out_h, int8_kv_cache)
     return max(0, min(WAN_BLOCKS, int(math.floor((cap_gb - fixed) / per))))
 
 
-def peak_gb(kind: str, out_w: int, out_h: int, resident: int) -> float:
-    per = WAN_BLOCK_GB[kind] + kv_block_gb(out_w, out_h)
+def peak_gb(kind: str, out_w: int, out_h: int, resident: int, int8_kv_cache: bool = False) -> float:
+    per = WAN_BLOCK_GB[kind] + kv_block_gb(out_w, out_h, int8_kv_cache)
     streamed = 1 if resident < WAN_BLOCKS else 0     # one streamed block (weights + KV) on the GPU at a time
-    return FLASH_GB + WAN_FIXED_GB + activation_gb(out_w, out_h) + (resident + streamed) * per
+    scratch = kv_block_gb(out_w, out_h) if int8_kv_cache else 0.0
+    return FLASH_GB + WAN_FIXED_GB + activation_gb(out_w, out_h) + (resident + streamed) * per + scratch
 
 
 def plan(settings: Dict[str, Any], *, in_w: int, in_h: int, frames: int, budget: Optional[VramBudget],
          image: bool = False) -> TunePlan:
     out = TunePlan(budget=budget)
-    out_w, out_h = in_w * 4, in_h * 4
+    factor = relayvsr_model_scale(str(settings.get("wan_model") or ""))
+    out_w, out_h = in_w * factor, in_h * factor
     kind = wan_kind(settings)
+    if kind == "bf16" and settings.get("fp8_wan"):
+        kind = "fp8"
+        out.lines.append("FP8 estimate assumes an SM 8.9 or newer CUDA GPU with BF16 compute.")
+    int8_kv_cache = bool(settings.get("int8_kv_cache"))
     if budget is None:
         out.updates["wan_gpu_blocks"] = -1
         out.lines.append("No GPU budget known: every Wan block that fits stays on the GPU (decided at run time).")
         return out
     cap = budget.limit_gb - RELAYVSR_PROCESS_OVERHEAD_GB
-    blocks = blocks_on_gpu(cap, kind, out_w, out_h)
-    out.estimate_gb = peak_gb(kind, out_w, out_h, blocks) + RELAYVSR_PROCESS_OVERHEAD_GB
+    blocks = blocks_on_gpu(cap, kind, out_w, out_h, int8_kv_cache)
+    out.estimate_gb = peak_gb(kind, out_w, out_h, blocks, int8_kv_cache) + RELAYVSR_PROCESS_OVERHEAD_GB
     out.updates["wan_gpu_blocks"] = -1 if blocks >= WAN_BLOCKS else blocks
     out.lines.append(f"Output {out_w}x{out_h} ({out_w * out_h / 1e6:.1f} MP), {'image' if image else f'{frames} frames'}: "
-                     f"Wan KV cache {kv_block_gb(out_w, out_h) * WAN_BLOCKS:.1f} GB, activations "
+                     f"Wan KV cache {kv_block_gb(out_w, out_h, int8_kv_cache) * WAN_BLOCKS:.1f} GB, activations "
                      f"{activation_gb(out_w, out_h):.1f} GB")
     if blocks >= WAN_BLOCKS:
         out.lines.append(f"All {WAN_BLOCKS} Wan blocks and their KV cache on the GPU (fastest)")
     else:
         out.lines.append(f"{blocks}/{WAN_BLOCKS} Wan blocks on the GPU; the rest stay in RAM with their KV cache and are "
                          f"copied to the GPU when Wan runs (once per window: same quality, somewhat slower)")
-    if cap < peak_gb(kind, out_w, out_h, 0):
+    minimum = peak_gb(kind, out_w, out_h, 0, int8_kv_cache)
+    if cap < minimum:
         out.fits = False
-        out.warnings.append(f"this output size needs about {peak_gb(kind, out_w, out_h, 0) + RELAYVSR_PROCESS_OVERHEAD_GB:.1f} GB "
+        out.warnings.append(f"this output size needs about {minimum + RELAYVSR_PROCESS_OVERHEAD_GB:.1f} GB "
                             f"even with Wan streamed from RAM; lower Max Resolution or use pre-downscale")
     return out
 

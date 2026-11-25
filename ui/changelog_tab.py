@@ -11,6 +11,34 @@ import gradio as gr
 # Each entry: (accordion title, markdown body). Newest first.
 CHANGELOG_ENTRIES = [
     (
+        "V10.6 — 25 November 2026 — Native RelayVSR 2×, Restoration Models and Matched Clip Comparisons",
+        """
+**RelayVSR**
+
+- Choose **Native 2x BF16** under Wan Model to run the dedicated 2× model on the full-resolution input. Selecting it sets the local output to 2×. Change the local output factor or re-enable Resolution tab settings whenever you need a different size. The native checkpoint pair downloads on first use.
+- **INT8 Temporal Cache** lowers the memory used by Wan keyframes. In one 4K test it reduced peak GPU memory from 23.0 to 17.8 GiB and added about eight seconds. **FP8 Wan Weights** are available with BF16 checkpoints on supported RTX 40-series and newer GPUs.
+- **Resize in First Encode** writes the requested dimensions in a single encode with standard encoder settings. **Temporal Checkpoint Folder** saves Wan state and completed segments so an interrupted libx264 job can resume.
+
+**FlashVSR and SeedVR2**
+
+- **FlashVSR+ Resident Input** keeps prepared frames in GPU memory when they fit. On the tested 4K clip it cut processing time from 578 to 477 seconds with identical decoded frames and higher VRAM use. **FlashVSR+ FP8 Weights** offers another precision choice on supported GPUs. **Legacy FlashVSR Tiled Stream** uses overlapping tiled windows in v1.1 Tiny and Tiny Long.
+- **Adaptive VAE Time Slices** lets SeedVR2 choose how many latent frames to decode together. It slightly reduced runtime with spatial tiling in both tests. The 1440p pair matched pixel for pixel.
+
+**Experimental Upscalers and Open-H3**
+
+- Try **ReCaVSR**, **ReCaVSR INT8** or **SwiftVR** on videos. ReCaVSR INT8 supports NVIDIA H.264 encoding and was 14–22% faster than ReCaVSR BF16 in the two A6000 tests.
+- Try **VOSR 2.0**, **HEART** and **Row-banded ESRGAN** on still images. Row banding cut peak GPU memory from 15.86 to 2.28 GiB in the 8K ESRGAN test. **SMoVSR** requires a trained checkpoint supplied by the user.
+- **LTX 2.5 HDR Restore** preserves the source grade of an EXR sequence and exports an ACEScg EXR sequence and a 10-bit BT.2020 HLG master.
+- **Open-H3 Regenerate** adds overlapping guided refinement tiles, tracked small-face re-draw and a 2D latent upscaler with six sharpness tiers.
+
+**Chains**
+
+- Choose a start time and duration to compare the current chain with a saved preset on the same segment. The comparison shows both outputs and their render times.
+
+Update through the Windows, RunPod or Massed Compute installer to pull the latest SeedVR2 and FlashVSR engine code.
+""",
+    ),
+    (
         "V10.5 — 23 November 2026 — NVIDIA GPU Video Encoding (NVENC H.265 10-bit, H.264, AV1) and Your Own FFmpeg Arguments in RelayVSR, RIFE and the Final Resize",
         """
 **Videos can now be encoded by the NVIDIA GPU instead of the CPU: much faster runs on cloud GPUs with few vCPUs, where the CPU encoder was the slowest part of the run while the GPU waited.**

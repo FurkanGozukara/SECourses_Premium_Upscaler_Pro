@@ -960,6 +960,12 @@ def run_flashvsr(
                     "--plus_kv_offload", plus_kv_offload,
                     "--plus_tiny_decoder", plus_tiny_decoder,
                 ])
+                if settings.get("plus_resident_frames"):
+                    local_cmd.append("--plus_resident_frames")
+                if settings.get("plus_fp8_weights"):
+                    local_cmd.append("--plus_fp8_weights")
+            elif settings.get("legacy_tiled_stream") and mode in {"tiny", "tiny-long"} and not is_image:
+                local_cmd.append("--legacy_tiled_stream")
             if run_precision == "int8_convrot" and cli_supports_int8_cache_dir:
                 local_cmd.extend(
                     ["--int8_cache_dir", str(base_dir / "FlashVSR_plus" / "models")]

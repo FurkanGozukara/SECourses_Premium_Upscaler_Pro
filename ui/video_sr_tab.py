@@ -135,9 +135,8 @@ def video_sr_tab(
 
     ctx.effective_scale = _effective_scale
 
-    def _model_scale_text(requested) -> str:
-        """The model-pass scale kept in the hidden `scale` state (fixed for RelayVSR, = requested for FlashVSR)."""
-        return str(int(spec.fixed_model_scale or float(requested)))
+    def _model_scale_text(requested, current=None) -> str:
+        return str(int((current or spec.fixed_model_scale) if spec.fixed_model_scale else float(requested)))
 
     cuda_available = False
     try:
@@ -175,7 +174,7 @@ def video_sr_tab(
                     with gr.Column(scale=2):
                         _initial_scale_state = spec.canonical_scale(
                             scale_value=_value("scale", "4"), upscale_factor_value=_value("upscale_factor", None), default=4)
-                        scale = gr.State(value=_model_scale_text(_initial_scale_state))
+                        scale = gr.State(value=_model_scale_text(_initial_scale_state, _value("scale", "4")))
                         c["scale"] = scale
                         spec.build_model_column(ctx)
                     with gr.Column(scale=2):
@@ -411,7 +410,7 @@ def video_sr_tab(
             state=state if isinstance(state, dict) else None,
         )
         requested = float(resolved_scale or 4)
-        ms = int(spec.fixed_model_scale or requested)
+        ms = int(_model_scale_text(requested, model_scale_val))
         return build_fixed_scale_analysis_update(
             input_path_val=path_val,
             model_scale=ms,
@@ -857,7 +856,7 @@ def video_sr_tab(
     )
     _after_sizing(max_res_evt)
 
-    def _sync_upscale_ui(use_global, local_x, state):
+    def _sync_upscale_ui(use_global, local_x, state, model_scale):
         shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
         if bool(use_global) and shared_scale is not None:
             effective = spec.canonical_scale(
@@ -867,7 +866,7 @@ def video_sr_tab(
             )
             return (
                 gr.update(value=float(effective), interactive=True),
-                gr.update(value=_model_scale_text(effective)),
+                gr.update(value=_model_scale_text(effective, model_scale)),
             )
 
         effective_local = spec.canonical_scale(
@@ -877,11 +876,11 @@ def video_sr_tab(
         )
         return (
             gr.update(value=float(effective_local), interactive=True),
-            gr.update(value=_model_scale_text(effective_local)),
+            gr.update(value=_model_scale_text(effective_local, model_scale)),
         )
 
-    def _sync_upscale_ui_and_sizing(use_global, local_x, path_val, max_edge, pre_down, state):
-        slider_upd, scale_upd = _sync_upscale_ui(use_global, local_x, state)
+    def _sync_upscale_ui_and_sizing(use_global, local_x, path_val, max_edge, pre_down, state, model_scale):
+        slider_upd, scale_upd = _sync_upscale_ui(use_global, local_x, state, model_scale)
         shared_scale = resolve_shared_upscale_factor(state if bool(use_global) else None)
         effective_scale = shared_scale if (bool(use_global) and shared_scale is not None) else local_x
         resolved = spec.canonical_scale(
@@ -891,7 +890,7 @@ def video_sr_tab(
         )
         info = _build_sizing_info(
             path_val or "",
-            int(resolved),
+            int(_model_scale_text(resolved, model_scale)),
             bool(use_global),
             float(resolved),
             max_edge,
@@ -900,7 +899,7 @@ def video_sr_tab(
         )
         return slider_upd, scale_upd, info
 
-    def _on_local_upscale_changed(local_x, use_global, state):
+    def _on_local_upscale_changed(local_x, use_global, state, model_scale):
         resolved = spec.canonical_scale(
             scale_value=None,
             upscale_factor_value=local_x,
@@ -912,11 +911,11 @@ def video_sr_tab(
         next_use_global = bool(use_global)
         if bool(use_global) and shared_scale is not None:
             next_use_global = False
-        return gr.update(value=next_use_global), gr.update(value=_model_scale_text(resolved))
+        return gr.update(value=next_use_global), gr.update(value=_model_scale_text(resolved, model_scale))
 
     local_scale_evt = upscale_factor.release(
         fn=_on_local_upscale_changed,
-        inputs=[upscale_factor, use_resolution_tab, shared_state],
+        inputs=[upscale_factor, use_resolution_tab, shared_state, scale],
         outputs=[use_resolution_tab, scale],
         preprocess=False,
         queue=False,
@@ -935,7 +934,7 @@ def video_sr_tab(
 
     use_resolution_evt = use_resolution_tab.change(
         fn=_sync_upscale_ui_and_sizing,
-        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state],
+        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, scale],
         outputs=[upscale_factor, scale, sizing_info],
         queue=False,
         show_progress="hidden",
@@ -1232,6 +1231,7 @@ def video_sr_tab(
         max_edge,
         pre_down,
         state,
+        model_scale,
         previous_signature: str = "",
     ):
         seed_controls = (state or {}).get("seed_controls", {}) if isinstance(state, dict) else {}
@@ -1242,6 +1242,7 @@ def video_sr_tab(
                 "path_val": path_val,
                 "max_edge": max_edge,
                 "pre_down": bool(pre_down),
+                "model_scale": model_scale,
                 "shared_scale": resolve_shared_upscale_factor(state if bool(use_global) else None),
                 "resolution_settings": seed_controls.get("resolution_settings", {}),
             }
@@ -1249,7 +1250,7 @@ def video_sr_tab(
         if signature == str(previous_signature or ""):
             return gr.skip(), gr.skip(), gr.skip(), previous_signature
         slider_upd, scale_upd, sizing_upd = _sync_upscale_ui_and_sizing(
-            use_global, local_x, path_val, max_edge, pre_down, state
+            use_global, local_x, path_val, max_edge, pre_down, state, model_scale
         )
         return slider_upd, scale_upd, sizing_upd, signature
 
@@ -1372,7 +1373,7 @@ def video_sr_tab(
 
     shared_scale_sync_evt = shared_state.change(
         fn=_sync_upscale_ui_and_sizing_if_needed,
-        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, upscale_sync_signature],
+        inputs=[use_resolution_tab, upscale_factor, input_path, max_target_resolution, pre_downscale_then_upscale, shared_state, scale, upscale_sync_signature],
         outputs=[upscale_factor, scale, sizing_info, upscale_sync_signature],
         queue=False,
         show_progress="hidden",

@@ -643,17 +643,35 @@ def _resume_plan(run_dir: Path, active: List[Dict[str, Any]]) -> tuple:
     return data.get("chain_input") or data.get("source"), done
 
 
-def _trim_for_test(source: str, seconds: float, run_dir: Path, log: List[str]) -> str:
-    """Quick test: the first ``seconds`` of a video, re-encoded near-lossless so every frame is kept."""
-    if Path(source).suffix.lower() not in VIDEO_EXTS or seconds <= 0:
-        return source
-    target = run_dir / f"{Path(source).stem}_first{seconds:g}s.mp4"
+def prepare_comparison_segment(source: str, start: float, seconds: float, target: Path) -> str:
+    """Extract one accurate video range, including audio, for both candidate runs."""
+    import math
     import subprocess
 
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-t", f"{seconds:g}", "-map", "0:v:0", "-map", "0:a?",
+    if Path(source).suffix.lower() not in VIDEO_EXTS or not all(math.isfinite(v) for v in (start, seconds)):
+        raise ValueError("Choose a video and enter a valid start and duration.")
+    if start < 0 or seconds <= 0:
+        raise ValueError("Start must be zero or later and duration must be positive.")
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-ss", f"{start:g}", "-i", str(source),
+           "-t", f"{seconds:g}", "-map", "0:v:0", "-map", "0:a?",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "10", "-pix_fmt", "yuv420p", "-c:a", "aac", str(target)]
     try:
         subprocess.run(cmd, check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode(errors="replace").strip()
+        raise ValueError(detail or "FFmpeg could not extract the selected time range.") from exc
+    if not media_info(str(target)).get("width"):
+        raise ValueError("The selected time range contains no video frames.")
+    return str(target)
+
+
+def _trim_for_test(source: str, seconds: float, run_dir: Path, log: List[str]) -> str:
+    """Quick test of the opening seconds, with the existing whole-file fallback."""
+    if Path(source).suffix.lower() not in VIDEO_EXTS or seconds <= 0:
+        return source
+    target = run_dir / f"{Path(source).stem}_first{seconds:g}s.mp4"
+    try:
+        prepare_comparison_segment(source, 0, seconds, target)
         log.append(f"    quick test: first {seconds:g} s -> {target.name}")
         return str(target)
     except Exception as exc:

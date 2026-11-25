@@ -83,6 +83,7 @@ from ui.rife_tab import rife_tab
 from ui.gan_tab import gan_tab
 from ui.flashvsr_tab import flashvsr_tab
 from ui.relayvsr_tab import relayvsr_tab
+from ui.experimental_vsr_tab import experimental_vsr_tab
 from ui.ltx25_tab import ltx25_tab
 from ui.open_h3_tab import open_h3_tab
 from ui.sparkvsr_tab import sparkvsr_tab
@@ -111,7 +112,7 @@ from ui.theme import (
 BASE_DIR = Path(__file__).parent.resolve()
 PRESET_DIR = BASE_DIR / "presets"
 FAVICON_PATH = BASE_DIR / "assets" / "favicon-upscaler.svg"
-APP_VERSION = "10.5"
+APP_VERSION = "10.6"
 PATREON_URL = "https://www.patreon.com/posts/150202809"
 APP_TITLE = f"SECourses Ultimate Video and Image Upscaler Pro V{APP_VERSION} – {PATREON_URL}"
 
@@ -1978,6 +1979,9 @@ def main(argv=None):
                     temp_dir=active_temp_dir,
                     output_dir=active_output_dir,
                 )
+            with gr.Tab("Experimental Upscalers", elem_id="sec-tab-experimental-vsr"):
+                experimental_vsr_tab(BASE_DIR, active_output_dir, shared_state, global_settings)
+
             tab_relayvsr.select(
                 fn=_make_tab_sync("relayvsr"),
                 inputs=[shared_state, tab_sync_relayvsr],

@@ -40,6 +40,18 @@ class ModelDownloadBridgeTests(unittest.TestCase):
         self.assertTrue(any("25%" in line for line in progress))
         self.assertTrue(any("Continuing upscale" in line for line in progress))
 
+    def test_native_relay_downloader_works_with_an_older_bundle(self):
+        from shared.relayvsr_constants import RELAYVSR_WAN_2X
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(model_downloads, "run_model_downloader") as run:
+            root = Path(tmp).resolve()
+            run.return_value = True, ""
+            flag = object()
+            self.assertEqual(model_downloads.ensure_relayvsr_model(root, RELAYVSR_WAN_2X, cancel_event=flag), (True, ""))
+            self.assertEqual(run.call_args.args[1], [str(root / "RelayVSR_Models")])
+            self.assertEqual(run.call_args.kwargs["script_path"], root / "tools" / "download_relayvsr_native.py")
+            self.assertIs(run.call_args.kwargs["cancel_event"], flag)
+
     def test_int8_cache_header_validation(self):
         metadata = {
             "seedvr2_int8_convrot": "true",

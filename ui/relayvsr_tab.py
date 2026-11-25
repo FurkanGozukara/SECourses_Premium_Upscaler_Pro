@@ -9,11 +9,13 @@ import gradio as gr
 
 from shared.relayvsr_constants import (
     RELAYVSR_PRECISIONS,
+    RELAYVSR_WAN_2X,
     RELAYVSR_WAN_DEFAULT,
     RELAYVSR_WAN_NAMES,
     RELAYVSR_WINDOW_DEFAULT,
     RELAYVSR_WINDOW_MAX,
     RELAYVSR_WINDOW_MIN,
+    relayvsr_model_scale,
 )
 from shared.services.relayvsr_service import RELAYVSR_ORDER, build_relayvsr_callbacks, canonical_relayvsr_scale
 from ui.video_sr_tab import TabContext, VideoSRTabSpec, video_sr_tab
@@ -26,10 +28,12 @@ def _build_model_column(ctx: TabContext) -> None:
         label="Wan Model",
         choices=list(RELAYVSR_WAN_NAMES),
         value=wan if wan in RELAYVSR_WAN_NAMES else RELAYVSR_WAN_DEFAULT,
-        info=("RelayVSR's large model, which writes the reference keyframes. INT8 ConvRot (default) is half the size "
-              "of BF16 with the same look; both download on first use from the SECourses Hugging Face mirror "
-              "(+ the 0.13 GB Flash decoder)."),
+        info=("Selecting Native 2x sets the local output factor to 2x and uses the LightX2V checkpoint pair. "
+              "The INT8 and BF16 options use the original 4x model. "
+              "The selected pair downloads on first use."),
     )
+    ctx.c["wan_model"].change(lambda name: str(relayvsr_model_scale(name)), inputs=[ctx.c["wan_model"]],
+                               outputs=[ctx.c["scale"]], queue=False, show_progress="hidden")
     precision = str(v("precision", "auto")).lower()
     ctx.c["precision"] = gr.Dropdown(
         label="Precision",
@@ -61,10 +65,48 @@ def _build_runtime_row(ctx: TabContext) -> None:
               "Auto Tune sets this."),
         scale=2,
     )
+    ctx.c["int8_kv_cache"] = gr.Checkbox(
+        label="INT8 Temporal Cache",
+        value=bool(ctx.value("int8_kv_cache", False)),
+        info="Reduce Wan keyframe cache memory. This can slightly change the restored image.",
+    )
+    ctx.c["fp8_wan"] = gr.Checkbox(
+        label="FP8 Wan Weights",
+        value=bool(ctx.value("fp8_wan", False)),
+        info="Try FP8 matrix multiplication with a BF16 Wan checkpoint on RTX 40 series and newer.",
+    )
 
 
 def _nothing(_ctx: TabContext) -> None:
     return None
+
+
+def _wire_model_selection(ctx: TabContext) -> None:
+    components = ctx.c
+
+    def set_native_output(model):
+        if model == RELAYVSR_WAN_2X:
+            return 2.0, False
+        return gr.skip(), gr.skip()
+
+    components["wan_model"].input(
+        set_native_output, inputs=[components["wan_model"]],
+        outputs=[components["upscale_factor"], components["use_resolution_tab"]],
+        queue=False, show_progress="hidden",
+    )
+
+
+def _build_output(ctx: TabContext) -> None:
+    ctx.c["direct_final_size"] = gr.Checkbox(
+        label="Resize in First Encode",
+        value=bool(ctx.value("direct_final_size", False)),
+        info="Write the requested video size directly when using standard encoder settings.",
+    )
+    ctx.c["temporal_resume_dir"] = gr.Textbox(
+        label="Temporal Checkpoint Folder",
+        value=str(ctx.value("temporal_resume_dir", "") or ""),
+        info="Optional. Save Wan state and video segments for libx264 jobs and use the same folder to resume.",
+    )
 
 
 RELAYVSR_TAB = VideoSRTabSpec(
@@ -76,7 +118,7 @@ RELAYVSR_TAB = VideoSRTabSpec(
     model_label="RelayVSR",
     runtime_label=lambda ms: f"RelayVSR streaming pipeline (fixed {ms}x pass)",
     upscale_slider=dict(label="RelayVSR Upscale Factor", minimum=1.0, maximum=4.0, step=0.5,
-                        info="The model always runs at 4x; smaller factors downscale the input first (Pre-downscale)."),
+                        info="Requested output scale. Select the native 2x or 4x checkpoint above."),
     input_path_info="Video file, image, or (with Enable Batch) a folder",
     input_placeholder="C:/path/to/video.mp4 or C:/path/to/image.png",
     gpu_note="RelayVSR uses a single GPU",
@@ -93,9 +135,8 @@ RELAYVSR_TAB = VideoSRTabSpec(
 
     **How it works**
     - A large Wan model writes a reference keyframe every (window - 1) frames; a small Flash decoder turns every
-      low-resolution frame into a 4x frame, relaying the detail between the keyframes. One frame streams at a time.
-    - The model always upscales **4x**. Smaller factors and `Max Resolution` downscale the input first, so the model
-      still runs at 4x.
+      low-resolution frame into a 2x or 4x frame, relaying the detail between the keyframes. One frame streams at a time.
+    - The checkpoint sets the model's native scale. The output scale and max resolution control the final dimensions.
 
     **Speed and memory**
     - With every Wan block on the GPU a 4K output needs about 19 GB (INT8). Smaller GPUs keep part of Wan and its
@@ -108,7 +149,8 @@ RELAYVSR_TAB = VideoSRTabSpec(
     build_runtime_row=_build_runtime_row,
     build_runtime_extra=_nothing,
     build_sections=_nothing,
-    build_output_leading=_nothing,
+    build_output_leading=_build_output,
+    wire_extra=_wire_model_selection,
     output_format_info="RelayVSR writes MP4 for videos and PNG for images (Output tab image format applies).",
     fixed_model_scale=4,
 )

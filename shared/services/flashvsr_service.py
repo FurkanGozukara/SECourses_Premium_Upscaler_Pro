@@ -165,6 +165,9 @@ def flashvsr_defaults(model_name: Optional[str] = None) -> Dict[str, Any]:
         # FlashVSR+ (official Turbo / Base) only
         "temporal_compression": 4,
         "decode_every": 16,
+        "plus_resident_frames": False,
+        "plus_fp8_weights": False,
+        "legacy_tiled_stream": False,
     }
 
 
@@ -218,6 +221,9 @@ FLASHVSR_ORDER: List[str] = [
     "auto_tune_on_run",
     "temporal_compression",
     "decode_every",
+    "plus_resident_frames",
+    "plus_fp8_weights",
+    "legacy_tiled_stream",
 ]
 
 
@@ -229,6 +235,9 @@ def _enforce_flashvsr_guardrails(cfg: Dict[str, Any], defaults: Dict[str, Any]) 
     cfg = {**defaults, **(cfg or {})}
 
     cfg["output_format"] = "mp4"
+    cfg["plus_resident_frames"] = _to_bool(cfg.get("plus_resident_frames"), False)
+    cfg["plus_fp8_weights"] = _to_bool(cfg.get("plus_fp8_weights"), False)
+    cfg["legacy_tiled_stream"] = _to_bool(cfg.get("legacy_tiled_stream"), False)
     cfg["save_metadata"] = _to_bool(cfg.get("save_metadata"), _to_bool(defaults.get("save_metadata", True), True))
     cfg["face_restore_after_upscale"] = _to_bool(
         cfg.get("face_restore_after_upscale"),

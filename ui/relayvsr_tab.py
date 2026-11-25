@@ -137,6 +137,7 @@ RELAYVSR_TAB = VideoSRTabSpec(
     - A large Wan model writes a reference keyframe every (window - 1) frames; a small Flash decoder turns every
       low-resolution frame into a 2x or 4x frame, relaying the detail between the keyframes. One frame streams at a time.
     - The checkpoint sets the model's native scale. The output scale and max resolution control the final dimensions.
+    - Start Frame and End Frame select a range for a single streaming pass with audio trimmed to the same range.
 
     **Speed and memory**
     - With every Wan block on the GPU a 4K output needs about 19 GB (INT8). Smaller GPUs keep part of Wan and its

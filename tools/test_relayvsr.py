@@ -44,9 +44,16 @@ def cpu_checks() -> None:
     )
     from shared.universal_preset import dict_to_values, get_all_defaults, values_to_dict
     from shared.vram_autotune import relayvsr as tune
+    from shared.services.video_sr_service import _relayvsr_uses_frame_range
 
     # 1) settings
     d = relayvsr_defaults()
+    check("A whole RelayVSR clip can use scene chunking", not _relayvsr_uses_frame_range("relayvsr", d))
+    check("RelayVSR streams an explicit first or last frame in one pass",
+          _relayvsr_uses_frame_range("relayvsr", {**d, "start_frame": 2})
+          and _relayvsr_uses_frame_range("relayvsr", {**d, "end_frame": 0}))
+    check("Frame-range handling is scoped to RelayVSR",
+          not _relayvsr_uses_frame_range("flashvsr", {**d, "end_frame": 16}))
     native = relayvsr_defaults(RELAYVSR_WAN_2X)
     check("Native checkpoint defaults to a local 2x export",
           native["scale"] == "2" and native["upscale_factor"] == 2 and not native["use_resolution_tab"])

@@ -66,6 +66,10 @@ from shared.video_codec_options import (
 )
 
 
+def _relayvsr_uses_frame_range(engine_key: str, settings: Dict[str, Any]) -> bool:
+    return engine_key == "relayvsr" and (settings.get("start_frame", 0) > 0 or settings.get("end_frame", -1) >= 0)
+
+
 def _custom_args_chunk_settings(
     chunk_settings: Dict[str, Any], label: str, log: Callable[[str], None]
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
@@ -1504,7 +1508,11 @@ def build_video_sr_callbacks(
                         continue
 
                     effective_for_chunk = normalize_path(item_settings.get("_effective_input_path") or item_path)
-                    should_chunk_video = (detect_input_type(effective_for_chunk) == "video") and (auto_chunk or chunk_size_sec > 0)
+                    should_chunk_video = (
+                        detect_input_type(effective_for_chunk) == "video"
+                        and (auto_chunk or chunk_size_sec > 0)
+                        and not _relayvsr_uses_frame_range(_key, item_settings)
+                    )
 
                     chunk_count_item = 0
                     if should_chunk_video:
@@ -1986,7 +1994,11 @@ def build_video_sr_callbacks(
 
             # Chunk against the effective (preprocessed) input, but keep output naming from the original filename.
             effective_for_chunk = normalize_path(settings.get("_effective_input_path") or input_path)
-            should_use_chunking = (detect_input_type(effective_for_chunk) == "video") and (auto_chunk or chunk_size_sec > 0)
+            should_use_chunking = (
+                detect_input_type(effective_for_chunk) == "video"
+                and (auto_chunk or chunk_size_sec > 0)
+                and not _relayvsr_uses_frame_range(_key, settings)
+            )
             resume_requested = bool(settings.get("_resume_run_requested") or str(settings.get("resume_run_dir") or "").strip())
             if resume_requested and not should_use_chunking:
                 vid_upd, img_upd = _media_updates(None)
